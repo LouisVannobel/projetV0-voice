@@ -286,6 +286,56 @@ async def test_relay_claim_survives_restart_and_reappears_only_after_lease_expir
 
 
 @pytest.mark.asyncio
+async def test_restart_fences_expired_relay_worker_from_reclaimed_row(tmp_path: Path) -> None:
+    database = tmp_path / "claim-fence-restart.sqlite"
+    keyring = CryptoKeyring({1: KEY_V1}, active_version=1)
+    writer = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
+    first_task = __import__("asyncio").create_task(writer.run())
+    assert await writer.wait_ready()
+    assert writer.try_enqueue_turn(synthetic_turn(keyring))
+    await writer.wait_until_idle()
+    claim_a = (
+        await writer.read_relay_batch(batch_size=1, now=NOW, lease_seconds=5)
+    )[0]
+    await writer.drain(2)
+    await first_task
+
+    restarted = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
+    second_task = __import__("asyncio").create_task(restarted.run())
+    assert await restarted.wait_ready()
+    claim_b = (
+        await restarted.read_relay_batch(
+            batch_size=1,
+            now=NOW + timedelta(seconds=5),
+            lease_seconds=5,
+        )
+    )[0]
+
+    stale_retry = await restarted.retry_outbox(
+        queue_id=claim_a.queue_id,
+        expected_claim_expires_at=claim_a.claim_expires_at,
+        next_attempt_at=NOW + timedelta(seconds=30),
+        error_code="stale_after_restart",
+    )
+    assert stale_retry.applied is False
+    assert restarted.fatal_fault is None
+    assert second_task.done() is False
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id = ?",
+            (claim_b.queue_id,),
+        ).fetchone() == (0, "2026-08-25T12:00:10Z", None)
+
+    current_ack = await restarted.ack_outbox(
+        queue_id=claim_b.queue_id,
+        expected_claim_expires_at=claim_b.claim_expires_at,
+    )
+    assert current_ack.applied is True
+    await restarted.drain(2)
+    await second_task
+
+
+@pytest.mark.asyncio
 async def test_restored_turn_decrypts_with_retained_old_key(tmp_path: Path) -> None:
     database = tmp_path / "restore.sqlite"
     old_keyring = CryptoKeyring({1: KEY_V1}, active_version=1)

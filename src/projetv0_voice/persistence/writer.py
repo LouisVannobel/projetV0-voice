@@ -136,6 +136,11 @@ class OutboxItem:
 
 
 @dataclass(frozen=True, slots=True)
+class RelayClaimResult:
+    applied: bool
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupResult:
     receipts: int
     leases: int
@@ -388,32 +393,65 @@ class PersistenceWriter:
             raise
         return await result
 
-    async def ack_outbox(self, *, queue_id: int) -> None:
-        await self.commit_control(
-            PersistenceCommand("relay_batch", {"action": "ack", "queue_id": queue_id}, None)
+    async def ack_outbox(
+        self,
+        *,
+        queue_id: int,
+        expected_claim_expires_at: datetime,
+    ) -> RelayClaimResult:
+        expected_claim = self._validate_expected_claim(expected_claim_expires_at)
+        return await self._commit_relay_claim_mutation(
+            {
+                "action": "ack",
+                "queue_id": queue_id,
+                "expected_claim_expires_at": expected_claim,
+            }
         )
 
     async def retry_outbox(
         self,
         *,
         queue_id: int,
+        expected_claim_expires_at: datetime,
         next_attempt_at: datetime,
         error_code: str,
-    ) -> None:
+    ) -> RelayClaimResult:
         if _SAFE_ERROR_CODE.fullmatch(error_code) is None:
             raise ValueError("error_code must be a bounded safe code")
-        await self.commit_control(
-            PersistenceCommand(
-                "relay_batch",
-                {
-                    "action": "retry",
-                    "queue_id": queue_id,
-                    "next_attempt_at": next_attempt_at,
-                    "error_code": error_code,
-                },
-                None,
-            )
+        expected_claim = self._validate_expected_claim(expected_claim_expires_at)
+        return await self._commit_relay_claim_mutation(
+            {
+                "action": "retry",
+                "queue_id": queue_id,
+                "expected_claim_expires_at": expected_claim,
+                "next_attempt_at": next_attempt_at,
+                "error_code": error_code,
+            }
         )
+
+    @staticmethod
+    def _validate_expected_claim(value: object) -> datetime:
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise ValueError("expected_claim_expires_at must be timezone-aware")
+        return value.astimezone(UTC)
+
+    async def _commit_relay_claim_mutation(
+        self, payload: dict[str, object]
+    ) -> RelayClaimResult:
+        result: asyncio.Future[RelayClaimResult] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand("relay_batch", {**payload, "result": result}, None)
+            )
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
 
     async def cleanup_local_state(self, *, now: datetime) -> CleanupResult:
         result: asyncio.Future[CleanupResult] = asyncio.get_running_loop().create_future()
@@ -1036,29 +1074,45 @@ class PersistenceWriter:
             await self._claim_batch(payload)
         elif action == "ack":
             queue_id = self._required_positive_int(payload, "queue_id")
-            cursor = await connection.execute("DELETE FROM outbox WHERE queue_id = ?", (queue_id,))
-            if cursor.rowcount != 1:
-                await cursor.close()
-                raise CommandConflictError("outbox_ack_conflict")
+            expected_claim = self._required_datetime(payload, "expected_claim_expires_at")
+            result = payload.get("result")
+            if not isinstance(result, asyncio.Future):
+                raise CommandSerializationError("invalid_relay_ack")
+            cursor = await connection.execute(
+                "DELETE FROM outbox WHERE queue_id = ? AND next_attempt_at = ?",
+                (queue_id, _iso(expected_claim)),
+            )
+            applied = cursor.rowcount == 1
             await cursor.close()
+            if not result.done():
+                result.set_result(RelayClaimResult(applied=applied))
         elif action == "retry":
             queue_id = self._required_positive_int(payload, "queue_id")
+            expected_claim = self._required_datetime(payload, "expected_claim_expires_at")
             next_attempt = self._required_datetime(payload, "next_attempt_at")
             error_code = self._required_str(payload, "error_code")
-            if _SAFE_ERROR_CODE.fullmatch(error_code) is None:
+            result = payload.get("result")
+            if _SAFE_ERROR_CODE.fullmatch(error_code) is None or not isinstance(
+                result, asyncio.Future
+            ):
                 raise CommandSerializationError("invalid_relay_retry")
             cursor = await connection.execute(
                 """
                 UPDATE outbox
                 SET attempts = attempts + 1, next_attempt_at = ?, last_error_code = ?
-                WHERE queue_id = ?
+                WHERE queue_id = ? AND next_attempt_at = ?
                 """,
-                (_iso(next_attempt), error_code, queue_id),
+                (
+                    _iso(next_attempt),
+                    error_code,
+                    queue_id,
+                    _iso(expected_claim),
+                ),
             )
-            if cursor.rowcount != 1:
-                await cursor.close()
-                raise CommandConflictError("outbox_retry_conflict")
+            applied = cursor.rowcount == 1
             await cursor.close()
+            if not result.done():
+                result.set_result(RelayClaimResult(applied=applied))
         elif action == "cleanup":
             now = self._required_datetime(payload, "now")
             result = payload.get("result")

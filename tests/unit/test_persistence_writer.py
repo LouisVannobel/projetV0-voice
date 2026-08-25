@@ -797,11 +797,13 @@ async def test_relay_claim_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Pat
     assert [item.queue_id for item in batch] == [1, 2]
     assert all(item.created_at == NOW for item in batch)
     assert all(item.claim_expires_at == NOW + timedelta(seconds=5) for item in batch)
-    await writer.retry_outbox(
+    retry_result = await writer.retry_outbox(
         queue_id=1,
+        expected_claim_expires_at=batch[0].claim_expires_at,
         next_attempt_at=NOW + timedelta(seconds=5),
         error_code="postgres_unavailable",
     )
+    assert retry_result.applied is True
     batch = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=5)
     assert batch == ()
     batch = await writer.read_relay_batch(
@@ -812,12 +814,20 @@ async def test_relay_claim_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Pat
         assert connection.execute(
             "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id=1"
         ).fetchone() == (1, "2026-08-25T12:00:10Z", "postgres_unavailable")
-    await writer.ack_outbox(queue_id=1)
+    ack_result = await writer.ack_outbox(
+        queue_id=1,
+        expected_claim_expires_at=batch[0].claim_expires_at,
+    )
+    assert ack_result.applied is True
     batch = await writer.read_relay_batch(
         batch_size=10, now=NOW + timedelta(seconds=10), lease_seconds=5
     )
     assert [item.queue_id for item in batch] == [2]
-    await writer.ack_outbox(queue_id=2)
+    ack_result = await writer.ack_outbox(
+        queue_id=2,
+        expected_claim_expires_at=batch[0].claim_expires_at,
+    )
+    assert ack_result.applied is True
     assert await writer.read_relay_batch(
         batch_size=10, now=NOW + timedelta(seconds=15), lease_seconds=5
     ) == ()
@@ -827,6 +837,90 @@ async def test_relay_claim_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Pat
             0,
         )
     await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_stale_relay_worker_cannot_ack_or_retry_a_newer_claim_in_same_process(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "claim-fence.sqlite"
+    writer, task = await start_writer(database, utcnow=lambda: NOW)
+    assert writer.try_enqueue_turn(turn_operation(1))
+    await writer.wait_until_idle()
+    claim_a = (
+        await writer.read_relay_batch(batch_size=1, now=NOW, lease_seconds=5)
+    )[0]
+    claim_b = (
+        await writer.read_relay_batch(
+            batch_size=1,
+            now=NOW + timedelta(seconds=5),
+            lease_seconds=5,
+        )
+    )[0]
+    assert claim_a.claim_expires_at == NOW + timedelta(seconds=5)
+    assert claim_b.claim_expires_at == NOW + timedelta(seconds=10)
+
+    stale_ack = await writer.ack_outbox(
+        queue_id=claim_a.queue_id,
+        expected_claim_expires_at=claim_a.claim_expires_at,
+    )
+    stale_retry = await writer.retry_outbox(
+        queue_id=claim_a.queue_id,
+        expected_claim_expires_at=claim_a.claim_expires_at,
+        next_attempt_at=NOW + timedelta(seconds=30),
+        error_code="stale_worker",
+    )
+
+    assert stale_ack.applied is False
+    assert stale_retry.applied is False
+    assert writer.fatal_fault is None
+    assert writer.is_degraded is False
+    assert task.done() is False
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id = ?",
+            (claim_b.queue_id,),
+        ).fetchone() == (0, "2026-08-25T12:00:10Z", None)
+
+    current_ack = await writer.ack_outbox(
+        queue_id=claim_b.queue_id,
+        expected_claim_expires_at=claim_b.claim_expires_at,
+    )
+    assert current_ack.applied is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (0,)
+    await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_relay_mutations_require_a_well_formed_expected_claim_timestamp(
+    tmp_path: Path,
+) -> None:
+    writer, task = await start_writer(tmp_path / "claim-input.sqlite", utcnow=lambda: NOW)
+    assert writer.try_enqueue_turn(turn_operation(1))
+    await writer.wait_until_idle()
+    claim = (await writer.read_relay_batch(batch_size=1, now=NOW, lease_seconds=30))[0]
+
+    try:
+        with pytest.raises(TypeError):
+            await writer.ack_outbox(queue_id=claim.queue_id)  # type: ignore[call-arg]
+        with pytest.raises(ValueError, match="expected_claim_expires_at"):
+            await writer.ack_outbox(
+                queue_id=claim.queue_id,
+                expected_claim_expires_at=datetime(2026, 8, 25, 12),
+            )
+        with pytest.raises(ValueError, match="expected_claim_expires_at"):
+            await writer.retry_outbox(
+                queue_id=claim.queue_id,
+                expected_claim_expires_at="not-a-datetime",  # type: ignore[arg-type]
+                next_attempt_at=NOW + timedelta(seconds=60),
+                error_code="invalid_input",
+            )
+        assert writer.fatal_fault is None
+        assert task.done() is False
+    finally:
+        if not task.done():
+            await stop_writer(writer, task)
 
 
 @pytest.mark.asyncio
