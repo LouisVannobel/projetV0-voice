@@ -19,6 +19,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
     "psycopg[binary,pool]==3.3.4",
     "pydantic==2.13.4",
     "pynacl==1.6.2",
+    "pyyaml==6.0.3",
     "telnyx==4.176.0",
     "uvicorn[standard]==0.52.4",
 ]

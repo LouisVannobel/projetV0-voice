@@ -1,0 +1,24 @@
+schema_version: 1
+tenant_id: projetv0
+agent_id: agent-a
+revision: agent-a-v1
+dids:
+  - "+33100000000"
+language: fr-FR
+prompt_path: prompt.md
+prompt_revision: prompt-v1
+greeting: >-
+  Bonjour, vous êtes en ligne avec projetV0. Vous interagissez avec une intelligence
+  artificielle pour assurer le suivi de votre demande. La transcription de cet échange sera
+  conservée pendant 7 jours. L’audio n’est pas enregistré. Comment puis-je vous aider ?
+conversation_mode: freeform
+max_concurrent_calls: 10
+direction: inbound_only
+transport_codec: PCMU
+transport_sample_rate_hz: 8000
+transcript_retention_days: 7
+recording_mode: "off"
+recording_format: wav
+recording_retention_days: null
+recording_required: false
+recording_play_beep: false

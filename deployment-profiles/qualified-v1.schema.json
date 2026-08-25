@@ -1,0 +1,154 @@
+{
+  "$defs": {
+    "InferenceProfileV1": {
+      "additionalProperties": false,
+      "properties": {
+        "llm_model": {
+          "minLength": 1,
+          "title": "Llm Model",
+          "type": "string"
+        },
+        "llm_provider_policy": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Llm Provider Policy",
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "stt_model": {
+          "minLength": 1,
+          "title": "Stt Model",
+          "type": "string"
+        },
+        "tts_model": {
+          "minLength": 1,
+          "title": "Tts Model",
+          "type": "string"
+        },
+        "tts_pcm_channels": {
+          "const": 1,
+          "title": "Tts Pcm Channels",
+          "type": "integer"
+        },
+        "tts_pcm_sample_rate": {
+          "gt": 0,
+          "title": "Tts Pcm Sample Rate",
+          "type": "integer"
+        },
+        "tts_provider_options": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Tts Provider Options",
+          "type": "object"
+        },
+        "tts_voice": {
+          "minLength": 1,
+          "title": "Tts Voice",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "stt_model",
+        "llm_model",
+        "tts_model",
+        "tts_voice",
+        "tts_pcm_sample_rate",
+        "tts_pcm_channels",
+        "llm_provider_policy",
+        "tts_provider_options"
+      ],
+      "title": "InferenceProfileV1",
+      "type": "object"
+    },
+    "JsonValue": {}
+  },
+  "additionalProperties": false,
+  "properties": {
+    "agent_bundle_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Agent Bundle Sha256",
+      "type": "string"
+    },
+    "call_lease_ttl_seconds": {
+      "gt": 0,
+      "title": "Call Lease Ttl Seconds",
+      "type": "integer"
+    },
+    "deployment_id": {
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "disclosure_mark_timeout_ms": {
+      "ge": 3000,
+      "le": 10000,
+      "title": "Disclosure Mark Timeout Ms",
+      "type": "integer"
+    },
+    "image_digest": {
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$",
+      "title": "Image Digest",
+      "type": "string"
+    },
+    "inference": {
+      "$ref": "#/$defs/InferenceProfileV1"
+    },
+    "inference_profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Inference Profile Sha256",
+      "type": "string"
+    },
+    "qualified_at": {
+      "format": "date-time",
+      "title": "Qualified At",
+      "type": "string"
+    },
+    "runtime_contract_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Runtime Contract Sha256",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "telnyx_handshake_fixture_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Telnyx Handshake Fixture Sha256",
+      "type": "string"
+    },
+    "token_locator_id": {
+      "enum": [
+        "telnyx-http-header-v1",
+        "telnyx-query-v1",
+        "telnyx-start-v1"
+      ],
+      "title": "Token Locator Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "deployment_id",
+    "runtime_contract_sha256",
+    "image_digest",
+    "agent_bundle_sha256",
+    "inference_profile_sha256",
+    "inference",
+    "token_locator_id",
+    "telnyx_handshake_fixture_sha256",
+    "disclosure_mark_timeout_ms",
+    "call_lease_ttl_seconds",
+    "qualified_at"
+  ],
+  "title": "QualifiedDeploymentProfileV1",
+  "type": "object"
+}

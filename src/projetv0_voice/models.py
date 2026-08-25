@@ -1,0 +1,212 @@
+"""Typed and versioned durable-operation contracts."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+from datetime import UTC, datetime
+from typing import Annotated, Literal, Self
+from uuid import UUID
+
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
+
+
+def _require_exact_int(value: object) -> object:
+    if type(value) is not int:
+        raise ValueError("value must be an exact integer")
+    return value
+
+
+SchemaVersionV1 = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
+PositiveInt = Annotated[int, BeforeValidator(_require_exact_int), Field(gt=0)]
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _optional_utc_datetime(value: datetime | None) -> datetime | None:
+    return None if value is None else _utc_datetime(value)
+
+
+class _StrictFrozenModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CallUpsertPayloadV1(_StrictFrozenModel):
+    telnyx_call_control_id: str = Field(min_length=1)
+    telnyx_call_leg_id: str | None
+    telnyx_call_session_id: str | None
+    status: Literal["pending", "active", "closing", "closed", "failed"]
+    disclosure_state: Literal["pending", "completed", "failed"]
+    started_at: datetime | None
+    ended_at: datetime | None
+    end_reason: str | None
+    retention_until: datetime
+
+    _normalize_datetimes = field_validator(
+        "started_at", "ended_at", "retention_until", mode="after"
+    )(_optional_utc_datetime)
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> Self:
+        if self.status == "pending":
+            if (
+                self.started_at is not None
+                or self.ended_at is not None
+                or self.end_reason is not None
+            ):
+                raise ValueError("pending call cannot contain start/end fields")
+        elif self.status in {"active", "closing"}:
+            if self.started_at is None:
+                raise ValueError("active call requires started_at")
+            if self.ended_at is not None:
+                raise ValueError("active or closing call cannot contain ended_at")
+            if self.status == "active" and self.end_reason is not None:
+                raise ValueError("active call cannot contain end_reason")
+        elif self.status == "closed" and (
+            self.started_at is None or self.ended_at is None or not self.end_reason
+        ):
+            raise ValueError("closed call requires start, end and reason")
+        elif self.status == "failed" and (self.ended_at is None or not self.end_reason):
+            raise ValueError("failed call requires end and reason")
+
+        if (
+            self.started_at is not None
+            and self.ended_at is not None
+            and self.ended_at < self.started_at
+        ):
+            raise ValueError("ended_at must not precede started_at")
+        boundary = self.ended_at or self.started_at
+        if boundary is not None and self.retention_until <= boundary:
+            raise ValueError("retention_until must follow the call timeline")
+        return self
+
+
+class TurnUpsertPayloadV1(_StrictFrozenModel):
+    turn_id: UUID
+    turn_no: PositiveInt
+    role: Literal["user", "assistant"]
+    source: Literal["stt_final", "pipecat_assistant"]
+    crypto_version: SchemaVersionV1
+    key_version: PositiveInt
+    nonce_b64: str
+    ciphertext_b64: str
+    started_at: datetime
+    ended_at: datetime
+    interrupted: StrictBool
+
+    _normalize_datetimes = field_validator("started_at", "ended_at", mode="after")(
+        _utc_datetime
+    )
+
+    @field_validator("nonce_b64", "ciphertext_b64")
+    @classmethod
+    def validate_encrypted_value(cls, value: str, info: object) -> str:
+        field_name = getattr(info, "field_name", "encrypted value")
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError(f"{field_name} must be canonical base64") from error
+        if base64.b64encode(decoded).decode("ascii") != value:
+            raise ValueError(f"{field_name} must be canonical base64")
+        maximum_size = 128 if field_name == "nonce_b64" else 1_048_576
+        if not decoded or len(decoded) > maximum_size:
+            raise ValueError(f"{field_name} decoded size is outside the structural bound")
+        return value
+
+    @model_validator(mode="after")
+    def validate_turn(self) -> Self:
+        expected_source = "stt_final" if self.role == "user" else "pipecat_assistant"
+        if self.source != expected_source:
+            raise ValueError("turn role and source do not match")
+        if self.ended_at < self.started_at:
+            raise ValueError("ended_at must not precede started_at")
+        return self
+
+
+class RecordingUpsertPayloadV1(_StrictFrozenModel):
+    recording_id: UUID
+    status: Literal["off", "pending", "active", "saved", "failed", "purged"]
+    telnyx_recording_id: str | None
+    channels: Literal["dual"] | None
+    format: Literal["wav"] | None
+    started_at: datetime | None
+    ended_at: datetime | None
+    retention_until: datetime | None
+
+    _normalize_datetimes = field_validator(
+        "started_at", "ended_at", "retention_until", mode="after"
+    )(_optional_utc_datetime)
+
+    @model_validator(mode="after")
+    def validate_recording(self) -> Self:
+        metadata = (
+            self.telnyx_recording_id,
+            self.channels,
+            self.format,
+            self.started_at,
+            self.ended_at,
+            self.retention_until,
+        )
+        if self.status == "off" and any(item is not None for item in metadata):
+            raise ValueError("off recording cannot contain recording metadata")
+        if self.status != "off" and (self.channels != "dual" or self.format != "wav"):
+            raise ValueError("enabled recording requires dual-channel WAV metadata")
+        if self.status in {"active", "saved", "failed", "purged"} and self.started_at is None:
+            raise ValueError("active or final recording requires started_at")
+        if self.status in {"saved", "failed", "purged"} and self.ended_at is None:
+            raise ValueError("final recording requires ended_at")
+        if (
+            self.started_at is not None
+            and self.ended_at is not None
+            and self.ended_at < self.started_at
+        ):
+            raise ValueError("ended_at must not precede started_at")
+        if self.retention_until is not None:
+            boundary = self.ended_at or self.started_at
+            if boundary is None or self.retention_until <= boundary:
+                raise ValueError("recording retention must follow its timeline")
+        return self
+
+
+OperationPayloadV1 = CallUpsertPayloadV1 | TurnUpsertPayloadV1 | RecordingUpsertPayloadV1
+
+
+class VoiceOperationV1(_StrictFrozenModel):
+    schema_version: SchemaVersionV1
+    operation_id: UUID
+    deployment_id: str = Field(min_length=1)
+    call_id: UUID
+    occurred_at: datetime
+    kind: Literal["call.upsert", "turn.upsert", "recording.upsert"]
+    payload: OperationPayloadV1
+
+    _normalize_occurred_at = field_validator("occurred_at", mode="after")(_utc_datetime)
+
+    @model_validator(mode="after")
+    def validate_kind_and_timeline(self) -> Self:
+        expected_type: dict[str, type[_StrictFrozenModel]] = {
+            "call.upsert": CallUpsertPayloadV1,
+            "turn.upsert": TurnUpsertPayloadV1,
+            "recording.upsert": RecordingUpsertPayloadV1,
+        }
+        if not isinstance(self.payload, expected_type[self.kind]):
+            raise ValueError("payload does not match kind")
+
+        payload_started = self.payload.started_at
+        payload_ended = self.payload.ended_at
+        timeline_boundary = payload_ended or payload_started
+        if timeline_boundary is not None and self.occurred_at < timeline_boundary:
+            raise ValueError("occurred_at must not precede the payload timeline")
+        return self
