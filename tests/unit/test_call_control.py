@@ -542,6 +542,43 @@ async def test_close_is_owned_concurrent_idempotent_and_rejects_new_calls(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_close_stays_closing_and_later_close_retries_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    attempts = 0
+
+    async def close_impl() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    _, instances = install_fake(monkeypatch, module, [], close_impl=close_impl)
+    client = module.CallControlClient(api_key=API_KEY)
+    interrupted = asyncio.create_task(client.aclose())
+    await entered.wait()
+    interrupted.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await interrupted
+    assert cancelled.is_set()
+    with pytest.raises(module.CallControlClosedError, match="call_control_client_closed"):
+        await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID)
+
+    await client.aclose()
+
+    assert instances[0].close_count == 2
+    assert instances[0].actions.calls == []
+
+
+@pytest.mark.asyncio
 async def test_close_has_one_second_bound_and_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     module = call_control()
     cancelled = asyncio.Event()

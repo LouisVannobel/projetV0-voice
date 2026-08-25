@@ -313,7 +313,6 @@ class CallControlClient:
                 async with asyncio.timeout(CLOSE_DEADLINE_SECONDS):
                     await self._client.close()
             except asyncio.CancelledError:
-                self._closed = True
                 raise
             except Exception:
                 close_failed = True
