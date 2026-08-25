@@ -796,10 +796,11 @@ async def test_relay_claim_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Pat
     batch = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=5)
     assert [item.queue_id for item in batch] == [1, 2]
     assert all(item.created_at == NOW for item in batch)
+    assert all(item.claim_attempt == 1 for item in batch)
     assert all(item.claim_expires_at == NOW + timedelta(seconds=5) for item in batch)
     retry_result = await writer.retry_outbox(
         queue_id=1,
-        expected_claim_expires_at=batch[0].claim_expires_at,
+        expected_claim_attempt=batch[0].claim_attempt,
         next_attempt_at=NOW + timedelta(seconds=5),
         error_code="postgres_unavailable",
     )
@@ -810,22 +811,24 @@ async def test_relay_claim_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Pat
         batch_size=10, now=NOW + timedelta(seconds=5), lease_seconds=5
     )
     assert [item.queue_id for item in batch] == [1, 2]
+    assert all(item.claim_attempt == 2 for item in batch)
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id=1"
-        ).fetchone() == (1, "2026-08-25T12:00:10Z", "postgres_unavailable")
+        ).fetchone() == (2, "2026-08-25T12:00:10Z", "postgres_unavailable")
     ack_result = await writer.ack_outbox(
         queue_id=1,
-        expected_claim_expires_at=batch[0].claim_expires_at,
+        expected_claim_attempt=batch[0].claim_attempt,
     )
     assert ack_result.applied is True
     batch = await writer.read_relay_batch(
         batch_size=10, now=NOW + timedelta(seconds=10), lease_seconds=5
     )
     assert [item.queue_id for item in batch] == [2]
+    assert batch[0].claim_attempt == 3
     ack_result = await writer.ack_outbox(
         queue_id=2,
-        expected_claim_expires_at=batch[0].claim_expires_at,
+        expected_claim_attempt=batch[0].claim_attempt,
     )
     assert ack_result.applied is True
     assert await writer.read_relay_batch(
@@ -859,14 +862,24 @@ async def test_stale_relay_worker_cannot_ack_or_retry_a_newer_claim_in_same_proc
     )[0]
     assert claim_a.claim_expires_at == NOW + timedelta(seconds=5)
     assert claim_b.claim_expires_at == NOW + timedelta(seconds=10)
+    assert claim_a.claim_attempt == 1
+    assert claim_b.claim_attempt == 2
+
+    current_retry = await writer.retry_outbox(
+        queue_id=claim_b.queue_id,
+        expected_claim_attempt=claim_b.claim_attempt,
+        next_attempt_at=claim_a.claim_expires_at,
+        error_code="current_worker_retry",
+    )
+    assert current_retry.applied is True
 
     stale_ack = await writer.ack_outbox(
         queue_id=claim_a.queue_id,
-        expected_claim_expires_at=claim_a.claim_expires_at,
+        expected_claim_attempt=claim_a.claim_attempt,
     )
     stale_retry = await writer.retry_outbox(
         queue_id=claim_a.queue_id,
-        expected_claim_expires_at=claim_a.claim_expires_at,
+        expected_claim_attempt=claim_a.claim_attempt,
         next_attempt_at=NOW + timedelta(seconds=30),
         error_code="stale_worker",
     )
@@ -880,11 +893,11 @@ async def test_stale_relay_worker_cannot_ack_or_retry_a_newer_claim_in_same_proc
         assert connection.execute(
             "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id = ?",
             (claim_b.queue_id,),
-        ).fetchone() == (0, "2026-08-25T12:00:10Z", None)
+        ).fetchone() == (2, "2026-08-25T12:00:05Z", "current_worker_retry")
 
     current_ack = await writer.ack_outbox(
         queue_id=claim_b.queue_id,
-        expected_claim_expires_at=claim_b.claim_expires_at,
+        expected_claim_attempt=claim_b.claim_attempt,
     )
     assert current_ack.applied is True
     with sqlite3.connect(database) as connection:
@@ -893,7 +906,7 @@ async def test_stale_relay_worker_cannot_ack_or_retry_a_newer_claim_in_same_proc
 
 
 @pytest.mark.asyncio
-async def test_relay_mutations_require_a_well_formed_expected_claim_timestamp(
+async def test_relay_mutations_require_a_positive_exact_claim_attempt(
     tmp_path: Path,
 ) -> None:
     writer, task = await start_writer(tmp_path / "claim-input.sqlite", utcnow=lambda: NOW)
@@ -904,18 +917,14 @@ async def test_relay_mutations_require_a_well_formed_expected_claim_timestamp(
     try:
         with pytest.raises(TypeError):
             await writer.ack_outbox(queue_id=claim.queue_id)  # type: ignore[call-arg]
-        with pytest.raises(ValueError, match="expected_claim_expires_at"):
-            await writer.ack_outbox(
-                queue_id=claim.queue_id,
-                expected_claim_expires_at=datetime(2026, 8, 25, 12),
-            )
-        with pytest.raises(ValueError, match="expected_claim_expires_at"):
-            await writer.retry_outbox(
-                queue_id=claim.queue_id,
-                expected_claim_expires_at="not-a-datetime",  # type: ignore[arg-type]
-                next_attempt_at=NOW + timedelta(seconds=60),
-                error_code="invalid_input",
-            )
+        for invalid_attempt in (True, 0, -1, 1.0, "1"):
+            with pytest.raises(ValueError, match="expected_claim_attempt"):
+                await writer.retry_outbox(
+                    queue_id=claim.queue_id,
+                    expected_claim_attempt=invalid_attempt,  # type: ignore[arg-type]
+                    next_attempt_at=NOW + timedelta(seconds=60),
+                    error_code="invalid_input",
+                )
         assert writer.fatal_fault is None
         assert task.done() is False
     finally:
@@ -976,6 +985,7 @@ async def test_concurrent_relay_readers_claim_each_row_once_and_lease_is_bounded
 
     assert [item.queue_id for item in claimed] == [1, 2]
     assert empty == ()
+    assert all(item.claim_attempt == 1 for item in claimed)
     assert all(item.created_at == NOW for item in claimed)
     assert all(item.next_attempt_at == NOW for item in claimed)
     assert all(item.claim_expires_at == NOW + timedelta(seconds=30) for item in claimed)

@@ -211,6 +211,7 @@ async def test_restart_reemits_expired_leases_until_terminal_ack_and_replays_fif
     assert [item.queue_id for item in batch] == [1, 2]
     assert [item.operation.operation_id for item in batch] == [UUID(int=501), UUID(int=503)]
     assert all(item.created_at == NOW for item in batch)
+    assert all(item.claim_attempt == 1 for item in batch)
     assert all(item.claim_expires_at == NOW + timedelta(seconds=30) for item in batch)
     await restarted.drain(2)
     await second_task
@@ -261,6 +262,7 @@ async def test_relay_claim_survives_restart_and_reappears_only_after_lease_expir
     claimed = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30)
     assert [item.queue_id for item in claimed] == [1]
     assert claimed[0].created_at == NOW
+    assert claimed[0].claim_attempt == 1
     assert claimed[0].claim_expires_at == NOW + timedelta(seconds=30)
     await writer.drain(2)
     await first_task
@@ -280,6 +282,7 @@ async def test_relay_claim_survives_restart_and_reappears_only_after_lease_expir
     )
     assert [item.queue_id for item in available] == [1]
     assert available[0].created_at == NOW
+    assert available[0].claim_attempt == 2
     assert available[0].claim_expires_at == NOW + timedelta(seconds=60)
     await restarted.drain(2)
     await second_task
@@ -310,10 +313,20 @@ async def test_restart_fences_expired_relay_worker_from_reclaimed_row(tmp_path: 
             lease_seconds=5,
         )
     )[0]
+    assert claim_a.claim_attempt == 1
+    assert claim_b.claim_attempt == 2
+
+    current_retry = await restarted.retry_outbox(
+        queue_id=claim_b.queue_id,
+        expected_claim_attempt=claim_b.claim_attempt,
+        next_attempt_at=claim_a.claim_expires_at,
+        error_code="current_after_restart",
+    )
+    assert current_retry.applied is True
 
     stale_retry = await restarted.retry_outbox(
         queue_id=claim_a.queue_id,
-        expected_claim_expires_at=claim_a.claim_expires_at,
+        expected_claim_attempt=claim_a.claim_attempt,
         next_attempt_at=NOW + timedelta(seconds=30),
         error_code="stale_after_restart",
     )
@@ -324,11 +337,11 @@ async def test_restart_fences_expired_relay_worker_from_reclaimed_row(tmp_path: 
         assert connection.execute(
             "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id = ?",
             (claim_b.queue_id,),
-        ).fetchone() == (0, "2026-08-25T12:00:10Z", None)
+        ).fetchone() == (2, "2026-08-25T12:00:05Z", "current_after_restart")
 
     current_ack = await restarted.ack_outbox(
         queue_id=claim_b.queue_id,
-        expected_claim_expires_at=claim_b.claim_expires_at,
+        expected_claim_attempt=claim_b.claim_attempt,
     )
     assert current_ack.applied is True
     await restarted.drain(2)
