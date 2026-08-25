@@ -1,0 +1,983 @@
+"""Single-owner bounded SQLite command writer."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import errno
+import inspect
+import re
+import sqlite3
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Literal, cast
+from uuid import UUID
+
+import aiosqlite
+
+from projetv0_voice.crypto import (
+    CRYPTO_VERSION,
+    CryptoError,
+    CryptoKeyring,
+    EncryptedValue,
+    UnknownKeyVersionError,
+)
+from projetv0_voice.models import (
+    RecordingUpsertPayloadV1,
+    TurnUpsertPayloadV1,
+    VoiceOperationV1,
+)
+from projetv0_voice.persistence.commands import (
+    CommandConflictError,
+    CommandSerializationError,
+    FatalPersistenceError,
+    PersistenceCommand,
+    PersistenceError,
+    canonical_operation_bytes,
+    decode_operation,
+    encrypt_operation,
+    operation_aad_from_metadata,
+    require_operation,
+)
+from projetv0_voice.persistence.schema import SCHEMA_SQL
+
+PERSISTENCE_QUEUE_MAX_ITEMS = 256
+CONTROL_COMMIT_TIMEOUT_SECONDS = 1.5
+QUEUE_OLDEST_LIMIT_SECONDS = 1.0
+MAX_STORAGE_BYTES = 268_435_456
+RECEIPT_RETENTION = timedelta(days=7)
+CLOSED_LEASE_RETENTION = timedelta(hours=24)
+_SAFE_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+Failpoint = Callable[[str], Awaitable[None] | None]
+
+
+@dataclass(frozen=True, slots=True)
+class FatalPersistenceFault:
+    code: str
+
+
+@dataclass(frozen=True, slots=True)
+class StaleLease:
+    call_control_id: str
+    call_id: UUID
+    tenant_id: str
+    agent_id: str
+    token_hash: bytes = field(repr=False)
+    previous_state: Literal["pending", "active"]
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxItem:
+    queue_id: int
+    operation: VoiceOperationV1 = field(repr=False)
+    attempts: int
+    next_attempt_at: datetime
+    last_error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupResult:
+    receipts: int
+    leases: int
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _default_file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _iso(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise CommandSerializationError("datetime_must_be_aware")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise CommandSerializationError("stored_datetime_invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CommandSerializationError("stored_datetime_invalid")
+    return parsed.astimezone(UTC)
+
+
+class PersistenceWriter:
+    """Own one queue, one coroutine, and one aiosqlite connection."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        keyring: CryptoKeyring,
+        *,
+        fatal_handler: Callable[[FatalPersistenceFault], None] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        utcnow: Callable[[], datetime] = _utc_now,
+        control_commit_timeout_seconds: float = CONTROL_COMMIT_TIMEOUT_SECONDS,
+        quick_check_interval_seconds: float = 30.0,
+        quick_check_observer: Callable[[float], None] | None = None,
+        quick_check_result: Callable[[], str | None] | None = None,
+        file_size: Callable[[Path], int] = _default_file_size,
+        max_storage_bytes: int = MAX_STORAGE_BYTES,
+        failpoint: Failpoint | None = None,
+    ) -> None:
+        if control_commit_timeout_seconds <= 0 or quick_check_interval_seconds <= 0:
+            raise ValueError("timeouts must be positive")
+        if max_storage_bytes <= 0:
+            raise ValueError("max_storage_bytes must be positive")
+        self._database_path = Path(database_path)
+        self._keyring = keyring
+        self._fatal_handler = fatal_handler
+        self._monotonic = monotonic
+        self._utcnow = utcnow
+        self.control_commit_timeout_seconds = control_commit_timeout_seconds
+        self._quick_check_interval_seconds = quick_check_interval_seconds
+        self._quick_check_observer = quick_check_observer
+        self._quick_check_result = quick_check_result
+        self._file_size = file_size
+        self.max_storage_bytes = max_storage_bytes
+        self._failpoint = failpoint
+
+        self._queue: asyncio.Queue[PersistenceCommand] = asyncio.Queue(
+            maxsize=PERSISTENCE_QUEUE_MAX_ITEMS
+        )
+        self._accepting = True
+        self._degraded = False
+        self._run_started = False
+        self._stop_requested = False
+        self._connection: aiosqlite.Connection | None = None
+        self._owner_task: asyncio.Task[object] | None = None
+        self._ready_event = asyncio.Event()
+        self._ready_ok = False
+        self._closed_event = asyncio.Event()
+        self.fatal_event = asyncio.Event()
+        self.fatal_fault: FatalPersistenceFault | None = None
+        self.fatal_exception: FatalPersistenceError | None = None
+        self.transcript_loss_count = 0
+        self._last_quick_check = False
+        self._last_check_at = float("-inf")
+        self._stale_leases: list[StaleLease] = []
+        self.pragma_state: dict[str, int | str] = {}
+
+    @property
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def is_degraded(self) -> bool:
+        return self._degraded
+
+    def _new_safe_error(
+        self, code: str, source: BaseException | None = None
+    ) -> FatalPersistenceError:
+        if isinstance(source, CommandConflictError):
+            return CommandConflictError(code)
+        return FatalPersistenceError(code)
+
+    def _signal_fatal(
+        self,
+        code: str,
+        *,
+        source: BaseException | None = None,
+    ) -> FatalPersistenceError:
+        safe_error = self._new_safe_error(code, source)
+        self._accepting = False
+        self._degraded = True
+        if self.fatal_fault is None:
+            self.fatal_fault = FatalPersistenceFault(code)
+            self.fatal_exception = safe_error
+            self.fatal_event.set()
+            if self._fatal_handler is not None:
+                with contextlib.suppress(Exception):
+                    self._fatal_handler(self.fatal_fault)
+        return safe_error
+
+    def try_enqueue_turn(self, operation: VoiceOperationV1) -> bool:
+        if operation.kind != "turn.upsert":
+            raise ValueError("try_enqueue_turn requires turn.upsert")
+        if not self._accepting or self._degraded:
+            self.transcript_loss_count += 1
+            self._signal_fatal("persistence_degraded")
+            return False
+        command = PersistenceCommand(
+            "outbox",
+            {"operation": operation},
+            None,
+            enqueued_at=self._monotonic(),
+        )
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull:
+            self.transcript_loss_count += 1
+            self._signal_fatal("queue_full")
+            return False
+        return True
+
+    async def commit_control(self, command: PersistenceCommand) -> None:
+        if command.kind == "shutdown":
+            raise ValueError("shutdown is internal")
+        if not self._accepting or self._degraded:
+            raise self._new_safe_error(
+                self.fatal_fault.code if self.fatal_fault else "persistence_degraded"
+            )
+        future = command.committed or asyncio.get_running_loop().create_future()
+        queued = replace(command, committed=future, enqueued_at=self._monotonic())
+        try:
+            self._queue.put_nowait(queued)
+        except asyncio.QueueFull as error:
+            safe_error = self._signal_fatal("queue_full", source=error)
+            if not future.done():
+                future.set_exception(safe_error)
+            raise safe_error from None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(future), timeout=self.control_commit_timeout_seconds
+            )
+        except TimeoutError:
+            raise self._signal_fatal("control_commit_timeout") from None
+
+    async def quick_check(self) -> bool:
+        return self._last_quick_check
+
+    async def wait_ready(self) -> bool:
+        await self._ready_event.wait()
+        return self._ready_ok
+
+    async def wait_until_idle(self) -> None:
+        await self._queue.join()
+
+    def take_stale_leases(self) -> tuple[StaleLease, ...]:
+        stale = tuple(self._stale_leases)
+        self._stale_leases.clear()
+        return stale
+
+    async def commit_lease(
+        self,
+        *,
+        call_control_id: str,
+        call_id: UUID,
+        tenant_id: str,
+        agent_id: str,
+        state: Literal["pending", "active", "terminal"],
+        token_hash: bytes,
+        created_at: datetime,
+        expires_at: datetime,
+        closed_at: datetime | None,
+    ) -> None:
+        await self.commit_control(
+            PersistenceCommand(
+                "lease",
+                {
+                    "action": "upsert",
+                    "call_control_id": call_control_id,
+                    "call_id": call_id,
+                    "tenant_id": tenant_id,
+                    "agent_id": agent_id,
+                    "state": state,
+                    "token_hash": token_hash,
+                    "created_at": created_at,
+                    "expires_at": expires_at,
+                    "closed_at": closed_at,
+                },
+                None,
+            )
+        )
+
+    async def read_relay_batch(
+        self, *, batch_size: int, now: datetime
+    ) -> tuple[OutboxItem, ...]:
+        if type(batch_size) is not int or batch_size <= 0 or batch_size > 1000:
+            raise ValueError("batch_size is outside the supported range")
+        result: asyncio.Future[tuple[OutboxItem, ...]] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "relay_batch",
+                    {"action": "read", "batch_size": batch_size, "now": now, "result": result},
+                    None,
+                )
+            )
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
+
+    async def ack_outbox(self, *, queue_id: int) -> None:
+        await self.commit_control(
+            PersistenceCommand("relay_batch", {"action": "ack", "queue_id": queue_id}, None)
+        )
+
+    async def retry_outbox(
+        self,
+        *,
+        queue_id: int,
+        next_attempt_at: datetime,
+        error_code: str,
+    ) -> None:
+        if _SAFE_ERROR_CODE.fullmatch(error_code) is None:
+            raise ValueError("error_code must be a bounded safe code")
+        await self.commit_control(
+            PersistenceCommand(
+                "relay_batch",
+                {
+                    "action": "retry",
+                    "queue_id": queue_id,
+                    "next_attempt_at": next_attempt_at,
+                    "error_code": error_code,
+                },
+                None,
+            )
+        )
+
+    async def cleanup_local_state(self, *, now: datetime) -> CleanupResult:
+        result: asyncio.Future[CleanupResult] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "relay_batch", {"action": "cleanup", "now": now, "result": result}, None
+                )
+            )
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
+
+    async def drain(self, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self._accepting = False
+        if not self._run_started or self._closed_event.is_set():
+            return
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        command = PersistenceCommand(
+            "shutdown", {}, future, enqueued_at=self._monotonic()
+        )
+        await self._queue.put(command)
+        async with asyncio.timeout(timeout_seconds):
+            await asyncio.shield(future)
+            await self._queue.join()
+            await self._closed_event.wait()
+
+    async def run(self) -> None:
+        if self._run_started:
+            raise RuntimeError("writer_run_already_started")
+        self._run_started = True
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("writer_requires_asyncio_task")
+        self._owner_task = cast(asyncio.Task[object], current)
+        current_command: PersistenceCommand | None = None
+        current_owned = False
+        try:
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = await aiosqlite.connect(self._database_path)
+            await self._initialize_owner_connection()
+            await self._reclaim_stale_leases()
+            if not await self._perform_quick_check():
+                raise FatalPersistenceError("quick_check_failed")
+            self._check_storage_limit()
+            self._ready_ok = True
+            self._ready_event.set()
+
+            while True:
+                try:
+                    current_command = await asyncio.wait_for(
+                        self._queue.get(), timeout=self._quick_check_interval_seconds
+                    )
+                    current_owned = True
+                except TimeoutError:
+                    await self._run_periodic_check_if_due()
+                    continue
+
+                if (
+                    current_command.kind != "shutdown"
+                    and self._monotonic() - current_command.enqueued_at
+                    > QUEUE_OLDEST_LIMIT_SECONDS
+                ):
+                    raise FatalPersistenceError("queue_oldest_age_exceeded")
+
+                should_stop = await self._process_command(current_command)
+                if should_stop:
+                    self._resolve_success(current_command)
+                    self._queue.task_done()
+                    current_owned = False
+                    current_command = None
+                    break
+                self._check_storage_limit()
+                await self._run_periodic_check_if_due()
+                self._resolve_success(current_command)
+                self._queue.task_done()
+                current_owned = False
+                current_command = None
+        except BaseException as error:
+            safe_error = self._classify_error(error)
+            self._signal_fatal(str(safe_error), source=error)
+            if current_owned and current_command is not None:
+                self._resolve_failure(current_command, safe_error)
+                self._count_lost_command(current_command)
+                self._queue.task_done()
+            self._fail_pending(safe_error)
+        finally:
+            self._ready_event.set()
+            if self._connection is not None:
+                try:
+                    await self._connection.close()
+                except Exception:
+                    self._signal_fatal("sqlite_close_failed")
+                self._connection = None
+            self._closed_event.set()
+
+    def _require_owner_connection(self) -> aiosqlite.Connection:
+        if asyncio.current_task() is not self._owner_task or self._connection is None:
+            raise FatalPersistenceError("writer_owner_violation")
+        return self._connection
+
+    async def _initialize_owner_connection(self) -> None:
+        connection = self._require_owner_connection()
+        cursor = await connection.execute("PRAGMA journal_mode=DELETE")
+        journal_row = await cursor.fetchone()
+        await cursor.close()
+        await connection.execute("PRAGMA synchronous=EXTRA")
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.executescript(SCHEMA_SQL)
+        await connection.commit()
+        synchronous = self._pragma_int(await self._pragma_scalar("synchronous"))
+        foreign_keys = self._pragma_int(await self._pragma_scalar("foreign_keys"))
+        journal_mode = str(journal_row[0]).lower() if journal_row else ""
+        self.pragma_state = {
+            "journal_mode": journal_mode,
+            "synchronous": synchronous,
+            "foreign_keys": foreign_keys,
+        }
+        if self.pragma_state != {
+            "journal_mode": "delete",
+            "synchronous": 3,
+            "foreign_keys": 1,
+        }:
+            raise FatalPersistenceError("sqlite_pragma_mismatch")
+
+    async def _pragma_scalar(self, name: str) -> object:
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(f"PRAGMA {name}")
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            raise FatalPersistenceError("sqlite_pragma_missing")
+        return row[0]
+
+    @staticmethod
+    def _pragma_int(value: object) -> int:
+        if type(value) is not int:
+            raise FatalPersistenceError("sqlite_pragma_mismatch")
+        return value
+
+    async def _perform_quick_check(self) -> bool:
+        self._require_owner_connection()
+        override = self._quick_check_result() if self._quick_check_result else None
+        if override is None:
+            connection = self._require_owner_connection()
+            cursor = await connection.execute("PRAGMA quick_check")
+            rows = await cursor.fetchall()
+            await cursor.close()
+            result = tuple(str(row[0]).lower() for row in rows)
+        else:
+            result = (override.lower(),)
+        self._last_quick_check = result == ("ok",)
+        self._last_check_at = self._monotonic()
+        if self._quick_check_observer is not None:
+            self._quick_check_observer(self._last_check_at)
+        return self._last_quick_check
+
+    async def _run_periodic_check_if_due(self) -> None:
+        if self._monotonic() - self._last_check_at < self._quick_check_interval_seconds:
+            return
+        if not await self._perform_quick_check():
+            raise FatalPersistenceError("quick_check_failed")
+        self._check_storage_limit()
+
+    def _check_storage_limit(self) -> None:
+        journal_path = Path(f"{self._database_path}-journal")
+        try:
+            total = self._file_size(self._database_path) + self._file_size(journal_path)
+        except OSError as error:
+            raise error
+        if total > self.max_storage_bytes:
+            raise FatalPersistenceError("storage_limit_exceeded")
+
+    async def _call_failpoint(self, name: str) -> None:
+        if self._failpoint is None:
+            return
+        result = self._failpoint(name)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _process_command(self, command: PersistenceCommand) -> bool:
+        if command.kind == "shutdown":
+            return True
+        if command.kind == "relay_batch" and command.payload.get("action") == "read":
+            await self._read_batch(command.payload)
+            return False
+
+        connection = self._require_owner_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            if command.kind == "outbox":
+                await self._insert_outbox(require_operation(command.payload))
+            elif command.kind == "lease":
+                await self._apply_lease(command.payload)
+            elif command.kind == "webhook_effect":
+                await self._apply_webhook_effect(command.payload)
+            elif command.kind == "relay_batch":
+                await self._apply_relay_command(command.payload)
+            else:
+                raise CommandSerializationError("unknown_persistence_command")
+            await self._call_failpoint("after_mutation_before_commit")
+            await connection.commit()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await connection.rollback()
+            raise
+        return False
+
+    async def _insert_outbox(self, operation: VoiceOperationV1) -> None:
+        connection = self._require_owner_connection()
+        prepared = encrypt_operation(operation, self._keyring)
+        created_at = self._utcnow()
+        turn_id: str | None = None
+        recording_id: str | None = None
+        if isinstance(operation.payload, TurnUpsertPayloadV1):
+            turn_id = str(operation.payload.turn_id)
+        elif isinstance(operation.payload, RecordingUpsertPayloadV1):
+            recording_id = str(operation.payload.recording_id)
+        try:
+            await connection.execute(
+                """
+                INSERT INTO outbox (
+                    op_id, deployment_id, kind, schema_version, call_id, turn_id,
+                    recording_id, crypto_version, key_version, nonce, ciphertext,
+                    created_at, attempts, next_attempt_at, last_error_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
+                """,
+                (
+                    str(operation.operation_id),
+                    operation.deployment_id,
+                    operation.kind,
+                    operation.schema_version,
+                    str(operation.call_id),
+                    turn_id,
+                    recording_id,
+                    CRYPTO_VERSION,
+                    prepared.encrypted.key_version,
+                    prepared.encrypted.nonce,
+                    prepared.encrypted.ciphertext,
+                    _iso(created_at),
+                    _iso(created_at),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = await self._load_operation_by_id(str(operation.operation_id))
+            if existing is None or canonical_operation_bytes(existing) != prepared.plaintext:
+                raise CommandConflictError("operation_identity_conflict") from None
+
+    async def _load_operation_by_id(self, operation_id: str) -> VoiceOperationV1 | None:
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            """
+            SELECT schema_version, op_id, deployment_id, call_id, kind,
+                   key_version, nonce, ciphertext
+            FROM outbox WHERE op_id = ?
+            """,
+            (operation_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        metadata = {
+            "schema_version": row[0],
+            "operation_id": row[1],
+            "deployment_id": row[2],
+            "call_id": row[3],
+            "kind": row[4],
+        }
+        plaintext = self._keyring.decrypt(
+            EncryptedValue(key_version=row[5], nonce=row[6], ciphertext=row[7]),
+            aad=operation_aad_from_metadata(metadata),
+        )
+        return decode_operation(plaintext)
+
+    async def _apply_webhook_effect(self, payload: Mapping[str, object]) -> None:
+        receipt = payload.get("receipt")
+        if not isinstance(receipt, Mapping):
+            raise CommandSerializationError("invalid_webhook_receipt")
+        is_new = await self._insert_receipt(receipt)
+        if not is_new:
+            return
+        lease = payload.get("lease")
+        operation = payload.get("operation")
+        if lease is not None:
+            if not isinstance(lease, Mapping):
+                raise CommandSerializationError("invalid_lease_command")
+            await self._apply_lease(lease)
+        if operation is not None:
+            if not isinstance(operation, VoiceOperationV1):
+                raise CommandSerializationError("invalid_outbox_command")
+            await self._insert_outbox(operation)
+
+    async def _insert_receipt(self, receipt: Mapping[str, object]) -> bool:
+        connection = self._require_owner_connection()
+        try:
+            event_id = self._required_str(receipt, "event_id")
+            event_type = self._required_str(receipt, "event_type")
+            call_control = receipt.get("call_control_id")
+            if call_control is not None and not isinstance(call_control, str):
+                raise CommandSerializationError("invalid_webhook_receipt")
+            occurred_at = _iso(self._required_datetime(receipt, "occurred_at"))
+            received_at = _iso(self._required_datetime(receipt, "received_at"))
+        except (KeyError, TypeError) as error:
+            raise CommandSerializationError("invalid_webhook_receipt") from error
+        cursor = await connection.execute(
+            """
+            INSERT OR IGNORE INTO webhook_receipts (
+                event_id, event_type, call_control_id, occurred_at, received_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (event_id, event_type, call_control, occurred_at, received_at),
+        )
+        inserted = cursor.rowcount == 1
+        await cursor.close()
+        if inserted:
+            return True
+        cursor = await connection.execute(
+            """
+            SELECT event_type, call_control_id, occurred_at
+            FROM webhook_receipts WHERE event_id = ?
+            """,
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row != (event_type, call_control, occurred_at):
+            raise CommandConflictError("webhook_identity_conflict")
+        return False
+
+    async def _apply_lease(self, payload: Mapping[str, object]) -> None:
+        if payload.get("action") != "upsert":
+            raise CommandSerializationError("invalid_lease_command")
+        connection = self._require_owner_connection()
+        call_control_id = self._required_str(payload, "call_control_id")
+        call_id = self._required_uuid(payload, "call_id")
+        tenant_id = self._required_str(payload, "tenant_id")
+        agent_id = self._required_str(payload, "agent_id")
+        state = payload.get("state")
+        token_hash = payload.get("token_hash")
+        created_at = self._required_datetime(payload, "created_at")
+        expires_at = self._required_datetime(payload, "expires_at")
+        closed_value = payload.get("closed_at")
+        if state not in {"pending", "active", "terminal"} or not isinstance(token_hash, bytes):
+            raise CommandSerializationError("invalid_lease_command")
+        if not token_hash or expires_at <= created_at:
+            raise CommandSerializationError("invalid_lease_command")
+        if closed_value is not None and not isinstance(closed_value, datetime):
+            raise CommandSerializationError("invalid_lease_command")
+        closed_at = closed_value
+        if (state == "terminal") != (closed_at is not None):
+            raise CommandSerializationError("invalid_lease_command")
+
+        cursor = await connection.execute(
+            """
+            SELECT call_id, tenant_id, agent_id, state, token_hash,
+                   created_at, expires_at, closed_at
+            FROM call_leases WHERE call_control_id = ?
+            """,
+            (call_control_id,),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        values = (
+            str(call_id),
+            tenant_id,
+            agent_id,
+            state,
+            token_hash,
+            _iso(created_at),
+            _iso(expires_at),
+            _iso(closed_at) if closed_at else None,
+        )
+        if existing is None:
+            if state != "pending":
+                raise CommandConflictError("lease_transition_conflict")
+            await connection.execute(
+                """
+                INSERT INTO call_leases (
+                    call_control_id, call_id, tenant_id, agent_id, state, token_hash,
+                    created_at, expires_at, closed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (call_control_id, *values),
+            )
+            return
+
+        old_state = existing[3]
+        identities_match = existing[:3] == values[:3] and existing[4] == token_hash
+        allowed = old_state == state or (old_state, state) in {
+            ("pending", "active"),
+            ("pending", "terminal"),
+            ("active", "terminal"),
+        }
+        if not identities_match or not allowed:
+            raise CommandConflictError("lease_transition_conflict")
+        if old_state == state:
+            if tuple(existing) != values:
+                raise CommandConflictError("lease_transition_conflict")
+            return
+        await connection.execute(
+            """
+            UPDATE call_leases
+            SET state = ?, expires_at = ?, closed_at = ?
+            WHERE call_control_id = ?
+            """,
+            (state, _iso(expires_at), _iso(closed_at) if closed_at else None, call_control_id),
+        )
+
+    async def _reclaim_stale_leases(self) -> None:
+        connection = self._require_owner_connection()
+        now = self._utcnow()
+        now_iso = _iso(now)
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await connection.execute(
+                """
+                SELECT call_control_id, call_id, tenant_id, agent_id, token_hash, state, expires_at
+                FROM call_leases
+                WHERE state IN ('pending', 'active') AND expires_at <= ?
+                ORDER BY created_at, call_control_id
+                """,
+                (now_iso,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            await connection.execute(
+                """
+                UPDATE call_leases SET state = 'terminal', closed_at = ?
+                WHERE state IN ('pending', 'active') AND expires_at <= ?
+                """,
+                (now_iso, now_iso),
+            )
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+        self._stale_leases.extend(
+            StaleLease(
+                call_control_id=row[0],
+                call_id=UUID(row[1]),
+                tenant_id=row[2],
+                agent_id=row[3],
+                token_hash=row[4],
+                previous_state=cast(Literal["pending", "active"], row[5]),
+                expires_at=_parse_datetime(row[6]),
+            )
+            for row in rows
+        )
+
+    async def _read_batch(self, payload: Mapping[str, object]) -> None:
+        connection = self._require_owner_connection()
+        batch_size = payload.get("batch_size")
+        now = payload.get("now")
+        result = payload.get("result")
+        if type(batch_size) is not int or not isinstance(now, datetime) or not isinstance(
+            result, asyncio.Future
+        ):
+            raise CommandSerializationError("invalid_relay_read")
+        cursor = await connection.execute(
+            """
+            SELECT queue_id, op_id, deployment_id, kind, schema_version, call_id,
+                   key_version, nonce, ciphertext, attempts, next_attempt_at, last_error_code
+            FROM outbox ORDER BY deployment_id, queue_id
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        selected: list[OutboxItem] = []
+        blocked_deployments: set[str] = set()
+        now_iso = _iso(now)
+        for row in rows:
+            deployment_id = row[2]
+            if deployment_id in blocked_deployments:
+                continue
+            if row[10] > now_iso:
+                blocked_deployments.add(deployment_id)
+                continue
+            metadata = {
+                "schema_version": row[4],
+                "operation_id": row[1],
+                "deployment_id": deployment_id,
+                "call_id": row[5],
+                "kind": row[3],
+            }
+            plaintext = self._keyring.decrypt(
+                EncryptedValue(key_version=row[6], nonce=row[7], ciphertext=row[8]),
+                aad=operation_aad_from_metadata(metadata),
+            )
+            selected.append(
+                OutboxItem(
+                    queue_id=row[0],
+                    operation=decode_operation(plaintext),
+                    attempts=row[9],
+                    next_attempt_at=_parse_datetime(row[10]),
+                    last_error_code=row[11],
+                )
+            )
+            if len(selected) >= batch_size:
+                break
+        if not result.done():
+            result.set_result(tuple(selected))
+
+    async def _apply_relay_command(self, payload: Mapping[str, object]) -> None:
+        connection = self._require_owner_connection()
+        action = payload.get("action")
+        if action == "ack":
+            queue_id = self._required_positive_int(payload, "queue_id")
+            cursor = await connection.execute("DELETE FROM outbox WHERE queue_id = ?", (queue_id,))
+            if cursor.rowcount != 1:
+                await cursor.close()
+                raise CommandConflictError("outbox_ack_conflict")
+            await cursor.close()
+        elif action == "retry":
+            queue_id = self._required_positive_int(payload, "queue_id")
+            next_attempt = self._required_datetime(payload, "next_attempt_at")
+            error_code = self._required_str(payload, "error_code")
+            if _SAFE_ERROR_CODE.fullmatch(error_code) is None:
+                raise CommandSerializationError("invalid_relay_retry")
+            cursor = await connection.execute(
+                """
+                UPDATE outbox
+                SET attempts = attempts + 1, next_attempt_at = ?, last_error_code = ?
+                WHERE queue_id = ?
+                """,
+                (_iso(next_attempt), error_code, queue_id),
+            )
+            if cursor.rowcount != 1:
+                await cursor.close()
+                raise CommandConflictError("outbox_retry_conflict")
+            await cursor.close()
+        elif action == "cleanup":
+            now = self._required_datetime(payload, "now")
+            result = payload.get("result")
+            if not isinstance(result, asyncio.Future):
+                raise CommandSerializationError("invalid_cleanup_command")
+            receipts_cursor = await connection.execute(
+                "DELETE FROM webhook_receipts WHERE received_at < ?",
+                (_iso(now - RECEIPT_RETENTION),),
+            )
+            leases_cursor = await connection.execute(
+                "DELETE FROM call_leases WHERE state = 'terminal' AND closed_at < ?",
+                (_iso(now - CLOSED_LEASE_RETENTION),),
+            )
+            cleanup = CleanupResult(receipts_cursor.rowcount, leases_cursor.rowcount)
+            await receipts_cursor.close()
+            await leases_cursor.close()
+            if not result.done():
+                result.set_result(cleanup)
+        else:
+            raise CommandSerializationError("invalid_relay_command")
+
+    @staticmethod
+    def _required_str(payload: Mapping[str, object], name: str) -> str:
+        value = payload.get(name)
+        if not isinstance(value, str) or not value:
+            raise CommandSerializationError("invalid_command_payload")
+        return value
+
+    @staticmethod
+    def _required_uuid(payload: Mapping[str, object], name: str) -> UUID:
+        value = payload.get(name)
+        if not isinstance(value, UUID):
+            raise CommandSerializationError("invalid_command_payload")
+        return value
+
+    @staticmethod
+    def _required_datetime(payload: Mapping[str, object], name: str) -> datetime:
+        value = payload.get(name)
+        if not isinstance(value, datetime):
+            raise CommandSerializationError("invalid_command_payload")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise CommandSerializationError("invalid_command_payload")
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _required_positive_int(payload: Mapping[str, object], name: str) -> int:
+        value = payload.get(name)
+        if type(value) is not int or value <= 0:
+            raise CommandSerializationError("invalid_command_payload")
+        return value
+
+    def _resolve_success(self, command: PersistenceCommand) -> None:
+        if command.committed is not None and not command.committed.done():
+            command.committed.set_result(None)
+
+    def _resolve_failure(
+        self, command: PersistenceCommand, error: FatalPersistenceError
+    ) -> None:
+        result = command.payload.get("result")
+        if isinstance(result, asyncio.Future) and not result.done():
+            result.set_exception(error)
+        if command.committed is not None and not command.committed.done():
+            command.committed.set_exception(error)
+
+    def _count_lost_command(self, command: PersistenceCommand) -> None:
+        if command.kind == "outbox":
+            self.transcript_loss_count += 1
+
+    def _fail_pending(self, error: FatalPersistenceError) -> None:
+        while True:
+            try:
+                command = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self._resolve_failure(command, error)
+            self._count_lost_command(command)
+            self._queue.task_done()
+
+    def _classify_error(self, error: BaseException) -> FatalPersistenceError:
+        if isinstance(error, FatalPersistenceError):
+            return error
+        if isinstance(error, UnknownKeyVersionError):
+            return FatalPersistenceError("unknown_key_version")
+        if isinstance(error, CryptoError):
+            return FatalPersistenceError("crypto_failed")
+        if isinstance(error, sqlite3.Error):
+            code = getattr(error, "sqlite_errorcode", None)
+            primary = code & 0xFF if isinstance(code, int) else None
+            if primary == sqlite3.SQLITE_FULL:
+                return FatalPersistenceError("sqlite_full")
+            if primary == sqlite3.SQLITE_CORRUPT:
+                return FatalPersistenceError("sqlite_corrupt")
+            if primary == sqlite3.SQLITE_IOERR:
+                return FatalPersistenceError("sqlite_ioerr")
+            message = str(error).lower()
+            if "not a database" in message or "malformed" in message:
+                return FatalPersistenceError("sqlite_corrupt")
+            return FatalPersistenceError("sqlite_failed")
+        if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+            return FatalPersistenceError("storage_enospc")
+        if isinstance(error, PersistenceError):
+            return FatalPersistenceError(str(error))
+        if isinstance(error, Exception):
+            return FatalPersistenceError("persistence_command_failed")
+        return FatalPersistenceError("writer_task_died")
