@@ -9,6 +9,7 @@ import inspect
 import re
 import sqlite3
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -42,17 +43,68 @@ from projetv0_voice.persistence.commands import (
     operation_aad_from_metadata,
     require_operation,
 )
-from projetv0_voice.persistence.schema import SCHEMA_SQL
+from projetv0_voice.persistence.schema import SCHEMA_SQL, SCHEMA_VERSION
 
 PERSISTENCE_QUEUE_MAX_ITEMS = 256
 CONTROL_COMMIT_TIMEOUT_SECONDS = 1.5
 QUEUE_OLDEST_LIMIT_SECONDS = 1.0
 MAX_STORAGE_BYTES = 268_435_456
+RELAY_CLAIM_MAX_SECONDS = 300
 RECEIPT_RETENTION = timedelta(days=7)
 CLOSED_LEASE_RETENTION = timedelta(hours=24)
 _SAFE_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 
 Failpoint = Callable[[str], Awaitable[None] | None]
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    normalized: list[str] = []
+    in_literal = False
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if character == "'":
+            normalized.append(character)
+            if in_literal and index + 1 < len(sql) and sql[index + 1] == "'":
+                normalized.append("'")
+                index += 2
+                continue
+            in_literal = not in_literal
+        elif in_literal:
+            normalized.append(character)
+        elif not character.isspace():
+            normalized.append(character.casefold())
+        index += 1
+    compact = "".join(normalized)
+    return compact.replace("createtableifnotexists", "createtable").replace(
+        "createindexifnotexists", "createindex"
+    )
+
+
+def _expected_schema_objects() -> dict[tuple[str, str], str]:
+    expected: dict[tuple[str, str], str] = {}
+    for statement in SCHEMA_SQL.split(";"):
+        compact = " ".join(statement.split())
+        matched = re.match(
+            r"^CREATE (TABLE|INDEX) IF NOT EXISTS ([A-Za-z_][A-Za-z0-9_]*)\b",
+            compact,
+            flags=re.IGNORECASE,
+        )
+        if matched is not None:
+            expected[(matched.group(1).casefold(), matched.group(2))] = _normalize_schema_sql(
+                statement
+            )
+    if set(expected) != {
+        ("table", "call_leases"),
+        ("table", "webhook_receipts"),
+        ("table", "outbox"),
+        ("index", "outbox_due_fifo_idx"),
+    }:
+        raise RuntimeError("invalid_expected_sqlite_schema")
+    return expected
+
+
+_EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects()
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +120,7 @@ class StaleLease:
     agent_id: str
     token_hash: bytes = field(repr=False)
     previous_state: Literal["pending", "active"]
+    created_at: datetime
     expires_at: datetime
 
 
@@ -75,8 +128,10 @@ class StaleLease:
 class OutboxItem:
     queue_id: int
     operation: VoiceOperationV1 = field(repr=False)
+    created_at: datetime
     attempts: int
     next_attempt_at: datetime
+    claim_expires_at: datetime
     last_error_code: str | None
 
 
@@ -152,6 +207,9 @@ class PersistenceWriter:
         self._queue: asyncio.Queue[PersistenceCommand] = asyncio.Queue(
             maxsize=PERSISTENCE_QUEUE_MAX_ITEMS
         )
+        self._pending_commands: deque[PersistenceCommand] = deque()
+        self._queue_watchdog_wakeup = asyncio.Event()
+        self._queue_watchdog_task: asyncio.Task[None] | None = None
         self._accepting = True
         self._degraded = False
         self._run_started = False
@@ -222,16 +280,19 @@ class PersistenceWriter:
             self.transcript_loss_count += 1
             self._signal_fatal("queue_full")
             return False
+        self._track_pending(command)
         return True
 
     async def commit_control(self, command: PersistenceCommand) -> None:
         if command.kind == "shutdown":
             raise ValueError("shutdown is internal")
+        if command.committed is not None:
+            raise CommandSerializationError("command_future_must_be_unset")
         if not self._accepting or self._degraded:
             raise self._new_safe_error(
                 self.fatal_fault.code if self.fatal_fault else "persistence_degraded"
             )
-        future = command.committed or asyncio.get_running_loop().create_future()
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         queued = replace(command, committed=future, enqueued_at=self._monotonic())
         try:
             self._queue.put_nowait(queued)
@@ -240,6 +301,7 @@ class PersistenceWriter:
             if not future.done():
                 future.set_exception(safe_error)
             raise safe_error from None
+        self._track_pending(queued)
         try:
             await asyncio.wait_for(
                 asyncio.shield(future), timeout=self.control_commit_timeout_seconds
@@ -295,16 +357,28 @@ class PersistenceWriter:
         )
 
     async def read_relay_batch(
-        self, *, batch_size: int, now: datetime
+        self, *, batch_size: int, now: datetime, lease_seconds: int
     ) -> tuple[OutboxItem, ...]:
         if type(batch_size) is not int or batch_size <= 0 or batch_size > 1000:
             raise ValueError("batch_size is outside the supported range")
+        if (
+            type(lease_seconds) is not int
+            or lease_seconds <= 0
+            or lease_seconds > RELAY_CLAIM_MAX_SECONDS
+        ):
+            raise ValueError("lease_seconds is outside the supported range")
         result: asyncio.Future[tuple[OutboxItem, ...]] = asyncio.get_running_loop().create_future()
         try:
             await self.commit_control(
                 PersistenceCommand(
                     "relay_batch",
-                    {"action": "read", "batch_size": batch_size, "now": now, "result": result},
+                    {
+                        "action": "read",
+                        "batch_size": batch_size,
+                        "now": now,
+                        "lease_seconds": lease_seconds,
+                        "result": result,
+                    },
                     None,
                 )
             )
@@ -365,8 +439,9 @@ class PersistenceWriter:
         command = PersistenceCommand(
             "shutdown", {}, future, enqueued_at=self._monotonic()
         )
-        await self._queue.put(command)
         async with asyncio.timeout(timeout_seconds):
+            await self._queue.put(command)
+            self._track_pending(command)
             await asyncio.shield(future)
             await self._queue.join()
             await self._closed_event.wait()
@@ -385,19 +460,32 @@ class PersistenceWriter:
             self._database_path.parent.mkdir(parents=True, exist_ok=True)
             self._connection = await aiosqlite.connect(self._database_path)
             await self._initialize_owner_connection()
-            await self._reclaim_stale_leases()
+            await self._discover_stale_leases()
             if not await self._perform_quick_check():
                 raise FatalPersistenceError("quick_check_failed")
             self._check_storage_limit()
+            self._queue_watchdog_task = asyncio.create_task(
+                self._watch_queue_age(),
+                name="voice-persistence-queue-watchdog",
+            )
             self._ready_ok = True
             self._ready_event.set()
 
             while True:
+                wait_timeout = max(
+                    0.0,
+                    self._quick_check_interval_seconds
+                    - (self._monotonic() - self._last_check_at),
+                )
+                if wait_timeout == 0.0:
+                    await self._run_periodic_check_if_due()
+                    continue
                 try:
                     current_command = await asyncio.wait_for(
-                        self._queue.get(), timeout=self._quick_check_interval_seconds
+                        self._queue.get(), timeout=wait_timeout
                     )
                     current_owned = True
+                    self._untrack_pending(current_command)
                 except TimeoutError:
                     await self._run_periodic_check_if_due()
                     continue
@@ -416,7 +504,6 @@ class PersistenceWriter:
                     current_owned = False
                     current_command = None
                     break
-                self._check_storage_limit()
                 await self._run_periodic_check_if_due()
                 self._resolve_success(current_command)
                 self._queue.task_done()
@@ -432,6 +519,11 @@ class PersistenceWriter:
             self._fail_pending(safe_error)
         finally:
             self._ready_event.set()
+            if self._queue_watchdog_task is not None:
+                self._queue_watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._queue_watchdog_task
+                self._queue_watchdog_task = None
             if self._connection is not None:
                 try:
                     await self._connection.close()
@@ -439,6 +531,51 @@ class PersistenceWriter:
                     self._signal_fatal("sqlite_close_failed")
                 self._connection = None
             self._closed_event.set()
+
+    def _track_pending(self, command: PersistenceCommand) -> None:
+        self._pending_commands.append(command)
+        self._queue_watchdog_wakeup.set()
+
+    def _untrack_pending(self, command: PersistenceCommand) -> None:
+        if not self._pending_commands or self._pending_commands[0] is not command:
+            raise FatalPersistenceError("queue_tracking_mismatch")
+        self._pending_commands.popleft()
+        self._queue_watchdog_wakeup.set()
+
+    async def _watch_queue_age(self) -> None:
+        try:
+            while True:
+                oldest = next(
+                    (
+                        command
+                        for command in self._pending_commands
+                        if command.kind != "shutdown"
+                    ),
+                    None,
+                )
+                if oldest is None:
+                    self._queue_watchdog_wakeup.clear()
+                    await self._queue_watchdog_wakeup.wait()
+                    continue
+
+                remaining = QUEUE_OLDEST_LIMIT_SECONDS - (
+                    self._monotonic() - oldest.enqueued_at
+                )
+                if remaining < 0.0:
+                    self._signal_fatal("queue_oldest_age_exceeded")
+                    return
+
+                self._queue_watchdog_wakeup.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._queue_watchdog_wakeup.wait(), timeout=remaining
+                    )
+                except TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            self._signal_fatal("queue_watchdog_failed", source=error)
 
     def _require_owner_connection(self) -> aiosqlite.Connection:
         if asyncio.current_task() is not self._owner_task or self._connection is None:
@@ -452,8 +589,24 @@ class PersistenceWriter:
         await cursor.close()
         await connection.execute("PRAGMA synchronous=EXTRA")
         await connection.execute("PRAGMA foreign_keys=ON")
-        await connection.executescript(SCHEMA_SQL)
-        await connection.commit()
+        existing_version = self._pragma_int(await self._pragma_scalar("user_version"))
+        existing_schema = await self._application_schema_objects()
+        if existing_schema:
+            if (
+                existing_version != SCHEMA_VERSION
+                or existing_schema != _EXPECTED_SCHEMA_OBJECTS
+            ):
+                raise FatalPersistenceError("sqlite_schema_mismatch")
+        else:
+            if existing_version != 0:
+                raise FatalPersistenceError("sqlite_schema_mismatch")
+            await connection.executescript(SCHEMA_SQL)
+            await connection.commit()
+            if (
+                self._pragma_int(await self._pragma_scalar("user_version")) != SCHEMA_VERSION
+                or await self._application_schema_objects() != _EXPECTED_SCHEMA_OBJECTS
+            ):
+                raise FatalPersistenceError("sqlite_schema_mismatch")
         synchronous = self._pragma_int(await self._pragma_scalar("synchronous"))
         foreign_keys = self._pragma_int(await self._pragma_scalar("foreign_keys"))
         journal_mode = str(journal_row[0]).lower() if journal_row else ""
@@ -468,6 +621,28 @@ class PersistenceWriter:
             "foreign_keys": 1,
         }:
             raise FatalPersistenceError("sqlite_pragma_mismatch")
+
+    async def _application_schema_objects(self) -> dict[tuple[str, str], str]:
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            """
+            SELECT type, name, sql
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'view', 'trigger')
+            ORDER BY type, name
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        objects: dict[tuple[str, str], str] = {}
+        for object_type, name, sql in rows:
+            if not isinstance(object_type, str) or not isinstance(name, str) or not isinstance(
+                sql, str
+            ):
+                raise FatalPersistenceError("sqlite_schema_mismatch")
+            objects[(object_type, name)] = _normalize_schema_sql(sql)
+        return objects
 
     async def _pragma_scalar(self, name: str) -> object:
         connection = self._require_owner_connection()
@@ -527,9 +702,6 @@ class PersistenceWriter:
     async def _process_command(self, command: PersistenceCommand) -> bool:
         if command.kind == "shutdown":
             return True
-        if command.kind == "relay_batch" and command.payload.get("action") == "read":
-            await self._read_batch(command.payload)
-            return False
 
         connection = self._require_owner_connection()
         await connection.execute("BEGIN IMMEDIATE")
@@ -545,6 +717,7 @@ class PersistenceWriter:
             else:
                 raise CommandSerializationError("unknown_persistence_command")
             await self._call_failpoint("after_mutation_before_commit")
+            self._check_storage_limit()
             await connection.commit()
         except BaseException:
             with contextlib.suppress(Exception):
@@ -687,9 +860,13 @@ class PersistenceWriter:
         created_at = self._required_datetime(payload, "created_at")
         expires_at = self._required_datetime(payload, "expires_at")
         closed_value = payload.get("closed_at")
-        if state not in {"pending", "active", "terminal"} or not isinstance(token_hash, bytes):
+        if (
+            state not in {"pending", "active", "terminal"}
+            or type(token_hash) is not bytes
+            or len(token_hash) != 32
+        ):
             raise CommandSerializationError("invalid_lease_command")
-        if not token_hash or expires_at <= created_at:
+        if expires_at <= created_at:
             raise CommandSerializationError("invalid_lease_command")
         if closed_value is not None and not isinstance(closed_value, datetime):
             raise CommandSerializationError("invalid_lease_command")
@@ -753,34 +930,19 @@ class PersistenceWriter:
             (state, _iso(expires_at), _iso(closed_at) if closed_at else None, call_control_id),
         )
 
-    async def _reclaim_stale_leases(self) -> None:
+    async def _discover_stale_leases(self) -> None:
         connection = self._require_owner_connection()
-        now = self._utcnow()
-        now_iso = _iso(now)
-        await connection.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = await connection.execute(
-                """
-                SELECT call_control_id, call_id, tenant_id, agent_id, token_hash, state, expires_at
-                FROM call_leases
-                WHERE state IN ('pending', 'active') AND expires_at <= ?
-                ORDER BY created_at, call_control_id
-                """,
-                (now_iso,),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            await connection.execute(
-                """
-                UPDATE call_leases SET state = 'terminal', closed_at = ?
-                WHERE state IN ('pending', 'active') AND expires_at <= ?
-                """,
-                (now_iso, now_iso),
-            )
-            await connection.commit()
-        except BaseException:
-            await connection.rollback()
-            raise
+        cursor = await connection.execute(
+            """
+            SELECT call_control_id, call_id, tenant_id, agent_id, token_hash, state,
+                   created_at, expires_at
+            FROM call_leases
+            WHERE state IN ('pending', 'active')
+            ORDER BY created_at, call_control_id
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
         self._stale_leases.extend(
             StaleLease(
                 call_control_id=row[0],
@@ -789,24 +951,32 @@ class PersistenceWriter:
                 agent_id=row[3],
                 token_hash=row[4],
                 previous_state=cast(Literal["pending", "active"], row[5]),
-                expires_at=_parse_datetime(row[6]),
+                created_at=_parse_datetime(row[6]),
+                expires_at=_parse_datetime(row[7]),
             )
             for row in rows
         )
 
-    async def _read_batch(self, payload: Mapping[str, object]) -> None:
+    async def _claim_batch(self, payload: Mapping[str, object]) -> None:
         connection = self._require_owner_connection()
         batch_size = payload.get("batch_size")
-        now = payload.get("now")
+        lease_seconds = payload.get("lease_seconds")
         result = payload.get("result")
-        if type(batch_size) is not int or not isinstance(now, datetime) or not isinstance(
-            result, asyncio.Future
+        if (
+            type(batch_size) is not int
+            or type(lease_seconds) is not int
+            or lease_seconds <= 0
+            or lease_seconds > RELAY_CLAIM_MAX_SECONDS
+            or not isinstance(result, asyncio.Future)
         ):
             raise CommandSerializationError("invalid_relay_read")
+        now = self._required_datetime(payload, "now")
+        claim_expires_at = now + timedelta(seconds=lease_seconds)
         cursor = await connection.execute(
             """
             SELECT queue_id, op_id, deployment_id, kind, schema_version, call_id,
-                   key_version, nonce, ciphertext, attempts, next_attempt_at, last_error_code
+                   key_version, nonce, ciphertext, created_at, attempts,
+                   next_attempt_at, last_error_code
             FROM outbox ORDER BY deployment_id, queue_id
             """
         )
@@ -820,7 +990,7 @@ class PersistenceWriter:
             deployment_id = row[2]
             if deployment_id in blocked_deployments:
                 continue
-            if row[10] > now_iso:
+            if row[11] > now_iso:
                 blocked_deployments.add(deployment_id)
                 continue
             metadata = {
@@ -838,20 +1008,33 @@ class PersistenceWriter:
                 OutboxItem(
                     queue_id=row[0],
                     operation=decode_operation(plaintext),
-                    attempts=row[9],
-                    next_attempt_at=_parse_datetime(row[10]),
-                    last_error_code=row[11],
+                    created_at=_parse_datetime(row[9]),
+                    attempts=row[10],
+                    next_attempt_at=_parse_datetime(row[11]),
+                    claim_expires_at=claim_expires_at,
+                    last_error_code=row[12],
                 )
             )
             if len(selected) >= batch_size:
                 break
+        for item in selected:
+            update_cursor = await connection.execute(
+                "UPDATE outbox SET next_attempt_at = ? WHERE queue_id = ?",
+                (_iso(claim_expires_at), item.queue_id),
+            )
+            if update_cursor.rowcount != 1:
+                await update_cursor.close()
+                raise CommandConflictError("outbox_claim_conflict")
+            await update_cursor.close()
         if not result.done():
             result.set_result(tuple(selected))
 
     async def _apply_relay_command(self, payload: Mapping[str, object]) -> None:
         connection = self._require_owner_connection()
         action = payload.get("action")
-        if action == "ack":
+        if action == "read":
+            await self._claim_batch(payload)
+        elif action == "ack":
             queue_id = self._required_positive_int(payload, "queue_id")
             cursor = await connection.execute("DELETE FROM outbox WHERE queue_id = ?", (queue_id,))
             if cursor.rowcount != 1:
@@ -950,6 +1133,7 @@ class PersistenceWriter:
                 command = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            self._untrack_pending(command)
             self._resolve_failure(command, error)
             self._count_lost_command(command)
             self._queue.task_done()

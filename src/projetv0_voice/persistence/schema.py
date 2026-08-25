@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS call_leases (
     tenant_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'terminal')),
-    token_hash BLOB NOT NULL CHECK (length(token_hash) > 0),
+    token_hash BLOB NOT NULL CHECK (length(token_hash) = 32),
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     closed_at TEXT,

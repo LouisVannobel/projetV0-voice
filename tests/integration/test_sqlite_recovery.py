@@ -135,7 +135,9 @@ def test_hard_kill_before_commit_loses_row_but_after_commit_survives(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_restart_reclaims_expired_lease_and_replays_fifo_outbox(tmp_path: Path) -> None:
+async def test_restart_reemits_expired_leases_until_terminal_ack_and_replays_fifo_outbox(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "restart.sqlite"
     keyring = CryptoKeyring({1: KEY_V1}, active_version=1)
     writer = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
@@ -164,6 +166,17 @@ async def test_restart_reclaims_expired_lease_and_replays_fifo_outbox(tmp_path: 
         closed_at=None,
     )
     await writer.commit_lease(
+        call_control_id="future-pending",
+        call_id=UUID(int=802),
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        state="pending",
+        token_hash=bytes(range(64, 96)),
+        created_at=NOW - timedelta(minutes=1),
+        expires_at=NOW + timedelta(minutes=1),
+        closed_at=None,
+    )
+    await writer.commit_lease(
         call_control_id="expired-active",
         call_id=UUID(int=801),
         tenant_id="tenant-a",
@@ -187,12 +200,87 @@ async def test_restart_reclaims_expired_lease_and_replays_fifo_outbox(tmp_path: 
     second_task = __import__("asyncio").create_task(restarted.run())
     assert await restarted.wait_ready()
     stale = restarted.take_stale_leases()
-    batch = await restarted.read_relay_batch(batch_size=100, now=NOW)
+    batch = await restarted.read_relay_batch(batch_size=100, now=NOW, lease_seconds=30)
 
-    assert [item.call_control_id for item in stale] == ["expired-active", "expired-control"]
-    assert [item.previous_state for item in stale] == ["active", "pending"]
+    assert [item.call_control_id for item in stale] == [
+        "expired-active",
+        "expired-control",
+        "future-pending",
+    ]
+    assert [item.previous_state for item in stale] == ["active", "pending", "pending"]
     assert [item.queue_id for item in batch] == [1, 2]
     assert [item.operation.operation_id for item in batch] == [UUID(int=501), UUID(int=503)]
+    assert all(item.created_at == NOW for item in batch)
+    assert all(item.claim_expires_at == NOW + timedelta(seconds=30) for item in batch)
+    await restarted.drain(2)
+    await second_task
+
+    again = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
+    third_task = __import__("asyncio").create_task(again.run())
+    assert await again.wait_ready()
+    stale_again = again.take_stale_leases()
+    assert [item.call_control_id for item in stale_again] == [
+        "expired-active",
+        "expired-control",
+        "future-pending",
+    ]
+    for item in stale_again:
+        await again.commit_lease(
+            call_control_id=item.call_control_id,
+            call_id=item.call_id,
+            tenant_id=item.tenant_id,
+            agent_id=item.agent_id,
+            state="terminal",
+            token_hash=item.token_hash,
+            created_at=item.created_at,
+            expires_at=item.expires_at,
+            closed_at=NOW,
+        )
+    await again.drain(2)
+    await third_task
+
+    acknowledged = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
+    fourth_task = __import__("asyncio").create_task(acknowledged.run())
+    assert await acknowledged.wait_ready()
+    assert acknowledged.take_stale_leases() == ()
+    await acknowledged.drain(2)
+    await fourth_task
+
+
+@pytest.mark.asyncio
+async def test_relay_claim_survives_restart_and_reappears_only_after_lease_expiry(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "claim-restart.sqlite"
+    keyring = CryptoKeyring({1: KEY_V1}, active_version=1)
+    writer = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
+    first_task = __import__("asyncio").create_task(writer.run())
+    assert await writer.wait_ready()
+    assert writer.try_enqueue_turn(synthetic_turn(keyring))
+    await writer.wait_until_idle()
+    claimed = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30)
+    assert [item.queue_id for item in claimed] == [1]
+    assert claimed[0].created_at == NOW
+    assert claimed[0].claim_expires_at == NOW + timedelta(seconds=30)
+    await writer.drain(2)
+    await first_task
+
+    restarted = PersistenceWriter(database, keyring, utcnow=lambda: NOW)
+    second_task = __import__("asyncio").create_task(restarted.run())
+    assert await restarted.wait_ready()
+    assert await restarted.read_relay_batch(
+        batch_size=10,
+        now=NOW + timedelta(seconds=29),
+        lease_seconds=30,
+    ) == ()
+    available = await restarted.read_relay_batch(
+        batch_size=10,
+        now=NOW + timedelta(seconds=30),
+        lease_seconds=30,
+    )
+    assert [item.queue_id for item in available] == [1]
+    assert available[0].created_at == NOW
+    assert available[0].claim_expires_at == NOW + timedelta(seconds=60)
     await restarted.drain(2)
     await second_task
 
@@ -272,7 +360,7 @@ async def test_missing_historical_outer_key_fails_relay_read_closed(tmp_path: Pa
     second_task = __import__("asyncio").create_task(restarted.run())
     assert await restarted.wait_ready()
     with pytest.raises(Exception, match="unknown_key_version"):
-        await restarted.read_relay_batch(batch_size=10, now=NOW)
+        await restarted.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30)
     await second_task
     assert restarted.fatal_fault is not None
     assert restarted.fatal_fault.code == "unknown_key_version"

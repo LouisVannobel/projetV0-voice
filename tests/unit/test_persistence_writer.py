@@ -17,6 +17,7 @@ from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
+    CommandSerializationError,
     EncryptedCommandTooLarge,
     FatalPersistenceError,
     PersistenceCommand,
@@ -24,6 +25,7 @@ from projetv0_voice.persistence.commands import (
     encrypt_operation,
     operation_aad,
 )
+from projetv0_voice.persistence.schema import SCHEMA_SQL
 from projetv0_voice.persistence.writer import PersistenceWriter
 
 KEY = bytes(range(32))
@@ -156,13 +158,18 @@ async def test_turn_queue_is_exactly_256_put_nowait_and_full_is_one_shot_fatal(
 
 
 @pytest.mark.asyncio
-async def test_fifo_queue_ids_and_plaintext_never_reach_database_or_journal(tmp_path: Path) -> None:
+async def test_fifo_queue_ids_and_raw_plaintext_never_reach_database_or_journal(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "voice.sqlite"
     writer, task = await start_writer(database)
     sentinel = "PLAINTEXT-TRANSCRIPT-SENTINEL-9D17"
-    encoded_sentinel = base64.b64encode(sentinel.encode())
+    plaintext_operation = operation(1, call_control_id=sentinel)
+    assert sentinel.encode() in canonical_operation_bytes(plaintext_operation)
 
-    assert writer.try_enqueue_turn(turn_operation(1, encoded_content=encoded_sentinel))
+    await writer.commit_control(
+        PersistenceCommand("outbox", {"operation": plaintext_operation}, None)
+    )
     assert writer.try_enqueue_turn(turn_operation(2))
     assert writer.try_enqueue_turn(turn_operation(3))
     await stop_writer(writer, task)
@@ -176,8 +183,44 @@ async def test_fifo_queue_ids_and_plaintext_never_reach_database_or_journal(tmp_
     if await asyncio.to_thread(journal.exists):
         journal_bytes = await asyncio.to_thread(journal.read_bytes)
         assert sentinel.encode() not in journal_bytes
-        assert encoded_sentinel not in journal_bytes
-    assert encoded_sentinel not in database_bytes
+
+
+@pytest.mark.asyncio
+async def test_drain_deadline_includes_waiting_to_enqueue_shutdown_on_a_full_queue(
+    tmp_path: Path,
+) -> None:
+    owner_stuck = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit":
+            owner_stuck.set()
+            await release_owner.wait()
+
+    writer, run_task = await start_writer(
+        tmp_path / "full-drain.sqlite",
+        failpoint=failpoint,
+    )
+    first_commit = asyncio.create_task(
+        writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+    )
+    await owner_stuck.wait()
+    for number in range(1, 257):
+        assert writer.try_enqueue_turn(turn_operation(number))
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(writer.drain(timeout_seconds=0.01), timeout=0.3)
+
+        assert loop.time() - started_at < 0.1
+        assert writer.queue_size == 256
+    finally:
+        release_owner.set()
+        await asyncio.gather(first_commit, return_exceptions=True)
+        run_task.cancel()
+        await asyncio.wait_for(run_task, timeout=1)
 
 
 @pytest.mark.asyncio
@@ -213,20 +256,42 @@ async def test_control_timeout_is_safe_fatal_and_leaves_no_hanging_future(tmp_pa
     )
     task = asyncio.create_task(writer.run())
     assert await writer.wait_ready()
-    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-    command = PersistenceCommand("lease", lease_payload(), future)
+    command = PersistenceCommand("lease", lease_payload(), None)
 
     with pytest.raises(FatalPersistenceError, match="control_commit_timeout"):
         await writer.commit_control(command)
 
-    assert not future.done()
     assert writer.is_degraded
     release_commit.set()
-    await asyncio.wait_for(future, timeout=1)
     await writer.wait_until_idle()
     assert not task.done()
     await writer.drain(2)
     await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("future_state", ["pending", "done", "cancelled"])
+async def test_commit_control_rejects_every_caller_owned_future_before_enqueue(
+    tmp_path: Path, future_state: str
+) -> None:
+    writer = PersistenceWriter(
+        tmp_path / f"caller-future-{future_state}.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        control_commit_timeout_seconds=0.01,
+    )
+    caller_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    if future_state == "done":
+        caller_future.set_result(None)
+    elif future_state == "cancelled":
+        caller_future.cancel()
+
+    command = PersistenceCommand("lease", lease_payload(), caller_future)
+    for _ in range(2):
+        with pytest.raises(CommandSerializationError, match="command_future_must_be_unset"):
+            await writer.commit_control(command)
+
+    assert writer.queue_size == 0
+    assert writer.is_degraded is False
 
 
 @pytest.mark.asyncio
@@ -313,6 +378,39 @@ async def test_idle_periodic_quick_check_runs_without_commands(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_command_just_before_due_check_waits_only_the_remaining_interval(
+    tmp_path: Path,
+) -> None:
+    clock_value = 0.0
+    checks: list[float] = []
+    second_check = asyncio.Event()
+
+    def clock() -> float:
+        return clock_value
+
+    def observe(when: float) -> None:
+        checks.append(when)
+        if len(checks) == 2:
+            second_check.set()
+
+    writer, task = await start_writer(
+        tmp_path / "remaining-interval.sqlite",
+        monotonic=clock,
+        quick_check_interval_seconds=1.0,
+        quick_check_observer=observe,
+    )
+    try:
+        clock_value = 0.999
+        await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+        clock_value = 1.0
+
+        await asyncio.wait_for(second_check.wait(), timeout=0.2)
+        assert checks == [0.0, 1.0]
+    finally:
+        await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
 async def test_pending_age_above_one_second_is_fatal_without_processing(tmp_path: Path) -> None:
     now = 1.0
     faults: list[object] = []
@@ -341,28 +439,81 @@ async def test_pending_age_above_one_second_is_fatal_without_processing(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_db_plus_journal_cap_is_owner_checked_with_injected_sizes(tmp_path: Path) -> None:
-    sizes: dict[str, int] = {}
+async def test_db_plus_journal_cap_rolls_back_before_commit_and_completes_failure(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "voice.sqlite"
+    max_storage_bytes = 268_435_456
+    mutation_has_run = False
 
     def file_size(path: Path) -> int:
-        return sizes.get(str(path), 0)
+        if mutation_has_run and path == database:
+            return max_storage_bytes + 1
+        return 0
 
-    database = tmp_path / "voice.sqlite"
+    def failpoint(name: str) -> None:
+        nonlocal mutation_has_run
+        if name == "after_mutation_before_commit":
+            mutation_has_run = True
+
     writer, task = await start_writer(
         database,
         file_size=file_size,
-        max_storage_bytes=268_435_456,
+        max_storage_bytes=max_storage_bytes,
+        failpoint=failpoint,
     )
-    assert writer.max_storage_bytes == 268_435_456
-    sizes[str(database)] = 200_000_000
-    sizes[f"{database}-journal"] = 68_435_457
-
     with pytest.raises(FatalPersistenceError, match="storage_limit_exceeded"):
         await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
-    await asyncio.wait_for(writer.fatal_event.wait(), timeout=1)
+    await asyncio.wait_for(writer.wait_until_idle(), timeout=1)
     await asyncio.wait_for(task, timeout=1)
     assert writer.fatal_fault is not None
     assert writer.fatal_fault.code == "storage_limit_exceeded"
+    assert writer.queue_size == 0
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM call_leases").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_queue_age_watchdog_fires_while_sqlite_owner_is_stuck_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    clock_value = 0.0
+    owner_stuck = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    def clock() -> float:
+        return clock_value
+
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit":
+            owner_stuck.set()
+            await release_owner.wait()
+
+    writer, run_task = await start_writer(
+        tmp_path / "watchdog.sqlite",
+        monotonic=clock,
+        failpoint=failpoint,
+    )
+    first_commit = asyncio.create_task(
+        writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+    )
+    await owner_stuck.wait()
+    assert writer.try_enqueue_turn(turn_operation())
+    clock_value = 1.001
+
+    try:
+        await asyncio.wait_for(writer.fatal_event.wait(), timeout=0.2)
+        assert writer.fatal_fault is not None
+        assert writer.fatal_fault.code == "queue_oldest_age_exceeded"
+    finally:
+        release_owner.set()
+        await asyncio.gather(first_commit, return_exceptions=True)
+        await asyncio.wait_for(run_task, timeout=1)
+
+    assert all(
+        task.get_name() != "voice-persistence-queue-watchdog"
+        for task in asyncio.all_tasks()
+    )
 
 
 @pytest.mark.asyncio
@@ -398,16 +549,15 @@ async def test_injected_failure_rolls_back_receipt_and_effect_and_completes_futu
             raise OSError("synthetic failpoint")
 
     writer, task = await start_writer(database, failpoint=failpoint)
-    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     command = PersistenceCommand(
         "webhook_effect",
         {"receipt": receipt_payload(), "lease": lease_payload(), "operation": operation()},
-        future,
+        None,
     )
 
     with pytest.raises(FatalPersistenceError):
         await writer.commit_control(command)
-    assert future.done()
+    await asyncio.wait_for(writer.wait_until_idle(), timeout=1)
     await asyncio.wait_for(task, timeout=1)
 
     with sqlite3.connect(database) as connection:
@@ -539,8 +689,57 @@ async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_
     for column in ("turn_id", "recording_id", "crypto_version", "key_version", "nonce"):
         assert column in ddl
     assert "check" in ddl
+    assert "length(token_hash) = 32" in ddl
     assert journal_mode == ("delete",)
     assert user_version == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["version_2", "user_version_0_with_tables", "superset", "weakened", "missing_index"],
+)
+async def test_existing_schema_must_be_exact_v1_and_is_never_repaired(
+    tmp_path: Path, mutation: str
+) -> None:
+    database = tmp_path / f"schema-{mutation}.sqlite"
+    with sqlite3.connect(database) as connection:
+        if mutation == "version_2":
+            connection.execute("PRAGMA user_version = 2")
+        else:
+            schema = SCHEMA_SQL
+            if mutation == "weakened":
+                schema = schema.replace(
+                    "CHECK (length(token_hash) = 32)",
+                    "CHECK (length(token_hash) > 0)",
+                )
+            elif mutation == "missing_index":
+                schema = schema.replace(
+                    """CREATE INDEX IF NOT EXISTS outbox_due_fifo_idx
+    ON outbox (deployment_id, queue_id, next_attempt_at);
+""",
+                    "",
+                )
+            connection.executescript(schema)
+            if mutation == "user_version_0_with_tables":
+                connection.execute("PRAGMA user_version = 0")
+            elif mutation == "superset":
+                connection.execute("CREATE TABLE unexpected_table (id INTEGER PRIMARY KEY)")
+        original_version = connection.execute("PRAGMA user_version").fetchone()
+
+    writer = PersistenceWriter(database, CryptoKeyring({1: KEY}, active_version=1))
+    task = asyncio.create_task(writer.run())
+    ready = await writer.wait_ready()
+    if ready:
+        await stop_writer(writer, task)
+    else:
+        await task
+
+    assert ready is False
+    assert writer.fatal_fault is not None
+    assert writer.fatal_fault.code == "sqlite_schema_mismatch"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == original_version
 
 
 @pytest.mark.asyncio
@@ -587,34 +786,40 @@ async def test_non_ok_idle_periodic_quick_check_fails_closed(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_relay_read_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Path) -> None:
+async def test_relay_claim_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Path) -> None:
     database = tmp_path / "relay.sqlite"
     writer, task = await start_writer(database, utcnow=lambda: NOW)
     assert writer.try_enqueue_turn(turn_operation(1))
     assert writer.try_enqueue_turn(turn_operation(2))
     await writer.wait_until_idle()
 
-    batch = await writer.read_relay_batch(batch_size=10, now=NOW)
+    batch = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=5)
     assert [item.queue_id for item in batch] == [1, 2]
+    assert all(item.created_at == NOW for item in batch)
+    assert all(item.claim_expires_at == NOW + timedelta(seconds=5) for item in batch)
     await writer.retry_outbox(
         queue_id=1,
         next_attempt_at=NOW + timedelta(seconds=5),
         error_code="postgres_unavailable",
     )
-    batch = await writer.read_relay_batch(batch_size=10, now=NOW)
+    batch = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=5)
     assert batch == ()
-    batch = await writer.read_relay_batch(batch_size=10, now=NOW + timedelta(seconds=5))
+    batch = await writer.read_relay_batch(
+        batch_size=10, now=NOW + timedelta(seconds=5), lease_seconds=5
+    )
     assert [item.queue_id for item in batch] == [1, 2]
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT attempts, next_attempt_at, last_error_code FROM outbox WHERE queue_id=1"
-        ).fetchone() == (1, "2026-08-25T12:00:05Z", "postgres_unavailable")
+        ).fetchone() == (1, "2026-08-25T12:00:10Z", "postgres_unavailable")
     await writer.ack_outbox(queue_id=1)
-    batch = await writer.read_relay_batch(batch_size=10, now=NOW + timedelta(seconds=5))
+    batch = await writer.read_relay_batch(
+        batch_size=10, now=NOW + timedelta(seconds=10), lease_seconds=5
+    )
     assert [item.queue_id for item in batch] == [2]
     await writer.ack_outbox(queue_id=2)
     assert await writer.read_relay_batch(
-        batch_size=10, now=NOW + timedelta(seconds=5)
+        batch_size=10, now=NOW + timedelta(seconds=15), lease_seconds=5
     ) == ()
 
     with sqlite3.connect(database) as connection:
@@ -622,6 +827,99 @@ async def test_relay_read_retry_and_ack_stay_fifo_and_ack_deletes(tmp_path: Path
             0,
         )
     await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_public_relay_read_decrypts_each_selected_row_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claim_calls = 0
+    decrypt_calls = 0
+    real_claim = PersistenceWriter._claim_batch
+    real_decrypt = CryptoKeyring.decrypt
+
+    async def tracking_claim(
+        self: PersistenceWriter, payload: dict[str, object]
+    ) -> None:
+        nonlocal claim_calls
+        claim_calls += 1
+        await real_claim(self, payload)
+
+    def tracking_decrypt(self: CryptoKeyring, value: Any, *, aad: bytes) -> bytes:
+        nonlocal decrypt_calls
+        decrypt_calls += 1
+        return real_decrypt(self, value, aad=aad)
+
+    monkeypatch.setattr(PersistenceWriter, "_claim_batch", tracking_claim)
+    monkeypatch.setattr(CryptoKeyring, "decrypt", tracking_decrypt)
+    writer, task = await start_writer(tmp_path / "single-read.sqlite", utcnow=lambda: NOW)
+    assert writer.try_enqueue_turn(turn_operation(1))
+    assert writer.try_enqueue_turn(turn_operation(2))
+    await writer.wait_until_idle()
+
+    batch = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30)
+
+    assert [item.queue_id for item in batch] == [1, 2]
+    assert claim_calls == 1
+    assert decrypt_calls == 2
+    await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_relay_readers_claim_each_row_once_and_lease_is_bounded(
+    tmp_path: Path,
+) -> None:
+    writer, task = await start_writer(tmp_path / "claims.sqlite", utcnow=lambda: NOW)
+    assert writer.try_enqueue_turn(turn_operation(1))
+    assert writer.try_enqueue_turn(turn_operation(2))
+    await writer.wait_until_idle()
+
+    first, second = await asyncio.gather(
+        writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30),
+        writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30),
+    )
+    claimed, empty = sorted((first, second), key=len, reverse=True)
+
+    assert [item.queue_id for item in claimed] == [1, 2]
+    assert empty == ()
+    assert all(item.created_at == NOW for item in claimed)
+    assert all(item.next_attempt_at == NOW for item in claimed)
+    assert all(item.claim_expires_at == NOW + timedelta(seconds=30) for item in claimed)
+    for invalid_lease in (True, 0, 301):
+        with pytest.raises(ValueError, match="lease_seconds"):
+            await writer.read_relay_batch(
+                batch_size=10,
+                now=NOW,
+                lease_seconds=invalid_lease,  # type: ignore[arg-type]
+            )
+    await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_token",
+    [b"raw-token", b"x" * 31, b"x" * 33, "RAW-TOKEN-SENTINEL", bytearray(32)],
+)
+async def test_lease_token_hash_must_be_exact_sha256_bytes_without_leaking(
+    tmp_path: Path, invalid_token: object
+) -> None:
+    fixture_name = (
+        f"invalid-token-{type(invalid_token).__name__}-{len(invalid_token)}.sqlite"  # type: ignore[arg-type]
+    )
+    database = tmp_path / fixture_name
+    writer, task = await start_writer(database)
+    payload = lease_payload()
+    payload["token_hash"] = invalid_token
+
+    with pytest.raises(FatalPersistenceError, match="invalid_lease_command") as raised:
+        await writer.commit_control(PersistenceCommand("lease", payload, None))
+    await asyncio.wait_for(task, timeout=1)
+
+    rendered = repr(raised.value) + repr(writer.fatal_fault)
+    assert "RAW-TOKEN-SENTINEL" not in rendered
+    assert "raw-token" not in rendered
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM call_leases").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
