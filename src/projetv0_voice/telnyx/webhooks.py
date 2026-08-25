@@ -261,18 +261,26 @@ class TelnyxWebhookVerifier:
         verification: ModuleType | None = None
         with contextlib.suppress(Exception):
             verification = importlib.import_module("telnyx.lib.webhook_verification")
+        decoded_key = _decode_public_key(public_key)
+        verify_key_preflighted = False
+        with contextlib.suppress(Exception):
+            signing = importlib.import_module("nacl.signing")
+            verify_key = getattr(signing, "VerifyKey", None)
+            if callable(verify_key) and decoded_key is not None:
+                verify_key(decoded_key)
+                verify_key_preflighted = True
         verification_error = (
             None
             if verification is None
             else getattr(verification, "WebhookVerificationError", None)
         )
-        valid_key = _decode_public_key(public_key) is not None
         valid_types = all(
             isinstance(item, str) and 0 < len(item) <= MAX_EVENT_TYPE_CHARS
             for item in call_control_required_types
         )
         if (
-            not valid_key
+            decoded_key is None
+            or not verify_key_preflighted
             or not valid_types
             or verification is None
             or not callable(getattr(verification, "verify_webhook_signature", None))

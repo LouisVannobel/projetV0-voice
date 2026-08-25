@@ -140,6 +140,63 @@ def test_missing_verification_dependency_is_constant_startup_failure(
     assert raised.value.__context__ is None
 
 
+@pytest.mark.parametrize("missing", ["module", "symbol"])
+def test_verifier_preflights_pynacl_when_telnyx_helper_import_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    module = webhooks()
+    public_key = base64.b64encode(b"x" * 32).decode("ascii")
+    real_import = module.importlib.import_module
+    verification = real_import("telnyx.lib.webhook_verification")
+
+    def import_with_missing_signing(name: str) -> Any:
+        if name == "telnyx.lib.webhook_verification":
+            return verification
+        if name == "nacl.signing":
+            if missing == "module":
+                raise ModuleNotFoundError("RAW-MISSING-PYNACL-SENTINEL")
+            return SimpleNamespace()
+        return real_import(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", import_with_missing_signing)
+
+    with pytest.raises(module.WebhookConfigurationError, match="webhook_config_invalid") as raised:
+        module.TelnyxWebhookVerifier(public_key=public_key)
+
+    assert "RAW-MISSING-PYNACL-SENTINEL" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_verifier_constructs_verify_key_from_strict_decoded_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = webhooks()
+    decoded_key = b"x" * 32
+    public_key = base64.b64encode(decoded_key).decode("ascii")
+    real_import = module.importlib.import_module
+    verification = real_import("telnyx.lib.webhook_verification")
+    preflighted: list[bytes] = []
+
+    def verify_key(value: bytes) -> object:
+        preflighted.append(value)
+        return object()
+
+    def import_with_preflight(name: str) -> Any:
+        if name == "telnyx.lib.webhook_verification":
+            return verification
+        if name == "nacl.signing":
+            return SimpleNamespace(VerifyKey=verify_key)
+        return real_import(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", import_with_preflight)
+
+    module.TelnyxWebhookVerifier(public_key=public_key)
+
+    assert preflighted == [decoded_key]
+
+
 @pytest.mark.parametrize("offset", [-301, -300, 0, 300, 301])
 def test_real_ed25519_verification_enforces_exact_timestamp_boundary(
     monkeypatch: pytest.MonkeyPatch, offset: int
@@ -622,13 +679,18 @@ async def test_concurrent_duplicate_processor_calls_commit_one_durable_effect(
 
 
 @pytest.mark.asyncio
-async def test_commit_timeout_then_late_commit_redelivery_becomes_empty_200() -> None:
+async def test_real_writer_late_commit_requires_restart_then_redelivery_is_duplicate_200(
+    tmp_path: Path,
+) -> None:
     module = webhooks()
+    database = tmp_path / "late-webhook.sqlite"
+    commit_blocked = asyncio.Event()
+    release_commit = asyncio.Event()
     event = module.VerifiedWebhook(
         event_id="event-1",
-        event_type="unknown.future",
+        event_type="handled.event",
         occurred_at=NOW,
-        call_control_id=None,
+        call_control_id="control-1",
         call_leg_id=None,
         call_session_id=None,
         recording_id=None,
@@ -639,24 +701,68 @@ async def test_commit_timeout_then_late_commit_redelivery_becomes_empty_200() ->
         def verify(self, **_: object) -> Any:
             return event
 
-    class LateCommitWriter:
-        def __init__(self) -> None:
-            self.committed = False
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit":
+            commit_blocked.set()
+            await release_commit.wait()
 
-        async def commit_control(self, _: PersistenceCommand) -> None:
-            if not self.committed:
-                self.committed = True
-                raise TimeoutError("RAW-LATE-COMMIT-SENTINEL")
-
+    effect = module.WebhookDurableEffect(
+        lease={
+            "action": "upsert",
+            "call_control_id": "control-1",
+            "call_id": UUID(int=2),
+            "tenant_id": "tenant-a",
+            "agent_id": "agent-a",
+            "state": "pending",
+            "token_hash": bytes(range(32)),
+            "created_at": NOW,
+            "expires_at": NOW + timedelta(seconds=30),
+            "closed_at": None,
+        },
+        operation=call_operation(),
+    )
+    writer = PersistenceWriter(
+        database,
+        CryptoKeyring({1: KEY}, active_version=1),
+        control_commit_timeout_seconds=0.01,
+        failpoint=failpoint,
+    )
+    writer_task = asyncio.create_task(writer.run())
+    assert await writer.wait_ready() is True
     processor = module.TelnyxWebhookProcessor(
         verifier=StubVerifier(),
-        writer=LateCommitWriter(),
-        resolver=lambda _: None,
+        writer=writer,
+        resolver=lambda _: effect,
         utcnow=lambda: NOW,
     )
 
-    first = await processor.process(body=b"{}", headers=[])
-    second = await processor.process(body=b"{}", headers=[])
-
+    first_task = asyncio.create_task(processor.process(body=b"{}", headers=[]))
+    await commit_blocked.wait()
+    first = await first_task
     assert (first.status_code, first.body) == (503, b"")
-    assert (second.status_code, second.body) == (200, b"")
+    assert writer.is_degraded is True
+
+    release_commit.set()
+    await writer.wait_until_idle()
+    same_process = await processor.process(body=b"{}", headers=[])
+    assert (same_process.status_code, same_process.body) == (503, b"")
+    await writer.drain(timeout_seconds=2)
+    await writer_task
+
+    restarted, restarted_task = await start_writer(database)
+    restarted_processor = module.TelnyxWebhookProcessor(
+        verifier=StubVerifier(),
+        writer=restarted,
+        resolver=lambda _: effect,
+        utcnow=lambda: NOW + timedelta(seconds=1),
+    )
+
+    redelivery = await restarted_processor.process(body=b"{}", headers=[])
+    assert (redelivery.status_code, redelivery.body) == (200, b"")
+    await restarted.drain(timeout_seconds=2)
+    await restarted_task
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM call_leases").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)

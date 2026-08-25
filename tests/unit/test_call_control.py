@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import telnyx
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from telnyx.resources.calls.actions import AsyncActionsResource
 from telnyx.types import (
     StreamBidirectionalSamplingRate,
@@ -222,7 +222,8 @@ def test_request_models_are_strict_frozen_and_input_redacting() -> None:
     recording = module.RecordingStartV1(play_beep=True)
 
     assert streaming.stream_url == URL
-    assert streaming.stream_auth_token == TOKEN
+    assert isinstance(streaming.stream_auth_token, SecretStr)
+    assert streaming.stream_auth_token.get_secret_value() == TOKEN
     assert recording.play_beep is True
     assert URL not in repr(streaming)
     assert TOKEN not in repr(streaming)
@@ -230,6 +231,17 @@ def test_request_models_are_strict_frozen_and_input_redacting() -> None:
         streaming.stream_url = "wss://changed.example.test"  # type: ignore[misc]
     with pytest.raises(ValidationError):
         module.RecordingStartV1(play_beep=True, trim="trim-silence")
+
+
+def test_stream_transport_fields_are_absent_from_dumps_and_safe_in_repr_and_str() -> None:
+    module = call_control()
+    streaming = module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)
+
+    assert streaming.model_dump() == {}
+    assert streaming.model_dump_json() == "{}"
+    for rendered in (repr(streaming), str(streaming)):
+        assert URL not in rendered
+        assert TOKEN not in rendered
 
 
 @pytest.mark.parametrize(
@@ -249,6 +261,25 @@ def test_stream_url_rejects_unqualified_shapes_without_reflecting_input(url: str
     module = call_control()
     with pytest.raises(ValidationError) as raised:
         module.StreamingStartV1(stream_url=url, stream_auth_token=TOKEN)
+    assert url not in str(raised.value)
+    assert TOKEN not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        r"wss://voice.example.test/telnyx\media",
+        r"wss://voice.example.test/\telnyx/media",
+    ],
+)
+def test_stream_url_rejects_backslash_anywhere_in_path_without_reflecting_input(
+    url: str,
+) -> None:
+    module = call_control()
+
+    with pytest.raises(ValidationError) as raised:
+        module.StreamingStartV1(stream_url=url, stream_auth_token=TOKEN)
+
     assert url not in str(raised.value)
     assert TOKEN not in str(raised.value)
 

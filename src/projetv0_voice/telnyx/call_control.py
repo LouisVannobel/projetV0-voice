@@ -11,7 +11,7 @@ from uuid import UUID
 
 import httpx
 import telnyx
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, field_validator
 
 ATTEMPT_DEADLINE_SECONDS = 0.500
 CLOSE_DEADLINE_SECONDS = 1.0
@@ -59,12 +59,21 @@ class _RedactedFrozenModel(BaseModel):
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
 
+    def __str__(self) -> str:
+        return f"{type(self).__name__}()"
+
 
 class StreamingStartV1(_RedactedFrozenModel):
-    stream_url: str = Field(min_length=1, max_length=MAX_STREAM_URL_CHARS, repr=False)
-    stream_auth_token: str = Field(
+    stream_url: str = Field(
+        min_length=1,
+        max_length=MAX_STREAM_URL_CHARS,
+        exclude=True,
+        repr=False,
+    )
+    stream_auth_token: SecretStr = Field(
         min_length=1,
         max_length=MAX_STREAM_AUTH_TOKEN_CHARS,
+        exclude=True,
         repr=False,
     )
 
@@ -85,7 +94,7 @@ class StreamingStartV1(_RedactedFrozenModel):
             or parsed.fragment
             or "?" in value
             or "#" in value
-            or "\\" in parsed.netloc
+            or "\\" in value
             or any(character.isspace() for character in value)
             or port is not None and not 1 <= port <= 65_535
         ):
@@ -211,7 +220,7 @@ class CallControlClient:
                 stream_bidirectional_target_legs="self",
                 stream_codec="PCMU",
                 stream_url=request.stream_url,
-                stream_auth_token=request.stream_auth_token,
+                stream_auth_token=request.stream_auth_token.get_secret_value(),
                 command_id=canonical_command,
                 timeout=self._timeout,
             )
