@@ -1,0 +1,16 @@
+# Normalize detected text while leaving binary content untouched.
+* text=auto eol=lf
+
+# Common binary artifacts used by audio and container tests.
+*.gif binary
+*.gz binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.mp3 binary
+*.ogg binary
+*.pdf binary
+*.png binary
+*.tar binary
+*.wav binary
+*.zip binary
