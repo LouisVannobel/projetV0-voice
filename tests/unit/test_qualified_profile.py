@@ -30,6 +30,13 @@ HEX_B = "b" * 64
 HEX_C = "c" * 64
 IMAGE = f"ghcr.io/louisvannobel/projetv0-voice@sha256:{'d' * 64}"
 RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
+DOCUMENTED_TOKEN_LOCATOR = "telnyx-header-connected-v1"
+REJECTED_TOKEN_LOCATORS = (
+    "telnyx-http-header-v1",
+    "telnyx-query-v1",
+    "telnyx-start-v1",
+    "telnyx-magic-v1",
+)
 
 
 def inference_data() -> dict[str, object]:
@@ -56,7 +63,7 @@ def qualified_data(now: datetime | None = None) -> dict[str, object]:
         "agent_bundle_sha256": HEX_B,
         "inference_profile_sha256": canonical_inference_profile_sha256(inference),
         "inference": inference.model_dump(mode="json"),
-        "token_locator_id": "telnyx-http-header-v1",
+        "token_locator_id": DOCUMENTED_TOKEN_LOCATOR,
         "telnyx_handshake_fixture_sha256": HEX_C,
         "disclosure_mark_timeout_ms": 5000,
         "call_lease_ttl_seconds": 30,
@@ -209,6 +216,74 @@ def test_qualified_profile_loader_accepts_exact_digest_bindings(tmp_path: Path) 
     assert profile.deployment_id == "voice-agent-a"
     with pytest.raises(ValidationError, match="frozen"):
         profile.deployment_id = "changed"  # type: ignore[misc]
+
+
+def test_profile_models_accept_only_documented_telnyx_token_locator() -> None:
+    for model, data in (
+        (QualifiedDeploymentProfileV1, qualified_data()),
+        (QualificationCandidateProfileV1, candidate_data()),
+    ):
+        data["token_locator_id"] = DOCUMENTED_TOKEN_LOCATOR
+        assert model.model_validate(data).token_locator_id == DOCUMENTED_TOKEN_LOCATOR
+
+        for rejected_locator in REJECTED_TOKEN_LOCATORS:
+            data["token_locator_id"] = rejected_locator
+            with pytest.raises(ValidationError, match="token_locator_id"):
+                model.model_validate(data)
+
+
+def test_profile_loaders_accept_only_documented_telnyx_token_locator(
+    tmp_path: Path,
+) -> None:
+    qualified = qualified_data()
+    qualified["token_locator_id"] = DOCUMENTED_TOKEN_LOCATOR
+    qualified_path = write_json(tmp_path / "qualified.json", qualified)
+    assert (
+        load_qualified_deployment_profile(qualified_path, **expected_hashes()).token_locator_id
+        == DOCUMENTED_TOKEN_LOCATOR
+    )
+
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    candidate = candidate_data(now)
+    candidate["token_locator_id"] = DOCUMENTED_TOKEN_LOCATOR
+    candidate_path = write_json(tmp_path / "candidate.json", candidate)
+    candidate_loader_kwargs = {
+        "qualification_mode": True,
+        "expected_run_id": RUN_ID,
+        "expected_benchmark_did_hash": HEX_C,
+        "manifest": manifest(),
+        "now": now,
+        **expected_hashes(),
+    }
+    assert (
+        load_qualification_candidate_profile(candidate_path, **candidate_loader_kwargs)
+        .token_locator_id
+        == DOCUMENTED_TOKEN_LOCATOR
+    )
+
+    for rejected_locator in REJECTED_TOKEN_LOCATORS:
+        qualified["token_locator_id"] = rejected_locator
+        write_json(qualified_path, qualified)
+        with pytest.raises(ValidationError, match="token_locator_id"):
+            load_qualified_deployment_profile(qualified_path, **expected_hashes())
+
+        candidate["token_locator_id"] = rejected_locator
+        write_json(candidate_path, candidate)
+        with pytest.raises(ValidationError, match="token_locator_id"):
+            load_qualification_candidate_profile(candidate_path, **candidate_loader_kwargs)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [QualifiedDeploymentProfileV1, QualificationCandidateProfileV1],
+)
+def test_profile_schemas_allow_only_documented_telnyx_token_locator(
+    model: type[QualifiedDeploymentProfileV1] | type[QualificationCandidateProfileV1],
+) -> None:
+    locator_schema = model.model_json_schema()["properties"]["token_locator_id"]
+
+    assert locator_schema["const"] == DOCUMENTED_TOKEN_LOCATOR
+    assert "enum" not in locator_schema
 
 
 def test_fake_profiles_are_explicit_test_fixtures_with_consistent_hashes() -> None:

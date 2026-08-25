@@ -40,11 +40,7 @@ ImageDigest = Annotated[
         )
     ),
 ]
-TokenLocatorId = Literal[
-    "telnyx-http-header-v1",
-    "telnyx-query-v1",
-    "telnyx-start-v1",
-]
+TokenLocatorId = Literal["telnyx-header-connected-v1"]
 
 
 def _require_exact_int(value: object) -> object:

@@ -126,11 +126,7 @@
       "type": "string"
     },
     "token_locator_id": {
-      "enum": [
-        "telnyx-http-header-v1",
-        "telnyx-query-v1",
-        "telnyx-start-v1"
-      ],
+      "const": "telnyx-header-connected-v1",
       "title": "Token Locator Id",
       "type": "string"
     }
