@@ -104,6 +104,17 @@ class _SafeFailure:
     code: str
 
 
+class _RollbackBoundary(Exception):
+    """Force pool exception-exit using only a constant safe kind and code."""
+
+    __slots__ = ("kind", "code")
+
+    def __init__(self, kind: _FailureKind, code: str) -> None:
+        super().__init__(code)
+        self.kind = kind
+        self.code = code
+
+
 @dataclass(frozen=True, slots=True)
 class _PoolBuildResult:
     pool: AsyncConnectionPool[Any] | None = field(repr=False)
@@ -437,6 +448,7 @@ class PsycopgOperationSink:
                 async with self._pool.connection(
                     timeout=POOL_ACQUIRE_TIMEOUT_SECONDS
                 ) as connection:
+                    rollback: _SafeFailure | None = None
                     try:
                         async with asyncio.timeout(SQL_TRANSACTION_TIMEOUT_SECONDS):
                             async with connection.transaction():
@@ -447,15 +459,19 @@ class PsycopgOperationSink:
                     except asyncio.CancelledError:
                         raise
                     except OperationSinkError as safe_error:
-                        failure = _safe_failure_from_exception(safe_error)
+                        rollback = _safe_failure_from_exception(safe_error)
                     except Exception as raw_error:
-                        failure = _failure_from_raw_exception(
+                        rollback = _failure_from_raw_exception(
                             raw_error,
                             dispatched=dispatched,
                             map_purge_ack_sqlstates=map_purge_ack_sqlstates,
                         )
+                    if rollback is not None:
+                        raise _RollbackBoundary(rollback.kind, rollback.code)
             except asyncio.CancelledError:
                 raise
+            except _RollbackBoundary as rollback_error:
+                failure = _SafeFailure(rollback_error.kind, rollback_error.code)
             except PoolTimeout:
                 failure = _SafeFailure(
                     "ambiguous" if dispatched else "transient",

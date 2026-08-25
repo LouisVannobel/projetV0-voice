@@ -105,6 +105,10 @@ class FakeTransaction:
             await self.connection.exit_gate.wait()
         if exc_type is None and self.connection.commit_error is not None:
             raise self.connection.commit_error
+        if exc_type is None:
+            self.connection.transaction_commits += 1
+        else:
+            self.connection.transaction_rollbacks += 1
         return False
 
 
@@ -130,6 +134,8 @@ class FakeConnection:
         self.calls: list[tuple[str, tuple[object, ...], bool]] = []
         self.events: list[str] = []
         self.transaction_exit_types: list[type[BaseException] | None] = []
+        self.transaction_commits = 0
+        self.transaction_rollbacks = 0
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
@@ -158,7 +164,16 @@ class ConnectionContext:
         self.pool.active += 1
         return self.pool.connection_value
 
-    async def __aexit__(self, *_: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        if exc_type is None:
+            self.pool.normal_exit_commits += 1
+        else:
+            self.pool.exception_exit_rollbacks += 1
         self.pool.active -= 1
         self.pool.returned.set()
 
@@ -183,6 +198,8 @@ class FakePool:
         self.close_calls: list[float] = []
         self.active = 0
         self.returned = asyncio.Event()
+        self.normal_exit_commits = 0
+        self.exception_exit_rollbacks = 0
 
     def connection(self, timeout: float | None = None) -> ConnectionContext:
         self.connection_timeouts.append(timeout)
@@ -337,6 +354,9 @@ async def test_ingest_uses_one_exact_statement_jsonb_and_validates_before_commit
     assert params[0].obj == candidate.model_dump(mode="json")
     assert connection.transaction_exit_types == [None]
     assert connection.events == ["transaction-enter", "execute", "transaction-exit"]
+    assert connection.transaction_commits == 1
+    assert pool.normal_exit_commits == 1
+    assert pool.exception_exit_rollbacks == 0
 
 
 @pytest.mark.asyncio
@@ -348,10 +368,13 @@ async def test_ingest_accepts_applied_and_duplicate(status: str) -> None:
 
 @pytest.mark.asyncio
 async def test_ingest_conflict_is_typed_and_rolls_back_before_commit() -> None:
-    sink, _, connection, _ = sink_with_rows([(ingest_result("conflict"),)])
+    sink, pool, connection, _ = sink_with_rows([(ingest_result("conflict"),)])
     with pytest.raises(OperationConflictError, match="operation_hash_conflict"):
         await sink.ingest(operation())
     assert connection.transaction_exit_types == [OperationConflictError]
+    assert connection.transaction_rollbacks == 1
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
 
 
 INVALID_INGEST_ROWS: list[Sequence[tuple[object, ...]]] = [
@@ -374,10 +397,13 @@ INVALID_INGEST_ROWS: list[Sequence[tuple[object, ...]]] = [
 async def test_ingest_rejects_malformed_result_inside_transaction(
     rows: Sequence[tuple[object, ...]],
 ) -> None:
-    sink, _, connection, _ = sink_with_rows(rows)
+    sink, pool, connection, _ = sink_with_rows(rows)
     with pytest.raises(OperationSinkContractError, match="ingest_result_invalid"):
         await sink.ingest(operation())
     assert connection.transaction_exit_types == [OperationSinkContractError]
+    assert connection.transaction_rollbacks == 1
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
 
 
 @pytest.mark.asyncio
@@ -405,7 +431,7 @@ async def test_failure_after_dispatch_is_commit_ambiguous_and_safe(stage: str) -
         "fetch_error": raw if stage == "fetch" else None,
         "commit_error": raw if stage == "commit" else None,
     }
-    sink, _, _, _ = sink_with_rows([(ingest_result(),)], **options)
+    sink, pool, connection, _ = sink_with_rows([(ingest_result(),)], **options)
     with pytest.raises(
         OperationSinkCommitAmbiguousError, match="operation_commit_ambiguous"
     ) as captured:
@@ -416,6 +442,9 @@ async def test_failure_after_dispatch_is_commit_ambiguous_and_safe(stage: str) -
         sentinels=("RAW-DB-SENTINEL", "control-1"),
         forbidden_objects=(sink,),
     )
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
+    assert connection.transaction_commits == 0
 
 
 @pytest.mark.asyncio
@@ -454,6 +483,9 @@ async def test_real_transaction_timeout_cancels_execute_and_is_commit_ambiguous(
     assert time.monotonic() - started >= 0.009
     assert connection.transaction_exit_types == [asyncio.CancelledError]
     assert pool.returned.is_set()
+    assert connection.transaction_rollbacks == 1
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
 
 
 @pytest.mark.asyncio
@@ -518,12 +550,14 @@ async def test_purge_lease_uses_exact_statement_and_returns_strict_utc_value() -
 
 @pytest.mark.asyncio
 async def test_purge_lease_rejects_non_utc_aware_expiry_inside_transaction() -> None:
-    sink, _, connection, _ = sink_with_rows(
+    sink, pool, connection, _ = sink_with_rows(
         [purge_row(lease_expires_at="2026-08-25T14:00:30+02:00")]
     )
     with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):
         await sink.lease_recording_purges("worker-1", 30, 1)
     assert connection.transaction_exit_types == [OperationSinkContractError]
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
 
 
 @pytest.mark.asyncio
@@ -596,6 +630,8 @@ async def test_purge_sqlstates_are_commit_ambiguous_outside_ack(
         sentinels=("RAW-DB-SENTINEL", "postgresql://SECRET"),
         forbidden_objects=(sink, pool, connection),
     )
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
 
 
 @pytest.mark.asyncio
@@ -652,7 +688,7 @@ async def test_purge_ack_rejects_invalid_void_cardinality(
 async def test_purge_ack_maps_frozen_sqlstates_without_raw_error(
     sqlstate: str, error_type: type[Exception], code: str
 ) -> None:
-    sink, _, _, _ = sink_with_rows([(None,)], execute_error=SqlstateError(sqlstate))
+    sink, pool, _, _ = sink_with_rows([(None,)], execute_error=SqlstateError(sqlstate))
     with pytest.raises(error_type, match=code) as captured:
         await sink.ack_recording_purge(UUID(int=10), UUID(int=11), "failed", NOW)
     assert "RAW-DB-SENTINEL" not in exception_graph(captured.value)
@@ -661,6 +697,8 @@ async def test_purge_ack_maps_frozen_sqlstates_without_raw_error(
         sentinels=("RAW-DB-SENTINEL", "postgresql://SECRET"),
         forbidden_objects=(sink,),
     )
+    assert pool.normal_exit_commits == 0
+    assert pool.exception_exit_rollbacks == 1
 
 
 @pytest.mark.asyncio

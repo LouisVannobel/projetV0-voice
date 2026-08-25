@@ -1117,11 +1117,17 @@ class PersistenceWriter:
                 raise CommandSerializationError("stored_datetime_invalid")
             stored = row[0]
             if stored is not None and not isinstance(stored, str):
-                raise CommandSerializationError("stored_datetime_invalid")
+                safe_error = self._signal_fatal("stored_datetime_invalid")
+                if not result.done():
+                    result.set_exception(safe_error)
+                return
             try:
                 oldest = None if stored is None else _parse_datetime(stored)
             except CommandSerializationError:
-                raise CommandSerializationError("stored_datetime_invalid") from None
+                safe_error = self._signal_fatal("stored_datetime_invalid")
+                if not result.done():
+                    result.set_exception(safe_error)
+                return
             if not result.done():
                 result.set_result(oldest)
         elif action == "ack":

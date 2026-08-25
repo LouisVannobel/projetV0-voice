@@ -1326,5 +1326,22 @@ async def test_invalid_stored_oldest_timestamp_is_constant_safe(tmp_path: Path) 
     restarted, task = await start_writer(database)
     with pytest.raises(FatalPersistenceError, match="stored_datetime_invalid") as captured:
         await restarted.oldest_outbox_created_at()
-    await task
+    rendered = repr(captured.value)
+    pending_traceback = captured.value.__traceback__
+    while pending_traceback is not None:
+        filename = pending_traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/projetv0_voice/persistence/writer.py" in filename:
+            for value in pending_traceback.tb_frame.f_locals.values():
+                rendered += repr(value)
+        pending_traceback = pending_traceback.tb_next
+    if captured.value.__cause__ is not None:
+        rendered += repr(captured.value.__cause__)
+    if captured.value.__context__ is not None:
+        rendered += repr(captured.value.__context__)
     assert sentinel not in repr(captured.value)
+    assert sentinel not in rendered
+    assert restarted.fatal_fault is not None
+    assert restarted.fatal_fault.code == "stored_datetime_invalid"
+    assert task.done() is False
+    await restarted.drain(2)
+    await task
