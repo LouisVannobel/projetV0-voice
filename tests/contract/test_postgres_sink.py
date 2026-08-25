@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -236,6 +237,38 @@ def exception_graph(error: BaseException) -> str:
     return " ".join(parts)
 
 
+def assert_production_traceback_is_safe(
+    error: BaseException,
+    *,
+    sentinels: Sequence[str] = (),
+    forbidden_objects: Sequence[object] = (),
+) -> None:
+    forbidden_names = {
+        "self",
+        "conninfo",
+        "pool_factory",
+        "pool",
+        "connection",
+        "cursor",
+        "operation",
+        "params",
+        "rows",
+        "error",
+    }
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        filename = frame.f_code.co_filename.replace("\\", "/")
+        if "/src/projetv0_voice/persistence/postgres_sink.py" in filename:
+            local_values = dict(frame.f_locals)
+            assert forbidden_names.isdisjoint(local_values)
+            for value in local_values.values():
+                assert all(value is not forbidden for forbidden in forbidden_objects)
+                rendered = repr(value)
+                assert all(sentinel not in rendered for sentinel in sentinels)
+        traceback = traceback.tb_next
+
+
 @pytest.mark.asyncio
 async def test_pool_factory_is_called_once_with_pgbouncer_safe_settings_and_nonblocking_open(
 ) -> None:
@@ -264,6 +297,11 @@ async def test_pool_open_failure_is_typed_safe() -> None:
     with pytest.raises(OperationSinkTransientError, match="operation_pool_open_failed") as error:
         await sink.open()
     assert "RAW-OPEN-SECRET" not in exception_graph(error.value)
+    assert_production_traceback_is_safe(
+        error.value,
+        sentinels=("RAW-OPEN-SECRET", "postgresql://SECRET"),
+        forbidden_objects=(sink, pool),
+    )
 
 
 def test_pool_factory_failure_is_typed_and_does_not_retain_dsn_or_raw_error() -> None:
@@ -277,6 +315,10 @@ def test_pool_factory_failure_is_typed_and_does_not_retain_dsn_or_raw_error() ->
     rendered = exception_graph(error.value)
     assert "RAW-FACTORY" not in rendered
     assert "postgresql://SECRET" not in rendered
+    assert_production_traceback_is_safe(
+        error.value,
+        sentinels=("RAW-FACTORY", "postgresql://SECRET"),
+    )
 
 
 @pytest.mark.asyncio
@@ -347,6 +389,11 @@ async def test_pool_timeout_before_dispatch_is_safe_transient() -> None:
         await sink.ingest(operation())
     assert connection.calls == []
     assert "RAW-POOL-SENTINEL" not in exception_graph(captured.value)
+    assert_production_traceback_is_safe(
+        captured.value,
+        sentinels=("RAW-POOL-SENTINEL", "postgresql://SECRET"),
+        forbidden_objects=(sink, pool, connection),
+    )
 
 
 @pytest.mark.asyncio
@@ -364,6 +411,11 @@ async def test_failure_after_dispatch_is_commit_ambiguous_and_safe(stage: str) -
     ) as captured:
         await sink.ingest(operation())
     assert "RAW-DB-SENTINEL" not in exception_graph(captured.value)
+    assert_production_traceback_is_safe(
+        captured.value,
+        sentinels=("RAW-DB-SENTINEL", "control-1"),
+        forbidden_objects=(sink,),
+    )
 
 
 @pytest.mark.asyncio
@@ -383,6 +435,25 @@ async def test_transaction_timeout_is_exactly_five_seconds_and_is_commit_ambiguo
     sink, _, _, _ = sink_with_rows([(ingest_result(),)])
     await sink.ingest(operation())
     assert observed == [5.0]
+
+
+@pytest.mark.asyncio
+async def test_real_transaction_timeout_cancels_execute_and_is_commit_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    sink, pool, connection, _ = sink_with_rows([(ingest_result(),)], execute_gate=gate)
+    monkeypatch.setattr(
+        "projetv0_voice.persistence.postgres_sink.SQL_TRANSACTION_TIMEOUT_SECONDS", 0.01
+    )
+    started = time.monotonic()
+    with pytest.raises(
+        OperationSinkCommitAmbiguousError, match="operation_commit_ambiguous"
+    ):
+        await sink.ingest(operation())
+    assert time.monotonic() - started >= 0.009
+    assert connection.transaction_exit_types == [asyncio.CancelledError]
+    assert pool.returned.is_set()
 
 
 @pytest.mark.asyncio
@@ -446,6 +517,16 @@ async def test_purge_lease_uses_exact_statement_and_returns_strict_utc_value() -
 
 
 @pytest.mark.asyncio
+async def test_purge_lease_rejects_non_utc_aware_expiry_inside_transaction() -> None:
+    sink, _, connection, _ = sink_with_rows(
+        [purge_row(lease_expires_at="2026-08-25T14:00:30+02:00")]
+    )
+    with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):
+        await sink.lease_recording_purges("worker-1", 30, 1)
+    assert connection.transaction_exit_types == [OperationSinkContractError]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("rows", "code"),
     [
@@ -491,6 +572,30 @@ async def test_purge_lease_rejects_more_rows_than_requested_batch() -> None:
     sink, _, _, _ = sink_with_rows([purge_row(), purge_row(recording_id=str(UUID(int=12)))])
     with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):
         await sink.lease_recording_purges("worker-1", 30, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["ingest", "lease"])
+@pytest.mark.parametrize("sqlstate", ["PV201", "PV202"])
+async def test_purge_sqlstates_are_commit_ambiguous_outside_ack(
+    method: str, sqlstate: str
+) -> None:
+    connection = FakeConnection([(ingest_result(),)], execute_error=SqlstateError(sqlstate))
+    pool = FakePool(connection)
+    sink = PsycopgOperationSink("postgresql://SECRET", pool_factory=PoolFactory(pool))
+    with pytest.raises(
+        OperationSinkCommitAmbiguousError, match="operation_commit_ambiguous"
+    ) as captured:
+        if method == "ingest":
+            await sink.ingest(operation())
+        else:
+            await sink.lease_recording_purges("worker-1", 30, 1)
+    assert "RAW-DB-SENTINEL" not in exception_graph(captured.value)
+    assert_production_traceback_is_safe(
+        captured.value,
+        sentinels=("RAW-DB-SENTINEL", "postgresql://SECRET"),
+        forbidden_objects=(sink, pool, connection),
+    )
 
 
 @pytest.mark.asyncio
@@ -551,6 +656,11 @@ async def test_purge_ack_maps_frozen_sqlstates_without_raw_error(
     with pytest.raises(error_type, match=code) as captured:
         await sink.ack_recording_purge(UUID(int=10), UUID(int=11), "failed", NOW)
     assert "RAW-DB-SENTINEL" not in exception_graph(captured.value)
+    assert_production_traceback_is_safe(
+        captured.value,
+        sentinels=("RAW-DB-SENTINEL", "postgresql://SECRET"),
+        forbidden_objects=(sink,),
+    )
 
 
 @pytest.mark.asyncio
@@ -617,5 +727,10 @@ async def test_pool_close_failure_is_typed_safe_and_leaves_sink_fail_closed() ->
     with pytest.raises(OperationSinkPermanentError, match="operation_sink_close_failed") as error:
         await sink.close()
     assert "RAW-CLOSE-SECRET" not in exception_graph(error.value)
+    assert_production_traceback_is_safe(
+        error.value,
+        sentinels=("RAW-CLOSE-SECRET", "postgresql://SECRET"),
+        forbidden_objects=(sink, pool),
+    )
     with pytest.raises(OperationSinkPermanentError, match="operation_sink_closing"):
         await sink.ingest(operation())

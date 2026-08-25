@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import gc
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -1273,6 +1274,42 @@ async def test_cancelled_oldest_request_leaves_no_orphan_exceptional_future(
     await writer.wait_until_idle()
     assert owner.done() is False
     await stop_writer(writer, owner)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_oldest_request_consumes_late_writer_failure(
+    tmp_path: Path,
+) -> None:
+    reached_commit = asyncio.Event()
+    release_commit = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit":
+            reached_commit.set()
+            await release_commit.wait()
+            raise RuntimeError("RAW-LATE-WRITER-SENTINEL")
+
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(dict(context)))
+    try:
+        writer, owner = await start_writer(
+            tmp_path / "oldest-cancel-late-failure.sqlite", failpoint=failpoint
+        )
+        pending = asyncio.create_task(writer.oldest_outbox_created_at())
+        await reached_commit.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        release_commit.set()
+        await owner
+        del pending
+        gc.collect()
+        await asyncio.sleep(0)
+        assert loop_errors == []
+    finally:
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

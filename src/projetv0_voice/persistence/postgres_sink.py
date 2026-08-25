@@ -88,6 +88,101 @@ class PostgresOperationSink(Protocol):
 
 PoolFactory = Callable[..., AsyncConnectionPool[Any]]
 
+_FailureKind = Literal[
+    "transient",
+    "ambiguous",
+    "permanent",
+    "contract",
+    "conflict",
+    "stale",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _SafeFailure:
+    kind: _FailureKind
+    code: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PoolBuildResult:
+    pool: AsyncConnectionPool[Any] | None = field(repr=False)
+    failure: _SafeFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseCallResult:
+    leases: tuple[RecordingPurgeLease, ...] = field(repr=False)
+    failure: _SafeFailure | None
+
+
+def _raise_safe_failure(failure: _SafeFailure) -> None:
+    exception_type: type[OperationSinkError]
+    if failure.kind == "transient":
+        exception_type = OperationSinkTransientError
+    elif failure.kind == "ambiguous":
+        exception_type = OperationSinkCommitAmbiguousError
+    elif failure.kind == "contract":
+        exception_type = OperationSinkContractError
+    elif failure.kind == "conflict":
+        exception_type = OperationConflictError
+    elif failure.kind == "stale":
+        exception_type = OperationSinkStaleLeaseError
+    else:
+        exception_type = OperationSinkPermanentError
+    raise exception_type(failure.code)
+
+
+def _build_pool(conninfo: str, pool_factory: PoolFactory) -> _PoolBuildResult:
+    try:
+        pool = pool_factory(
+            conninfo,
+            kwargs={"prepare_threshold": None},
+            min_size=1,
+            max_size=3,
+            open=False,
+            timeout=POOL_ACQUIRE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return _PoolBuildResult(
+            pool=None,
+            failure=_SafeFailure("permanent", "operation_pool_factory_failed"),
+        )
+    return _PoolBuildResult(pool=pool, failure=None)
+
+
+def _safe_failure_from_exception(error: OperationSinkError) -> _SafeFailure:
+    if isinstance(error, OperationConflictError):
+        kind: _FailureKind = "conflict"
+    elif isinstance(error, OperationSinkContractError):
+        kind = "contract"
+    elif isinstance(error, OperationSinkStaleLeaseError):
+        kind = "stale"
+    elif isinstance(error, OperationSinkCommitAmbiguousError):
+        kind = "ambiguous"
+    elif isinstance(error, OperationSinkTransientError):
+        kind = "transient"
+    else:
+        kind = "permanent"
+    return _SafeFailure(kind, str(error))
+
+
+def _failure_from_raw_exception(
+    error: Exception,
+    *,
+    dispatched: bool,
+    map_purge_ack_sqlstates: bool,
+) -> _SafeFailure:
+    if map_purge_ack_sqlstates:
+        sqlstate = getattr(error, "sqlstate", None)
+        if sqlstate == "PV201":
+            return _SafeFailure("stale", "purge_stale_lease")
+        if sqlstate == "PV202":
+            return _SafeFailure("permanent", "purge_contract_failure")
+    if dispatched:
+        return _SafeFailure("ambiguous", "operation_commit_ambiguous")
+    return _SafeFailure("transient", "operation_pre_dispatch_failed")
+
 
 class PsycopgOperationSink:
     """Own one small PgBouncer-safe pool and only versioned function calls."""
@@ -98,21 +193,14 @@ class PsycopgOperationSink:
         *,
         pool_factory: PoolFactory = AsyncConnectionPool,
     ) -> None:
-        factory_failure: OperationSinkPermanentError | None = None
-        try:
-            pool = pool_factory(
-                conninfo,
-                kwargs={"prepare_threshold": None},
-                min_size=1,
-                max_size=3,
-                open=False,
-                timeout=POOL_ACQUIRE_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            factory_failure = OperationSinkPermanentError("operation_pool_factory_failed")
-        if factory_failure is not None:
-            raise factory_failure
-        self._pool = pool
+        built = _build_pool(conninfo, pool_factory)
+        if built.failure is not None:
+            failure = built.failure
+            del built, conninfo, pool_factory, self
+            _raise_safe_failure(failure)
+        if built.pool is None:
+            raise RuntimeError("operation_pool_factory_result_invalid")
+        self._pool = built.pool
         self._condition = asyncio.Condition()
         self._active_calls = 0
         self._closing = False
@@ -122,44 +210,58 @@ class PsycopgOperationSink:
         return "PsycopgOperationSink()"
 
     async def open(self) -> None:
+        failure = await self._open_result()
+        if failure is not None:
+            del self
+            _raise_safe_failure(failure)
+
+    async def _open_result(self) -> _SafeFailure | None:
         async with self._condition:
             if self._closing or self._closed:
-                raise OperationSinkPermanentError("operation_sink_closing")
-        open_failure: OperationSinkTransientError | None = None
+                return _SafeFailure("permanent", "operation_sink_closing")
         try:
             await self._pool.open(wait=False)
         except asyncio.CancelledError:
             raise
         except Exception:
-            open_failure = OperationSinkTransientError("operation_pool_open_failed")
-        if open_failure is not None:
-            raise open_failure
+            return _SafeFailure("transient", "operation_pool_open_failed")
+        return None
 
     async def close(self) -> None:
+        failure = await self._close_result()
+        if failure is not None:
+            del self
+            _raise_safe_failure(failure)
+
+    async def _close_result(self) -> _SafeFailure | None:
         async with self._condition:
             if self._closed:
-                return
+                return None
             self._closing = True
             try:
                 async with asyncio.timeout(POOL_CLOSE_TIMEOUT_SECONDS):
                     await self._condition.wait_for(lambda: self._active_calls == 0)
             except TimeoutError:
-                raise OperationSinkPermanentError("operation_sink_quiesce_timeout") from None
-        close_failure: OperationSinkPermanentError | None = None
+                return _SafeFailure("permanent", "operation_sink_quiesce_timeout")
         try:
             await self._pool.close(timeout=POOL_CLOSE_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception:
-            close_failure = OperationSinkPermanentError("operation_sink_close_failed")
-        if close_failure is not None:
-            raise close_failure
+            return _SafeFailure("permanent", "operation_sink_close_failed")
         async with self._condition:
             self._closed = True
+        return None
 
     async def ingest(self, operation: VoiceOperationV1) -> None:
         if not isinstance(operation, VoiceOperationV1):
             raise ValueError("operation must be VoiceOperationV1")
+        failure = await self._ingest_result(operation)
+        if failure is not None:
+            del self, operation
+            _raise_safe_failure(failure)
+
+    async def _ingest_result(self, operation: VoiceOperationV1) -> _SafeFailure | None:
         expected_id = operation.operation_id
 
         def validate(rows: Sequence[tuple[object, ...]]) -> None:
@@ -188,10 +290,11 @@ class PsycopgOperationSink:
             if status == "conflict":
                 raise OperationConflictError("operation_hash_conflict")
 
-        await self._execute(
+        return await self._execute_result(
             INGEST_SQL,
             (Jsonb(operation.model_dump(mode="json")),),
             validate,
+            map_purge_ack_sqlstates=False,
         )
 
     async def lease_recording_purges(
@@ -201,6 +304,18 @@ class PsycopgOperationSink:
             raise ValueError("worker_id is outside the supported range")
         _exact_bounded_int(lease_seconds, 1, 300, "lease_seconds")
         _exact_bounded_int(batch_size, 1, 100, "batch_size")
+        result = await self._lease_recording_purges_result(
+            worker_id, lease_seconds, batch_size
+        )
+        if result.failure is not None:
+            failure = result.failure
+            del result, self, worker_id, lease_seconds, batch_size
+            _raise_safe_failure(failure)
+        return result.leases
+
+    async def _lease_recording_purges_result(
+        self, worker_id: str, lease_seconds: int, batch_size: int
+    ) -> _LeaseCallResult:
         leases: list[RecordingPurgeLease] = []
 
         def validate(rows: Sequence[tuple[object, ...]]) -> None:
@@ -254,12 +369,15 @@ class PsycopgOperationSink:
                     )
                 )
 
-        await self._execute(
+        failure = await self._execute_result(
             LEASE_PURGES_SQL,
             (worker_id, lease_seconds, batch_size),
             validate,
+            map_purge_ack_sqlstates=False,
         )
-        return tuple(leases)
+        if failure is not None:
+            return _LeaseCallResult(leases=(), failure=failure)
+        return _LeaseCallResult(leases=tuple(leases), failure=None)
 
     async def ack_recording_purge(
         self,
@@ -273,108 +391,94 @@ class PsycopgOperationSink:
         if not isinstance(outcome, str) or outcome not in _PURGE_OUTCOMES:
             raise ValueError("outcome is outside the supported values")
         normalized_time = _input_aware_datetime(occurred_at)
+        failure = await self._ack_recording_purge_result(
+            recording_id,
+            lease_token,
+            outcome,
+            normalized_time,
+        )
+        if failure is not None:
+            del self, recording_id, lease_token, outcome, occurred_at, normalized_time
+            _raise_safe_failure(failure)
+
+    async def _ack_recording_purge_result(
+        self,
+        recording_id: UUID,
+        lease_token: UUID,
+        outcome: PurgeOutcome,
+        occurred_at: datetime,
+    ) -> _SafeFailure | None:
 
         def validate(rows: Sequence[tuple[object, ...]]) -> None:
             if len(rows) != 1 or len(rows[0]) != 1 or rows[0][0] is not None:
                 raise OperationSinkContractError("purge_ack_result_invalid")
 
-        await self._execute(
+        return await self._execute_result(
             ACK_PURGE_SQL,
-            (recording_id, lease_token, outcome, normalized_time),
+            (recording_id, lease_token, outcome, occurred_at),
             validate,
+            map_purge_ack_sqlstates=True,
         )
 
-    async def _execute(
+    async def _execute_result(
         self,
         sql: str,
         params: tuple[object, ...],
         validate: Callable[[Sequence[tuple[object, ...]]], None],
-    ) -> None:
-        safe_failure: OperationSinkError | None = None
-        try:
-            await self._execute_with_transaction(sql, params, validate)
-        except asyncio.CancelledError:
-            raise
-        except OperationSinkError as error:
-            error.__cause__ = None
-            error.__context__ = None
-            safe_failure = error
-        if safe_failure is not None:
-            raise safe_failure
-
-    async def _execute_with_transaction(
-        self,
-        sql: str,
-        params: tuple[object, ...],
-        validate: Callable[[Sequence[tuple[object, ...]]], None],
-    ) -> None:
-        await self._enter_call()
+        *,
+        map_purge_ack_sqlstates: bool,
+    ) -> _SafeFailure | None:
+        if not await self._enter_call():
+            return _SafeFailure("permanent", "operation_sink_closing")
         dispatched = False
+        failure: _SafeFailure | None = None
         try:
-            async with self._pool.connection(
-                timeout=POOL_ACQUIRE_TIMEOUT_SECONDS
-            ) as connection:
-                try:
-                    async with asyncio.timeout(SQL_TRANSACTION_TIMEOUT_SECONDS):
-                        async with connection.transaction():
-                            dispatched = True
-                            cursor = await connection.execute(sql, params, prepare=False)
-                            rows = await cursor.fetchall()
-                            validate(cast(Sequence[tuple[object, ...]], rows))
-                except asyncio.CancelledError:
-                    raise
-                except (
-                    OperationConflictError,
-                    OperationSinkContractError,
-                    OperationSinkStaleLeaseError,
-                    OperationSinkPermanentError,
-                ):
-                    raise
-                except Exception as error:
-                    mapped = self._map_sqlstate(error)
-                    if mapped is not None:
-                        raise mapped from None
-                    if dispatched:
-                        raise OperationSinkCommitAmbiguousError(
-                            "operation_commit_ambiguous"
-                        ) from None
-                    raise OperationSinkTransientError("operation_pre_dispatch_failed") from None
-        except asyncio.CancelledError:
-            raise
-        except PoolTimeout:
-            if dispatched:
-                raise OperationSinkCommitAmbiguousError("operation_commit_ambiguous") from None
-            raise OperationSinkTransientError("pool_acquire_timeout") from None
-        except (
-            OperationConflictError,
-            OperationSinkContractError,
-            OperationSinkStaleLeaseError,
-            OperationSinkPermanentError,
-            OperationSinkCommitAmbiguousError,
-            OperationSinkTransientError,
-        ):
-            raise
-        except Exception:
-            if dispatched:
-                raise OperationSinkCommitAmbiguousError("operation_commit_ambiguous") from None
-            raise OperationSinkTransientError("operation_pre_dispatch_failed") from None
+            try:
+                async with self._pool.connection(
+                    timeout=POOL_ACQUIRE_TIMEOUT_SECONDS
+                ) as connection:
+                    try:
+                        async with asyncio.timeout(SQL_TRANSACTION_TIMEOUT_SECONDS):
+                            async with connection.transaction():
+                                dispatched = True
+                                cursor = await connection.execute(sql, params, prepare=False)
+                                rows = await cursor.fetchall()
+                                validate(cast(Sequence[tuple[object, ...]], rows))
+                    except asyncio.CancelledError:
+                        raise
+                    except OperationSinkError as safe_error:
+                        failure = _safe_failure_from_exception(safe_error)
+                    except Exception as raw_error:
+                        failure = _failure_from_raw_exception(
+                            raw_error,
+                            dispatched=dispatched,
+                            map_purge_ack_sqlstates=map_purge_ack_sqlstates,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except PoolTimeout:
+                failure = _SafeFailure(
+                    "ambiguous" if dispatched else "transient",
+                    "operation_commit_ambiguous" if dispatched else "pool_acquire_timeout",
+                )
+            except OperationSinkError as safe_error:
+                failure = _safe_failure_from_exception(safe_error)
+            except Exception as raw_error:
+                failure = _failure_from_raw_exception(
+                    raw_error,
+                    dispatched=dispatched,
+                    map_purge_ack_sqlstates=map_purge_ack_sqlstates,
+                )
         finally:
             await self._leave_call()
+        return failure
 
-    @staticmethod
-    def _map_sqlstate(error: Exception) -> OperationSinkError | None:
-        sqlstate = getattr(error, "sqlstate", None)
-        if sqlstate == "PV201":
-            return OperationSinkStaleLeaseError("purge_stale_lease")
-        if sqlstate == "PV202":
-            return OperationSinkPermanentError("purge_contract_failure")
-        return None
-
-    async def _enter_call(self) -> None:
+    async def _enter_call(self) -> bool:
         async with self._condition:
             if self._closing or self._closed:
-                raise OperationSinkPermanentError("operation_sink_closing")
+                return False
             self._active_calls += 1
+            return True
 
     async def _leave_call(self) -> None:
         async with self._condition:
@@ -418,7 +522,11 @@ def _strict_aware_datetime(value: object, code: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise OperationSinkContractError(code) from None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.utcoffset() != timedelta(0)
+    ):
         raise OperationSinkContractError(code)
     return parsed.astimezone(UTC)
 

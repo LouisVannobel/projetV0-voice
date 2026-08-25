@@ -311,8 +311,16 @@ class PersistenceWriter:
             await asyncio.wait_for(
                 asyncio.shield(future), timeout=self.control_commit_timeout_seconds
             )
+        except asyncio.CancelledError:
+            future.add_done_callback(self._consume_control_commit_exception)
+            raise
         except TimeoutError:
             raise self._signal_fatal("control_commit_timeout") from None
+
+    @staticmethod
+    def _consume_control_commit_exception(result: asyncio.Future[None]) -> None:
+        if not result.cancelled():
+            result.exception()
 
     async def quick_check(self) -> bool:
         return self._last_quick_check
@@ -403,11 +411,21 @@ class PersistenceWriter:
                     None,
                 )
             )
+        except asyncio.CancelledError:
+            result.add_done_callback(self._consume_relay_result_exception)
+            raise
         except BaseException:
             if result.done() and not result.cancelled():
                 result.exception()
             raise
         return await result
+
+    @staticmethod
+    def _consume_relay_result_exception(
+        result: asyncio.Future[datetime | None],
+    ) -> None:
+        if not result.cancelled():
+            result.exception()
 
     async def ack_outbox(
         self,
@@ -1100,7 +1118,10 @@ class PersistenceWriter:
             stored = row[0]
             if stored is not None and not isinstance(stored, str):
                 raise CommandSerializationError("stored_datetime_invalid")
-            oldest = None if stored is None else _parse_datetime(stored)
+            try:
+                oldest = None if stored is None else _parse_datetime(stored)
+            except CommandSerializationError:
+                raise CommandSerializationError("stored_datetime_invalid") from None
             if not result.done():
                 result.set_result(oldest)
         elif action == "ack":
