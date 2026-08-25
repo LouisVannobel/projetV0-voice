@@ -120,7 +120,7 @@ class TurnUpsertPayloadV1(_StrictFrozenModel):
             raise ValueError(f"{field_name} must be canonical base64") from error
         if base64.b64encode(decoded).decode("ascii") != value:
             raise ValueError(f"{field_name} must be canonical base64")
-        maximum_size = 128 if field_name == "nonce_b64" else 1_048_576
+        maximum_size = 128 if field_name == "nonce_b64" else 65_536
         if not decoded or len(decoded) > maximum_size:
             raise ValueError(f"{field_name} decoded size is outside the structural bound")
         return value

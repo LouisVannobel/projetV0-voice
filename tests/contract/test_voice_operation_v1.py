@@ -211,6 +211,16 @@ def test_turn_envelope_does_not_choose_task3_nonce_algorithm(nonce_length: int) 
     assert len(base64.b64decode(parsed.nonce_b64)) == nonce_length
 
 
+def test_turn_ciphertext_structural_bound_is_64_kib() -> None:
+    accepted = base64.b64encode(b"c" * 65_536).decode("ascii")
+    rejected = base64.b64encode(b"c" * 65_537).decode("ascii")
+
+    parsed = TurnUpsertPayloadV1.model_validate(turn_payload(ciphertext_b64=accepted))
+    assert len(base64.b64decode(parsed.ciphertext_b64)) == 65_536
+    with pytest.raises(ValidationError, match="ciphertext_b64"):
+        TurnUpsertPayloadV1.model_validate(turn_payload(ciphertext_b64=rejected))
+
+
 def test_turn_rejects_invalid_numbers_role_source_and_time_order() -> None:
     for updates in (
         {"turn_no": 0},
