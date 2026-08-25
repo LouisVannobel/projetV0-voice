@@ -29,6 +29,20 @@ STREAM_ID = "sensitive-stream-id"
 FROM_NUMBER = "+33111111111"
 TO_NUMBER = "+33222222222"
 LOCATOR_ID = "telnyx-header-connected-v1"
+EXPECTED_CANONICAL_FIXTURE = (
+    b'{"authentication":{"connected.connected.x-telnyx-streaming-auth-token":'
+    b'{"type":"string","utf8_length":20},"header.x-telnyx-streaming-auth-token":'
+    b'{"type":"string","utf8_length":20}},"connected":{"event":"connected",'
+    b'"version":"1.0.0"},"provider":"telnyx","schema":'
+    b'"projetv0.telnyx.handshake.v1","start":{"event":"start",'
+    b'"sequence_number":{"format":"decimal","type":"string"},'
+    b'"start.call_control_id":{"type":"string"},"start.from":{"type":"string"},'
+    b'"start.media_format.channels":1,"start.media_format.encoding":"PCMU",'
+    b'"start.media_format.sample_rate":8000,"start.to":{"type":"string"},'
+    b'"stream_id":{"type":"string"}},"token_locator_id":'
+    b'"telnyx-header-connected-v1"}'
+)
+EXPECTED_CANONICAL_SHA256 = "6ef76b42d6f0db4a60fdeda1e6c4a202363674e4eea3d04a82977cba9ef6da80"
 
 
 @dataclass(frozen=True)
@@ -58,6 +72,16 @@ class _Gate:
     def try_acquire(self) -> _Permit | None:
         self.acquire_count += 1
         return self.permit
+
+
+class _RaisingGate:
+    def try_acquire(self) -> None:
+        raise RuntimeError("gate-provider-secret")
+
+
+class _CancellingGate:
+    def try_acquire(self) -> None:
+        raise asyncio.CancelledError
 
 
 class _LeaseAuthority:
@@ -138,8 +162,18 @@ def _connected(token: str = TOKEN, **extras: object) -> str:
             "protocol": "Call",
             "version": "1.0.0",
             "event": "connected",
-            "x-telnyx-streaming-auth-token": token,
+            "connected": {"x-telnyx-streaming-auth-token": token},
             **extras,
+        }
+    )
+
+
+def _root_connected(token: str = TOKEN) -> str:
+    return json.dumps(
+        {
+            "event": "connected",
+            "version": "1.0.0",
+            "x-telnyx-streaming-auth-token": token,
         }
     )
 
@@ -166,41 +200,7 @@ def _start(**start_extras: object) -> str:
     )
 
 
-def _canonical_fixture(token: str = TOKEN) -> bytes:
-    fixture = {
-        "authentication": {
-            "connected.x-telnyx-streaming-auth-token": {
-                "type": "string",
-                "utf8_length": len(token.encode("utf-8")),
-            },
-            "header.x-telnyx-streaming-auth-token": {
-                "type": "string",
-                "utf8_length": len(token.encode("utf-8")),
-            },
-        },
-        "connected": {
-            "event": "connected",
-            "version": "1.0.0",
-        },
-        "provider": "telnyx",
-        "schema": "projetv0.telnyx.handshake.v1",
-        "start": {
-            "event": "start",
-            "sequence_number": {"format": "decimal", "type": "string"},
-            "start.call_control_id": {"type": "string"},
-            "start.from": {"type": "string"},
-            "start.media_format.channels": 1,
-            "start.media_format.encoding": "PCMU",
-            "start.media_format.sample_rate": 8000,
-            "start.to": {"type": "string"},
-            "stream_id": {"type": "string"},
-        },
-        "token_locator_id": LOCATOR_ID,
-    }
-    return json.dumps(fixture, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _profile(token: str = TOKEN) -> QualifiedDeploymentProfileV1:
+def _profile() -> QualifiedDeploymentProfileV1:
     original = QualifiedDeploymentProfileV1.model_validate_json(
         Path("tests/fixtures/qualified-deployment-profile-v1.json").read_text(
             encoding="utf-8"
@@ -208,9 +208,7 @@ def _profile(token: str = TOKEN) -> QualifiedDeploymentProfileV1:
     )
     return original.model_copy(
         update={
-            "telnyx_handshake_fixture_sha256": hashlib.sha256(
-                _canonical_fixture(token)
-            ).hexdigest()
+            "telnyx_handshake_fixture_sha256": EXPECTED_CANONICAL_SHA256
         }
     )
 
@@ -302,6 +300,7 @@ async def test_authenticate_builds_exact_native_call_data_and_transport_after_cl
     result = await _service(authority, gate).authenticate(websocket)
 
     assert state["receive_count"] == 2
+    assert hashlib.sha256(EXPECTED_CANONICAL_FIXTURE).hexdigest() == EXPECTED_CANONICAL_SHA256
     assert authority.claim_calls == [(CALL_CONTROL_ID, _token_digest())]
     assert authority.abort_calls == []
     assert gate.acquire_count == 1
@@ -359,6 +358,10 @@ async def test_authenticate_builds_exact_native_call_data_and_transport_after_cl
         (
             ((b"x-telnyx-streaming-auth-token", ("t" * 4001).encode()),),
             _connected("t" * 4001),
+        ),
+        (
+            ((b"x-telnyx-streaming-auth-token", TOKEN.encode()),),
+            _root_connected(),
         ),
     ],
 )
@@ -426,14 +429,15 @@ async def test_strict_message_contract_rejects_order_media_and_duplicate_keys(
     [
         (
             '{"event":"connected","version":"1.0.0",'
+            '"connected":{'
             f'"x-telnyx-streaming-auth-token":"{TOKEN}",'
-            f'"x-telnyx-streaming-auth-token":"{TOKEN}"}}'
+            f'"x-telnyx-streaming-auth-token":"{TOKEN}"}}}}'
         ),
         json.dumps(
             {
                 "event": "connected",
                 "version": "1.0.0",
-                "x-telnyx-streaming-auth-token": TOKEN,
+                "connected": {"x-telnyx-streaming-auth-token": TOKEN},
                 "oversized_extra": "x" * 65_536,
             }
         ),
@@ -490,6 +494,42 @@ async def test_capacity_rejection_is_synchronous_and_consumes_nothing() -> None:
     assert state["receive_count"] == 0
     assert authority.claim_calls == []
     assert str(raised.value) == "telnyx_handshake_capacity"
+
+
+@pytest.mark.asyncio
+async def test_gate_provider_exception_is_constant_safe_without_context() -> None:
+    websocket, state = _websocket()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    service = AuthenticatedTelnyxHandshakeService(
+        profile=_profile(),
+        lease_authority=authority,
+        unauthenticated_gate=_RaisingGate(),
+        timeout_seconds=0.5,
+    )
+
+    with pytest.raises(TelnyxHandshakeError) as raised:
+        await service.authenticate(websocket)
+
+    assert state["receive_count"] == 0
+    assert authority.claim_calls == []
+    assert str(raised.value) == "telnyx_handshake_gate_failed"
+    assert "gate-provider-secret" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_gate_cancellation_is_never_wrapped() -> None:
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    service = AuthenticatedTelnyxHandshakeService(
+        profile=_profile(),
+        lease_authority=authority,
+        unauthenticated_gate=_CancellingGate(),
+        timeout_seconds=0.5,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.authenticate(_websocket()[0])
 
 
 @pytest.mark.asyncio
@@ -644,5 +684,39 @@ async def test_raising_permit_release_aborts_unreturned_handoff_constant_safely(
     assert authority.abort_calls == [(CALL_CONTROL_ID, _token_digest())]
     assert str(raised.value) == "telnyx_handshake_cleanup_failed"
     assert "permit-provider-secret" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_release_cleanup_failure_takes_precedence_over_stored_rejection() -> None:
+    websocket, _ = _websocket(messages=(_root_connected(), _start()))
+    permit = _RaisingPermit()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+
+    with pytest.raises(TelnyxHandshakeError) as raised:
+        await _service(authority, _Gate(permit)).authenticate(websocket)
+
+    assert permit.release_count == 1
+    assert authority.claim_calls == []
+    assert str(raised.value) == "telnyx_handshake_cleanup_failed"
+    assert "permit-provider-secret" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_abort_cleanup_failure_takes_precedence_over_stored_timeout() -> None:
+    websocket, _ = _websocket()
+    permit = _Permit()
+    authority = _RaisingBlockingLeaseAuthority(expected_digest=_token_digest())
+
+    with pytest.raises(TelnyxHandshakeError) as raised:
+        await _service(authority, _Gate(permit), timeout_seconds=0.01).authenticate(websocket)
+
+    assert permit.release_count == 1
+    assert authority.abort_calls == [(CALL_CONTROL_ID, _token_digest())]
+    assert str(raised.value) == "telnyx_handshake_cleanup_failed"
+    assert "scheduler-provider-secret" not in repr(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None

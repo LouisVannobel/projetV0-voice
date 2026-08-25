@@ -23,6 +23,20 @@ STREAM_ID = "probe-stream-secret"
 FROM_NUMBER = "+33333333333"
 TO_NUMBER = "+33444444444"
 LOCATOR_ID = "telnyx-header-connected-v1"
+EXPECTED_CANONICAL_FIXTURE = (
+    b'{"authentication":{"connected.connected.x-telnyx-streaming-auth-token":'
+    b'{"type":"string","utf8_length":21},"header.x-telnyx-streaming-auth-token":'
+    b'{"type":"string","utf8_length":21}},"connected":{"event":"connected",'
+    b'"version":"1.0.0"},"provider":"telnyx","schema":'
+    b'"projetv0.telnyx.handshake.v1","start":{"event":"start",'
+    b'"sequence_number":{"format":"decimal","type":"string"},'
+    b'"start.call_control_id":{"type":"string"},"start.from":{"type":"string"},'
+    b'"start.media_format.channels":1,"start.media_format.encoding":"PCMU",'
+    b'"start.media_format.sample_rate":8000,"start.to":{"type":"string"},'
+    b'"stream_id":{"type":"string"}},"token_locator_id":'
+    b'"telnyx-header-connected-v1"}'
+)
+EXPECTED_CANONICAL_SHA256 = "295e07dee25a019d098d8b7fecf9cf99cd3f58b1b2c9dda83eecfd987c80b03b"
 
 
 @dataclass(frozen=True)
@@ -71,7 +85,7 @@ def _connected(*, reverse_order: bool = False) -> str:
     pairs: list[tuple[str, object]] = [
         ("event", "connected"),
         ("version", "1.0.0"),
-        ("x-telnyx-streaming-auth-token", TOKEN),
+        ("connected", {"x-telnyx-streaming-auth-token": TOKEN}),
         ("documented_extra", {"type": "streaming"}),
     ]
     if reverse_order:
@@ -102,37 +116,6 @@ def _start(*, reverse_order: bool = False) -> str:
     if reverse_order:
         pairs.reverse()
     return json.dumps(dict(pairs))
-
-
-def _fixture() -> bytes:
-    fixture = {
-        "authentication": {
-            "connected.x-telnyx-streaming-auth-token": {
-                "type": "string",
-                "utf8_length": len(TOKEN.encode("utf-8")),
-            },
-            "header.x-telnyx-streaming-auth-token": {
-                "type": "string",
-                "utf8_length": len(TOKEN.encode("utf-8")),
-            },
-        },
-        "connected": {"event": "connected", "version": "1.0.0"},
-        "provider": "telnyx",
-        "schema": "projetv0.telnyx.handshake.v1",
-        "start": {
-            "event": "start",
-            "sequence_number": {"format": "decimal", "type": "string"},
-            "start.call_control_id": {"type": "string"},
-            "start.from": {"type": "string"},
-            "start.media_format.channels": 1,
-            "start.media_format.encoding": "PCMU",
-            "start.media_format.sample_rate": 8000,
-            "start.to": {"type": "string"},
-            "stream_id": {"type": "string"},
-        },
-        "token_locator_id": LOCATOR_ID,
-    }
-    return json.dumps(fixture, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _websocket(
@@ -179,13 +162,14 @@ async def test_probe_returns_only_exact_redacted_conformance_result(
 
     assert isinstance(result, ContractProbeResult)
     assert result.token_locator_id == LOCATOR_ID
-    assert result.redacted_fixture_bytes == _fixture()
-    assert result.fixture_sha256 == hashlib.sha256(_fixture()).hexdigest()
+    assert result.redacted_fixture_bytes == EXPECTED_CANONICAL_FIXTURE
+    assert hashlib.sha256(EXPECTED_CANONICAL_FIXTURE).hexdigest() == EXPECTED_CANONICAL_SHA256
+    assert result.fixture_sha256 == EXPECTED_CANONICAL_SHA256
     assert result.safe_summary == (
         ("connected.event", "string"),
         ("connected.version", "string"),
         ("header.x-telnyx-streaming-auth-token", "string"),
-        ("connected.x-telnyx-streaming-auth-token", "string"),
+        ("connected.connected.x-telnyx-streaming-auth-token", "string"),
         ("token.utf8_length", len(TOKEN.encode("utf-8"))),
         ("start.event", "string"),
         ("start.sequence_number", "decimal-string"),

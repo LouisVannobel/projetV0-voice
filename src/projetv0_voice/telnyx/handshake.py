@@ -206,7 +206,7 @@ def _redacted_fixture(
 ) -> bytes:
     fixture = {
         "authentication": {
-            "connected.x-telnyx-streaming-auth-token": {
+            "connected.connected.x-telnyx-streaming-auth-token": {
                 "type": "string",
                 "utf8_length": token_byte_length,
             },
@@ -244,7 +244,7 @@ def _safe_summary(
         ("connected.event", "string"),
         ("connected.version", "string"),
         ("header.x-telnyx-streaming-auth-token", "string"),
-        ("connected.x-telnyx-streaming-auth-token", "string"),
+        ("connected.connected.x-telnyx-streaming-auth-token", "string"),
         ("token.utf8_length", token_byte_length),
         ("start.event", "string"),
         ("start.sequence_number", "decimal-string"),
@@ -265,7 +265,10 @@ async def _capture_telnyx_handshake(websocket: WebSocket) -> _CapturedTelnyxHand
 
     if connected.get("event") != "connected" or connected.get("version") != "1.0.0":
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    _, connected_bytes = _token_bytes(connected.get(TOKEN_FIELD))
+    connected_payload = connected.get("connected")
+    if not isinstance(connected_payload, dict):
+        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+    _, connected_bytes = _token_bytes(connected_payload.get(TOKEN_FIELD))
     if not hmac.compare_digest(header_bytes, connected_bytes):
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
 
@@ -359,7 +362,16 @@ class AuthenticatedTelnyxHandshakeService:
         return "AuthenticatedTelnyxHandshakeService()"
 
     async def authenticate(self, websocket: WebSocket) -> AuthenticatedTelnyxHandshake:
-        permit = self._unauthenticated_gate.try_acquire()
+        permit: UnauthenticatedPermit | None = None
+        gate_failed = False
+        try:
+            permit = self._unauthenticated_gate.try_acquire()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            gate_failed = True
+        if gate_failed:
+            raise TelnyxHandshakeError("telnyx_handshake_gate_failed")
         if permit is None:
             raise TelnyxHandshakeCapacityError("telnyx_handshake_capacity")
 
@@ -371,6 +383,7 @@ class AuthenticatedTelnyxHandshakeService:
         timed_out = False
         unexpected_failure = False
         cleanup_failed = False
+        stored_error: TelnyxHandshakeError | None = None
         try:
             try:
                 async with asyncio.timeout(self._timeout_seconds):
@@ -418,8 +431,8 @@ class AuthenticatedTelnyxHandshakeService:
                 timed_out = True
             except asyncio.CancelledError:
                 raise
-            except TelnyxHandshakeError:
-                raise
+            except TelnyxHandshakeError as error:
+                stored_error = error
             except Exception:
                 unexpected_failure = True
         finally:
@@ -456,6 +469,8 @@ class AuthenticatedTelnyxHandshakeService:
 
         if cleanup_failed:
             raise TelnyxHandshakeError("telnyx_handshake_cleanup_failed")
+        if stored_error is not None:
+            raise stored_error
         if timed_out:
             raise TelnyxHandshakeTimeoutError("telnyx_handshake_timeout")
         if unexpected_failure or result is None:
