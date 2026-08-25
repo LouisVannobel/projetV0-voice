@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "projetv0-voice"
+version = "0.1.0"
+description = "Reusable self-hosted Pipecat voice runtime for projetV0 SaaS deployments"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "aiosqlite==0.22.1",
+  "cryptography==50.0.0",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "opentelemetry-api==1.44.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+  "opentelemetry-sdk==1.44.0",
+  "pipecat-ai[openai,openrouter,silero,websocket]==1.7.0",
+  "psycopg[binary,pool]==3.3.4",
+  "pydantic==2.13.4",
+  "pynacl==1.6.2",
+  "telnyx==4.176.0",
+  "uvicorn[standard]==0.52.4",
+]
+
+[dependency-groups]
+dev = [
+  "mypy==2.3.1",
+  "pipecat-ai[evals]==1.7.0",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "respx==0.23.1",
+  "ruff==0.16.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/projetv0_voice"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [".superpowers"]
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "E", "F", "I", "SIM", "UP"]

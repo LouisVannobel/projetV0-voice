@@ -1,0 +1,37 @@
+# Python and uv caches
+__pycache__/
+*.py[cod]
+.venv/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and package artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environments, credentials, and runtime state
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Local task evidence
+.superpowers/
+
+# Editor and operating-system artifacts
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
