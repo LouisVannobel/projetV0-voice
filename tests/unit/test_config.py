@@ -50,6 +50,26 @@ def write_bundle(root: Path, data: dict[str, object] | None = None) -> Path:
     return root
 
 
+def create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(  # noqa: S603 - fixed local executable and bounded temp paths
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def remove_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        link.rmdir()
+    else:
+        link.unlink()
+
+
 def test_loader_parses_yaml_instead_of_only_json_with_a_yaml_extension(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -173,25 +193,56 @@ def test_loader_rejects_symlink_whose_target_escapes_bundle(tmp_path: Path) -> N
         tmp_path / "bundle", manifest_data(prompt_path="linked-dir/prompt.md")
     )
     link = bundle / "linked-dir"
-    if os.name == "nt":
-        completed = subprocess.run(  # noqa: S603 - fixed local executable and validated paths
-            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(outside)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert completed.returncode == 0, completed.stderr
-    else:
-        link.symlink_to(outside, target_is_directory=True)
+    create_directory_link(link, outside)
 
     try:
         with pytest.raises(ValueError, match="prompt"):
             load_agent_manifest(bundle, host_max_concurrent_calls=10)
     finally:
-        if os.name == "nt":
-            link.rmdir()
-        else:
-            link.unlink()
+        remove_directory_link(link)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_manifest_yaml_rejects_duplicate_keys_recursively(tmp_path: Path, nested: bool) -> None:
+    bundle = write_bundle(tmp_path / "bundle")
+    serialized = json.dumps(manifest_data())
+    if nested:
+        serialized = serialized[:-1] + ', "forbidden": {"key": 1, "key": 2}}'
+    else:
+        serialized = serialized.replace(
+            '"tenant_id": "tenant-a",',
+            '"tenant_id": "tenant-a", "tenant_id": "tenant-b",',
+        )
+    (bundle / "manifest.yaml").write_text(serialized, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate YAML key"):
+        load_agent_manifest(bundle, host_max_concurrent_calls=10)
+
+
+def test_loader_rejects_reparse_bundle_root(tmp_path: Path) -> None:
+    target = write_bundle(tmp_path / "target")
+    linked_root = tmp_path / "linked-root"
+    create_directory_link(linked_root, target)
+    try:
+        with pytest.raises(ValueError, match="bundle root"):
+            load_agent_manifest(linked_root, host_max_concurrent_calls=10)
+    finally:
+        remove_directory_link(linked_root)
+
+
+def test_loader_rejects_manifest_reparse_escape(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "prompt.md").write_text("prompt", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    manifest_link = bundle / "manifest.yaml"
+    create_directory_link(manifest_link, outside)
+    try:
+        with pytest.raises(ValueError, match="manifest"):
+            load_agent_manifest(bundle, host_max_concurrent_calls=10)
+    finally:
+        remove_directory_link(manifest_link)
 
 
 def test_static_first_agent_bundle_matches_v1_policy() -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -120,6 +122,26 @@ def manifest(
 def write_json(path: Path, data: dict[str, object]) -> Path:
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
+
+
+def create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(  # noqa: S603 - fixed executable and bounded temp paths
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def remove_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        link.rmdir()
+    else:
+        link.unlink()
 
 
 def expected_hashes() -> dict[str, str]:
@@ -304,6 +326,29 @@ def test_profile_rejects_unknown_fields_schema_versions_and_naive_datetimes() ->
         data.update(updates)
         with pytest.raises(ValidationError):
             QualifiedDeploymentProfileV1.model_validate(data)
+
+
+@pytest.mark.parametrize("invalid_datetime", [True, 1, 1.5, "1", "1724572800"])
+def test_profiles_reject_numeric_datetime_coercion(invalid_datetime: object) -> None:
+    qualified = qualified_data()
+    qualified["qualified_at"] = invalid_datetime
+    with pytest.raises(ValidationError, match="qualified_at"):
+        QualifiedDeploymentProfileV1.model_validate(qualified)
+
+    candidate = candidate_data()
+    candidate["expires_at"] = invalid_datetime
+    with pytest.raises(ValidationError, match="expires_at"):
+        QualificationCandidateProfileV1.model_validate(candidate)
+
+    override = {
+        "schema_version": 1,
+        "run_id": str(RUN_ID),
+        "benchmark_max_calls": 15,
+        "created_at": invalid_datetime,
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    with pytest.raises(ValidationError, match="created_at"):
+        QualificationOverrideV1.model_validate(override)
 
 
 @pytest.mark.parametrize("value", [True, 1.0, "1"])
@@ -496,6 +541,134 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             expected_run_id=RUN_ID,
             ownership_check=lambda _: True,
             now=now - timedelta(seconds=1),
+        )
+
+
+def test_override_ownership_check_receives_the_open_file_stat(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    path = write_json(
+        tmp_path / "override.json",
+        {
+            "schema_version": 1,
+            "run_id": str(RUN_ID),
+            "benchmark_max_calls": 15,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    received: list[os.stat_result] = []
+
+    load_qualification_override(
+        path,
+        qualification_mode=True,
+        expected_run_id=RUN_ID,
+        ownership_check=lambda file_stat: received.append(file_stat) is None,
+        now=now,
+    )
+
+    assert len(received) == 1
+    assert isinstance(received[0], os.stat_result)
+    assert received[0].st_ino == path.stat().st_ino
+
+
+def test_override_atomic_open_rejects_a_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    path = write_json(
+        tmp_path / "override.json",
+        {
+            "schema_version": 1,
+            "run_id": str(RUN_ID),
+            "benchmark_max_calls": 15,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    replacement = write_json(tmp_path / "replacement.json", json.loads(path.read_text()))
+    real_open = os.open
+
+    def swapping_open(open_path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        replacement.replace(path)
+        return real_open(open_path, flags, mode)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises(ValueError, match="changed before atomic open"):
+        load_qualification_override(
+            path,
+            qualification_mode=True,
+            expected_run_id=RUN_ID,
+            ownership_check=lambda _: True,
+            now=now,
+        )
+
+
+def test_override_loader_reads_from_open_fd_not_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    path = write_json(
+        tmp_path / "override.json",
+        {
+            "schema_version": 1,
+            "run_id": str(RUN_ID),
+            "benchmark_max_calls": 20,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+
+    def reject_path_reread(*args: object, **kwargs: object) -> str:
+        raise AssertionError("path reread")
+
+    monkeypatch.setattr(Path, "read_text", reject_path_reread)
+    loaded = load_qualification_override(
+        path,
+        qualification_mode=True,
+        expected_run_id=RUN_ID,
+        ownership_check=lambda _: True,
+        now=now,
+    )
+    assert loaded.benchmark_max_calls == 20
+
+
+def test_override_loader_rejects_reparse_ancestor_and_oversized_file(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_json(
+        outside / "override.json",
+        {
+            "schema_version": 1,
+            "run_id": str(RUN_ID),
+            "benchmark_max_calls": 15,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    linked = tmp_path / "linked"
+    create_directory_link(linked, outside)
+    try:
+        with pytest.raises(ValueError, match="symlink or junction"):
+            load_qualification_override(
+                linked / "override.json",
+                qualification_mode=True,
+                expected_run_id=RUN_ID,
+                ownership_check=lambda _: True,
+                now=now,
+            )
+    finally:
+        remove_directory_link(linked)
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"{" + b" " * 65_536 + b"}")
+    with pytest.raises(ValueError, match="too large"):
+        load_qualification_override(
+            oversized,
+            qualification_mode=True,
+            expected_run_id=RUN_ID,
+            ownership_check=lambda _: True,
+            now=now,
         )
 
 

@@ -28,6 +28,35 @@ PositiveInt = Annotated[int, BeforeValidator(_require_exact_int), Field(gt=0)]
 PcmuSampleRate = Annotated[Literal[8000], BeforeValidator(_require_exact_int)]
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    pass
+
+
+def _construct_unique_mapping(loader, node, deep=False):  # type: ignore[no-untyped-def]
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as error:
+            raise ValueError("YAML mapping keys must be hashable") from error
+        if duplicate:
+            raise ValueError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
 class AgentManifestV1(BaseModel):
     """Immutable, non-secret policy shipped with an agent bundle."""
 
@@ -86,14 +115,23 @@ def load_agent_manifest(
 
     if host_max_concurrent_calls < 1:
         raise ValueError("host allocation must be positive")
+    if _is_symlink_or_junction(bundle_root):
+        raise ValueError("agent bundle root must not be a symlink or junction")
     resolved_root = bundle_root.resolve(strict=True)
     if not resolved_root.is_dir():
         raise ValueError("agent bundle root must be a directory")
 
     manifest_path = resolved_root / "manifest.yaml"
-    if not manifest_path.is_file():
-        raise ValueError("agent manifest is missing")
-    raw = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    try:
+        resolved_manifest = manifest_path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ValueError("agent manifest is missing") from error
+    if not resolved_manifest.is_relative_to(resolved_root) or not resolved_manifest.is_file():
+        raise ValueError("agent manifest must resolve to a file inside the bundle")
+    raw = yaml.load(
+        resolved_manifest.read_text(encoding="utf-8"),
+        Loader=_UniqueKeySafeLoader,
+    )
     if not isinstance(raw, dict):
         raise ValueError("agent manifest must be a YAML mapping")
     manifest = AgentManifestV1.model_validate(raw)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -66,6 +68,18 @@ def _utc_datetime(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _validate_datetime_input(value: object) -> object:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("datetime input must be an ISO-8601 string") from error
+        return value
+    raise ValueError("datetime input must be a datetime object or ISO-8601 string")
+
+
 def _freeze_json(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({str(key): _freeze_json(item) for key, item in value.items()})
@@ -125,6 +139,9 @@ class QualifiedDeploymentProfileV1(_StrictFrozenProfile):
     call_lease_ttl_seconds: PositiveInt
     qualified_at: datetime
 
+    _validate_qualified_at_input = field_validator("qualified_at", mode="before")(
+        _validate_datetime_input
+    )
     _normalize_qualified_at = field_validator("qualified_at", mode="after")(_utc_datetime)
 
 
@@ -145,6 +162,9 @@ class QualificationCandidateProfileV1(_StrictFrozenProfile):
     call_lease_ttl_seconds: CandidateLeaseTtl
     max_concurrent_calls: CandidateMaxCalls
 
+    _validate_expires_at_input = field_validator("expires_at", mode="before")(
+        _validate_datetime_input
+    )
     _normalize_expires_at = field_validator("expires_at", mode="after")(_utc_datetime)
 
 
@@ -155,6 +175,9 @@ class QualificationOverrideV1(_StrictFrozenProfile):
     created_at: datetime
     expires_at: datetime
 
+    _validate_datetime_inputs = field_validator("created_at", "expires_at", mode="before")(
+        _validate_datetime_input
+    )
     _normalize_datetimes = field_validator("created_at", "expires_at", mode="after")(
         _utc_datetime
     )
@@ -195,6 +218,67 @@ def _read_json_model[ModelT: BaseModel](path: Path, model: type[ModelT]) -> Mode
     if not path.is_file():
         raise ValueError(f"profile file does not exist: {path}")
     return model.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+_MAX_OVERRIDE_BYTES = 65_536
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(file_stat, "st_file_attributes", 0)
+    return path.is_symlink() or path.is_junction() or bool(file_attributes & reparse_attribute)
+
+
+def _has_reparse_component(path: Path) -> bool:
+    absolute_path = path.absolute()
+    return any(
+        _is_symlink_or_junction(component)
+        for component in (absolute_path, *absolute_path.parents)
+    )
+
+
+def _read_override_atomic(
+    path: Path,
+    ownership_check: Callable[[os.stat_result], bool],
+) -> QualificationOverrideV1:
+    if _has_reparse_component(path):
+        raise ValueError("qualification override path must not contain a symlink or junction")
+    try:
+        before_open = path.lstat()
+    except FileNotFoundError as error:
+        raise ValueError("qualification override file does not exist") from error
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("qualification override could not be opened safely") from error
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (before_open.st_dev, before_open.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
+            raise ValueError("qualification override changed before atomic open")
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("qualification override must be a regular file")
+        if not ownership_check(opened_stat):
+            raise ValueError("qualification override must be root-owned")
+        chunks: list[bytes] = []
+        remaining = _MAX_OVERRIDE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > _MAX_OVERRIDE_BYTES:
+            raise ValueError("qualification override file is too large")
+    finally:
+        os.close(descriptor)
+    return QualificationOverrideV1.model_validate_json(content)
 
 
 def _validate_bindings(
@@ -288,14 +372,12 @@ def load_qualification_override(
     *,
     qualification_mode: bool,
     expected_run_id: UUID,
-    ownership_check: Callable[[Path], bool],
+    ownership_check: Callable[[os.stat_result], bool],
     now: datetime,
 ) -> QualificationOverrideV1:
     if not qualification_mode:
         raise ValueError("qualification overrides require explicit qualification mode")
-    if not ownership_check(path):
-        raise ValueError("qualification override must be root-owned")
-    override = _read_json_model(path, QualificationOverrideV1)
+    override = _read_override_atomic(path, ownership_check)
     if override.run_id != expected_run_id:
         raise ValueError("qualification override run ID does not match")
     current_time = _utc_datetime(now)

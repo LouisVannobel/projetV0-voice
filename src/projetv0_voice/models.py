@@ -35,6 +35,20 @@ def _utc_datetime(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _validate_datetime_input(value: object) -> object:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("datetime input must be an ISO-8601 string") from error
+        return value
+    if value is None:
+        return value
+    raise ValueError("datetime input must be a datetime object or ISO-8601 string")
+
+
 def _optional_utc_datetime(value: datetime | None) -> datetime | None:
     return None if value is None else _utc_datetime(value)
 
@@ -54,6 +68,9 @@ class CallUpsertPayloadV1(_StrictFrozenModel):
     end_reason: str | None
     retention_until: datetime
 
+    _validate_datetime_inputs = field_validator(
+        "started_at", "ended_at", "retention_until", mode="before"
+    )(_validate_datetime_input)
     _normalize_datetimes = field_validator(
         "started_at", "ended_at", "retention_until", mode="after"
     )(_optional_utc_datetime)
@@ -106,6 +123,9 @@ class TurnUpsertPayloadV1(_StrictFrozenModel):
     ended_at: datetime
     interrupted: StrictBool
 
+    _validate_datetime_inputs = field_validator("started_at", "ended_at", mode="before")(
+        _validate_datetime_input
+    )
     _normalize_datetimes = field_validator("started_at", "ended_at", mode="after")(
         _utc_datetime
     )
@@ -145,6 +165,9 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
     ended_at: datetime | None
     retention_until: datetime | None
 
+    _validate_datetime_inputs = field_validator(
+        "started_at", "ended_at", "retention_until", mode="before"
+    )(_validate_datetime_input)
     _normalize_datetimes = field_validator(
         "started_at", "ended_at", "retention_until", mode="after"
     )(_optional_utc_datetime)
@@ -192,6 +215,9 @@ class VoiceOperationV1(_StrictFrozenModel):
     kind: Literal["call.upsert", "turn.upsert", "recording.upsert"]
     payload: OperationPayloadV1
 
+    _validate_occurred_at_input = field_validator("occurred_at", mode="before")(
+        _validate_datetime_input
+    )
     _normalize_occurred_at = field_validator("occurred_at", mode="after")(_utc_datetime)
 
     @model_validator(mode="after")

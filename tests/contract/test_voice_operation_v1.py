@@ -259,6 +259,18 @@ def test_all_contract_datetimes_reject_naive_values_and_normalize_offsets_to_utc
     assert parsed.occurred_at.tzinfo is UTC
 
 
+@pytest.mark.parametrize("invalid_datetime", [True, 1, 1.5, "1", "1724572800"])
+def test_operation_contract_rejects_numeric_datetime_coercion(
+    invalid_datetime: object,
+) -> None:
+    with pytest.raises(ValidationError, match="occurred_at"):
+        VoiceOperationV1.model_validate(
+            operation("turn.upsert", turn_payload(), occurred_at=invalid_datetime)
+        )
+    with pytest.raises(ValidationError, match="started_at"):
+        TurnUpsertPayloadV1.model_validate(turn_payload(started_at=invalid_datetime))
+
+
 def test_contracts_reject_unknown_fields_and_unsupported_schema_versions() -> None:
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         VoiceOperationV1.model_validate(operation("call.upsert", call_payload(), extra="no"))
