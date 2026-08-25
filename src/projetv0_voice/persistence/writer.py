@@ -393,6 +393,22 @@ class PersistenceWriter:
             raise
         return await result
 
+    async def oldest_outbox_created_at(self) -> datetime | None:
+        result: asyncio.Future[datetime | None] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "relay_batch",
+                    {"action": "oldest_created_at", "result": result},
+                    None,
+                )
+            )
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
+
     async def ack_outbox(
         self,
         *,
@@ -1072,6 +1088,21 @@ class PersistenceWriter:
         action = payload.get("action")
         if action == "read":
             await self._claim_batch(payload)
+        elif action == "oldest_created_at":
+            result = payload.get("result")
+            if not isinstance(result, asyncio.Future):
+                raise CommandSerializationError("invalid_oldest_created_at_command")
+            cursor = await connection.execute("SELECT MIN(created_at) FROM outbox")
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None or len(row) != 1:
+                raise CommandSerializationError("stored_datetime_invalid")
+            stored = row[0]
+            if stored is not None and not isinstance(stored, str):
+                raise CommandSerializationError("stored_datetime_invalid")
+            oldest = None if stored is None else _parse_datetime(stored)
+            if not result.done():
+                result.set_result(oldest)
         elif action == "ack":
             queue_id = self._required_positive_int(payload, "queue_id")
             expected_claim = self._required_positive_int(payload, "expected_claim_attempt")

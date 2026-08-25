@@ -1183,3 +1183,111 @@ async def test_writer_task_death_fails_all_queued_futures_once(tmp_path: Path) -
     assert all(isinstance(result, FatalPersistenceError) for result in results)
     assert len(faults) == 1
     assert writer.queue_size == 0
+
+
+@pytest.mark.asyncio
+async def test_oldest_outbox_timestamp_empty_and_includes_non_due_claimed_all_deployments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "oldest.sqlite"
+    current = NOW
+    writer, task = await start_writer(database, utcnow=lambda: current)
+    assert await writer.oldest_outbox_created_at() is None
+    await writer.commit_control(PersistenceCommand("outbox", {"operation": operation(1)}, None))
+    current = NOW + timedelta(seconds=10)
+    await writer.commit_control(
+        PersistenceCommand(
+            "outbox",
+            {"operation": operation(2).model_copy(update={"deployment_id": "agent-b"})},
+            None,
+        )
+    )
+    claimed = await writer.read_relay_batch(batch_size=1, now=current, lease_seconds=30)
+    assert len(claimed) == 1
+    second_claim = await writer.read_relay_batch(
+        batch_size=1, now=current, lease_seconds=30
+    )
+    assert len(second_claim) == 1
+    retried = await writer.retry_outbox(
+        queue_id=2,
+        expected_claim_attempt=1,
+        next_attempt_at=current + timedelta(hours=1),
+        error_code="not_due",
+    )
+    assert retried.applied is True
+
+    def forbidden_decrypt(*_: object, **__: object) -> bytes:
+        raise AssertionError("oldest timestamp must not decrypt payloads")
+
+    monkeypatch.setattr(CryptoKeyring, "decrypt", forbidden_decrypt)
+    assert await writer.oldest_outbox_created_at() == NOW
+    await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_oldest_outbox_runs_on_owner_and_resolves_only_after_command_commit(
+    tmp_path: Path,
+) -> None:
+    reached_commit = asyncio.Event()
+    release_commit = asyncio.Event()
+    owner_tasks: list[asyncio.Task[object] | None] = []
+    block_oldest = False
+
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit" and block_oldest:
+            owner_tasks.append(asyncio.current_task())
+            reached_commit.set()
+            await release_commit.wait()
+
+    writer, owner = await start_writer(tmp_path / "oldest-owner.sqlite", failpoint=failpoint)
+    block_oldest = True
+    pending = asyncio.create_task(writer.oldest_outbox_created_at())
+    await reached_commit.wait()
+    assert pending.done() is False
+    assert owner_tasks == [owner]
+    release_commit.set()
+    assert await pending is None
+    await stop_writer(writer, owner)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_oldest_request_leaves_no_orphan_exceptional_future(
+    tmp_path: Path,
+) -> None:
+    reached_commit = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit":
+            reached_commit.set()
+            await release_commit.wait()
+
+    writer, owner = await start_writer(tmp_path / "oldest-cancel.sqlite", failpoint=failpoint)
+    pending = asyncio.create_task(writer.oldest_outbox_created_at())
+    await reached_commit.wait()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    release_commit.set()
+    await writer.wait_until_idle()
+    assert owner.done() is False
+    await stop_writer(writer, owner)
+
+
+@pytest.mark.asyncio
+async def test_invalid_stored_oldest_timestamp_is_constant_safe(tmp_path: Path) -> None:
+    database = tmp_path / "oldest-invalid.sqlite"
+    writer, owner = await start_writer(database)
+    await writer.commit_control(PersistenceCommand("outbox", {"operation": operation(1)}, None))
+    await stop_writer(writer, owner)
+    sentinel = "RAW-TIMESTAMP-SENTINEL"
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE outbox SET created_at = ?", (sentinel,))
+        connection.commit()
+
+    restarted, task = await start_writer(database)
+    with pytest.raises(FatalPersistenceError, match="stored_datetime_invalid") as captured:
+        await restarted.oldest_outbox_created_at()
+    await task
+    assert sentinel not in repr(captured.value)
