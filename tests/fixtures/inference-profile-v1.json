@@ -1,1 +1,1 @@
-{"llm_model":"test/llm","llm_provider_policy":{"fallbacks":true,"sort":"latency"},"schema_version":1,"stt_model":"test/stt","tts_model":"test/tts","tts_pcm_channels":1,"tts_pcm_sample_rate":24000,"tts_provider_options":{"temperature":0.2},"tts_voice":"fr-test"}
+{"llm_model":"test/llm","llm_provider_policy":{"allow_fallbacks":true,"sort":"latency"},"schema_version":1,"stt_model":"test/stt","tts_model":"test/tts","tts_pcm_channels":1,"tts_pcm_sample_rate":24000,"tts_provider_options":{"azure":{"temperature":0.2}},"tts_voice":"fr-test"}

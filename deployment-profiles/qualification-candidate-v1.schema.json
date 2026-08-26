@@ -42,7 +42,10 @@
         },
         "tts_provider_options": {
           "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
           },
           "title": "Tts Provider Options",
           "type": "object"

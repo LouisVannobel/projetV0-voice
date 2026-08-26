@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ ImageDigest = Annotated[
     ),
 ]
 TokenLocatorId = Literal["telnyx-header-connected-v1"]
+_OPENROUTER_PROVIDER_SLUG = re.compile(r"^[a-z0-9]+(?:[./_-][a-z0-9]+)*$")
 
 
 def _require_exact_int(value: object) -> object:
@@ -105,18 +107,44 @@ class InferenceProfileV1(_StrictFrozenProfile):
     tts_pcm_sample_rate: PositiveInt
     tts_pcm_channels: MonoChannel
     llm_provider_policy: Mapping[str, JsonValue]
-    tts_provider_options: Mapping[str, JsonValue]
+    tts_provider_options: Mapping[str, Mapping[str, JsonValue]]
 
-    @field_validator("llm_provider_policy", "tts_provider_options", mode="after")
+    @field_validator("llm_provider_policy", mode="after")
     @classmethod
-    def freeze_provider_maps(
+    def validate_and_freeze_llm_provider_policy(
         cls, value: Mapping[str, JsonValue]
     ) -> Mapping[str, JsonValue]:
+        if "fallbacks" in value:
+            raise ValueError("llm_provider_policy uses allow_fallbacks, not fallbacks")
+        if "provider" in value:
+            raise ValueError("llm_provider_policy must not contain a provider wrapper")
+        if "allow_fallbacks" in value and type(value["allow_fallbacks"]) is not bool:
+            raise ValueError("llm_provider_policy allow_fallbacks must be an exact boolean")
         return cast(Mapping[str, JsonValue], _freeze_json(value))
 
-    @field_serializer("llm_provider_policy", "tts_provider_options")
-    def serialize_provider_maps(self, value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    @field_validator("tts_provider_options", mode="after")
+    @classmethod
+    def validate_and_freeze_tts_provider_options(
+        cls, value: Mapping[str, Mapping[str, JsonValue]]
+    ) -> Mapping[str, Mapping[str, JsonValue]]:
+        for provider_slug in value:
+            if _OPENROUTER_PROVIDER_SLUG.fullmatch(provider_slug) is None:
+                raise ValueError("tts_provider_options contains an invalid provider slug")
+            if provider_slug in {"provider", "options"}:
+                raise ValueError("tts_provider_options must not contain an outer wrapper")
+        return cast(Mapping[str, Mapping[str, JsonValue]], _freeze_json(value))
+
+    @field_serializer("llm_provider_policy")
+    def serialize_llm_provider_policy(
+        self, value: Mapping[str, JsonValue]
+    ) -> dict[str, JsonValue]:
         return cast(dict[str, JsonValue], _thaw_json(value))
+
+    @field_serializer("tts_provider_options")
+    def serialize_tts_provider_options(
+        self, value: Mapping[str, Mapping[str, JsonValue]]
+    ) -> dict[str, dict[str, JsonValue]]:
+        return cast(dict[str, dict[str, JsonValue]], _thaw_json(value))
 
 
 class QualifiedDeploymentProfileV1(_StrictFrozenProfile):

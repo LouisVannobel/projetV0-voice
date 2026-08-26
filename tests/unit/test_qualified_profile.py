@@ -48,8 +48,8 @@ def inference_data() -> dict[str, object]:
         "tts_voice": "fr-test",
         "tts_pcm_sample_rate": 24000,
         "tts_pcm_channels": 1,
-        "llm_provider_policy": {"sort": "latency", "fallbacks": True},
-        "tts_provider_options": {"temperature": 0.2},
+        "llm_provider_policy": {"sort": "latency", "allow_fallbacks": True},
+        "tts_provider_options": {"azure": {"temperature": 0.2}},
     }
 
 
@@ -174,17 +174,29 @@ def test_inference_hash_uses_stable_canonical_json() -> None:
     assert len(canonical_inference_profile_sha256(first)) == 64
 
 
+def test_inference_hash_matches_independent_literal_witness() -> None:
+    profile = InferenceProfileV1.model_validate(inference_data())
+
+    assert (
+        canonical_inference_profile_sha256(profile)
+        == "a452d4b5d530f36f13a3bbd63a5f5aafb7c76b3a9cfba3d9bfac1ab066d4edda"
+    )
+
+
 def test_inference_provider_policy_is_deeply_immutable_and_round_trips() -> None:
     data = inference_data()
     data["llm_provider_policy"] = {
         "routing": {"providers": ["first", "second"]},
-        "fallbacks": True,
+        "allow_fallbacks": True,
+    }
+    data["tts_provider_options"] = {
+        "azure": {"nested": {"voices": ["first", "second"]}}
     }
     profile = InferenceProfileV1.model_validate(data)
     original_hash = canonical_inference_profile_sha256(profile)
 
     with pytest.raises(TypeError):
-        profile.llm_provider_policy["fallbacks"] = False  # type: ignore[index]
+        profile.llm_provider_policy["allow_fallbacks"] = False  # type: ignore[index]
     routing = profile.llm_provider_policy["routing"]
     assert isinstance(routing, Mapping)
     with pytest.raises(TypeError):
@@ -193,6 +205,11 @@ def test_inference_provider_policy_is_deeply_immutable_and_round_trips() -> None
     assert isinstance(providers, tuple)
     with pytest.raises(TypeError):
         providers[0] = "changed"  # type: ignore[index]
+    provider_options = profile.tts_provider_options["azure"]
+    nested = provider_options["nested"]
+    assert isinstance(nested, Mapping)
+    with pytest.raises(TypeError):
+        nested["voices"] = []  # type: ignore[index]
 
     dumped = profile.model_dump_json()
     restored = InferenceProfileV1.model_validate_json(dumped)
@@ -203,8 +220,53 @@ def test_inference_provider_policy_is_deeply_immutable_and_round_trips() -> None
 @pytest.mark.parametrize("invalid_number", [float("nan"), float("inf"), float("-inf")])
 def test_inference_profile_rejects_non_finite_nested_numbers(invalid_number: float) -> None:
     data = inference_data()
-    data["tts_provider_options"] = {"invalid": invalid_number}
+    data["tts_provider_options"] = {"azure": {"invalid": invalid_number}}
     with pytest.raises(ValidationError):
+        InferenceProfileV1.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"fallbacks": True},
+        {"provider": {"sort": "latency"}},
+        {"allow_fallbacks": 1},
+        {"allow_fallbacks": "true"},
+        {"allow_fallbacks": None},
+    ],
+)
+def test_inference_profile_rejects_ambiguous_openrouter_llm_policy(
+    policy: dict[str, object],
+) -> None:
+    data = inference_data()
+    data["llm_provider_policy"] = policy
+
+    with pytest.raises(ValidationError, match="llm_provider_policy"):
+        InferenceProfileV1.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"": {}},
+        {" test-provider": {}},
+        {"test-provider ": {}},
+        {"Azure": {}},
+        {"azure!": {}},
+        {"provider": {}},
+        {"options": {}},
+        {"test-provider": 1},
+        {"test-provider": []},
+        {"test-provider": None},
+    ],
+)
+def test_inference_profile_requires_provider_slug_option_objects(
+    options: dict[str, object],
+) -> None:
+    data = inference_data()
+    data["tts_provider_options"] = options
+
+    with pytest.raises(ValidationError, match="tts_provider_options"):
         InferenceProfileV1.model_validate(data)
 
 
@@ -292,6 +354,7 @@ def test_fake_profiles_are_explicit_test_fixtures_with_consistent_hashes() -> No
         (fixture_root / "inference-profile-v1.json").read_text(encoding="utf-8")
     )
     fixture_hash = canonical_inference_profile_sha256(fixture_inference)
+    assert fixture_hash == "a452d4b5d530f36f13a3bbd63a5f5aafb7c76b3a9cfba3d9bfac1ab066d4edda"
     hashes = {
         "expected_deployment_id": "voice-agent-a",
         "expected_runtime_contract_sha256": HEX_A,
