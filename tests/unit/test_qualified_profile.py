@@ -348,6 +348,33 @@ def test_profile_schemas_allow_only_documented_telnyx_token_locator(
     assert "enum" not in locator_schema
 
 
+@pytest.mark.parametrize(
+    "model",
+    [QualifiedDeploymentProfileV1, QualificationCandidateProfileV1],
+)
+def test_inference_schema_expresses_openrouter_policy_key_contracts(
+    model: type[QualifiedDeploymentProfileV1] | type[QualificationCandidateProfileV1],
+) -> None:
+    inference_properties = model.model_json_schema()["$defs"]["InferenceProfileV1"][
+        "properties"
+    ]
+    llm_policy = inference_properties["llm_provider_policy"]
+    tts_options = inference_properties["tts_provider_options"]
+
+    assert llm_policy["additionalProperties"] == {"$ref": "#/$defs/JsonValue"}
+    assert llm_policy["properties"] == {"allow_fallbacks": {"type": "boolean"}}
+    assert llm_policy["allOf"] == [
+        {"not": {"required": ["fallbacks"]}},
+        {"not": {"required": ["provider"]}},
+    ]
+    assert tts_options["propertyNames"] == {
+        "allOf": [
+            {"pattern": r"^[a-z0-9]+(?:[./_-][a-z0-9]+)*$"},
+            {"not": {"enum": ["provider", "options"]}},
+        ]
+    }
+
+
 def test_fake_profiles_are_explicit_test_fixtures_with_consistent_hashes() -> None:
     fixture_root = REPOSITORY_ROOT / "tests" / "fixtures"
     fixture_inference = InferenceProfileV1.model_validate_json(

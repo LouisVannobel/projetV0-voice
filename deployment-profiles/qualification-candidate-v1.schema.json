@@ -12,6 +12,27 @@
           "additionalProperties": {
             "$ref": "#/$defs/JsonValue"
           },
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "fallbacks"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "provider"
+                ]
+              }
+            }
+          ],
+          "properties": {
+            "allow_fallbacks": {
+              "type": "boolean"
+            }
+          },
           "title": "Llm Provider Policy",
           "type": "object"
         },
@@ -46,6 +67,21 @@
               "$ref": "#/$defs/JsonValue"
             },
             "type": "object"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[a-z0-9]+(?:[./_-][a-z0-9]+)*$"
+              },
+              {
+                "not": {
+                  "enum": [
+                    "provider",
+                    "options"
+                  ]
+                }
+              }
+            ]
           },
           "title": "Tts Provider Options",
           "type": "object"

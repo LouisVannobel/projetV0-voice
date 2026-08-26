@@ -106,8 +106,25 @@ class InferenceProfileV1(_StrictFrozenProfile):
     tts_voice: str = Field(min_length=1)
     tts_pcm_sample_rate: PositiveInt
     tts_pcm_channels: MonoChannel
-    llm_provider_policy: Mapping[str, JsonValue]
-    tts_provider_options: Mapping[str, Mapping[str, JsonValue]]
+    llm_provider_policy: Mapping[str, JsonValue] = Field(
+        json_schema_extra={
+            "properties": {"allow_fallbacks": {"type": "boolean"}},
+            "allOf": [
+                {"not": {"required": ["fallbacks"]}},
+                {"not": {"required": ["provider"]}},
+            ],
+        }
+    )
+    tts_provider_options: Mapping[str, Mapping[str, JsonValue]] = Field(
+        json_schema_extra={
+            "propertyNames": {
+                "allOf": [
+                    {"pattern": r"^[a-z0-9]+(?:[./_-][a-z0-9]+)*$"},
+                    {"not": {"enum": ["provider", "options"]}},
+                ]
+            }
+        }
+    )
 
     @field_validator("llm_provider_policy", mode="after")
     @classmethod
