@@ -57,7 +57,7 @@
           "type": "integer"
         },
         "tts_pcm_sample_rate": {
-          "gt": 0,
+          "exclusiveMinimum": 0,
           "title": "Tts Pcm Sample Rate",
           "type": "integer"
         },
@@ -116,7 +116,7 @@
       "type": "string"
     },
     "call_lease_ttl_seconds": {
-      "gt": 0,
+      "exclusiveMinimum": 0,
       "title": "Call Lease Ttl Seconds",
       "type": "integer"
     },
@@ -126,8 +126,8 @@
       "type": "string"
     },
     "disclosure_mark_timeout_ms": {
-      "ge": 3000,
-      "le": 10000,
+      "maximum": 10000,
+      "minimum": 3000,
       "title": "Disclosure Mark Timeout Ms",
       "type": "integer"
     },

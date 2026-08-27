@@ -108,7 +108,13 @@ class OpenRouterTTSService(TTSService):
         self._failed_contexts[context_id] = code
         self._neutralize_failed_context(context_id)
         if not audio_emitted:
-            await self.stop_ttfb_metrics()
+            try:
+                await self.stop_ttfb_metrics()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Observability must not suppress an already-classified fatal failure.
+                pass
         return FatalErrorFrame(error=code)
 
     @traced_tts

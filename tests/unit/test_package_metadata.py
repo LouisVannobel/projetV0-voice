@@ -24,6 +24,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
     "uvicorn[standard]==0.52.4",
 ]
 EXPECTED_DEVELOPMENT_DEPENDENCIES = [
+    "jsonschema==4.25.1",
     "mypy==2.3.1",
     "pipecat-ai[evals]==1.7.0",
     "pytest==9.1.1",

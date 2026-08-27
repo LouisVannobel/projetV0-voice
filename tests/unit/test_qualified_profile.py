@@ -9,6 +9,8 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
 
 from projetv0_voice.config import AgentManifestV1
@@ -528,6 +530,20 @@ def test_profiles_do_not_coerce_integer_contract_fields(value: object) -> None:
     with pytest.raises(ValidationError, match="max_concurrent_calls"):
         QualificationCandidateProfileV1.model_validate(candidate)
 
+    for field in (
+        "call_lease_ttl_seconds",
+        "disclosure_mark_timeout_ms",
+    ):
+        qualified = qualified_data()
+        qualified[field] = value
+        with pytest.raises(ValidationError, match=field):
+            QualifiedDeploymentProfileV1.model_validate(qualified)
+
+    inference = inference_data()
+    inference["tts_pcm_sample_rate"] = value
+    with pytest.raises(ValidationError, match="tts_pcm_sample_rate"):
+        InferenceProfileV1.model_validate(inference)
+
 
 @pytest.mark.parametrize("timeout_ms", [2999, 10001])
 def test_qualified_disclosure_timeout_is_clamped_to_3_through_10_seconds(
@@ -878,3 +894,103 @@ def test_committed_profile_schema_is_the_exact_deterministic_model_schema(
     for definition in committed.get("$defs", {}).values():
         if definition.get("type") == "object":
             assert definition["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    ("schema_filename", "fixture_filename"),
+    [
+        ("qualified-v1.schema.json", "qualified-deployment-profile-v1.json"),
+        ("qualification-candidate-v1.schema.json", "qualification-candidate-v1.json"),
+    ],
+)
+def test_committed_profile_schema_semantically_accepts_its_fixture(
+    schema_filename: str,
+    fixture_filename: str,
+) -> None:
+    schema = json.loads(
+        (REPOSITORY_ROOT / "deployment-profiles" / schema_filename).read_text(encoding="utf-8")
+    )
+    fixture = json.loads(
+        (REPOSITORY_ROOT / "tests" / "fixtures" / fixture_filename).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema).validate(fixture)
+
+
+@pytest.mark.parametrize(
+    ("schema_filename", "fixture_filename", "field_path", "rejected_value"),
+    [
+        (
+            "qualified-v1.schema.json",
+            "qualified-deployment-profile-v1.json",
+            ("inference", "tts_pcm_sample_rate"),
+            0,
+        ),
+        (
+            "qualified-v1.schema.json",
+            "qualified-deployment-profile-v1.json",
+            ("inference", "tts_pcm_sample_rate"),
+            -1,
+        ),
+        (
+            "qualification-candidate-v1.schema.json",
+            "qualification-candidate-v1.json",
+            ("inference", "tts_pcm_sample_rate"),
+            0,
+        ),
+        (
+            "qualification-candidate-v1.schema.json",
+            "qualification-candidate-v1.json",
+            ("inference", "tts_pcm_sample_rate"),
+            -1,
+        ),
+        (
+            "qualified-v1.schema.json",
+            "qualified-deployment-profile-v1.json",
+            ("call_lease_ttl_seconds",),
+            0,
+        ),
+        (
+            "qualified-v1.schema.json",
+            "qualified-deployment-profile-v1.json",
+            ("call_lease_ttl_seconds",),
+            -1,
+        ),
+        (
+            "qualified-v1.schema.json",
+            "qualified-deployment-profile-v1.json",
+            ("disclosure_mark_timeout_ms",),
+            2999,
+        ),
+        (
+            "qualified-v1.schema.json",
+            "qualified-deployment-profile-v1.json",
+            ("disclosure_mark_timeout_ms",),
+            10001,
+        ),
+    ],
+)
+def test_committed_profile_schema_semantically_rejects_numeric_contract_violations(
+    schema_filename: str,
+    fixture_filename: str,
+    field_path: tuple[str, ...],
+    rejected_value: int,
+) -> None:
+    schema = json.loads(
+        (REPOSITORY_ROOT / "deployment-profiles" / schema_filename).read_text(encoding="utf-8")
+    )
+    instance = json.loads(
+        (REPOSITORY_ROOT / "tests" / "fixtures" / fixture_filename).read_text(
+            encoding="utf-8"
+        )
+    )
+    target = instance
+    for component in field_path[:-1]:
+        target = target[component]
+    target[field_path[-1]] = rejected_value
+
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(schema).validate(instance)

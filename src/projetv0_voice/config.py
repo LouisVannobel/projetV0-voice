@@ -24,7 +24,7 @@ def _require_exact_int(value: object) -> object:
 
 
 SchemaVersionV1 = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
-PositiveInt = Annotated[int, BeforeValidator(_require_exact_int), Field(gt=0)]
+PositiveInt = Annotated[int, Field(gt=0), BeforeValidator(_require_exact_int)]
 PcmuSampleRate = Annotated[Literal[8000], BeforeValidator(_require_exact_int)]
 
 

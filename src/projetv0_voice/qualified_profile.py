@@ -52,7 +52,7 @@ def _require_exact_int(value: object) -> object:
 
 
 SchemaVersionV1 = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
-PositiveInt = Annotated[int, BeforeValidator(_require_exact_int), Field(gt=0)]
+PositiveInt = Annotated[int, Field(gt=0), BeforeValidator(_require_exact_int)]
 MonoChannel = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
 CandidateTimeout = Annotated[Literal[10000], BeforeValidator(_require_exact_int)]
 CandidateLeaseTtl = Annotated[Literal[30], BeforeValidator(_require_exact_int)]
@@ -175,7 +175,7 @@ class QualifiedDeploymentProfileV1(_StrictFrozenProfile):
     token_locator_id: TokenLocatorId
     telnyx_handshake_fixture_sha256: Sha256
     disclosure_mark_timeout_ms: Annotated[
-        int, BeforeValidator(_require_exact_int), Field(ge=3000, le=10000)
+        int, Field(ge=3000, le=10000), BeforeValidator(_require_exact_int)
     ]
     call_lease_ttl_seconds: PositiveInt
     qualified_at: datetime

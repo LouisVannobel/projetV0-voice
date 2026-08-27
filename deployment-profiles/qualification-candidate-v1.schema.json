@@ -57,7 +57,7 @@
           "type": "integer"
         },
         "tts_pcm_sample_rate": {
-          "gt": 0,
+          "exclusiveMinimum": 0,
           "title": "Tts Pcm Sample Rate",
           "type": "integer"
         },

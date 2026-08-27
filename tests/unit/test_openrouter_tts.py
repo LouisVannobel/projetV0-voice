@@ -9,7 +9,15 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from pipecat.frames.frames import FatalErrorFrame, TTSAudioRawFrame, TTSSpeakFrame, TTSTextFrame
+from pipecat.frames.frames import (
+    FatalErrorFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TTSAudioRawFrame,
+    TTSSpeakFrame,
+    TTSTextFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -290,6 +298,57 @@ async def test_transport_stream_and_empty_audio_fail_with_stable_codes() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "transport_error", "expected_code"),
+    [
+        (429, False, "openrouter_tts_http_status"),
+        (200, True, "openrouter_tts_transport"),
+    ],
+)
+async def test_metrics_failure_cannot_suppress_first_stable_fatal(
+    status_code: int,
+    transport_error: bool,
+    expected_code: str,
+) -> None:
+    sentinel = "sentinel-provider-secret"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if transport_error:
+            raise httpx.ConnectError("provider-transport", request=request)
+        return httpx.Response(status_code, stream=_ChunkStream())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    service = _service(client)
+    service.stop_ttfb_metrics = AsyncMock(side_effect=RuntimeError(sentinel))
+    try:
+        frames = await _collect(service)
+    finally:
+        await client.aclose()
+
+    assert len(frames) == 1
+    assert isinstance(frames[0], FatalErrorFrame)
+    assert frames[0].error == expected_code
+    assert frames[0].exception is None
+    assert sentinel not in repr(frames[0])
+
+
+@pytest.mark.asyncio
+async def test_metrics_cancellation_still_propagates() -> None:
+    client = _client_for(status_code=429, stream=_ChunkStream())
+    service = _service(client)
+    service.stop_ttfb_metrics = AsyncMock(side_effect=asyncio.CancelledError)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await _collect(service)
+        assert service._failed_contexts == {"context-one": "openrouter_tts_http_status"}
+        await service.cleanup()
+        assert service._failed_contexts == {}
+        assert not client.is_closed
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_stream_failure_after_audio_does_not_stop_ttfb_in_adapter() -> None:
     stream = _ChunkStream(
         [b"\x01\x02"],
@@ -444,3 +503,49 @@ async def test_full_pipecat_failure_does_not_commit_assistant_text_and_success_d
     assert success_stream.closed
     assert not success_client.is_closed
     await success_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_full_pipecat_shared_turn_stops_after_first_failed_sentence() -> None:
+    captured: list[httpx.Request] = []
+    stream = _ChunkStream()
+    client = _client_for(stream=stream, captured=captured)
+    service = _service(client)
+    context = LLMContext()
+    pair = LLMContextAggregatorPair(context)
+    tts_requests: list[tuple[str, str]] = []
+
+    @service.event_handler("on_tts_request")
+    async def capture_tts_request(
+        _service: TTSService,
+        context_id: str,
+        text: str,
+    ) -> None:
+        tts_requests.append((context_id, text))
+
+    down, up = await run_test(
+        Pipeline([service, pair.assistant()]),
+        frames_to_send=[
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Première phrase. "),
+            LLMTextFrame("Deuxième phrase."),
+            LLMFullResponseEndFrame(),
+        ],
+        pipeline_params=PipelineParams(
+            audio_out_sample_rate=24000,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+    )
+
+    assert len(captured) == 1
+    assert [text for _, text in tts_requests] == ["Première phrase.", "Deuxième phrase."]
+    assert len({context_id for context_id, _ in tts_requests}) == 1
+    assert not any(isinstance(frame, TTSAudioRawFrame) for frame in down)
+    fatal = [frame for frame in up if isinstance(frame, FatalErrorFrame)]
+    assert [frame.error for frame in fatal] == ["openrouter_tts_empty_audio"]
+    assert context.get_messages() == []
+    assert service._failed_contexts == {}
+    assert stream.closed
+    assert not client.is_closed
+    await client.aclose()
