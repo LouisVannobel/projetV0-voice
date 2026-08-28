@@ -455,13 +455,13 @@ def build_pipeline(
             return
         _sanitize_inline_error(error, "tts_failed")
         first_failure.signal("tts_failed")
+        error.fatal = False
         try:
             await controller.abort("tts_failed")
         except asyncio.CancelledError:
             raise
         except Exception:
             return
-        error.fatal = False
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
     assistant_aggregator.add_event_handler(
         "on_assistant_turn_stopped", record_assistant_turn

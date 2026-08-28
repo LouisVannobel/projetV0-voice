@@ -1320,12 +1320,19 @@ async def test_partial_tts_failure_invokes_injected_termination_cleanup() -> Non
     assert lease.calls == [("failed", "tts_failed")]
 
 
+@pytest.mark.parametrize(
+    "abort_raises",
+    [False, True],
+    ids=("normal-abort", "ordinary-abort-error"),
+)
 @pytest.mark.asyncio
 async def test_pre_active_tts_failure_waits_for_exact_clear_before_public_runner_cancel(
     monkeypatch: pytest.MonkeyPatch,
+    abort_raises: bool,
 ) -> None:
     clear_started = asyncio.Event()
     clear_release = asyncio.Event()
+    abort_attempted = asyncio.Event()
     upstream_error_reached = asyncio.Event()
     pipeline_finished = asyncio.Event()
     upstream_errors: list[ErrorFrame] = []
@@ -1334,6 +1341,7 @@ async def test_pre_active_tts_failure_waits_for_exact_clear_before_public_runner
     original_build_runtime = session_module.build_runtime
     original_request_clear = pipeline_module.CallRuntime.request_clear
     original_runner_cancel = WorkerRunner.cancel
+    original_controller_abort = session_module.DisclosureController.abort
 
     def build_observed_runtime(**kwargs: object) -> object:
         runtime = original_build_runtime(**kwargs)
@@ -1368,9 +1376,24 @@ async def test_pre_active_tts_failure_waits_for_exact_clear_before_public_runner
         cancel_reasons.append(reason)
         await original_runner_cancel(runner, reason=reason)
 
+    async def raise_on_tts_abort(
+        controller: session_module.DisclosureController,
+        code: str,
+    ) -> None:
+        if code == "tts_failed":
+            abort_attempted.set()
+            raise RuntimeError("controller-abort-secret")
+        await original_controller_abort(controller, code)
+
     monkeypatch.setattr(session_module, "build_runtime", build_observed_runtime)
     monkeypatch.setattr(pipeline_module.CallRuntime, "request_clear", block_exact_clear)
     monkeypatch.setattr(WorkerRunner, "cancel", observe_runner_cancel)
+    if abort_raises:
+        monkeypatch.setattr(
+            session_module.DisclosureController,
+            "abort",
+            raise_on_tts_abort,
+        )
     session, lease, writer, admission, sent, client, stream = (
         _actual_partial_tts_telnyx_session()
     )
@@ -1378,6 +1401,7 @@ async def test_pre_active_tts_failure_waits_for_exact_clear_before_public_runner
     try:
         await asyncio.wait_for(clear_started.wait(), timeout=5)
         await asyncio.wait_for(upstream_error_reached.wait(), timeout=5)
+        assert abort_attempted.is_set() is abort_raises
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(pipeline_finished.wait(), timeout=0.2)
 
@@ -1391,6 +1415,7 @@ async def test_pre_active_tts_failure_waits_for_exact_clear_before_public_runner
         assert upstream_errors[0].exception is None
         assert upstream_errors[0].processor is None
         assert "tts-provider-secret" not in repr(upstream_errors[0])
+        assert "controller-abort-secret" not in repr(upstream_errors[0])
 
         blocked_payloads = [
             json.loads(message["text"])
