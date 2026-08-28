@@ -23,6 +23,7 @@ from pipecat.frames.frames import (
     StartFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
+    UserSpeakingFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
@@ -47,10 +48,6 @@ from pipecat.workers.runner import WorkerRunner
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 
 
-class PipelineLifecycleError(RuntimeError):
-    """A constant-safe per-call pipeline lifecycle error."""
-
-
 class FirstFailure:
     """One constant-safe failure signal shared by a call's native tasks."""
 
@@ -68,6 +65,8 @@ class FirstFailure:
             "recording_cleanup_failed",
             "recording_failed",
             "service_close_failed",
+            "transport_disconnected",
+            "transport_session_timeout",
             "tts_failed",
             "writer_failed",
         }
@@ -156,17 +155,19 @@ class ObservedPipeline(Pipeline):
         self,
         processors: Sequence[FrameProcessor],
         *,
+        first_failure: FirstFailure,
         source: FrameProcessor | None = None,
         sink: FrameProcessor | None = None,
     ) -> None:
         super().__init__(processors, source=source, sink=sink)
+        self._first_failure = first_failure
 
     async def cleanup(self) -> None:
         failed = False
         try:
             await FrameProcessor.cleanup(self)  # type: ignore[no-untyped-call]
         except asyncio.CancelledError:
-            raise
+            failed = True
         except Exception:
             failed = True
 
@@ -174,12 +175,12 @@ class ObservedPipeline(Pipeline):
             try:
                 await cast(_CleanupProcessor, processor).cleanup()
             except asyncio.CancelledError:
-                raise
+                failed = True
             except Exception:
                 failed = True
 
         if failed:
-            raise PipelineLifecycleError("pipeline_cleanup_failed")
+            self._first_failure.signal("pipeline_cleanup_failed")
 
 
 class InferenceErrorBoundary(FrameProcessor):
@@ -242,6 +243,7 @@ class GateController(Protocol):
 
 _CLOSED_INPUT_FRAMES = (
     InputDTMFFrame,
+    UserSpeakingFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
@@ -288,7 +290,7 @@ def build_input_gate(
                 return controller.is_active()
             if isinstance(frame, InterruptionFrame) and not controller.is_active():
                 await controller.abort("disclosure_failed")
-                return False
+                return True
             return not (
                 isinstance(frame, _CLOSED_INPUT_FRAMES) and not controller.is_active()
             )
@@ -473,7 +475,8 @@ def build_pipeline(
             barrier,
             transport.output(),
             assistant_aggregator,
-        ]
+        ],
+        first_failure=first_failure,
     )
 
 
@@ -566,7 +569,6 @@ __all__ = [
     "InferenceErrorBoundary",
     "ObservedPipeline",
     "ObservedTaskManager",
-    "PipelineLifecycleError",
     "PipelineServices",
     "PipelineTransport",
     "PipelineTurnRecorder",

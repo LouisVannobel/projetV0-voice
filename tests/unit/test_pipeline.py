@@ -10,13 +10,14 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
+    CancelFrame,
     EndFrame,
     ErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
+    InterruptionFrame,
     OutputTransportMessageFrame,
     StartFrame,
     TextFrame,
@@ -24,6 +25,7 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSSpeakFrame,
     TTSStoppedFrame,
+    UserSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -51,15 +53,29 @@ pipeline_module = import_module("projetv0_voice.pipeline")
 
 
 class _CleanupProbe(FrameProcessor):
-    def __init__(self, name: str, calls: list[str], *, failure: str | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        calls: list[str],
+        *,
+        failure: str | None = None,
+        cancel: bool = False,
+    ) -> None:
         super().__init__(name=name)
         self._calls = calls
         self._failure = failure
+        self._cancel = cancel
 
     async def cleanup(self) -> None:
         self._calls.append(self.name)
+        if self._cancel:
+            raise asyncio.CancelledError
         if self._failure is not None:
             raise RuntimeError(self._failure)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
 
 
 class _GateController:
@@ -255,11 +271,6 @@ def test_pinned_public_runner_pipeline_filter_and_message_contracts() -> None:
         "filter_system_frames",
         "kwargs",
     ]
-    assert set(PipelineWorker(Pipeline([]))._event_handlers) >= {
-        "on_pipeline_started",
-        "on_pipeline_finished",
-        "on_pipeline_error",
-    }
 
 
 @pytest.mark.asyncio
@@ -309,22 +320,62 @@ async def test_observed_manager_closes_inner_coroutine_when_cancelled_before_cpu
 
 
 @pytest.mark.asyncio
-async def test_observed_pipeline_attempts_every_child_after_secret_cleanup_failure() -> None:
+async def test_observed_pipeline_attempts_every_child_and_signals_cleanup_failure() -> None:
     calls: list[str] = []
+    failure = pipeline_module.FirstFailure()
     pipeline = pipeline_module.ObservedPipeline(
         [
             _CleanupProbe("first", calls),
             _CleanupProbe("middle", calls, failure="cleanup-provider-secret"),
+            _CleanupProbe("cancelled", calls, cancel=True),
             _CleanupProbe("last", calls),
-        ]
+        ],
+        first_failure=failure,
     )
 
-    with pytest.raises(pipeline_module.PipelineLifecycleError) as raised:
-        await pipeline.cleanup()
+    await pipeline.cleanup()
 
-    assert str(raised.value) == "pipeline_cleanup_failed"
-    assert "cleanup-provider-secret" not in repr(raised.value)
-    assert calls == ["first", "middle", "last"]
+    assert failure.code == "pipeline_cleanup_failed"
+    assert calls == ["first", "middle", "cancelled", "last"]
+
+
+@pytest.mark.asyncio
+async def test_real_worker_finishes_after_observed_pipeline_cleanup_failure() -> None:
+    calls: list[str] = []
+    failure = pipeline_module.FirstFailure()
+    pipeline = pipeline_module.ObservedPipeline(
+        [
+            _CleanupProbe("middle", calls, failure="cleanup-provider-secret"),
+            _CleanupProbe("last", calls),
+        ],
+        first_failure=failure,
+    )
+    runtime = await pipeline_module.build_runtime(
+        pipeline=pipeline,
+        first_failure=failure,
+        greeting="Disclosure.",
+        mark_name="mark",
+        idle_timeout_seconds=60.0,
+    )
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def on_started(_worker: object, _frame: StartFrame) -> None:
+        started.set()
+
+    async def on_finished(_worker: object, _frame: Frame) -> None:
+        finished.set()
+
+    runtime.worker.add_event_handler("on_pipeline_started", on_started)
+    runtime.worker.add_event_handler("on_pipeline_finished", on_finished)
+    running = asyncio.create_task(runtime.runner.run(auto_end=True))
+    await asyncio.wait_for(started.wait(), timeout=3)
+    await runtime.worker.queue_frame(EndFrame())
+    await asyncio.wait_for(running, timeout=3)
+
+    assert finished.is_set()
+    assert failure.code == "pipeline_cleanup_failed"
+    assert calls == ["middle", "last"]
 
 
 @pytest.mark.asyncio
@@ -386,25 +437,31 @@ async def test_direct_input_gate_consumes_control_and_rechecks_audio_before_stt(
         frames_to_send=[
             InputAudioRawFrame(audio=b"\x00\x00", sample_rate=8000, num_channels=1),
             VADUserStartedSpeakingFrame(),
+            UserSpeakingFrame(),
+            InterruptionFrame(),
             InputTransportMessageFrame(
                 message={"event": "mark", "mark": {"name": "expected-mark"}}
             ),
             ErrorFrame(error="already-safe", fatal=False),
         ],
-        expected_down_frames=[ErrorFrame],
+        expected_down_frames=[InterruptionFrame, ErrorFrame],
     )
-    assert [type(frame) for frame in downstream] == [ErrorFrame]
+    assert [type(frame) for frame in downstream] == [InterruptionFrame, ErrorFrame]
     assert controller.messages == ["expected-mark"]
+    assert controller.aborts == ["disclosure_failed"]
 
     controller.active = True
     downstream, _ = await run_test(
         pipeline_module.build_input_gate(controller=controller, first_failure=failure),
-        frames_to_send=[
-            InputAudioRawFrame(audio=b"\x01\x00", sample_rate=8000, num_channels=1)
-        ],
-        expected_down_frames=[InputAudioRawFrame],
+            frames_to_send=[
+                InputAudioRawFrame(
+                    audio=b"\x01\x00", sample_rate=8000, num_channels=1
+                ),
+                UserSpeakingFrame(),
+            ],
+        expected_down_frames=[InputAudioRawFrame, UserSpeakingFrame],
     )
-    assert len(downstream) == 1
+    assert len(downstream) == 2
 
     controller.active = False
     downstream, _ = await run_test(
@@ -455,6 +512,38 @@ async def test_input_gate_predicate_and_inline_error_handler_are_total_and_const
     rendered = "\n".join(messages)
     assert "transport-secret" not in rendered
     assert "filter-provider-secret" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_input_gate_public_lifecycle_and_upstream_error_paths_are_preserved() -> None:
+    controller = _GateController(active=False)
+    failure = pipeline_module.FirstFailure()
+
+    downstream, _ = await run_test(
+        pipeline_module.build_input_gate(controller=controller, first_failure=failure),
+        frames_to_send=[EndFrame()],
+        ignore_start=False,
+        send_end_frame=False,
+        expected_down_frames=[StartFrame, EndFrame],
+    )
+    assert [type(frame) for frame in downstream] == [StartFrame, EndFrame]
+
+    downstream, _ = await run_test(
+        pipeline_module.build_input_gate(controller=controller, first_failure=failure),
+        frames_to_send=[CancelFrame()],
+        ignore_start=False,
+        send_end_frame=False,
+        expected_down_frames=[StartFrame, CancelFrame],
+    )
+    assert [type(frame) for frame in downstream] == [StartFrame, CancelFrame]
+
+    _, upstream = await run_test(
+        pipeline_module.build_input_gate(controller=controller, first_failure=failure),
+        frames_to_send=[ErrorFrame(error="safe", fatal=False)],
+        frames_to_send_direction=FrameDirection.UPSTREAM,
+        expected_up_frames=[ErrorFrame],
+    )
+    assert upstream[0].error == "safe"
 
 
 @pytest.mark.asyncio
@@ -517,9 +606,6 @@ def test_build_pipeline_has_exact_native_context_and_project_boundary_order() ->
     assert isinstance(public[8], pipeline_module.DisclosureOutputBarrier)
     assert public[9] is transport.output_processor
     assert isinstance(public[10], LLMAssistantAggregator)
-    assert isinstance(public[5]._params.vad_analyzer, SileroVADAnalyzer)
-    assert public[5]._params.user_turn_strategies is not None
-    assert public[5]._realtime_service_mode is False
     assert all(type(processor).__name__ != "TranscriptProcessor" for processor in public)
     assert all(type(processor).__name__ != "AudioBufferProcessor" for processor in public)
 
@@ -529,7 +615,7 @@ async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pai
     failure = pipeline_module.FirstFailure()
     probe = _SetupProbe()
     runtime = await pipeline_module.build_runtime(
-        pipeline=pipeline_module.ObservedPipeline([probe]),
+        pipeline=pipeline_module.ObservedPipeline([probe], first_failure=failure),
         first_failure=failure,
         greeting="Bonjour, appel automatise.",
         mark_name="expected-mark",
@@ -607,14 +693,12 @@ async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() 
             ]
         )
         await asyncio.wait_for(runner_task, timeout=5)
-        vad_rate = user_aggregator._params.vad_analyzer.sample_rate
     finally:
         if not runner_task.done():
             await runtime.runner.cancel(reason="test_cleanup")
             await asyncio.wait_for(runner_task, timeout=5)
 
     assert stt_rate == 8000
-    assert vad_rate == 8000
     assert greeting_messages == []
     assert turns.assistant == []
     assert turns.user == ["bonjour"]

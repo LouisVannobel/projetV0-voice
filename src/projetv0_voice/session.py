@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import hmac
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 from importlib.metadata import version
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from pipecat.processors.frame_processor import FrameProcessor
@@ -22,7 +21,13 @@ from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import PersistenceCommand
-from projetv0_voice.pipeline import FirstFailure, build_pipeline, build_runtime
+from projetv0_voice.pipeline import (
+    CallRuntime,
+    FirstFailure,
+    ObservedPipeline,
+    build_pipeline,
+    build_runtime,
+)
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
 
@@ -348,6 +353,13 @@ class CallSessionError(RuntimeError):
     """A constant-safe per-call runtime failure."""
 
 
+class _TransportEvents(Protocol):
+    def add_event_handler(self, event_name: str, handler: object) -> None: ...
+
+
+SessionTaskFactory = Callable[[Coroutine[Any, Any, Any], str], asyncio.Task[Any]]
+
+
 class CallSession:
     """Own and supervise one authenticated Pipecat call runtime."""
 
@@ -363,6 +375,8 @@ class CallSession:
         recording: RecordingBoundary,
         lease_terminalizer: LeaseTerminalizer,
         idle_timeout_seconds: float,
+        cleanup_phase_timeout_seconds: float = 5.0,
+        task_factory: SessionTaskFactory | None = None,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
@@ -372,6 +386,10 @@ class CallSession:
             or isinstance(idle_timeout_seconds, bool)
             or not math.isfinite(idle_timeout_seconds)
             or idle_timeout_seconds <= 0
+            or not isinstance(cleanup_phase_timeout_seconds, int | float)
+            or isinstance(cleanup_phase_timeout_seconds, bool)
+            or not math.isfinite(cleanup_phase_timeout_seconds)
+            or cleanup_phase_timeout_seconds <= 0
         ):
             raise ValueError("call_session_config_invalid")
         self._identity = identity
@@ -383,6 +401,8 @@ class CallSession:
         self._recording = recording
         self._lease_terminalizer = lease_terminalizer
         self._idle_timeout_seconds = float(idle_timeout_seconds)
+        self._cleanup_phase_timeout_seconds = float(cleanup_phase_timeout_seconds)
+        self._task_factory = task_factory or self._default_task_factory
         self._utcnow = utcnow
         self._uuid_factory = uuid_factory
         self._run_started = False
@@ -414,92 +434,87 @@ class CallSession:
             uuid_factory=self._uuid_factory,
             utcnow=self._utcnow,
         )
-        try:
-            handshake.audio_admission.bind(controller.is_active)
-        except Exception:
-            first_failure.signal("call_failed")
-            await self._cleanup_without_runtime(
-                controller=controller,
-                recorder=recorder,
-                first_failure=first_failure,
-                reason="call_failed",
-            )
-            raise CallSessionError("call_failed") from None
-
-        pipeline = build_pipeline(
-            transport=handshake.transport,
-            services=self._services,
-            controller=controller,
-            turn_recorder=recorder,
-            first_failure=first_failure,
-        )
-        runtime = await build_runtime(
-            pipeline=pipeline,
-            first_failure=first_failure,
-            greeting=self._manifest.greeting,
-            mark_name=controller.mark_name,
-            idle_timeout_seconds=self._idle_timeout_seconds,
-        )
-        self._active_runner = runtime.runner
-
-        runner_task = asyncio.create_task(
-            runtime.runner.run(auto_end=True),
-            name="call-runner",
-        )
-        failure_task = asyncio.create_task(
-            first_failure.wait(),
-            name="call-first-failure",
-        )
+        pipeline: ObservedPipeline | None = None
+        runtime: CallRuntime | None = None
+        runner_task: asyncio.Task[None] | None = None
+        failure_task: asyncio.Task[str] | None = None
         reason: str | None = None
-        external_cancelled = False
         cancellation: asyncio.CancelledError | None = None
         try:
+            handshake.audio_admission.bind(controller.is_active)
+            self._register_transport_handlers(
+                transport=cast(_TransportEvents, handshake.transport),
+                controller=controller,
+                first_failure=first_failure,
+            )
+            pipeline = build_pipeline(
+                transport=handshake.transport,
+                services=self._services,
+                controller=controller,
+                turn_recorder=recorder,
+                first_failure=first_failure,
+            )
+            runtime = await build_runtime(
+                pipeline=pipeline,
+                first_failure=first_failure,
+                greeting=self._manifest.greeting,
+                mark_name=controller.mark_name,
+                idle_timeout_seconds=self._idle_timeout_seconds,
+            )
+            self._active_runner = runtime.runner
+            runner_task = cast(
+                asyncio.Task[None],
+                self._create_session_task(
+                    runtime.runner.run(auto_end=True),
+                    "call-runner",
+                ),
+            )
+            failure_task = cast(
+                asyncio.Task[str],
+                self._create_session_task(
+                    first_failure.wait(),
+                    "call-first-failure",
+                ),
+            )
             done, _pending = await asyncio.wait(
                 (runner_task, failure_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if failure_task in done:
                 reason = failure_task.result()
-                await controller.abort(reason)
-                await runtime.runner.cancel(reason="local_failure")
-                await runner_task
             else:
                 await runner_task
                 if not controller.is_active():
                     reason = first_failure.code or "call_failed"
         except asyncio.CancelledError as error:
-            external_cancelled = True
             cancellation = error
             reason = "external_cancel"
-            await controller.terminalize_and_join(cancel_continuations=True)
-            await runtime.runner.cancel(reason="external_cancel")
-            try:
-                await runner_task
-            except Exception:
-                first_failure.signal("call_failed")
         except Exception:
             reason = first_failure.code or "call_failed"
             first_failure.signal(reason)
-            await runtime.runner.cancel(reason="local_failure")
-            with contextlib.suppress(Exception):
-                await runner_task
-        finally:
-            failure_task.cancel()
-            await asyncio.gather(failure_task, return_exceptions=True)
-
-        final_reason = reason or "closed"
-        await self._cleanup_after_runtime(
+        final_reason = [reason or "closed"]
+        cleanup = self._cleanup_owned_state(
             controller=controller,
             recorder=recorder,
             first_failure=first_failure,
+            pipeline=pipeline,
+            runtime=runtime,
+            runner_task=runner_task,
+            failure_task=failure_task,
             reason=final_reason,
-            cancel_continuations=external_cancelled,
+            cancel_continuations=cancellation is not None,
+        )
+        cancellation = await self._await_owned_cleanup(
+            cleanup,
+            cancellation=cancellation,
+            reason=final_reason,
+            first_failure=first_failure,
         )
         self._active_runner = None
         if cancellation is not None:
             raise cancellation
-        if reason is not None:
-            raise CallSessionError(reason)
+        if final_reason[0] != "closed":
+            raise CallSessionError(final_reason[0])
 
     async def request_drain(self) -> None:
         """End the active per-call runner through its public cancellation surface."""
@@ -507,6 +522,151 @@ class CallSession:
         runner = self._active_runner
         if runner is not None:
             await runner.cancel(reason="drain")
+
+    @staticmethod
+    def _default_task_factory(
+        coroutine: Coroutine[Any, Any, Any],
+        name: str,
+    ) -> asyncio.Task[Any]:
+        return asyncio.create_task(coroutine, name=name)
+
+    def _create_session_task(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+        name: str,
+    ) -> asyncio.Task[Any]:
+        try:
+            return self._task_factory(coroutine, name)
+        except BaseException:
+            coroutine.close()
+            raise
+
+    @staticmethod
+    def _register_transport_handlers(
+        *,
+        transport: _TransportEvents,
+        controller: DisclosureController,
+        first_failure: FirstFailure,
+    ) -> None:
+        def handler(code: str) -> Callable[[object, object], Awaitable[None]]:
+            async def fail_transport(_transport: object, _websocket: object) -> None:
+                first_failure.signal(code)
+                try:
+                    await controller.abort(code)
+                except asyncio.CancelledError:
+                    first_failure.signal(code)
+                except Exception:
+                    first_failure.signal(code)
+
+            return fail_transport
+
+        transport.add_event_handler(
+            "on_client_disconnected",
+            handler("transport_disconnected"),
+        )
+        transport.add_event_handler(
+            "on_session_timeout",
+            handler("transport_session_timeout"),
+        )
+
+    async def _await_owned_cleanup(
+        self,
+        cleanup: Coroutine[Any, Any, None],
+        *,
+        cancellation: asyncio.CancelledError | None,
+        reason: list[str],
+        first_failure: FirstFailure,
+    ) -> asyncio.CancelledError | None:
+        cleanup_task = asyncio.create_task(cleanup, name="call-cleanup")
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+                    if reason[0] == "closed":
+                        reason[0] = "external_cancel"
+            except Exception:
+                first_failure.signal("call_failed")
+                break
+        if cleanup_task.done() and not cleanup_task.cancelled():
+            try:
+                cleanup_task.result()
+            except Exception:
+                first_failure.signal("call_failed")
+        return cancellation
+
+    async def _cleanup_owned_state(
+        self,
+        *,
+        controller: DisclosureController,
+        recorder: TurnRecorder,
+        first_failure: FirstFailure,
+        pipeline: ObservedPipeline | None,
+        runtime: CallRuntime | None,
+        runner_task: asyncio.Task[None] | None,
+        failure_task: asyncio.Task[str] | None,
+        reason: list[str],
+        cancel_continuations: bool,
+    ) -> None:
+        await self._attempt(
+            lambda: controller.terminalize_and_join(
+                cancel_continuations=cancel_continuations
+            ),
+            first_failure,
+            "call_failed",
+        )
+
+        if runtime is not None and runner_task is not None:
+            if not runner_task.done():
+                await asyncio.sleep(0)
+                await self._attempt(
+                    lambda: runtime.runner.cancel(
+                        reason=(
+                            "external_cancel"
+                            if reason[0] == "external_cancel"
+                            else "local_failure"
+                        )
+                    ),
+                    first_failure,
+                    "call_failed",
+                )
+            await self._attempt(
+                lambda: self._join_task(runner_task),
+                first_failure,
+                "call_failed",
+            )
+        elif pipeline is not None:
+            await self._attempt(
+                pipeline.cleanup,
+                first_failure,
+                "pipeline_cleanup_failed",
+            )
+
+        if failure_task is not None:
+            failure_task.cancel()
+            await asyncio.gather(failure_task, return_exceptions=True)
+
+        try:
+            recorder.close()
+        except Exception:
+            first_failure.signal("persistence_failed")
+        await self._attempt(
+            lambda: controller.cleanup_termination(reason[0]),
+            first_failure,
+            "recording_cleanup_failed",
+        )
+        await self._attempt(self._services.aclose, first_failure, "service_close_failed")
+        self._promote_cleanup_failure(reason, first_failure)
+        await self._finish_durable_boundaries(
+            first_failure=first_failure,
+            reason=reason,
+            disclosure_completed=controller.disclosure_completed,
+        )
+
+    @staticmethod
+    async def _join_task(task: asyncio.Task[None]) -> None:
+        await task
 
     def _verify_handshake(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if (
@@ -517,80 +677,44 @@ class CallSession:
         ):
             raise CallSessionError("call_identity_mismatch")
 
-    async def _cleanup_without_runtime(
-        self,
-        *,
-        controller: DisclosureController,
-        recorder: TurnRecorder,
-        first_failure: FirstFailure,
-        reason: str,
-    ) -> None:
-        await controller.terminalize_and_join(cancel_continuations=True)
-        recorder.close()
-        await controller.cleanup_termination(reason)
-        await self._attempt(self._services.aclose, first_failure, "service_close_failed")
-        await self._finish_durable_boundaries(
-            first_failure=first_failure,
-            reason=reason,
-            disclosure_completed=controller.disclosure_completed,
-        )
-
-    async def _cleanup_after_runtime(
-        self,
-        *,
-        controller: DisclosureController,
-        recorder: TurnRecorder,
-        first_failure: FirstFailure,
-        reason: str,
-        cancel_continuations: bool,
-    ) -> None:
-        await self._attempt(
-            lambda: controller.terminalize_and_join(
-                cancel_continuations=cancel_continuations
-            ),
-            first_failure,
-            "call_failed",
-        )
-        recorder.close()
-        await self._attempt(
-            lambda: controller.cleanup_termination(reason),
-            first_failure,
-            "recording_cleanup_failed",
-        )
-        await self._attempt(self._services.aclose, first_failure, "service_close_failed")
-        await self._finish_durable_boundaries(
-            first_failure=first_failure,
-            reason=reason,
-            disclosure_completed=controller.disclosure_completed,
-        )
-
     async def _finish_durable_boundaries(
         self,
         *,
         first_failure: FirstFailure,
-        reason: str,
+        reason: list[str],
         disclosure_completed: bool,
     ) -> None:
-        status: Literal["closed", "failed"] = "closed" if reason == "closed" else "failed"
+        self._promote_cleanup_failure(reason, first_failure)
+        status: Literal["closed", "failed"] = (
+            "closed" if reason[0] == "closed" else "failed"
+        )
         if not self._writer.fatal_event.is_set():
             await self._attempt(
                 lambda: self._commit_terminal_call(
                     status=status,
-                    reason=reason,
+                    reason=reason[0],
                     disclosure_completed=disclosure_completed,
                 ),
                 first_failure,
                 "persistence_failed",
             )
+        self._promote_cleanup_failure(reason, first_failure)
+        status = "closed" if reason[0] == "closed" else "failed"
         await self._attempt(
             lambda: self._lease_terminalizer.terminalize(
                 self._identity,
                 status=status,
-                reason=reason,
+                reason=reason[0],
             ),
             first_failure,
             "lease_terminalization_failed",
         )
+        self._promote_cleanup_failure(reason, first_failure)
+
+    @staticmethod
+    def _promote_cleanup_failure(reason: list[str], first_failure: FirstFailure) -> None:
+        if reason[0] == "closed" and first_failure.code is not None:
+            reason[0] = first_failure.code
 
     async def _commit_terminal_call(
         self,
@@ -623,15 +747,18 @@ class CallSession:
             PersistenceCommand("outbox", {"operation": operation}, None)
         )
 
-    @staticmethod
     async def _attempt(
+        self,
         phase: Callable[[], Awaitable[None]],
         first_failure: FirstFailure,
         code: str,
     ) -> None:
         try:
-            await phase()
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
+                await phase()
         except asyncio.CancelledError:
+            first_failure.signal(code)
+        except TimeoutError:
             first_failure.signal(code)
         except Exception:
             first_failure.signal(code)
@@ -718,10 +845,14 @@ class DisclosureController:
             self._track(task)
 
     async def accept_mark(self, mark_name: str) -> bool:
+        try:
+            received_mark = mark_name.encode("utf-8")
+        except (AttributeError, UnicodeEncodeError):
+            return False
         async with self._lock:
             if (
                 not isinstance(mark_name, str)
-                or not hmac.compare_digest(mark_name, self.mark_name)
+                or not hmac.compare_digest(received_mark, self.mark_name.encode("ascii"))
                 or self.state is not DisclosureState.MARK_PENDING
             ):
                 return False
@@ -731,7 +862,10 @@ class DisclosureController:
             if timeout_task is not None:
                 timeout_task.cancel()
             task = asyncio.create_task(
-                self._complete_disclosure(self._utcnow()),
+                self._run_owned_continuation(
+                    lambda: self._complete_disclosure(self._utcnow()),
+                    "disclosure_commit_failed",
+                ),
                 name="disclosure-ack-continuation",
             )
             self._track(task)
@@ -791,7 +925,29 @@ class DisclosureController:
 
     def _track(self, task: asyncio.Task[None]) -> None:
         self._continuations.add(task)
-        task.add_done_callback(self._continuations.discard)
+        task.add_done_callback(self._consume_continuation_result)
+
+    def _consume_continuation_result(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            self._first_failure.signal("disclosure_failed")
+        finally:
+            self._continuations.discard(task)
+
+    async def _run_owned_continuation(
+        self,
+        continuation: Callable[[], Awaitable[None]],
+        failure_code: str,
+    ) -> None:
+        try:
+            await continuation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self.abort(failure_code)
 
     async def _mark_timeout(self) -> None:
         try:
