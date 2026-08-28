@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-from collections.abc import Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextvars import Context
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -400,6 +400,7 @@ def build_pipeline(
     controller: GateController,
     turn_recorder: PipelineTurnRecorder,
     first_failure: FirstFailure,
+    local_failure_clear: Callable[[], Awaitable[None]] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
 
@@ -455,6 +456,13 @@ def build_pipeline(
             raise
         except Exception:
             return
+        if local_failure_clear is not None:
+            try:
+                await local_failure_clear()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                first_failure.signal("call_failed")
 
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
     assistant_aggregator.add_event_handler(
@@ -486,9 +494,10 @@ class CallRuntime:
     worker: PipelineWorker
     runner: WorkerRunner
     task_manager: ObservedTaskManager
+    interruption_reached: asyncio.Event
 
 
-async def build_runtime(
+def build_runtime(
     *,
     pipeline: ObservedPipeline,
     first_failure: FirstFailure,
@@ -520,6 +529,17 @@ async def build_runtime(
         enable_tracing=False,
         idle_timeout_secs=float(idle_timeout_seconds),
     )
+    interruption_reached = asyncio.Event()
+
+    async def on_interruption_reached(
+        _worker: PipelineWorker,
+        frame: Frame,
+    ) -> None:
+        if isinstance(frame, InterruptionFrame):
+            interruption_reached.set()
+
+    worker.add_reached_downstream_filter((InterruptionFrame,))
+    worker.add_event_handler("on_frame_reached_downstream", on_interruption_reached)
 
     async def queue_disclosure(_worker: PipelineWorker, _frame: StartFrame) -> None:
         try:
@@ -541,12 +561,12 @@ async def build_runtime(
         handle_sigterm=False,
         task_manager=task_manager,
     )
-    await runner.add_workers(worker)
     return CallRuntime(
         pipeline=pipeline,
         worker=worker,
         runner=runner,
         task_manager=task_manager,
+        interruption_reached=interruption_reached,
     )
 
 

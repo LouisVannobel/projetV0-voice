@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
 from pipecat.frames.frames import (
     ErrorFrame,
@@ -40,6 +41,7 @@ from starlette.websockets import WebSocket, WebSocketState
 
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
+from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.inference.services import build_llm
 from projetv0_voice.models import VoiceOperationV1
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
@@ -406,6 +408,21 @@ class _PartialFailingTts(_OfflineTts):
         await super().process_frame(frame, direction)
 
 
+class _FailingPcmStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: Sequence[bytes]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+            await asyncio.sleep(0.1)
+        raise RuntimeError("tts-provider-secret")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class _Transport:
     def __init__(self, events: list[str], *, echo_ack: bool = False) -> None:
         self._input = _PassProcessor("transport-input", events)
@@ -448,12 +465,21 @@ async def _apply_phase_fault(kind: str | None, secret: str) -> None:
 
 
 class _SessionWriter:
-    def __init__(self, events: list[str], *, cleanup_fault: str | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        cleanup_fault: str | None = None,
+        terminal_started: asyncio.Event | None = None,
+        terminal_release: asyncio.Event | None = None,
+    ) -> None:
         self.events = events
         self.fatal_event = asyncio.Event()
         self.disclosure_committed = asyncio.Event()
         self.commands: list[object] = []
         self.cleanup_fault = cleanup_fault
+        self.terminal_started = terminal_started
+        self.terminal_release = terminal_release
 
     def try_enqueue_turn(self, operation: object) -> bool:
         self.commands.append(operation)
@@ -466,6 +492,10 @@ class _SessionWriter:
             self.disclosure_committed.set()
         if operation.kind == "call.upsert" and operation.payload.status in {"closed", "failed"}:
             self.events.append("call-terminal-attempt")
+            if self.terminal_started is not None:
+                self.terminal_started.set()
+            if self.terminal_release is not None:
+                await self.terminal_release.wait()
             await _apply_phase_fault(self.cleanup_fault, "writer-cleanup-secret")
             self.events.append("call-terminal")
 
@@ -495,13 +525,26 @@ class _RecordingBoundary:
 
 
 class _LeaseTerminalizer:
-    def __init__(self, events: list[str], *, cleanup_fault: str | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        cleanup_fault: str | None = None,
+        started: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+    ) -> None:
         self.events = events
         self.calls: list[tuple[str, str]] = []
         self.cleanup_fault = cleanup_fault
+        self.started = started
+        self.release = release
 
     async def terminalize(self, _identity: object, *, status: str, reason: str) -> None:
         self.events.append("lease-attempt")
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
         await _apply_phase_fault(self.cleanup_fault, "lease-cleanup-secret")
         self.calls.append((status, reason))
         self.events.append("lease-terminal")
@@ -613,6 +656,10 @@ def _session(
     writer_override: _SessionWriter | None = None,
     cleanup_fault_phase: str | None = None,
     cleanup_fault_kind: str | None = None,
+    terminal_started: asyncio.Event | None = None,
+    terminal_release: asyncio.Event | None = None,
+    lease_started: asyncio.Event | None = None,
+    lease_release: asyncio.Event | None = None,
 ) -> tuple[object, FrameProcessor, _LeaseTerminalizer, _SessionWriter, _Transport]:
     transport = _Transport(events, echo_ack=echo_ack)
     stt: FrameProcessor = (
@@ -643,12 +690,16 @@ def _session(
         cleanup_fault=(
             cleanup_fault_kind if cleanup_fault_phase == "writer" else None
         ),
+        terminal_started=terminal_started,
+        terminal_release=terminal_release,
     )
     lease = _LeaseTerminalizer(
         events,
         cleanup_fault=(
             cleanup_fault_kind if cleanup_fault_phase == "lease" else None
         ),
+        started=lease_started,
+        release=lease_release,
     )
     lease_claim = object()
     identity = _identity(lease_claim, call_int=call_int)
@@ -800,6 +851,120 @@ def _real_websocket_session(
     return session, lease, writer, admission, disconnect
 
 
+def _actual_partial_tts_telnyx_session() -> tuple[
+    object,
+    _LeaseTerminalizer,
+    _SessionWriter,
+    AudioAdmission,
+    list[dict[str, object]],
+    httpx.AsyncClient,
+    _FailingPcmStream,
+]:
+    events: list[str] = []
+    never = asyncio.Event()
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        await never.wait()
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    websocket = WebSocket(
+        {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "scheme": "wss",
+            "server": ("voice.invalid", 443),
+            "client": ("127.0.0.1", 12345),
+            "root_path": "",
+            "path": "/media",
+            "raw_path": b"/media",
+            "query_string": b"",
+            "headers": [],
+            "subprotocols": [],
+        },
+        receive=receive,
+        send=send,
+    )
+    websocket.application_state = WebSocketState.CONNECTED
+    websocket.client_state = WebSocketState.CONNECTED
+    admission = AudioAdmission()
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-1",
+        expected_call_control_id="call-control-1",
+        audio_admission=admission,
+    )
+    transport = FastAPIWebsocketTransport(
+        websocket,
+        FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            serializer=serializer,
+        ),
+    )
+    stream = _FailingPcmStream(
+        [
+            b"\x01",
+            b"\x00" + b"\x02\x00" * 12000 + b"\x03",
+            b"\x00" + b"\x04\x00" * 12000,
+        ]
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "audio/pcm"},
+            stream=stream,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tts = OpenRouterTTSService(
+        profile=_profile().inference,
+        api_key=SecretStr("offline-secret"),
+        http_client=client,
+    )
+    services = _SessionServices(
+        stt=_PassProcessor("stt", events),
+        llm=_PassProcessor("llm", events),
+        tts=tts,
+        events=events,
+    )
+    writer = _SessionWriter(events)
+    lease = _LeaseTerminalizer(events)
+    lease_claim = object()
+    session = session_module.CallSession(
+        identity=_identity(lease_claim),
+        manifest=_manifest(),
+        profile=_profile(),
+        services=services,
+        writer=writer,
+        keyring=CryptoKeyring(
+            {1: b"k" * 32},
+            active_version=1,
+            nonce_factory=lambda size: b"n" * size,
+        ),
+        recording=_RecordingBoundary(events),
+        lease_terminalizer=lease,
+        idle_timeout_seconds=60.0,
+        utcnow=lambda: NOW + timedelta(seconds=5),
+        uuid_factory=_uuid_factory(),
+    )
+    session.handshake = AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData(
+            stream_id="stream-1",
+            call_id="call-control-1",
+            outbound_encoding="PCMU",
+        ),
+        token_locator_id="telnyx-header-connected-v1",
+        lease_claim=lease_claim,
+        transport=transport,
+        audio_admission=admission,
+    )
+    return session, lease, writer, admission, sent, client, stream
+
+
 @pytest.mark.asyncio
 async def test_public_call_session_cancellation_waits_for_ordered_bounded_cleanup() -> None:
     events: list[str] = []
@@ -848,6 +1013,63 @@ async def test_cancellation_during_cleanup_is_shielded_and_first_cancel_wins() -
     assert close_cancelled.is_set() is False
     assert "call-terminal" in events
     assert lease.calls == [("failed", "external_cancel")]
+    terminal_operation = next(
+        command.payload["operation"]
+        for command in writer.commands
+        if not isinstance(command, VoiceOperationV1)
+        and hasattr(command, "payload")
+        and command.payload["operation"].kind == "call.upsert"
+        and command.payload["operation"].payload.status == "failed"
+    )
+    assert terminal_operation.payload.end_reason == "external_cancel"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_phase", ["terminal", "lease"])
+async def test_terminal_outcome_is_frozen_before_irreversible_boundaries(
+    blocked_phase: str,
+) -> None:
+    events: list[str] = []
+    terminal_started = asyncio.Event()
+    terminal_release = asyncio.Event()
+    lease_started = asyncio.Event()
+    lease_release = asyncio.Event()
+    session, _stt, lease, writer, _transport = _session(
+        events=events,
+        echo_ack=True,
+        terminal_started=terminal_started if blocked_phase == "terminal" else None,
+        terminal_release=terminal_release if blocked_phase == "terminal" else None,
+        lease_started=lease_started if blocked_phase == "lease" else None,
+        lease_release=lease_release if blocked_phase == "lease" else None,
+    )
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(writer.disclosure_committed.wait(), timeout=3)
+    await session.request_drain()
+    if blocked_phase == "terminal":
+        await asyncio.wait_for(terminal_started.wait(), timeout=3)
+    else:
+        await asyncio.wait_for(lease_started.wait(), timeout=3)
+
+    running.cancel("cancel-after-freeze")
+    await asyncio.sleep(0)
+    terminal_release.set()
+    lease_release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(running, timeout=3)
+
+    terminal_operations = [
+        command.payload["operation"]
+        for command in writer.commands
+        if not isinstance(command, VoiceOperationV1)
+        and hasattr(command, "payload")
+        and command.payload["operation"].kind == "call.upsert"
+        and command.payload["operation"].payload.status in {"closed", "failed"}
+    ]
+    assert cancelled.value.args == ("cancel-after-freeze",)
+    assert len(terminal_operations) == 1
+    assert terminal_operations[0].payload.status == "closed"
+    assert terminal_operations[0].payload.end_reason == "closed"
+    assert lease.calls == [("closed", "closed")]
 
 
 @pytest.mark.asyncio
@@ -911,6 +1133,8 @@ async def test_first_cleanup_failure_changes_normal_close_to_failed_terminal_sta
 
     if phase == "lease":
         assert lease.calls == []
+    elif phase == "writer":
+        assert lease.calls == [("closed", "closed")]
     else:
         assert lease.calls == [("failed", code)]
 
@@ -959,6 +1183,79 @@ async def test_controller_and_runner_cleanup_faults_do_not_skip_later_phases(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["ordinary", "cancel"])
+async def test_turn_recorder_close_fault_is_safe_and_failure_waiter_is_joined(
+    fault: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    waiter_joined = asyncio.Event()
+
+    def fail_close(_recorder: object) -> None:
+        events.append("turn-recorder-close-attempt")
+        if fault == "cancel":
+            raise asyncio.CancelledError("turn-recorder-close-secret")
+        raise RuntimeError("turn-recorder-close-secret")
+
+    def task_factory(coroutine: object, name: str) -> asyncio.Task[object]:
+        if name != "call-first-failure":
+            return asyncio.create_task(coroutine, name=name)  # type: ignore[arg-type]
+
+        async def observe_waiter() -> object:
+            try:
+                return await coroutine  # type: ignore[misc]
+            finally:
+                waiter_joined.set()
+
+        return asyncio.create_task(observe_waiter(), name=name)
+
+    monkeypatch.setattr(session_module.TurnRecorder, "close", fail_close)
+    session, _stt, lease, writer, _transport = _session(
+        events=events,
+        echo_ack=True,
+        task_factory=task_factory,
+    )
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(writer.disclosure_committed.wait(), timeout=3)
+    await session.request_drain()
+
+    with pytest.raises(session_module.CallSessionError, match="persistence_failed"):
+        await asyncio.wait_for(running, timeout=3)
+
+    assert waiter_joined.is_set()
+    assert "services-attempt" in events
+    assert "call-terminal-attempt" in events
+    assert "lease-attempt" in events
+    assert lease.calls == [("failed", "persistence_failed")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["ordinary", "cancel"])
+async def test_internal_cleanup_owner_failure_is_not_reported_as_caller_cancellation(
+    fault: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    async def fail_cleanup(_session: object, **_kwargs: object) -> None:
+        if fault == "cancel":
+            raise asyncio.CancelledError("internal-cleanup-secret")
+        raise RuntimeError("internal-cleanup-secret")
+
+    monkeypatch.setattr(session_module.CallSession, "_cleanup_owned_state", fail_cleanup)
+    session, _stt, _lease, writer, _transport = _session(
+        events=events,
+        echo_ack=True,
+    )
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(writer.disclosure_committed.wait(), timeout=3)
+    await session.request_drain()
+
+    with pytest.raises(session_module.CallSessionError, match="call_failed"):
+        await asyncio.wait_for(running, timeout=3)
+
+
+@pytest.mark.asyncio
 async def test_nested_native_task_failure_cancels_and_joins_real_runner_before_return() -> None:
     events: list[str] = []
     session, _stt, lease, _writer, _transport = _session(
@@ -985,6 +1282,38 @@ async def test_partial_tts_failure_invokes_injected_termination_cleanup() -> Non
 
     assert "termination:False:tts_failed" in events
     assert lease.calls == [("failed", "tts_failed")]
+
+
+@pytest.mark.asyncio
+async def test_actual_partial_tts_failure_reaches_real_telnyx_clear_without_mark() -> None:
+    session, lease, writer, admission, sent, client, stream = (
+        _actual_partial_tts_telnyx_session()
+    )
+    try:
+        with pytest.raises(session_module.CallSessionError, match="tts_failed"):
+            await asyncio.wait_for(session.run(session.handshake), timeout=5)
+    finally:
+        await client.aclose()
+
+    payloads = [
+        json.loads(message["text"])
+        for message in sent
+        if message.get("type") == "websocket.send" and isinstance(message.get("text"), str)
+    ]
+    events = [payload.get("event") for payload in payloads]
+    assert "media" in events
+    assert "clear" in events
+    assert "mark" not in events
+    assert events.index("media") < events.index("clear")
+    assert not any(
+        not isinstance(command, VoiceOperationV1)
+        and hasattr(command, "payload")
+        and command.payload["operation"].payload.disclosure_state == "completed"
+        for command in writer.commands
+    )
+    assert admission.allows_audio() is False
+    assert lease.calls == [("failed", "tts_failed")]
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio
@@ -1148,6 +1477,7 @@ async def test_post_bind_startup_failure_runs_partial_state_cleanup(
 ) -> None:
     events: list[str] = []
     session, _stt, lease, _writer, _transport = _session(events=events)
+    worker_finished = asyncio.Event()
 
     if failure_point == "pipeline":
         def fail_pipeline(**_kwargs: object) -> None:
@@ -1160,12 +1490,21 @@ async def test_post_bind_startup_failure_runs_partial_state_cleanup(
 
         monkeypatch.setattr(pipeline_module, "PipelineWorker", fail_worker)
     elif failure_point == "add_workers":
-        async def fail_add_workers(_runner: object, *_workers: object) -> None:
+        original_add_workers = pipeline_module.WorkerRunner.add_workers
+
+        async def fail_add_workers(runner: object, *workers: object) -> None:
+            worker = workers[0]
+
+            async def on_finished(_worker: object, _frame: object) -> None:
+                worker_finished.set()
+
+            worker.add_event_handler("on_pipeline_finished", on_finished)
+            await original_add_workers(runner, *workers)
             raise RuntimeError("worker-registration-secret")
 
         monkeypatch.setattr(pipeline_module.WorkerRunner, "add_workers", fail_add_workers)
     elif failure_point == "runtime":
-        async def fail_runtime(**_kwargs: object) -> None:
+        def fail_runtime(**_kwargs: object) -> None:
             raise RuntimeError("worker-registration-secret")
 
         monkeypatch.setattr(session_module, "build_runtime", fail_runtime)
@@ -1183,13 +1522,31 @@ async def test_post_bind_startup_failure_runs_partial_state_cleanup(
     assert events.index("call-terminal") < events.index("lease-terminal")
     assert lease.calls == [("failed", "call_failed")]
     assert session.handshake.audio_admission.allows_audio() is False
+    if failure_point == "add_workers":
+        assert worker_finished.is_set()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_on", [1, 2])
-async def test_runner_and_failure_task_creation_failures_run_cleanup(fail_on: int) -> None:
+async def test_runner_and_failure_task_creation_failures_run_cleanup(
+    fail_on: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events: list[str] = []
     calls = 0
+    worker_finished = asyncio.Event()
+    original_build_runtime = session_module.build_runtime
+
+    def build_observed_runtime(**kwargs: object) -> object:
+        runtime = original_build_runtime(**kwargs)
+
+        async def on_finished(_worker: object, _frame: object) -> None:
+            worker_finished.set()
+
+        runtime.worker.add_event_handler("on_pipeline_finished", on_finished)
+        return runtime
+
+    monkeypatch.setattr(session_module, "build_runtime", build_observed_runtime)
 
     def task_factory(coroutine: object, name: str) -> asyncio.Task[object]:
         nonlocal calls
@@ -1210,6 +1567,8 @@ async def test_runner_and_failure_task_creation_failures_run_cleanup(fail_on: in
     assert "services:stt" in events
     assert events.index("call-terminal") < events.index("lease-terminal")
     assert lease.calls == [("failed", "call_failed")]
+    assert any(item.startswith("pipeline:") for item in events)
+    assert worker_finished.is_set() is (fail_on == 2)
 
 
 @pytest.mark.asyncio

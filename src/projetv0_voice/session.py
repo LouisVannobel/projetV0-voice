@@ -14,6 +14,7 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
+from pipecat.frames.frames import InterruptionFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.workers.runner import WorkerRunner
 
@@ -360,6 +361,41 @@ class _TransportEvents(Protocol):
 SessionTaskFactory = Callable[[Coroutine[Any, Any, Any], str], asyncio.Task[Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class _FrozenTerminalOutcome:
+    status: Literal["closed", "failed"]
+    reason: str
+
+
+class _TerminalOutcome:
+    """Same-event-loop terminal reason owner with one irreversible freeze."""
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+        self._frozen: _FrozenTerminalOutcome | None = None
+
+    @property
+    def reason(self) -> str:
+        frozen = self._frozen
+        return frozen.reason if frozen is not None else self._reason
+
+    def note_caller_cancellation(self) -> None:
+        if self._frozen is None and self._reason == "closed":
+            self._reason = "external_cancel"
+
+    def promote_failure(self, code: str | None) -> None:
+        if self._frozen is None and self._reason == "closed" and code is not None:
+            self._reason = code
+
+    def freeze(self) -> _FrozenTerminalOutcome:
+        if self._frozen is None:
+            self._frozen = _FrozenTerminalOutcome(
+                status="closed" if self._reason == "closed" else "failed",
+                reason=self._reason,
+            )
+        return self._frozen
+
+
 class CallSession:
     """Own and supervise one authenticated Pipecat call runtime."""
 
@@ -440,6 +476,13 @@ class CallSession:
         failure_task: asyncio.Task[str] | None = None
         reason: str | None = None
         cancellation: asyncio.CancelledError | None = None
+
+        async def clear_local_playout() -> None:
+            if runtime is None:
+                raise CallSessionError("call_failed")
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
+                await self._queue_interruption_and_wait(runtime)
+
         try:
             handshake.audio_admission.bind(controller.is_active)
             self._register_transport_handlers(
@@ -453,8 +496,9 @@ class CallSession:
                 controller=controller,
                 turn_recorder=recorder,
                 first_failure=first_failure,
+                local_failure_clear=clear_local_playout,
             )
-            runtime = await build_runtime(
+            runtime = build_runtime(
                 pipeline=pipeline,
                 first_failure=first_failure,
                 greeting=self._manifest.greeting,
@@ -469,6 +513,7 @@ class CallSession:
                     "call-runner",
                 ),
             )
+            await runtime.runner.add_workers(runtime.worker)
             failure_task = cast(
                 asyncio.Task[str],
                 self._create_session_task(
@@ -492,7 +537,7 @@ class CallSession:
         except Exception:
             reason = first_failure.code or "call_failed"
             first_failure.signal(reason)
-        final_reason = [reason or "closed"]
+        terminal_outcome = _TerminalOutcome(reason or "closed")
         cleanup = self._cleanup_owned_state(
             controller=controller,
             recorder=recorder,
@@ -501,20 +546,23 @@ class CallSession:
             runtime=runtime,
             runner_task=runner_task,
             failure_task=failure_task,
-            reason=final_reason,
+            terminal_outcome=terminal_outcome,
             cancel_continuations=cancellation is not None,
         )
         cancellation = await self._await_owned_cleanup(
             cleanup,
             cancellation=cancellation,
-            reason=final_reason,
+            terminal_outcome=terminal_outcome,
             first_failure=first_failure,
         )
         self._active_runner = None
         if cancellation is not None:
             raise cancellation
-        if final_reason[0] != "closed":
-            raise CallSessionError(final_reason[0])
+        final_error = first_failure.code
+        if final_error is not None:
+            raise CallSessionError(final_error)
+        if terminal_outcome.reason != "closed":
+            raise CallSessionError(terminal_outcome.reason)
 
     async def request_drain(self) -> None:
         """End the active per-call runner through its public cancellation surface."""
@@ -574,7 +622,7 @@ class CallSession:
         cleanup: Coroutine[Any, Any, None],
         *,
         cancellation: asyncio.CancelledError | None,
-        reason: list[str],
+        terminal_outcome: _TerminalOutcome,
         first_failure: FirstFailure,
     ) -> asyncio.CancelledError | None:
         cleanup_task = asyncio.create_task(cleanup, name="call-cleanup")
@@ -582,18 +630,26 @@ class CallSession:
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError as error:
+                if cleanup_task.done() and cleanup_task.cancelled():
+                    first_failure.signal("call_failed")
+                    self._promote_cleanup_failure(terminal_outcome, first_failure)
+                    break
                 if cancellation is None:
                     cancellation = error
-                    if reason[0] == "closed":
-                        reason[0] = "external_cancel"
+                    terminal_outcome.note_caller_cancellation()
             except Exception:
                 first_failure.signal("call_failed")
+                self._promote_cleanup_failure(terminal_outcome, first_failure)
                 break
-        if cleanup_task.done() and not cleanup_task.cancelled():
+        if cleanup_task.cancelled():
+            first_failure.signal("call_failed")
+            self._promote_cleanup_failure(terminal_outcome, first_failure)
+        elif cleanup_task.done():
             try:
                 cleanup_task.result()
             except Exception:
                 first_failure.signal("call_failed")
+                self._promote_cleanup_failure(terminal_outcome, first_failure)
         return cancellation
 
     async def _cleanup_owned_state(
@@ -606,7 +662,7 @@ class CallSession:
         runtime: CallRuntime | None,
         runner_task: asyncio.Task[None] | None,
         failure_task: asyncio.Task[str] | None,
-        reason: list[str],
+        terminal_outcome: _TerminalOutcome,
         cancel_continuations: bool,
     ) -> None:
         await self._attempt(
@@ -620,11 +676,17 @@ class CallSession:
         if runtime is not None and runner_task is not None:
             if not runner_task.done():
                 await asyncio.sleep(0)
+                if terminal_outcome.reason != "closed":
+                    await self._attempt(
+                        lambda: self._queue_interruption_and_wait(runtime),
+                        first_failure,
+                        "call_failed",
+                    )
                 await self._attempt(
                     lambda: runtime.runner.cancel(
                         reason=(
                             "external_cancel"
-                            if reason[0] == "external_cancel"
+                            if terminal_outcome.reason == "external_cancel"
                             else "local_failure"
                         )
                     ),
@@ -649,24 +711,31 @@ class CallSession:
 
         try:
             recorder.close()
+        except asyncio.CancelledError:
+            first_failure.signal("persistence_failed")
         except Exception:
             first_failure.signal("persistence_failed")
         await self._attempt(
-            lambda: controller.cleanup_termination(reason[0]),
+            lambda: controller.cleanup_termination(terminal_outcome.reason),
             first_failure,
             "recording_cleanup_failed",
         )
         await self._attempt(self._services.aclose, first_failure, "service_close_failed")
-        self._promote_cleanup_failure(reason, first_failure)
+        self._promote_cleanup_failure(terminal_outcome, first_failure)
         await self._finish_durable_boundaries(
             first_failure=first_failure,
-            reason=reason,
+            terminal_outcome=terminal_outcome,
             disclosure_completed=controller.disclosure_completed,
         )
 
     @staticmethod
     async def _join_task(task: asyncio.Task[None]) -> None:
         await task
+
+    @staticmethod
+    async def _queue_interruption_and_wait(runtime: CallRuntime) -> None:
+        await runtime.worker.queue_frame(InterruptionFrame())
+        await runtime.interruption_reached.wait()
 
     def _verify_handshake(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if (
@@ -681,40 +750,37 @@ class CallSession:
         self,
         *,
         first_failure: FirstFailure,
-        reason: list[str],
+        terminal_outcome: _TerminalOutcome,
         disclosure_completed: bool,
     ) -> None:
-        self._promote_cleanup_failure(reason, first_failure)
-        status: Literal["closed", "failed"] = (
-            "closed" if reason[0] == "closed" else "failed"
-        )
+        self._promote_cleanup_failure(terminal_outcome, first_failure)
+        frozen = terminal_outcome.freeze()
         if not self._writer.fatal_event.is_set():
             await self._attempt(
                 lambda: self._commit_terminal_call(
-                    status=status,
-                    reason=reason[0],
+                    status=frozen.status,
+                    reason=frozen.reason,
                     disclosure_completed=disclosure_completed,
                 ),
                 first_failure,
                 "persistence_failed",
             )
-        self._promote_cleanup_failure(reason, first_failure)
-        status = "closed" if reason[0] == "closed" else "failed"
         await self._attempt(
             lambda: self._lease_terminalizer.terminalize(
                 self._identity,
-                status=status,
-                reason=reason[0],
+                status=frozen.status,
+                reason=frozen.reason,
             ),
             first_failure,
             "lease_terminalization_failed",
         )
-        self._promote_cleanup_failure(reason, first_failure)
 
     @staticmethod
-    def _promote_cleanup_failure(reason: list[str], first_failure: FirstFailure) -> None:
-        if reason[0] == "closed" and first_failure.code is not None:
-            reason[0] = first_failure.code
+    def _promote_cleanup_failure(
+        terminal_outcome: _TerminalOutcome,
+        first_failure: FirstFailure,
+    ) -> None:
+        terminal_outcome.promote_failure(first_failure.code)
 
     async def _commit_terminal_call(
         self,

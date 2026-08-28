@@ -350,7 +350,7 @@ async def test_real_worker_finishes_after_observed_pipeline_cleanup_failure() ->
         ],
         first_failure=failure,
     )
-    runtime = await pipeline_module.build_runtime(
+    runtime = pipeline_module.build_runtime(
         pipeline=pipeline,
         first_failure=failure,
         greeting="Disclosure.",
@@ -369,6 +369,7 @@ async def test_real_worker_finishes_after_observed_pipeline_cleanup_failure() ->
     runtime.worker.add_event_handler("on_pipeline_started", on_started)
     runtime.worker.add_event_handler("on_pipeline_finished", on_finished)
     running = asyncio.create_task(runtime.runner.run(auto_end=True))
+    await runtime.runner.add_workers(runtime.worker)
     await asyncio.wait_for(started.wait(), timeout=3)
     await runtime.worker.queue_frame(EndFrame())
     await asyncio.wait_for(running, timeout=3)
@@ -614,7 +615,7 @@ def test_build_pipeline_has_exact_native_context_and_project_boundary_order() ->
 async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pair() -> None:
     failure = pipeline_module.FirstFailure()
     probe = _SetupProbe()
-    runtime = await pipeline_module.build_runtime(
+    runtime = pipeline_module.build_runtime(
         pipeline=pipeline_module.ObservedPipeline([probe], first_failure=failure),
         first_failure=failure,
         greeting="Bonjour, appel automatise.",
@@ -625,6 +626,7 @@ async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pai
         _ = runtime.worker.task_manager
 
     runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    await runtime.runner.add_workers(runtime.worker)
     await probe.started.wait()
     assert probe.setup_manager is runtime.task_manager
     assert runtime.worker.task_manager is runtime.task_manager
@@ -650,6 +652,30 @@ async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pai
 
 
 @pytest.mark.asyncio
+async def test_build_runtime_returns_owned_unregistered_runtime_before_add_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = pipeline_module.FirstFailure()
+    pipeline = pipeline_module.ObservedPipeline(
+        [_SetupProbe()],
+        first_failure=failure,
+    )
+
+    async def unexpected_add(_runner: object, *_workers: object) -> None:
+        raise AssertionError("build_runtime registered a worker")
+
+    monkeypatch.setattr(pipeline_module.WorkerRunner, "add_workers", unexpected_add)
+    built = pipeline_module.build_runtime(
+        pipeline=pipeline,
+        first_failure=failure,
+        greeting="Disclosure.",
+        mark_name="mark",
+        idle_timeout_seconds=60.0,
+    )
+    assert isinstance(built, pipeline_module.CallRuntime)
+
+
+@pytest.mark.asyncio
 async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() -> None:
     transport = _Transport()
     stt = _SegmentedSttProbe()
@@ -666,7 +692,7 @@ async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() 
         first_failure=failure,
     )
     user_aggregator = pipeline.processors[5]
-    runtime = await pipeline_module.build_runtime(
+    runtime = pipeline_module.build_runtime(
         pipeline=pipeline,
         first_failure=failure,
         greeting="Disclosure seulement.",
@@ -674,6 +700,7 @@ async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() 
         idle_timeout_seconds=60.0,
     )
     runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    await runtime.runner.add_workers(runtime.worker)
     try:
         await asyncio.wait_for(stt.started.wait(), timeout=5)
         stt_rate = stt.sample_rate
@@ -749,7 +776,7 @@ async def test_actual_task7_partial_tts_failure_never_forwards_disclosure_mark()
         first_failure=failure,
     )
     output = transport.output_processor
-    runtime = await pipeline_module.build_runtime(
+    runtime = pipeline_module.build_runtime(
         pipeline=pipeline,
         first_failure=failure,
         greeting="Disclosure.",
@@ -759,6 +786,7 @@ async def test_actual_task7_partial_tts_failure_never_forwards_disclosure_mark()
     messages: list[str] = []
     log_sink = logger.add(messages.append, format="{message}")
     runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    await runtime.runner.add_workers(runtime.worker)
     try:
         assert await asyncio.wait_for(failure.wait(), timeout=5) == "tts_failed"
         await runtime.runner.cancel(reason="local_failure")
