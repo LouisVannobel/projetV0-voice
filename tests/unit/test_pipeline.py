@@ -840,3 +840,84 @@ async def test_actual_task7_partial_tts_failure_never_forwards_disclosure_mark()
     assert "tts_failed" in controller.aborts
     assert stream.closed is True
     assert "tts-provider-secret" not in "\n".join(messages)
+
+
+@pytest.mark.asyncio
+async def test_active_tts_fatal_error_retains_native_fatal_cancellation() -> None:
+    stream = _FailingChunkStream([b"\x01\x00" * 80])
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "audio/pcm"},
+            stream=stream,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    profile = InferenceProfileV1.model_validate(
+        {
+            "schema_version": 1,
+            "stt_model": "test/stt",
+            "llm_model": "test/llm",
+            "tts_model": "test/tts",
+            "tts_voice": "test-voice",
+            "tts_pcm_sample_rate": 8000,
+            "tts_pcm_channels": 1,
+            "llm_provider_policy": {"allow_fallbacks": False},
+            "tts_provider_options": {},
+        }
+    )
+    tts = OpenRouterTTSService(
+        profile=profile,
+        api_key=SecretStr("offline-secret"),
+        http_client=client,
+    )
+    controller = _GateController(active=True)
+    failure = pipeline_module.FirstFailure()
+    pipeline = pipeline_module.build_pipeline(
+        transport=_Transport(),
+        services=SimpleNamespace(
+            stt=_SetupProbe("stt"),
+            llm=_SetupProbe("llm"),
+            tts=tts,
+        ),
+        controller=controller,
+        turn_recorder=_Turns(),
+        first_failure=failure,
+    )
+    runtime = pipeline_module.build_runtime(
+        pipeline=pipeline,
+        first_failure=failure,
+        greeting="Conversation active.",
+        mark_name=controller.mark_name,
+        idle_timeout_seconds=60.0,
+    )
+    upstream_errors: list[ErrorFrame] = []
+    error_reached = asyncio.Event()
+
+    async def observe_error(_worker: object, frame: Frame) -> None:
+        assert isinstance(frame, ErrorFrame)
+        upstream_errors.append(frame)
+        error_reached.set()
+
+    runtime.worker.add_reached_upstream_filter((ErrorFrame,))
+    runtime.worker.add_event_handler("on_frame_reached_upstream", observe_error)
+    await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    try:
+        await asyncio.wait_for(error_reached.wait(), timeout=3)
+        await asyncio.wait_for(runner_task, timeout=3)
+    finally:
+        if not runner_task.done():
+            await runtime.runner.cancel(reason="test_cleanup")
+            await asyncio.wait_for(runner_task, timeout=3)
+        await client.aclose()
+
+    assert len(upstream_errors) == 1
+    assert upstream_errors[0].error == "tts_failed"
+    assert upstream_errors[0].fatal is True
+    assert upstream_errors[0].exception is None
+    assert upstream_errors[0].processor is None
+    assert failure.code is None
+    assert controller.aborts == []
+    assert stream.closed is True

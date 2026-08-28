@@ -952,6 +952,7 @@ def _actual_partial_tts_telnyx_session() -> tuple[
         recording=_RecordingBoundary(events),
         lease_terminalizer=lease,
         idle_timeout_seconds=60.0,
+        cleanup_phase_timeout_seconds=0.25,
         utcnow=lambda: NOW + timedelta(seconds=5),
         uuid_factory=_uuid_factory(),
     )
@@ -1320,14 +1321,105 @@ async def test_partial_tts_failure_invokes_injected_termination_cleanup() -> Non
 
 
 @pytest.mark.asyncio
-async def test_actual_partial_tts_failure_reaches_real_telnyx_clear_without_mark() -> None:
+async def test_pre_active_tts_failure_waits_for_exact_clear_before_public_runner_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_started = asyncio.Event()
+    clear_release = asyncio.Event()
+    upstream_error_reached = asyncio.Event()
+    pipeline_finished = asyncio.Event()
+    upstream_errors: list[ErrorFrame] = []
+    cancel_reasons: list[str | None] = []
+    runtime_box: list[object] = []
+    original_build_runtime = session_module.build_runtime
+    original_request_clear = pipeline_module.CallRuntime.request_clear
+    original_runner_cancel = WorkerRunner.cancel
+
+    def build_observed_runtime(**kwargs: object) -> object:
+        runtime = original_build_runtime(**kwargs)
+        runtime_box.append(runtime)
+
+        async def observe_upstream_error(_worker: object, frame: Frame) -> None:
+            assert isinstance(frame, ErrorFrame)
+            upstream_errors.append(frame)
+            upstream_error_reached.set()
+
+        async def observe_pipeline_finished(_worker: object, _frame: Frame) -> None:
+            pipeline_finished.set()
+
+        runtime.worker.add_reached_upstream_filter((ErrorFrame,))
+        runtime.worker.add_event_handler(
+            "on_frame_reached_upstream", observe_upstream_error
+        )
+        runtime.worker.add_event_handler(
+            "on_pipeline_finished", observe_pipeline_finished
+        )
+        return runtime
+
+    async def block_exact_clear(runtime: object) -> None:
+        clear_started.set()
+        await clear_release.wait()
+        await original_request_clear(runtime)
+
+    async def observe_runner_cancel(
+        runner: WorkerRunner,
+        reason: str | None = None,
+    ) -> None:
+        cancel_reasons.append(reason)
+        await original_runner_cancel(runner, reason=reason)
+
+    monkeypatch.setattr(session_module, "build_runtime", build_observed_runtime)
+    monkeypatch.setattr(pipeline_module.CallRuntime, "request_clear", block_exact_clear)
+    monkeypatch.setattr(WorkerRunner, "cancel", observe_runner_cancel)
     session, lease, writer, admission, sent, client, stream = (
         _actual_partial_tts_telnyx_session()
     )
+    running = asyncio.create_task(session.run(session.handshake))
     try:
+        await asyncio.wait_for(clear_started.wait(), timeout=5)
+        await asyncio.wait_for(upstream_error_reached.wait(), timeout=5)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(pipeline_finished.wait(), timeout=0.2)
+
+        assert len(runtime_box) == 1
+        assert runtime_box[0].worker.has_finished() is False
+        assert running.done() is False
+        assert cancel_reasons == []
+        assert len(upstream_errors) == 1
+        assert upstream_errors[0].error == "tts_failed"
+        assert upstream_errors[0].fatal is False
+        assert upstream_errors[0].exception is None
+        assert upstream_errors[0].processor is None
+        assert "tts-provider-secret" not in repr(upstream_errors[0])
+
+        blocked_payloads = [
+            json.loads(message["text"])
+            for message in sent
+            if message.get("type") == "websocket.send"
+            and isinstance(message.get("text"), str)
+        ]
+        blocked_events = [payload.get("event") for payload in blocked_payloads]
+        assert "media" in blocked_events
+        assert "clear" not in blocked_events
+        assert "mark" not in blocked_events
+        assert not any(
+            not isinstance(command, VoiceOperationV1)
+            and hasattr(command, "payload")
+            and command.payload["operation"].payload.disclosure_state == "completed"
+            for command in writer.commands
+        )
+        assert admission.allows_audio() is False
+
+        clear_release.set()
         with pytest.raises(session_module.CallSessionError, match="tts_failed"):
-            await asyncio.wait_for(session.run(session.handshake), timeout=5)
+            await asyncio.wait_for(running, timeout=5)
     finally:
+        clear_release.set()
+        if not running.done():
+            await asyncio.wait_for(
+                asyncio.gather(running, return_exceptions=True),
+                timeout=5,
+            )
         await client.aclose()
 
     payloads = [
@@ -1347,6 +1439,8 @@ async def test_actual_partial_tts_failure_reaches_real_telnyx_clear_without_mark
         for command in writer.commands
     )
     assert admission.allows_audio() is False
+    assert cancel_reasons == ["local_failure"]
+    assert pipeline_finished.is_set()
     assert lease.calls == [("failed", "tts_failed")]
     assert stream.closed is True
 

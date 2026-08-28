@@ -461,6 +461,7 @@ def build_pipeline(
             raise
         except Exception:
             return
+        error.fatal = False
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
     assistant_aggregator.add_event_handler(
         "on_assistant_turn_stopped", record_assistant_turn
