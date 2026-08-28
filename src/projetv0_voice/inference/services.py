@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, cast
 
+from openai import DefaultAsyncHttpxClient
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.services.whisper.base_stt import language_to_whisper_language
@@ -22,6 +23,7 @@ def build_stt(
     api_key: SecretStr,
     *,
     language: str,
+    http_client: DefaultAsyncHttpxClient | None = None,
 ) -> OpenAISTTService:
     """Build Pipecat's native segmented STT service against OpenRouter."""
 
@@ -41,6 +43,7 @@ def build_stt(
             model=profile.stt_model,
             language=resolved_language,
         ),
+        http_client=http_client,
     )
 
 

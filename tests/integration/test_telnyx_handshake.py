@@ -320,6 +320,8 @@ async def test_authenticate_builds_exact_native_call_data_and_transport_after_cl
     assert params.audio_out_enabled is True
     assert params.add_wav_header is False
     assert isinstance(params.serializer, ProjetV0TelnyxFrameSerializer)
+    assert result.audio_admission.is_bound is False
+    assert params.serializer.audio_admission is result.audio_admission
     assert params.serializer._stream_id == STREAM_ID
     assert params.serializer._expected_call_control_id == CALL_CONTROL_ID
     assert params.serializer._call_control_id is None

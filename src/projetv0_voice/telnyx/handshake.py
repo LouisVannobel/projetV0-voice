@@ -19,7 +19,7 @@ from pydantic import SecretStr
 from starlette.websockets import WebSocket
 
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
-from projetv0_voice.telnyx.serializer import ProjetV0TelnyxFrameSerializer
+from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
 TOKEN_HEADER = b"x-telnyx-streaming-auth-token"
 TOKEN_FIELD = "x-telnyx-streaming-auth-token"
@@ -79,6 +79,7 @@ class AuthenticatedTelnyxHandshake:
     token_locator_id: str
     lease_claim: LeaseClaim = field(repr=False)
     transport: FastAPIWebsocketTransport = field(repr=False)
+    audio_admission: AudioAdmission = field(repr=False)
 
     def __repr__(self) -> str:
         return "AuthenticatedTelnyxHandshake()"
@@ -408,9 +409,11 @@ class AuthenticatedTelnyxHandshakeService:
                         abort_required = False
                         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
 
+                    audio_admission = AudioAdmission()
                     serializer = ProjetV0TelnyxFrameSerializer(
                         captured.call_data.stream_id or "",
                         expected_call_control_id=call_control_id,
+                        audio_admission=audio_admission,
                     )
                     params = FastAPIWebsocketParams(
                         audio_in_enabled=True,
@@ -424,6 +427,7 @@ class AuthenticatedTelnyxHandshakeService:
                         token_locator_id=TOKEN_LOCATOR_ID,
                         lease_claim=lease_claim,
                         transport=transport,
+                        audio_admission=audio_admission,
                     )
                     handoff_complete = True
                     abort_required = False

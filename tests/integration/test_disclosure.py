@@ -1,0 +1,476 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+from datetime import UTC, datetime, timedelta
+from importlib import import_module
+from uuid import UUID
+
+import pytest
+from pipecat.frames.frames import InputAudioRawFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.tests.utils import run_test
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
+from starlette.websockets import WebSocket, WebSocketState
+
+from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
+
+pipeline_module = import_module("projetv0_voice.pipeline")
+session_module = import_module("projetv0_voice.session")
+
+NOW = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+
+
+class _Writer:
+    def __init__(self, *, fail: bool = False, block: bool = False) -> None:
+        self.fail = fail
+        self.block = block
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.commands: list[PersistenceCommand] = []
+
+    async def commit_control(self, command: PersistenceCommand) -> None:
+        self.commands.append(command)
+        self.started.set()
+        if self.block:
+            await self.release.wait()
+        if self.fail:
+            raise RuntimeError("storage-secret")
+
+
+class _Recording:
+    def __init__(
+        self,
+        outcome: object,
+        *,
+        block_after_accept: bool = False,
+    ) -> None:
+        self.outcome = outcome
+        self.block_after_accept = block_after_accept
+        self.starts = 0
+        self.accepted = asyncio.Event()
+        self.never = asyncio.Event()
+        self.cleanups = 0
+
+    async def start(self, _identity: object) -> object:
+        self.starts += 1
+        self.accepted.set()
+        if self.block_after_accept:
+            await self.never.wait()
+        return self.outcome
+
+    async def cleanup(
+        self,
+        _identity: object,
+        *,
+        recording_may_be_active: bool,
+        reason: str,
+    ) -> None:
+        del recording_may_be_active, reason
+        self.cleanups += 1
+
+
+def _identity(call_int: int = 1) -> object:
+    return session_module.CallIdentity(
+        call_id=UUID(int=call_int),
+        durable_generation=f"generation-{call_int}",
+        lease_identity=f"lease-{call_int}",
+        lease_claim=object(),
+        deployment_id=f"deployment-{call_int}",
+        registry_handle=f"registry-{call_int}",
+        telnyx_call_control_id=f"call-control-{call_int}",
+        telnyx_call_leg_id=f"call-leg-{call_int}",
+        telnyx_call_session_id=f"call-session-{call_int}",
+        stream_id=f"stream-{call_int}",
+        started_at=NOW,
+        retention_until=NOW + timedelta(days=7),
+    )
+
+
+def _uuids(start: int = 100):
+    current = start
+
+    def factory() -> UUID:
+        nonlocal current
+        value = UUID(int=current)
+        current += 1
+        return value
+
+    return factory
+
+
+def _controller(
+    *,
+    writer: _Writer | None = None,
+    recording: _Recording | None = None,
+    recording_enabled: bool = False,
+    recording_required: bool = False,
+    timeout: float = 0.05,
+    call_int: int = 1,
+) -> tuple[object, _Writer, _Recording, object]:
+    selected_writer = writer or _Writer()
+    selected_recording = recording or _Recording(
+        session_module.RecordingStartResult(
+            session_module.RecordingStartState.DEFINITELY_NOT_STARTED
+        )
+    )
+    failure = pipeline_module.FirstFailure()
+    controller = session_module.DisclosureController(
+        identity=_identity(call_int),
+        writer=selected_writer,
+        first_failure=failure,
+        recording=selected_recording,
+        recording_enabled=recording_enabled,
+        recording_required=recording_required,
+        mark_timeout_seconds=timeout,
+        utcnow=lambda: NOW + timedelta(seconds=1),
+        uuid_factory=_uuids(100 + call_int * 10),
+    )
+    return controller, selected_writer, selected_recording, failure
+
+
+@pytest.mark.asyncio
+async def test_fast_ack_before_mark_forward_commits_once_without_timeout_or_recording(
+) -> None:
+    controller, writer, recording, failure = _controller()
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+
+    assert await controller.accept_mark(controller.mark_name) is True
+    await controller.mark_forwarded()
+    await controller.join_continuations()
+
+    assert controller.state is session_module.DisclosureState.ACTIVE
+    assert controller.disclosure_completed is True
+    assert controller.is_active() is True
+    assert len(writer.commands) == 1
+    operation = writer.commands[0].payload["operation"]
+    assert operation.call_id == UUID(int=1)
+    assert operation.deployment_id == "deployment-1"
+    assert operation.payload.telnyx_call_control_id == "call-control-1"
+    assert operation.payload.telnyx_call_leg_id == "call-leg-1"
+    assert operation.payload.telnyx_call_session_id == "call-session-1"
+    assert operation.payload.disclosure_state == "completed"
+    assert recording.starts == 0
+    assert failure.code is None
+    assert controller.pending_task_count == 0
+
+
+@pytest.mark.asyncio
+async def test_no_audio_clear_timeout_and_foreign_or_late_acks_never_commit_or_open() -> None:
+    no_audio, writer, _, _ = _controller()
+    assert await no_audio.arm_expected_mark() is False
+    assert no_audio.state is session_module.DisclosureState.ABORTED
+    assert await no_audio.accept_mark(no_audio.mark_name) is False
+    assert writer.commands == []
+
+    cleared, cleared_writer, _, _ = _controller(call_int=2)
+    await cleared.note_disclosure_audio()
+    assert await cleared.arm_expected_mark() is True
+    await cleared.abort("disclosure_failed")
+    assert await cleared.accept_mark(cleared.mark_name) is False
+    assert cleared_writer.commands == []
+
+    timed, timed_writer, _, _ = _controller(timeout=0.001, call_int=3)
+    await timed.note_disclosure_audio()
+    assert await timed.arm_expected_mark() is True
+    await timed.mark_forwarded()
+    await asyncio.sleep(0.01)
+    assert timed.state is session_module.DisclosureState.ABORTED
+    assert await timed.accept_mark(timed.mark_name) is False
+    assert timed_writer.commands == []
+
+    foreign, foreign_writer, _, _ = _controller(call_int=4)
+    other, _, _, _ = _controller(call_int=5)
+    await foreign.note_disclosure_audio()
+    assert await foreign.arm_expected_mark() is True
+    assert await foreign.accept_mark(other.mark_name) is False
+    assert foreign_writer.commands == []
+    await foreign.abort("disclosure_failed")
+
+
+@pytest.mark.asyncio
+async def test_clear_during_blocked_commit_preserves_completed_history_but_never_opens() -> None:
+    writer = _Writer(block=True)
+    controller, _, recording, failure = _controller(writer=writer)
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    assert await controller.accept_mark(controller.mark_name) is True
+    await writer.started.wait()
+
+    await controller.abort("disclosure_failed")
+    writer.release.set()
+    await controller.join_continuations()
+
+    assert controller.state is session_module.DisclosureState.ABORTED
+    assert controller.disclosure_completed is True
+    assert controller.is_active() is False
+    assert recording.starts == 0
+    assert len(writer.commands) == 1
+    assert failure.code == "disclosure_failed"
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_is_constant_safe_and_starts_nothing() -> None:
+    writer = _Writer(fail=True)
+    controller, _, recording, failure = _controller(writer=writer)
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    assert await controller.accept_mark(controller.mark_name) is True
+    await controller.join_continuations()
+
+    assert controller.state is session_module.DisclosureState.ABORTED
+    assert controller.disclosure_completed is False
+    assert controller.is_active() is False
+    assert recording.starts == 0
+    assert failure.code == "disclosure_commit_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("required", "result", "active", "cleanup_required"),
+    [
+        (
+            True,
+            lambda: session_module.RecordingStartResult(
+                session_module.RecordingStartState.STARTED
+            ),
+            True,
+            True,
+        ),
+        (
+            True,
+            lambda: session_module.RecordingStartResult(
+                session_module.RecordingStartState.DEFINITELY_NOT_STARTED
+            ),
+            False,
+            False,
+        ),
+        (
+            False,
+            lambda: session_module.RecordingStartResult(
+                session_module.RecordingStartState.DEFINITELY_NOT_STARTED
+            ),
+            True,
+            False,
+        ),
+        (
+            False,
+            lambda: session_module.RecordingStartResult(
+                session_module.RecordingStartState.INDETERMINATE,
+                gate_may_open=True,
+            ),
+            True,
+            True,
+        ),
+        (
+            True,
+            lambda: session_module.RecordingStartResult(
+                session_module.RecordingStartState.INDETERMINATE
+            ),
+            False,
+            True,
+        ),
+    ],
+)
+async def test_recording_policy_matrix(
+    required: bool,
+    result: object,
+    active: bool,
+    cleanup_required: bool,
+) -> None:
+    recording = _Recording(result())
+    controller, _, _, failure = _controller(
+        recording=recording,
+        recording_enabled=True,
+        recording_required=required,
+    )
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    assert await controller.accept_mark(controller.mark_name) is True
+    await controller.join_continuations()
+
+    assert controller.is_active() is active
+    assert controller.recording_may_be_active is cleanup_required
+    assert recording.starts == 1
+    assert (failure.code is None) is active
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_recording_provider_acceptance_keeps_cleanup_ownership() -> None:
+    recording = _Recording(
+        session_module.RecordingStartResult(session_module.RecordingStartState.STARTED),
+        block_after_accept=True,
+    )
+    controller, _, _, _ = _controller(
+        recording=recording,
+        recording_enabled=True,
+        recording_required=True,
+    )
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    assert await controller.accept_mark(controller.mark_name) is True
+    await recording.accepted.wait()
+    await controller.abort("recording_failed")
+    await controller.cancel_and_join_continuations()
+
+    assert controller.state is session_module.DisclosureState.ABORTED
+    assert controller.recording_may_be_active is True
+    assert controller.pending_task_count == 0
+
+
+class _TransportGateController:
+    def __init__(self) -> None:
+        self.active = False
+        self.mark_name = "open"
+
+    def is_active(self) -> bool:
+        return self.active
+
+    async def accept_mark(self, mark_name: str) -> bool:
+        if mark_name == self.mark_name:
+            self.active = True
+            return True
+        return False
+
+    async def abort(self, _code: str) -> None:
+        self.active = False
+
+    async def note_disclosure_audio(self) -> None:
+        return None
+
+    async def arm_expected_mark(self) -> bool:
+        return True
+
+    async def mark_forwarded(self) -> None:
+        return None
+
+
+def _media(byte: int) -> str:
+    return json.dumps(
+        {
+            "event": "media",
+            "stream_id": "stream-one",
+            "media": {"payload": base64.b64encode(bytes([byte]) * 80).decode("ascii")},
+        }
+    )
+
+
+def _websocket_messages(messages: list[str]) -> WebSocket:
+    queued = list(messages)
+
+    async def receive() -> dict[str, object]:
+        if queued:
+            return {"type": "websocket.receive", "text": queued.pop(0)}
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send(_message: dict[str, object]) -> None:
+        return None
+
+    websocket = WebSocket(
+        {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "scheme": "wss",
+            "server": ("voice.invalid", 443),
+            "client": ("127.0.0.1", 12345),
+            "root_path": "",
+            "path": "/media",
+            "raw_path": b"/media",
+            "query_string": b"",
+            "headers": [],
+            "subprotocols": [],
+        },
+        receive=receive,
+        send=send,
+    )
+    websocket.application_state = WebSocketState.CONNECTED
+    websocket.client_state = WebSocketState.CONNECTED
+    return websocket
+
+
+@pytest.mark.asyncio
+async def test_real_fastapi_transport_drops_pre_ack_audio_then_passes_post_active_once() -> None:
+    controller = _TransportGateController()
+    admission = AudioAdmission()
+    admission.bind(controller.is_active)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=admission,
+    )
+    mark = json.dumps(
+        {
+            "event": "mark",
+            "stream_id": "stream-one",
+            "mark": {"name": "open"},
+        }
+    )
+    transport = FastAPIWebsocketTransport(
+        _websocket_messages([_media(1), mark, _media(2)]),
+        FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            serializer=serializer,
+        ),
+    )
+    gate = pipeline_module.build_input_gate(
+        controller=controller,
+        first_failure=pipeline_module.FirstFailure(),
+    )
+
+    downstream, _ = await run_test(
+        Pipeline([transport.input(), gate]),
+        frames_to_send=[],
+        pipeline_params=pipeline_module.pipeline_params(),
+    )
+
+    audio = [frame for frame in downstream if isinstance(frame, InputAudioRawFrame)]
+    assert len(audio) == 1
+    assert audio[0].audio != b""
+
+
+@pytest.mark.asyncio
+async def test_real_fastapi_transport_rechecks_admitted_audio_after_immediate_abort() -> None:
+    controller = _TransportGateController()
+    controller.active = True
+    admission = AudioAdmission()
+    admission.bind(controller.is_active)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=admission,
+    )
+    error = json.dumps(
+        {
+            "event": "error",
+            "stream_id": "stream-one",
+            "payload": {"code": 100005, "title": "media failure"},
+        }
+    )
+    transport = FastAPIWebsocketTransport(
+        _websocket_messages([_media(3), error]),
+        FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            serializer=serializer,
+        ),
+    )
+    gate = pipeline_module.build_input_gate(
+        controller=controller,
+        first_failure=pipeline_module.FirstFailure(),
+    )
+
+    downstream, _ = await run_test(
+        Pipeline([transport.input(), gate]),
+        frames_to_send=[],
+        pipeline_params=pipeline_module.pipeline_params(),
+    )
+
+    assert controller.active is False
+    assert not any(isinstance(frame, InputAudioRawFrame) for frame in downstream)

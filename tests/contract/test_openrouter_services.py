@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from loguru import logger
-from openai import NOT_GIVEN, AsyncOpenAI
+from openai import NOT_GIVEN, AsyncOpenAI, DefaultAsyncHttpxClient
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pydantic import SecretStr
@@ -64,6 +64,31 @@ async def test_build_stt_uses_native_openrouter_multipart_with_manifest_language
         "model": "test/stt",
         "language": "fr",
     }
+
+
+@pytest.mark.asyncio
+async def test_build_stt_passes_the_publicly_injected_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _services_module()
+    profile = InferenceProfileV1.model_validate(_profile_data())
+    client = DefaultAsyncHttpxClient()
+    captured: dict[str, object] = {}
+
+    def capture_init(_self: OpenAISTTService, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(OpenAISTTService, "__init__", capture_init)
+    try:
+        module.build_stt(
+            profile,
+            SecretStr("unit-secret"),
+            language="fr-FR",
+            http_client=client,
+        )
+        assert captured["http_client"] is client
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.parametrize("language", ["not-a-language", "ast"])
