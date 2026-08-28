@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Coroutine, Sequence
 from contextvars import Context
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -76,7 +76,6 @@ class FirstFailure:
         self._event = asyncio.Event()
         self._code: str | None = None
         self._shared_failure_event = shared_failure_event
-        self._on_first_failure: Callable[[str], None] | None = None
 
     @property
     def code(self) -> str | None:
@@ -86,12 +85,7 @@ class FirstFailure:
         safe_code = code if code in self._SAFE_CODES else "call_failed"
         if self._code is None:
             self._code = safe_code
-            if self._on_first_failure is not None:
-                self._on_first_failure(safe_code)
             self._event.set()
-
-    def set_on_first_failure(self, callback: Callable[[str], None]) -> None:
-        self._on_first_failure = callback
 
     async def wait(self) -> str:
         shared = self._shared_failure_event
@@ -273,6 +267,9 @@ def build_input_gate(
         except Exception:
             return
 
+    def input_is_open() -> bool:
+        return first_failure.code is None and controller.is_active()
+
     async def predicate(frame: Frame) -> bool:
         try:
             if isinstance(frame, (StartFrame, EndFrame, CancelFrame, ErrorFrame)):
@@ -286,19 +283,20 @@ def build_input_gate(
                     mark = message.get("mark")
                     if not isinstance(mark, dict) or not isinstance(mark.get("name"), str):
                         raise ValueError
-                    await controller.accept_mark(mark["name"])
+                    if first_failure.code is None:
+                        await controller.accept_mark(mark["name"])
                 elif event in {"stop", "error"}:
                     await controller.abort("call_failed")
                 else:
                     raise ValueError
                 return False
             if isinstance(frame, InputAudioRawFrame):
-                return controller.is_active()
-            if isinstance(frame, InterruptionFrame) and not controller.is_active():
+                return input_is_open()
+            if isinstance(frame, InterruptionFrame) and not input_is_open():
                 await controller.abort("disclosure_failed")
                 return True
             return not (
-                isinstance(frame, _CLOSED_INPUT_FRAMES) and not controller.is_active()
+                isinstance(frame, _CLOSED_INPUT_FRAMES) and not input_is_open()
             )
         except asyncio.CancelledError:
             raise

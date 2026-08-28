@@ -30,7 +30,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.registry.registry import WorkerRegistry
 from pipecat.runner.types import TelnyxCallData
 from pipecat.services.stt_service import SegmentedSTTService
@@ -60,11 +60,19 @@ NOW = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
 
 
 class _SttClient:
-    def __init__(self, *, failures: int = 0, block: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        failures: int = 0,
+        block: bool = False,
+        child_cancel: bool = False,
+    ) -> None:
         self.failures = failures
         self.block = block
+        self.child_cancel = child_cancel
         self.calls = 0
         self.started = asyncio.Event()
+        self.completed = asyncio.Event()
         self.cancelled = asyncio.Event()
         self.never = asyncio.Event()
 
@@ -77,16 +85,27 @@ class _SttClient:
             except asyncio.CancelledError:
                 self.cancelled.set()
                 raise
+        if self.child_cancel:
+            raise asyncio.CancelledError("stt-child-cancel")
         if self.calls <= self.failures:
             raise RuntimeError("stt-client-secret")
+        self.completed.set()
 
 
 class _LlmClient:
-    def __init__(self, *, failures: int = 0, block: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        failures: int = 0,
+        block: bool = False,
+        child_cancel: bool = False,
+    ) -> None:
         self.failures = failures
         self.block = block
+        self.child_cancel = child_cancel
         self.calls = 0
         self.started = asyncio.Event()
+        self.completed = asyncio.Event()
         self.cancelled = asyncio.Event()
         self.never = asyncio.Event()
 
@@ -99,8 +118,11 @@ class _LlmClient:
             except asyncio.CancelledError:
                 self.cancelled.set()
                 raise
+        if self.child_cancel:
+            raise asyncio.CancelledError("llm-child-cancel")
         if self.calls <= self.failures:
             raise RuntimeError("llm-client-secret")
+        self.completed.set()
 
 
 def _identity(lease_claim: object | None = None, *, call_int: int = 1) -> object:
@@ -190,6 +212,80 @@ async def test_service_bundle_cancellation_joins_close_tasks_and_is_retryable() 
     await bundle.aclose()
     assert stt_client.calls == 2
     assert llm_client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_service_bundle_parent_cancel_retains_completed_stt_close() -> None:
+    stt_client = _SttClient()
+    llm_client = _LlmClient(block=True)
+    bundle = session_module.ServiceBundle(
+        stt=SimpleNamespace(),
+        llm=SimpleNamespace(_client=llm_client),
+        tts=SimpleNamespace(),
+        stt_http_client=stt_client,
+        close_timeout_seconds=1.0,
+    )
+    closing = asyncio.create_task(bundle.aclose())
+    await asyncio.gather(stt_client.completed.wait(), llm_client.started.wait())
+
+    closing.cancel("parent-close-cancel")
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+    assert cancelled.value.args == ("parent-close-cancel",)
+    assert llm_client.cancelled.is_set()
+
+    llm_client.block = False
+    await bundle.aclose()
+    assert stt_client.calls == 1
+    assert llm_client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_service_bundle_parent_cancel_retains_completed_llm_close() -> None:
+    stt_client = _SttClient(block=True)
+    llm_client = _LlmClient()
+    bundle = session_module.ServiceBundle(
+        stt=SimpleNamespace(),
+        llm=SimpleNamespace(_client=llm_client),
+        tts=SimpleNamespace(),
+        stt_http_client=stt_client,
+        close_timeout_seconds=1.0,
+    )
+    closing = asyncio.create_task(bundle.aclose())
+    await asyncio.gather(stt_client.started.wait(), llm_client.completed.wait())
+
+    closing.cancel("parent-close-cancel")
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+    assert cancelled.value.args == ("parent-close-cancel",)
+    assert stt_client.cancelled.is_set()
+
+    stt_client.block = False
+    await bundle.aclose()
+    assert stt_client.calls == 2
+    assert llm_client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_service_bundle_preserves_child_cancel_after_sibling_success() -> None:
+    stt_client = _SttClient(child_cancel=True)
+    llm_client = _LlmClient()
+    bundle = session_module.ServiceBundle(
+        stt=SimpleNamespace(),
+        llm=SimpleNamespace(_client=llm_client),
+        tts=SimpleNamespace(),
+        stt_http_client=stt_client,
+        close_timeout_seconds=1.0,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await bundle.aclose()
+    assert llm_client.completed.is_set()
+
+    stt_client.child_cancel = False
+    await bundle.aclose()
+    assert stt_client.calls == 2
+    assert llm_client.calls == 1
 
 
 @pytest.mark.asyncio
@@ -347,6 +443,17 @@ class _PassProcessor(FrameProcessor):
         raise RuntimeError("nested-provider-secret")
 
 
+class _SetupFailingProcessor(_PassProcessor):
+    def __init__(self, name: str, events: list[str]) -> None:
+        super().__init__(name, events)
+        self.setup_attempted = asyncio.Event()
+
+    async def setup(self, setup: FrameProcessorSetup) -> None:
+        await super().setup(setup)
+        self.setup_attempted.set()
+        raise RuntimeError("processor-setup-secret")
+
+
 class _SegmentedSessionStt(SegmentedSTTService):
     def __init__(self) -> None:
         super().__init__()
@@ -409,6 +516,35 @@ class _PartialFailingTts(_OfflineTts):
                 )
             )
             return
+        await super().process_frame(frame, direction)
+
+
+class _ConversationFailingTts(_OfflineTts):
+    def __init__(self, name: str, events: list[str]) -> None:
+        super().__init__(name, events)
+        self._speak_count = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, TTSSpeakFrame):
+            self._speak_count += 1
+            if self._speak_count > 1:
+                await FrameProcessor.process_frame(self, frame, direction)
+                await self.push_frame(
+                    TTSAudioRawFrame(
+                        audio=b"\x01\x00" * 80,
+                        sample_rate=8000,
+                        num_channels=1,
+                        context_id="conversation",
+                    ),
+                    direction,
+                )
+                await self.push_error_frame(
+                    ErrorFrame(
+                        error="tts-conversation-secret",
+                        fatal=True,
+                    )
+                )
+                return
         await super().process_frame(frame, direction)
 
 
@@ -655,6 +791,7 @@ def _session(
     service_close_cancelled: asyncio.Event | None = None,
     task_factory: object | None = None,
     partial_tts_failure: bool = False,
+    tts_override: FrameProcessor | None = None,
     segmented_stt: bool = False,
     call_int: int = 1,
     writer_override: _SessionWriter | None = None,
@@ -672,7 +809,7 @@ def _session(
         else _PassProcessor("stt", events, nested_failure=nested_failure)
     )
     llm = _PassProcessor("llm", events)
-    tts = (
+    tts = tts_override or (
         _PartialFailingTts("tts", events)
         if partial_tts_failure
         else _OfflineTts("tts", events)
@@ -733,6 +870,99 @@ def _session(
     )
     session.handshake = _handshake(transport, lease_claim, call_int=call_int)
     return session, stt, lease, writer, transport
+
+
+def _real_cleanup_session(
+    *,
+    events: list[str],
+    stt: FrameProcessor,
+) -> tuple[object, _LeaseTerminalizer, _SessionWriter, WebSocket]:
+    never = asyncio.Event()
+
+    class _ObservedTransport(FastAPIWebsocketTransport):
+        async def cleanup(self) -> None:
+            events.append("transport-owner-cleanup")
+            await super().cleanup()
+
+    async def receive() -> dict[str, object]:
+        await never.wait()
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send(message: dict[str, object]) -> None:
+        if message.get("type") == "websocket.close":
+            events.append("websocket-disconnect")
+
+    websocket = WebSocket(
+        {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "scheme": "wss",
+            "server": ("voice.invalid", 443),
+            "client": ("127.0.0.1", 12345),
+            "root_path": "",
+            "path": "/media",
+            "raw_path": b"/media",
+            "query_string": b"",
+            "headers": [],
+            "subprotocols": [],
+        },
+        receive=receive,
+        send=send,
+    )
+    websocket.application_state = WebSocketState.CONNECTED
+    websocket.client_state = WebSocketState.CONNECTED
+    admission = AudioAdmission()
+    transport = _ObservedTransport(
+        websocket,
+        FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            serializer=ProjetV0TelnyxFrameSerializer(
+                "stream-1",
+                expected_call_control_id="call-control-1",
+                audio_admission=admission,
+            ),
+        ),
+    )
+    services = _SessionServices(
+        stt=stt,
+        llm=_PassProcessor("llm", events),
+        tts=_OfflineTts("tts", events),
+        events=events,
+    )
+    writer = _SessionWriter(events)
+    lease = _LeaseTerminalizer(events)
+    lease_claim = object()
+    session = session_module.CallSession(
+        identity=_identity(lease_claim),
+        manifest=_manifest(),
+        profile=_profile(),
+        services=services,
+        writer=writer,
+        keyring=CryptoKeyring(
+            {1: b"k" * 32},
+            active_version=1,
+            nonce_factory=lambda size: b"n" * size,
+        ),
+        recording=_RecordingBoundary(events),
+        lease_terminalizer=lease,
+        idle_timeout_seconds=60.0,
+        cleanup_phase_timeout_seconds=0.25,
+        utcnow=lambda: NOW + timedelta(seconds=5),
+        uuid_factory=_uuid_factory(),
+    )
+    session.handshake = AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData(
+            stream_id="stream-1",
+            call_id="call-control-1",
+            outbound_encoding="PCMU",
+        ),
+        token_locator_id="telnyx-header-connected-v1",
+        lease_claim=lease_claim,
+        transport=transport,
+        audio_admission=admission,
+    )
+    return session, lease, writer, websocket
 
 
 def _real_websocket_session(
@@ -1145,6 +1375,46 @@ async def test_first_cleanup_failure_changes_normal_close_to_failed_terminal_sta
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "code"),
+    [
+        ("recording", "recording_cleanup_failed"),
+        ("services", "service_close_failed"),
+        ("writer", "persistence_failed"),
+        ("lease", "lease_terminalization_failed"),
+    ],
+)
+async def test_late_cleanup_failure_never_requests_clear_after_runner_quiescence(
+    phase: str,
+    code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    clear_calls = 0
+
+    async def observe_clear(_runtime: object) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+
+    monkeypatch.setattr(pipeline_module.CallRuntime, "request_clear", observe_clear)
+    session, _stt, _lease, writer, _transport = _session(
+        events=events,
+        echo_ack=True,
+        cleanup_fault_phase=phase,
+        cleanup_fault_kind="ordinary",
+    )
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(writer.disclosure_committed.wait(), timeout=3)
+    await session.request_drain()
+
+    with pytest.raises(session_module.CallSessionError, match=code):
+        await asyncio.wait_for(running, timeout=3)
+    await asyncio.sleep(0)
+
+    assert clear_calls == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["controller", "runner"])
 @pytest.mark.parametrize("fault", ["ordinary", "cancel", "timeout"])
 async def test_controller_and_runner_cleanup_faults_do_not_skip_later_phases(
@@ -1318,6 +1588,92 @@ async def test_partial_tts_failure_invokes_injected_termination_cleanup() -> Non
 
     assert "termination:False:tts_failed" in events
     assert lease.calls == [("failed", "tts_failed")]
+
+
+@pytest.mark.asyncio
+async def test_active_native_tts_fatal_keeps_native_ownership_and_failed_terminal_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime_box: list[object] = []
+    upstream_errors: list[ErrorFrame] = []
+    failure_codes_at_error: list[str | None] = []
+    cancel_reasons: list[str | None] = []
+    clear_calls = 0
+    error_reached = asyncio.Event()
+    original_build_runtime = session_module.build_runtime
+    original_runner_cancel = WorkerRunner.cancel
+
+    def build_observed_runtime(**kwargs: object) -> object:
+        first_failure = kwargs["first_failure"]
+        runtime = original_build_runtime(**kwargs)
+        runtime_box.append(runtime)
+
+        async def observe_pipeline_error(_worker: object, frame: Frame) -> None:
+            assert isinstance(frame, ErrorFrame)
+            upstream_errors.append(frame)
+            failure_codes_at_error.append(first_failure.code)
+            error_reached.set()
+
+        runtime.worker.add_event_handler("on_pipeline_error", observe_pipeline_error)
+        return runtime
+
+    async def observe_runner_cancel(
+        runner: WorkerRunner,
+        reason: str | None = None,
+    ) -> None:
+        cancel_reasons.append(reason)
+        await original_runner_cancel(runner, reason=reason)
+
+    async def observe_clear(_runtime: object) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+
+    monkeypatch.setattr(session_module, "build_runtime", build_observed_runtime)
+    monkeypatch.setattr(WorkerRunner, "cancel", observe_runner_cancel)
+    monkeypatch.setattr(pipeline_module.CallRuntime, "request_clear", observe_clear)
+    session, _stt, lease, writer, _transport = _session(
+        events=events,
+        echo_ack=True,
+        tts_override=_ConversationFailingTts("tts", events),
+        cleanup_fault_phase="services",
+        cleanup_fault_kind="ordinary",
+    )
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(writer.disclosure_committed.wait(), timeout=3)
+    await asyncio.sleep(0)
+    assert session.handshake.audio_admission.allows_audio() is True
+    assert len(runtime_box) == 1
+    await runtime_box[0].worker.queue_frame(
+        TTSSpeakFrame("Conversation en cours.", append_to_context=False)
+    )
+    await asyncio.wait_for(error_reached.wait(), timeout=3)
+
+    with pytest.raises(session_module.CallSessionError, match="tts_failed"):
+        await asyncio.wait_for(running, timeout=3)
+
+    terminal_operations = [
+        command.payload["operation"]
+        for command in writer.commands
+        if not isinstance(command, VoiceOperationV1)
+        and hasattr(command, "payload")
+        and command.payload["operation"].kind == "call.upsert"
+        and command.payload["operation"].payload.status == "failed"
+    ]
+    assert len(upstream_errors) == 1
+    assert upstream_errors[0].error == "tts_failed"
+    assert upstream_errors[0].fatal is True
+    assert upstream_errors[0].exception is None
+    assert upstream_errors[0].processor is None
+    assert failure_codes_at_error == [None]
+    assert cancel_reasons == []
+    assert clear_calls == 0
+    assert "termination:False:tts_failed" in events
+    assert len(terminal_operations) == 1
+    assert terminal_operations[0].payload.end_reason == "tts_failed"
+    assert terminal_operations[0].payload.disclosure_state == "completed"
+    assert lease.calls == [("failed", "tts_failed")]
+    assert session.handshake.audio_admission.allows_audio() is False
 
 
 @pytest.mark.parametrize(
@@ -1504,6 +1860,7 @@ async def test_request_drain_uses_public_runner_and_closes_active_session() -> N
 
     assert lease.calls == [("closed", "closed")]
     assert events[-1] == "lease-terminal"
+    assert events.count("pipeline:tts") == 1
 
 
 @pytest.mark.asyncio
@@ -1715,6 +2072,82 @@ async def test_post_bind_startup_failure_runs_partial_state_cleanup(
     if failure_point == "add_workers":
         assert worker_finished.is_set() is False
         assert any(item.startswith("pipeline:") for item in events)
+
+
+@pytest.mark.asyncio
+async def test_composition_failure_cleans_known_processors_and_websocket_before_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    session, lease, _writer, websocket = _real_cleanup_session(
+        events=events,
+        stt=_PassProcessor("stt", events),
+    )
+
+    def fail_composition(**_kwargs: object) -> None:
+        raise RuntimeError("pipeline-composition-secret")
+
+    monkeypatch.setattr(session_module, "build_pipeline", fail_composition)
+    with pytest.raises(session_module.CallSessionError, match="call_failed"):
+        await asyncio.wait_for(session.run(session.handshake), timeout=3)
+
+    assert events.index("pipeline:stt") < events.index("pipeline:llm")
+    assert events.index("pipeline:llm") < events.index("pipeline:tts")
+    assert events.index("websocket-disconnect") < events.index("pipeline:stt")
+    output_cleanup_index = max(
+        index
+        for index, event in enumerate(events)
+        if event == "transport-owner-cleanup"
+    )
+    assert events.count("transport-owner-cleanup") == 2
+    assert events.index("pipeline:tts") < output_cleanup_index
+    assert output_cleanup_index < events.index("services-attempt")
+    assert websocket.application_state is WebSocketState.DISCONNECTED
+    assert lease.calls == [("failed", "call_failed")]
+
+
+@pytest.mark.asyncio
+async def test_native_processor_setup_failure_recovers_public_pipeline_and_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stt = _SetupFailingProcessor("stt", events)
+    runtime_box: list[object] = []
+    worker_cleanup_states: list[bool] = []
+    original_build_runtime = session_module.build_runtime
+    original_worker_cleanup = PipelineWorker.cleanup
+
+    def build_observed_runtime(**kwargs: object) -> object:
+        runtime = original_build_runtime(**kwargs)
+        runtime_box.append(runtime)
+        return runtime
+
+    async def observe_worker_cleanup(worker: PipelineWorker) -> None:
+        worker_cleanup_states.append(worker.has_finished())
+        await original_worker_cleanup(worker)
+
+    monkeypatch.setattr(session_module, "build_runtime", build_observed_runtime)
+    monkeypatch.setattr(PipelineWorker, "cleanup", observe_worker_cleanup)
+    session, lease, _writer, websocket = _real_cleanup_session(events=events, stt=stt)
+
+    with pytest.raises(session_module.CallSessionError, match="pipeline_task_failed"):
+        await asyncio.wait_for(session.run(session.handshake), timeout=3)
+
+    assert stt.setup_attempted.is_set()
+    assert len(runtime_box) == 1
+    assert worker_cleanup_states == [False]
+    assert events.count("pipeline:tts") == 1
+    assert events.index("websocket-disconnect") < events.index("pipeline:stt")
+    output_cleanup_index = max(
+        index
+        for index, event in enumerate(events)
+        if event == "transport-owner-cleanup"
+    )
+    assert events.count("transport-owner-cleanup") == 2
+    assert events.index("pipeline:tts") < output_cleanup_index
+    assert output_cleanup_index < events.index("services-attempt")
+    assert websocket.application_state is WebSocketState.DISCONNECTED
+    assert lease.calls == [("failed", "pipeline_task_failed")]
 
 
 @pytest.mark.asyncio

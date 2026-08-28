@@ -8,7 +8,7 @@ from importlib import import_module
 from uuid import UUID
 
 import pytest
-from pipecat.frames.frames import InputAudioRawFrame, InterruptionFrame
+from pipecat.frames.frames import InputAudioRawFrame, InterruptionFrame, StartFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.tests.utils import run_test
 from pipecat.transports.websocket.fastapi import (
@@ -225,6 +225,40 @@ async def test_clear_during_blocked_commit_preserves_completed_history_but_never
 
 
 @pytest.mark.asyncio
+async def test_local_failure_before_mark_or_ack_blocks_completion_and_open() -> None:
+    controller, writer, recording, failure = _controller()
+    await controller.note_disclosure_audio()
+    failure.signal("writer_failed")
+
+    assert await controller.arm_expected_mark() is False
+    assert await controller.accept_mark(controller.mark_name) is False
+    await controller.join_continuations()
+
+    assert controller.is_active() is False
+    assert writer.commands == []
+    assert recording.starts == 0
+
+
+@pytest.mark.asyncio
+async def test_local_failure_during_ack_commit_retains_history_but_never_opens() -> None:
+    writer = _Writer(block=True)
+    controller, _, recording, failure = _controller(writer=writer)
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    assert await controller.accept_mark(controller.mark_name) is True
+    await writer.started.wait()
+
+    failure.signal("writer_failed")
+    writer.release.set()
+    await controller.join_continuations()
+
+    assert controller.disclosure_completed is True
+    assert controller.is_active() is False
+    assert recording.starts == 0
+    assert len(writer.commands) == 1
+
+
+@pytest.mark.asyncio
 async def test_commit_failure_is_constant_safe_and_starts_nothing() -> None:
     writer = _Writer(fail=True)
     controller, _, recording, failure = _controller(writer=writer)
@@ -430,6 +464,42 @@ def _media(byte: int) -> str:
             "media": {"payload": base64.b64encode(bytes([byte]) * 80).decode("ascii")},
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_active_local_failure_closes_serializer_and_drops_admitted_audio_at_gate() -> None:
+    controller, _writer, _recording, failure = _controller()
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    assert await controller.accept_mark(controller.mark_name) is True
+    await controller.join_continuations()
+    assert controller.is_active() is True
+
+    admission = AudioAdmission()
+    admission.bind(controller.is_active)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=admission,
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    admitted = await serializer.deserialize(_media(6))
+    assert isinstance(admitted, InputAudioRawFrame)
+
+    failure.signal("writer_failed")
+
+    assert controller.state is session_module.DisclosureState.ACTIVE
+    assert admission.allows_audio() is False
+    assert await serializer.deserialize(_media(7)) is None
+    downstream, _ = await run_test(
+        pipeline_module.build_input_gate(
+            controller=controller,
+            first_failure=failure,
+        ),
+        frames_to_send=[admitted],
+        expected_down_frames=[],
+    )
+    assert downstream == []
 
 
 def _websocket_messages(

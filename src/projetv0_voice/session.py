@@ -14,6 +14,7 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
+from pipecat.frames.frames import ErrorFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.workers.runner import WorkerRunner
 
@@ -25,6 +26,7 @@ from projetv0_voice.pipeline import (
     CallRuntime,
     FirstFailure,
     ObservedPipeline,
+    PipelineTransport,
     build_pipeline,
     build_runtime,
 )
@@ -151,48 +153,53 @@ class ServiceBundle:
 
     async def aclose(self) -> None:
         async with self._lock:
-            close_jobs: list[tuple[str, asyncio.Task[None]]] = []
+            close_jobs: list[asyncio.Task[None]] = []
             if not self._stt_closed:
                 close_jobs.append(
-                    (
-                        "stt",
-                        asyncio.create_task(
-                            self._bounded_close(self.stt_http_client.aclose),
-                            name="close-stt-http-client",
-                        ),
+                    asyncio.create_task(
+                        self._close_stt_client(),
+                        name="close-stt-http-client",
                     )
                 )
             if not self._llm_closed:
                 close_jobs.append(
-                    (
-                        "llm",
-                        asyncio.create_task(
-                            self._bounded_close(self._close_pinned_llm_client),
-                            name="close-llm-client",
-                        ),
+                    asyncio.create_task(
+                        self._close_llm_client(),
+                        name="close-llm-client",
                     )
                 )
             if not close_jobs:
                 return
-            tasks = [task for _, task in close_jobs]
             try:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-            except asyncio.CancelledError:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+                await asyncio.wait(close_jobs)
+            except asyncio.CancelledError as cancellation:
+                for task in close_jobs:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*close_jobs, return_exceptions=True)
+                raise cancellation
+            results = await asyncio.gather(*close_jobs, return_exceptions=True)
 
-            failed = False
-            for (resource, _task), result in zip(close_jobs, results, strict=True):
-                if isinstance(result, BaseException):
-                    failed = True
-                elif resource == "stt":
-                    self._stt_closed = True
-                else:
-                    self._llm_closed = True
-            if failed:
+            child_cancellation = next(
+                (
+                    result
+                    for result in results
+                    if isinstance(result, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if child_cancellation is not None:
+                raise child_cancellation
+            if any(isinstance(result, BaseException) for result in results):
                 raise ServiceLifecycleError("service_close_failed")
+
+    async def _close_stt_client(self) -> None:
+        await self._bounded_close(self.stt_http_client.aclose)
+        self._stt_closed = True
+
+    async def _close_llm_client(self) -> None:
+        await self._bounded_close(self._close_pinned_llm_client)
+        self._llm_closed = True
 
     async def _bounded_close(self, close: Callable[[], Awaitable[None]]) -> None:
         try:
@@ -395,6 +402,32 @@ class _TerminalOutcome:
         return self._frozen
 
 
+class _NativeFatalObservation:
+    """First constant-safe fatal evidence observed on Pipecat's native path."""
+
+    _SAFE_CODES = frozenset(
+        {"stt_failed", "llm_failed", "tts_failed", "inference_failed", "call_failed"}
+    )
+
+    def __init__(self) -> None:
+        self._code: str | None = None
+
+    @property
+    def code(self) -> str | None:
+        return self._code
+
+    def record(self, error: ErrorFrame) -> None:
+        if self._code is not None:
+            return
+        try:
+            if not isinstance(error, ErrorFrame) or not error.fatal:
+                return
+            code = error.error if error.error in self._SAFE_CODES else "call_failed"
+        except Exception:
+            code = "call_failed"
+        self._code = code
+
+
 class CallSession:
     """Own and supervise one authenticated Pipecat call runtime."""
 
@@ -453,6 +486,7 @@ class CallSession:
         self._verify_handshake(handshake)
 
         first_failure = FirstFailure(shared_failure_event=self._writer.fatal_event)
+        native_fatal = _NativeFatalObservation()
         controller = DisclosureController(
             identity=self._identity,
             writer=self._writer,
@@ -476,7 +510,6 @@ class CallSession:
         runtime: CallRuntime | None = None
         runner_task: asyncio.Task[None] | None = None
         failure_task: asyncio.Task[str] | None = None
-        early_clear_task: asyncio.Task[None] | None = None
         reason: str | None = None
         cancellation: asyncio.CancelledError | None = None
 
@@ -501,6 +534,17 @@ class CallSession:
                 mark_name=controller.mark_name,
                 idle_timeout_seconds=self._idle_timeout_seconds,
             )
+
+            async def observe_native_fatal(
+                _worker: object,
+                error: ErrorFrame,
+            ) -> None:
+                native_fatal.record(error)
+
+            runtime.worker.add_event_handler(
+                "on_pipeline_error",
+                observe_native_fatal,
+            )
             await runtime.runner.add_workers(runtime.worker)
             runner_task = cast(
                 asyncio.Task[None],
@@ -510,15 +554,6 @@ class CallSession:
                 ),
             )
 
-            def schedule_early_clear(_code: str) -> None:
-                nonlocal early_clear_task
-                if early_clear_task is None and runtime is not None:
-                    early_clear_task = asyncio.create_task(
-                        runtime.request_clear(),
-                        name="call-early-clear",
-                    )
-
-            first_failure.set_on_first_failure(schedule_early_clear)
             await asyncio.sleep(0)
             self._active_runner = runtime.runner
             await self._replay_pending_drain()
@@ -537,7 +572,8 @@ class CallSession:
                 reason = failure_task.result()
             else:
                 await runner_task
-                if not controller.is_active():
+                reason = first_failure.code or native_fatal.code
+                if reason is None and not controller.is_active():
                     reason = first_failure.code or "call_failed"
         except asyncio.CancelledError as error:
             cancellation = error
@@ -550,11 +586,11 @@ class CallSession:
             controller=controller,
             recorder=recorder,
             first_failure=first_failure,
+            transport=handshake.transport,
             pipeline=pipeline,
             runtime=runtime,
             runner_task=runner_task,
             failure_task=failure_task,
-            early_clear_task=early_clear_task,
             terminal_outcome=terminal_outcome,
             cancel_continuations=cancellation is not None,
         )
@@ -567,11 +603,11 @@ class CallSession:
         self._active_runner = None
         if cancellation is not None:
             raise cancellation
+        if terminal_outcome.reason != "closed":
+            raise CallSessionError(terminal_outcome.reason)
         final_error = first_failure.code
         if final_error is not None:
             raise CallSessionError(final_error)
-        if terminal_outcome.reason != "closed":
-            raise CallSessionError(terminal_outcome.reason)
 
     async def request_drain(self) -> None:
         """End the active per-call runner through its public cancellation surface."""
@@ -689,11 +725,11 @@ class CallSession:
         controller: DisclosureController,
         recorder: TurnRecorder,
         first_failure: FirstFailure,
+        transport: PipelineTransport,
         pipeline: ObservedPipeline | None,
         runtime: CallRuntime | None,
         runner_task: asyncio.Task[None] | None,
         failure_task: asyncio.Task[str] | None,
-        early_clear_task: asyncio.Task[None] | None,
         terminal_outcome: _TerminalOutcome,
         cancel_continuations: bool,
     ) -> None:
@@ -730,11 +766,16 @@ class CallSession:
                 first_failure,
                 "call_failed",
             )
-            if early_clear_task is not None:
+            if not runtime.worker.has_finished():
                 await self._attempt(
-                    lambda: self._join_task(early_clear_task),
+                    runtime.worker.pipeline.cleanup,
                     first_failure,
-                    "call_failed",
+                    "pipeline_cleanup_failed",
+                )
+                await self._attempt(
+                    runtime.worker.cleanup,
+                    first_failure,
+                    "pipeline_cleanup_failed",
                 )
         elif runtime is not None:
             await self._attempt(
@@ -768,6 +809,33 @@ class CallSession:
                 first_failure,
                 "pipeline_cleanup_failed",
             )
+        else:
+            processor_factories: tuple[Callable[[], FrameProcessor], ...] = (
+                transport.input,
+                lambda: self._services.stt,
+                lambda: self._services.llm,
+                lambda: self._services.tts,
+                transport.output,
+            )
+            cleaned_processor_ids: set[int] = set()
+            for processor_factory in processor_factories:
+                try:
+                    processor = processor_factory()
+                except asyncio.CancelledError:
+                    first_failure.signal("pipeline_cleanup_failed")
+                    continue
+                except Exception:
+                    first_failure.signal("pipeline_cleanup_failed")
+                    continue
+                processor_id = id(processor)
+                if processor_id in cleaned_processor_ids:
+                    continue
+                cleaned_processor_ids.add(processor_id)
+                await self._attempt(
+                    processor.cleanup,
+                    first_failure,
+                    "pipeline_cleanup_failed",
+                )
 
         if failure_task is not None:
             failure_task.cancel()
@@ -943,16 +1011,30 @@ class DisclosureController:
         return sum(not task.done() for task in self._continuations)
 
     def is_active(self) -> bool:
-        return self.state is DisclosureState.ACTIVE and not self._input_closed
+        return (
+            self._first_failure.code is None
+            and self.state is DisclosureState.ACTIVE
+            and not self._input_closed
+        )
 
     async def note_disclosure_audio(self) -> None:
         async with self._lock:
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                return
             if self.state is DisclosureState.PLAYING:
                 self._audio_observed = True
 
     async def arm_expected_mark(self) -> bool:
         failed = False
         async with self._lock:
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                return False
             if self.state is not DisclosureState.PLAYING or not self._audio_observed:
                 if self.state is not DisclosureState.ACTIVE:
                     self.state = DisclosureState.ABORTED
@@ -967,6 +1049,11 @@ class DisclosureController:
 
     async def mark_forwarded(self) -> None:
         async with self._lock:
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                return
             if self.state is not DisclosureState.MARK_PENDING or self._timeout_task is not None:
                 return
             task = asyncio.create_task(self._mark_timeout(), name="disclosure-mark-timeout")
@@ -979,6 +1066,15 @@ class DisclosureController:
         except (AttributeError, UnicodeEncodeError):
             return False
         async with self._lock:
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                timeout_task = self._timeout_task
+                self._timeout_task = None
+                if timeout_task is not None:
+                    timeout_task.cancel()
+                return False
             if (
                 not isinstance(mark_name, str)
                 or not hmac.compare_digest(received_mark, self.mark_name.encode("ascii"))
@@ -1092,6 +1188,13 @@ class DisclosureController:
             raise
 
     async def _complete_disclosure(self, acknowledged_at: datetime) -> None:
+        async with self._lock:
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                return
+
         operation = VoiceOperationV1(
             schema_version=1,
             operation_id=self._uuid_factory(),
@@ -1127,6 +1230,11 @@ class DisclosureController:
 
         async with self._lock:
             self.disclosure_completed = True
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                return
             if self.state is not DisclosureState.ACK_COMMITTING:
                 return
             self.state = DisclosureState.DISCLOSURE_DURABLE
@@ -1157,6 +1265,11 @@ class DisclosureController:
         async with self._lock:
             if result.state is RecordingStartState.DEFINITELY_NOT_STARTED:
                 self.recording_may_be_active = False
+            if self._first_failure.code is not None:
+                self._input_closed = True
+                if self.state is not DisclosureState.ACTIVE:
+                    self.state = DisclosureState.ABORTED
+                return
             if self.state is not DisclosureState.RECORDING_STARTING:
                 return
             if result.state is RecordingStartState.STARTED:
