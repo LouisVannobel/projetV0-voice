@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from contextvars import Context
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -76,6 +76,7 @@ class FirstFailure:
         self._event = asyncio.Event()
         self._code: str | None = None
         self._shared_failure_event = shared_failure_event
+        self._on_first_failure: Callable[[str], None] | None = None
 
     @property
     def code(self) -> str | None:
@@ -85,7 +86,12 @@ class FirstFailure:
         safe_code = code if code in self._SAFE_CODES else "call_failed"
         if self._code is None:
             self._code = safe_code
+            if self._on_first_failure is not None:
+                self._on_first_failure(safe_code)
             self._event.set()
+
+    def set_on_first_failure(self, callback: Callable[[str], None]) -> None:
+        self._on_first_failure = callback
 
     async def wait(self) -> str:
         shared = self._shared_failure_event
@@ -400,7 +406,6 @@ def build_pipeline(
     controller: GateController,
     turn_recorder: PipelineTurnRecorder,
     first_failure: FirstFailure,
-    local_failure_clear: Callable[[], Awaitable[None]] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
 
@@ -456,14 +461,6 @@ def build_pipeline(
             raise
         except Exception:
             return
-        if local_failure_clear is not None:
-            try:
-                await local_failure_clear()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                first_failure.signal("call_failed")
-
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
     assistant_aggregator.add_event_handler(
         "on_assistant_turn_stopped", record_assistant_turn
@@ -494,7 +491,41 @@ class CallRuntime:
     worker: PipelineWorker
     runner: WorkerRunner
     task_manager: ObservedTaskManager
-    interruption_reached: asyncio.Event
+    _clear_coordinator: _ClearCoordinator
+
+    async def request_clear(self) -> None:
+        await self._clear_coordinator.request(self.worker)
+
+
+class _ClearCoordinator:
+    """Exactly-once completion for one project-created interruption frame."""
+
+    def __init__(self) -> None:
+        self._frame = InterruptionFrame()
+        self._lock = asyncio.Lock()
+        self._requested = False
+        self._completed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def observe(self, frame: Frame) -> None:
+        if frame is self._frame and not self._completed.done():
+            self._completed.set_result(None)
+
+    async def request(self, worker: PipelineWorker) -> None:
+        async with self._lock:
+            first_request = not self._requested
+            if first_request:
+                self._requested = True
+        if first_request:
+            try:
+                await worker.queue_frame(self._frame)
+            except asyncio.CancelledError:
+                if not self._completed.done():
+                    self._completed.cancel()
+                raise
+            except Exception:
+                if not self._completed.done():
+                    self._completed.set_exception(RuntimeError("call_clear_failed"))
+        await asyncio.shield(self._completed)
 
 
 def build_runtime(
@@ -529,17 +560,16 @@ def build_runtime(
         enable_tracing=False,
         idle_timeout_secs=float(idle_timeout_seconds),
     )
-    interruption_reached = asyncio.Event()
+    clear_coordinator = _ClearCoordinator()
 
-    async def on_interruption_reached(
+    async def on_clear_frame_reached(
         _worker: PipelineWorker,
         frame: Frame,
     ) -> None:
-        if isinstance(frame, InterruptionFrame):
-            interruption_reached.set()
+        clear_coordinator.observe(frame)
 
     worker.add_reached_downstream_filter((InterruptionFrame,))
-    worker.add_event_handler("on_frame_reached_downstream", on_interruption_reached)
+    worker.add_event_handler("on_frame_reached_downstream", on_clear_frame_reached)
 
     async def queue_disclosure(_worker: PipelineWorker, _frame: StartFrame) -> None:
         try:
@@ -566,7 +596,7 @@ def build_runtime(
         worker=worker,
         runner=runner,
         task_manager=task_manager,
-        interruption_reached=interruption_reached,
+        _clear_coordinator=clear_coordinator,
     )
 
 

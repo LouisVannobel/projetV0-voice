@@ -368,8 +368,8 @@ async def test_real_worker_finishes_after_observed_pipeline_cleanup_failure() ->
 
     runtime.worker.add_event_handler("on_pipeline_started", on_started)
     runtime.worker.add_event_handler("on_pipeline_finished", on_finished)
-    running = asyncio.create_task(runtime.runner.run(auto_end=True))
     await runtime.runner.add_workers(runtime.worker)
+    running = asyncio.create_task(runtime.runner.run(auto_end=True))
     await asyncio.wait_for(started.wait(), timeout=3)
     await runtime.worker.queue_frame(EndFrame())
     await asyncio.wait_for(running, timeout=3)
@@ -625,8 +625,8 @@ async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pai
     with pytest.raises(Exception, match="TaskManager is not initialized"):
         _ = runtime.worker.task_manager
 
-    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
     await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
     await probe.started.wait()
     assert probe.setup_manager is runtime.task_manager
     assert runtime.worker.task_manager is runtime.task_manager
@@ -676,6 +676,42 @@ async def test_build_runtime_returns_owned_unregistered_runtime_before_add_worke
 
 
 @pytest.mark.asyncio
+async def test_runtime_clear_is_once_specific_after_unrelated_interruption() -> None:
+    failure = pipeline_module.FirstFailure()
+    probe = _SetupProbe()
+    runtime = pipeline_module.build_runtime(
+        pipeline=pipeline_module.ObservedPipeline([probe], first_failure=failure),
+        first_failure=failure,
+        greeting="Disclosure.",
+        mark_name="mark",
+        idle_timeout_seconds=60.0,
+    )
+    unrelated_reached = asyncio.Event()
+
+    async def on_interruption(_worker: object, _frame: InterruptionFrame) -> None:
+        unrelated_reached.set()
+
+    runtime.worker.add_event_handler("on_frame_reached_downstream", on_interruption)
+    await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    try:
+        await asyncio.wait_for(probe.started.wait(), timeout=3)
+        await runtime.worker.queue_frame(InterruptionFrame())
+        await asyncio.wait_for(unrelated_reached.wait(), timeout=3)
+
+        await asyncio.gather(runtime.request_clear(), runtime.request_clear())
+        await runtime.worker.queue_frame(EndFrame())
+        await asyncio.wait_for(runner_task, timeout=3)
+    finally:
+        if not runner_task.done():
+            await runtime.runner.cancel(reason="test_cleanup")
+            await asyncio.wait_for(runner_task, timeout=3)
+
+    interruptions = [frame for frame in probe.frames if isinstance(frame, InterruptionFrame)]
+    assert len(interruptions) == 2
+
+
+@pytest.mark.asyncio
 async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() -> None:
     transport = _Transport()
     stt = _SegmentedSttProbe()
@@ -699,8 +735,8 @@ async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() 
         mark_name=controller.mark_name,
         idle_timeout_seconds=60.0,
     )
-    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
     await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
     try:
         await asyncio.wait_for(stt.started.wait(), timeout=5)
         stt_rate = stt.sample_rate
@@ -785,8 +821,8 @@ async def test_actual_task7_partial_tts_failure_never_forwards_disclosure_mark()
     )
     messages: list[str] = []
     log_sink = logger.add(messages.append, format="{message}")
-    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
     await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
     try:
         assert await asyncio.wait_for(failure.wait(), timeout=5) == "tts_failed"
         await runtime.runner.cancel(reason="local_failure")

@@ -14,6 +14,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from pipecat.bus.bus import WorkerBus
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
@@ -27,8 +28,10 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.registry.registry import WorkerRegistry
 from pipecat.runner.types import TelnyxCallData
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transcriptions.language import Language
@@ -36,6 +39,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.workers.runner import WorkerRunner
 from pydantic import SecretStr
 from starlette.websockets import WebSocket, WebSocketState
 
@@ -1256,6 +1260,37 @@ async def test_internal_cleanup_owner_failure_is_not_reported_as_caller_cancella
 
 
 @pytest.mark.asyncio
+async def test_same_turn_caller_and_internal_cleanup_cancellation_preserves_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def cancel_cleanup(_session: object, **_kwargs: object) -> None:
+        cleanup_started.set()
+        await cleanup_release.wait()
+        raise asyncio.CancelledError("internal-cleanup-secret")
+
+    monkeypatch.setattr(session_module.CallSession, "_cleanup_owned_state", cancel_cleanup)
+    session, _stt, _lease, writer, _transport = _session(
+        events=events,
+        echo_ack=True,
+    )
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(writer.disclosure_committed.wait(), timeout=3)
+    await session.request_drain()
+    await asyncio.wait_for(cleanup_started.wait(), timeout=3)
+
+    cleanup_release.set()
+    asyncio.get_running_loop().call_soon(running.cancel, "caller-same-turn")
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(running, timeout=3)
+
+    assert cancelled.value.args == ("caller-same-turn",)
+
+
+@pytest.mark.asyncio
 async def test_nested_native_task_failure_cancels_and_joins_real_runner_before_return() -> None:
     events: list[str] = []
     session, _stt, lease, _writer, _transport = _session(
@@ -1302,7 +1337,7 @@ async def test_actual_partial_tts_failure_reaches_real_telnyx_clear_without_mark
     ]
     events = [payload.get("event") for payload in payloads]
     assert "media" in events
-    assert "clear" in events
+    assert events.count("clear") == 1
     assert "mark" not in events
     assert events.index("media") < events.index("clear")
     assert not any(
@@ -1350,6 +1385,42 @@ async def test_request_drain_uses_public_runner_and_closes_active_session() -> N
 
     assert lease.calls == [("closed", "closed")]
     assert events[-1] == "lease-terminal"
+
+
+@pytest.mark.asyncio
+async def test_request_drain_during_add_workers_is_replayed_after_runner_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    add_blocked = asyncio.Event()
+    add_release = asyncio.Event()
+    cancel_calls = 0
+    original_add_workers = WorkerRunner.add_workers
+    original_cancel = WorkerRunner.cancel
+
+    async def blocked_add(runner: WorkerRunner, *workers: object) -> None:
+        await original_add_workers(runner, *workers)
+        add_blocked.set()
+        await add_release.wait()
+
+    async def observe_cancel(runner: WorkerRunner, reason: str | None = None) -> None:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        await original_cancel(runner, reason=reason)
+
+    monkeypatch.setattr(WorkerRunner, "add_workers", blocked_add)
+    monkeypatch.setattr(WorkerRunner, "cancel", observe_cancel)
+    session, _stt, lease, _writer, _transport = _session(events=events)
+    running = asyncio.create_task(session.run(session.handshake))
+    await asyncio.wait_for(add_blocked.wait(), timeout=3)
+
+    await session.request_drain()
+    add_release.set()
+    with pytest.raises(session_module.CallSessionError, match="call_failed"):
+        await asyncio.wait_for(running, timeout=3)
+
+    assert cancel_calls == 1
+    assert lease.calls == [("failed", "call_failed")]
 
 
 @pytest.mark.asyncio
@@ -1523,7 +1594,8 @@ async def test_post_bind_startup_failure_runs_partial_state_cleanup(
     assert lease.calls == [("failed", "call_failed")]
     assert session.handshake.audio_admission.allows_audio() is False
     if failure_point == "add_workers":
-        assert worker_finished.is_set()
+        assert worker_finished.is_set() is False
+        assert any(item.startswith("pipeline:") for item in events)
 
 
 @pytest.mark.asyncio
@@ -1569,6 +1641,72 @@ async def test_runner_and_failure_task_creation_failures_run_cleanup(
     assert lease.calls == [("failed", "call_failed")]
     assert any(item.startswith("pipeline:") for item in events)
     assert worker_finished.is_set() is (fail_on == 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["watch", "runner_task"])
+async def test_direct_no_run_cleanup_covers_owned_public_surfaces(
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    worker_cleanup = asyncio.Event()
+    runner_cleanup = asyncio.Event()
+    bus_stop = asyncio.Event()
+    bus_cleanup = asyncio.Event()
+    original_worker_cleanup = PipelineWorker.cleanup
+    original_runner_cleanup = WorkerRunner.cleanup
+    original_bus_stop = WorkerBus.stop
+    original_bus_cleanup = WorkerBus.cleanup
+
+    async def observe_worker_cleanup(worker: PipelineWorker) -> None:
+        worker_cleanup.set()
+        await original_worker_cleanup(worker)
+
+    async def observe_runner_cleanup(runner: WorkerRunner) -> None:
+        runner_cleanup.set()
+        await original_runner_cleanup(runner)
+
+    async def observe_bus_stop(bus: WorkerBus) -> None:
+        bus_stop.set()
+        await original_bus_stop(bus)
+
+    async def observe_bus_cleanup(bus: WorkerBus) -> None:
+        bus_cleanup.set()
+        await original_bus_cleanup(bus)
+
+    monkeypatch.setattr(PipelineWorker, "cleanup", observe_worker_cleanup)
+    monkeypatch.setattr(WorkerRunner, "cleanup", observe_runner_cleanup)
+    monkeypatch.setattr(WorkerBus, "stop", observe_bus_stop)
+    monkeypatch.setattr(WorkerBus, "cleanup", observe_bus_cleanup)
+
+    task_factory: object | None = None
+    if failure_point == "watch":
+        async def fail_watch(_registry: object, *_args: object) -> None:
+            raise RuntimeError("registry-watch-secret")
+
+        monkeypatch.setattr(WorkerRegistry, "watch", fail_watch)
+    else:
+        def fail_runner_task(coroutine: object, name: str) -> None:
+            del coroutine, name
+            raise RuntimeError("runner-task-secret")
+
+        task_factory = fail_runner_task
+
+    session, _stt, lease, _writer, _transport = _session(
+        events=events,
+        task_factory=task_factory,
+    )
+    with pytest.raises(session_module.CallSessionError, match="call_failed"):
+        await asyncio.wait_for(session.run(session.handshake), timeout=3)
+
+    assert any(item.startswith("pipeline:") for item in events)
+    assert worker_cleanup.is_set()
+    assert runner_cleanup.is_set()
+    assert bus_stop.is_set()
+    assert bus_cleanup.is_set()
+    assert "services-attempt" in events
+    assert lease.calls == [("failed", "call_failed")]
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,6 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-from pipecat.frames.frames import InterruptionFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.workers.runner import WorkerRunner
 
@@ -443,6 +442,9 @@ class CallSession:
         self._uuid_factory = uuid_factory
         self._run_started = False
         self._active_runner: WorkerRunner | None = None
+        self._drain_requested = False
+        self._drain_claimed = False
+        self._drain_lock = asyncio.Lock()
 
     async def run(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if self._run_started:
@@ -474,14 +476,9 @@ class CallSession:
         runtime: CallRuntime | None = None
         runner_task: asyncio.Task[None] | None = None
         failure_task: asyncio.Task[str] | None = None
+        early_clear_task: asyncio.Task[None] | None = None
         reason: str | None = None
         cancellation: asyncio.CancelledError | None = None
-
-        async def clear_local_playout() -> None:
-            if runtime is None:
-                raise CallSessionError("call_failed")
-            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
-                await self._queue_interruption_and_wait(runtime)
 
         try:
             handshake.audio_admission.bind(controller.is_active)
@@ -496,7 +493,6 @@ class CallSession:
                 controller=controller,
                 turn_recorder=recorder,
                 first_failure=first_failure,
-                local_failure_clear=clear_local_playout,
             )
             runtime = build_runtime(
                 pipeline=pipeline,
@@ -505,7 +501,7 @@ class CallSession:
                 mark_name=controller.mark_name,
                 idle_timeout_seconds=self._idle_timeout_seconds,
             )
-            self._active_runner = runtime.runner
+            await runtime.runner.add_workers(runtime.worker)
             runner_task = cast(
                 asyncio.Task[None],
                 self._create_session_task(
@@ -513,7 +509,19 @@ class CallSession:
                     "call-runner",
                 ),
             )
-            await runtime.runner.add_workers(runtime.worker)
+
+            def schedule_early_clear(_code: str) -> None:
+                nonlocal early_clear_task
+                if early_clear_task is None and runtime is not None:
+                    early_clear_task = asyncio.create_task(
+                        runtime.request_clear(),
+                        name="call-early-clear",
+                    )
+
+            first_failure.set_on_first_failure(schedule_early_clear)
+            await asyncio.sleep(0)
+            self._active_runner = runtime.runner
+            await self._replay_pending_drain()
             failure_task = cast(
                 asyncio.Task[str],
                 self._create_session_task(
@@ -546,6 +554,7 @@ class CallSession:
             runtime=runtime,
             runner_task=runner_task,
             failure_task=failure_task,
+            early_clear_task=early_clear_task,
             terminal_outcome=terminal_outcome,
             cancel_continuations=cancellation is not None,
         )
@@ -567,7 +576,25 @@ class CallSession:
     async def request_drain(self) -> None:
         """End the active per-call runner through its public cancellation surface."""
 
-        runner = self._active_runner
+        runner: WorkerRunner | None = None
+        async with self._drain_lock:
+            self._drain_requested = True
+            if self._active_runner is not None and not self._drain_claimed:
+                self._drain_claimed = True
+                runner = self._active_runner
+        if runner is not None:
+            await runner.cancel(reason="drain")
+
+    async def _replay_pending_drain(self) -> None:
+        runner: WorkerRunner | None = None
+        async with self._drain_lock:
+            if (
+                self._drain_requested
+                and not self._drain_claimed
+                and self._active_runner is not None
+            ):
+                self._drain_claimed = True
+                runner = self._active_runner
         if runner is not None:
             await runner.cancel(reason="drain")
 
@@ -625,18 +652,22 @@ class CallSession:
         terminal_outcome: _TerminalOutcome,
         first_failure: FirstFailure,
     ) -> asyncio.CancelledError | None:
+        caller_task = asyncio.current_task()
         cleanup_task = asyncio.create_task(cleanup, name="call-cleanup")
         while not cleanup_task.done():
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError as error:
+                caller_is_cancelling = (
+                    caller_task is not None and caller_task.cancelling() > 0
+                )
+                if caller_is_cancelling and cancellation is None:
+                    cancellation = error
+                    terminal_outcome.note_caller_cancellation()
                 if cleanup_task.done() and cleanup_task.cancelled():
                     first_failure.signal("call_failed")
                     self._promote_cleanup_failure(terminal_outcome, first_failure)
                     break
-                if cancellation is None:
-                    cancellation = error
-                    terminal_outcome.note_caller_cancellation()
             except Exception:
                 first_failure.signal("call_failed")
                 self._promote_cleanup_failure(terminal_outcome, first_failure)
@@ -662,6 +693,7 @@ class CallSession:
         runtime: CallRuntime | None,
         runner_task: asyncio.Task[None] | None,
         failure_task: asyncio.Task[str] | None,
+        early_clear_task: asyncio.Task[None] | None,
         terminal_outcome: _TerminalOutcome,
         cancel_continuations: bool,
     ) -> None:
@@ -695,6 +727,38 @@ class CallSession:
                 )
             await self._attempt(
                 lambda: self._join_task(runner_task),
+                first_failure,
+                "call_failed",
+            )
+            if early_clear_task is not None:
+                await self._attempt(
+                    lambda: self._join_task(early_clear_task),
+                    first_failure,
+                    "call_failed",
+                )
+        elif runtime is not None:
+            await self._attempt(
+                runtime.pipeline.cleanup,
+                first_failure,
+                "pipeline_cleanup_failed",
+            )
+            await self._attempt(
+                runtime.worker.cleanup,
+                first_failure,
+                "pipeline_cleanup_failed",
+            )
+            await self._attempt(
+                runtime.runner.cleanup,
+                first_failure,
+                "call_failed",
+            )
+            await self._attempt(
+                runtime.runner.bus.stop,
+                first_failure,
+                "call_failed",
+            )
+            await self._attempt(
+                runtime.runner.bus.cleanup,
                 first_failure,
                 "call_failed",
             )
@@ -734,8 +798,7 @@ class CallSession:
 
     @staticmethod
     async def _queue_interruption_and_wait(runtime: CallRuntime) -> None:
-        await runtime.worker.queue_frame(InterruptionFrame())
-        await runtime.interruption_reached.wait()
+        await runtime.request_clear()
 
     def _verify_handshake(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if (
