@@ -179,6 +179,7 @@ class QualificationRunConsumed:
 
 
 WebhookCommitValue = WebhookCommitResult | QualificationRunConsumed
+WebhookReceiptClassification = Literal["missing", "duplicate", "conflict"]
 
 
 class WebhookCommitTicket:
@@ -426,6 +427,40 @@ class PersistenceWriter:
                 PersistenceCommand(
                     "qualification_run_status",
                     {"run_id": run_id, "result": result},
+                    None,
+                )
+            )
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
+
+    async def classify_webhook_receipt(
+        self,
+        *,
+        event_id: str,
+        semantic_fingerprint_sha256: bytes,
+    ) -> WebhookReceiptClassification:
+        if (
+            not isinstance(event_id, str)
+            or not 0 < len(event_id) <= 256
+            or type(semantic_fingerprint_sha256) is not bytes
+            or len(semantic_fingerprint_sha256) != 32
+        ):
+            raise CommandSerializationError("invalid_webhook_receipt")
+        result: asyncio.Future[WebhookReceiptClassification] = (
+            asyncio.get_running_loop().create_future()
+        )
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "webhook_receipt_status",
+                    {
+                        "event_id": event_id,
+                        "semantic_fingerprint_sha256": semantic_fingerprint_sha256,
+                        "result": result,
+                    },
                     None,
                 )
             )
@@ -684,14 +719,13 @@ class PersistenceWriter:
                     raise FatalPersistenceError("queue_oldest_age_exceeded")
 
                 should_stop, command_result = await self._process_command(current_command)
+                self._resolve_success(current_command, command_result)
                 if should_stop:
-                    self._resolve_success(current_command, command_result)
                     self._queue.task_done()
                     current_owned = False
                     current_command = None
                     break
                 await self._run_periodic_check_if_due()
-                self._resolve_success(current_command, command_result)
                 self._queue.task_done()
                 current_owned = False
                 current_command = None
@@ -921,6 +955,8 @@ class PersistenceWriter:
                 await self._apply_lease(command.payload)
             elif command.kind == "webhook_effect":
                 command_result = await self._apply_webhook_effect(command.payload)
+            elif command.kind == "webhook_receipt_status":
+                command_result = await self._classify_webhook_receipt(command.payload)
             elif command.kind == "webhook_enrichment":
                 await self._apply_webhook_enrichment(command.payload)
             elif command.kind == "relay_batch":
@@ -937,6 +973,26 @@ class PersistenceWriter:
                 await connection.rollback()
             raise
         return False, command_result
+
+    async def _classify_webhook_receipt(
+        self, payload: Mapping[str, object]
+    ) -> WebhookReceiptClassification:
+        event_id = self._required_str(payload, "event_id")
+        semantic_fingerprint = payload.get("semantic_fingerprint_sha256")
+        if type(semantic_fingerprint) is not bytes or len(semantic_fingerprint) != 32:
+            raise CommandSerializationError("invalid_webhook_receipt")
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT semantic_fingerprint_sha256 FROM webhook_receipts WHERE event_id = ?",
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return "missing"
+        if row == (semantic_fingerprint,):
+            return "duplicate"
+        return "conflict"
 
     async def _insert_outbox(self, operation: VoiceOperationV1) -> None:
         connection = self._require_owner_connection()

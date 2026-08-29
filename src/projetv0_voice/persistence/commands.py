@@ -42,6 +42,7 @@ class EncryptedCommandTooLarge(FatalPersistenceError):
 class PersistenceCommand:
     kind: Literal[
         "webhook_effect",
+        "webhook_receipt_status",
         "webhook_enrichment",
         "lease",
         "outbox",

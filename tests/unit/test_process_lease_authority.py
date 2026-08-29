@@ -66,7 +66,10 @@ class CallControl:
 
 
 def _registry(
-    writer: Writer, control: CallControl, clock: Any
+    writer: Writer,
+    control: CallControl,
+    clock: Any,
+    utcnow: Any = lambda: NOW,
 ) -> Any:
     from projetv0_voice.admission import CallRegistry
 
@@ -89,7 +92,7 @@ def _registry(
         lease_ttl_seconds=30,
         stream_url="wss://voice.invalid/telnyx/stream",
         retention_days=7,
-        utcnow=lambda: NOW,
+        utcnow=utcnow,
         monotonic=clock,
         token_factory=lambda _: "A" * 43,
         uuid_factory=lambda: next(ids),
@@ -149,8 +152,13 @@ async def test_digest_only_claim_race_has_one_post_commit_winner() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("now", [130.0, 130.001])
-async def test_claim_at_or_after_monotonic_deadline_loses(now: float) -> None:
+@pytest.mark.parametrize(
+    ("now", "wins"),
+    [(129.999, True), (130.0, False), (130.001, False)],
+)
+async def test_claim_deadline_epsilon_wins_but_equality_and_later_lose(
+    now: float, wins: bool
+) -> None:
     from projetv0_voice.admission import ProcessLeaseAuthority
 
     clock = 100.0
@@ -163,8 +171,66 @@ async def test_claim_at_or_after_monotonic_deadline_loses(now: float) -> None:
         call_control_id="control-a", token_digest=DIGEST
     )
 
-    assert claim is None
-    assert writer.commits == []
+    assert (claim is not None) is wins
+    assert [commit["state"] for commit in writer.commits] == (["active"] if wins else [])
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_jump_cannot_override_monotonic_claim_window() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    monotonic = 100.0
+    wall_clock = NOW
+    writer = Writer()
+    registry = _registry(
+        writer,
+        CallControl(),
+        lambda: monotonic,
+        utcnow=lambda: wall_clock,
+    )
+    await _durable_waiting_wss(registry)
+    wall_clock = datetime(2099, 1, 1, tzinfo=UTC)
+    monotonic = 129.999
+
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+
+    assert claim is not None
+    assert [commit["state"] for commit in writer.commits] == ["active"]
+
+
+@pytest.mark.asyncio
+async def test_reaper_wins_against_claim_blocked_before_active_commit() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+
+    class BarrierWriter(Writer):
+        async def commit_lease(self, **values: object) -> None:
+            if values["state"] == "active":
+                active_started.set()
+                await release_active.wait()
+            self.commits.append(values)
+
+    now = 100.0
+    writer = BarrierWriter()
+    registry = _registry(writer, CallControl(), lambda: now)
+    await _durable_waiting_wss(registry)
+    authority = ProcessLeaseAuthority(registry)
+    claim_task = asyncio.create_task(
+        authority.claim_once(call_control_id="control-a", token_digest=DIGEST)
+    )
+    await active_started.wait()
+    now = 130.0
+
+    assert await registry.reap_expired() == 1
+    release_active.set()
+    assert await claim_task is None
+    assert await registry.snapshot("control-a") is None
+    assert await registry.live_call_count() == 0
+    assert [commit["state"] for commit in writer.commits] == ["terminal", "active"]
 
 
 @pytest.mark.asyncio
@@ -232,4 +298,66 @@ async def test_attached_active_call_survives_past_token_deadline() -> None:
     assert await registry.reap_expired() == 0
     snapshot = await registry.snapshot("control-a")
     assert snapshot is not None
+    assert snapshot.lease_state == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "late_outcome",
+    [
+        "accepted",
+        "rate_limited",
+        "retryable_not_sent",
+        "rejected",
+        "outcome_unknown",
+        "exception",
+    ],
+)
+async def test_authenticated_wss_evidence_wins_every_late_streaming_outcome(
+    late_outcome: str,
+) -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class LateStreaming(CallControl):
+        async def start_streaming(self, *_: object, **__: object) -> CallControlResult:
+            entered.set()
+            await release.wait()
+            if late_outcome == "exception":
+                raise RuntimeError("synthetic late provider failure")
+            return CallControlResult(late_outcome)  # type: ignore[arg-type]
+
+    writer = Writer()
+    control = LateStreaming()
+    registry = _registry(writer, control, lambda: 100.0)
+    initiated = _event("call.initiated", "event-a")
+    resolution = await registry.resolve_webhook(initiated)
+    await registry.reconcile_after_commit(
+        initiated, resolution, WebhookCommitResult("first", "applied")
+    )
+    answered = _event("call.answered", "event-b")
+    resolution = await registry.resolve_webhook(answered)
+    streaming_owner = asyncio.create_task(
+        registry.reconcile_after_commit(
+            answered, resolution, WebhookCommitResult("first", "applied")
+        )
+    )
+    await entered.wait()
+
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    assert snapshot.streaming_state == "accepted"
+
+    release.set()
+    late = await streaming_owner
+    snapshot = await registry.snapshot("control-a")
+    assert late.status_code == 200
+    assert snapshot is not None
+    assert snapshot.streaming_state == "accepted"
     assert snapshot.lease_state == "active"

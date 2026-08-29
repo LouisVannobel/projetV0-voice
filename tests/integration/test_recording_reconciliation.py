@@ -547,6 +547,12 @@ async def test_signed_saved_reconciliation_preserves_1024_call_control_end_to_en
             return await self.task
 
     class Owner:
+        async def classify_webhook_receipt(self, event: VerifiedWebhook) -> str:
+            return await writer.classify_webhook_receipt(
+                event_id=event.event_id,
+                semantic_fingerprint_sha256=event.semantic_fingerprint_sha256,
+            )
+
         def start_webhook_finalization(
             self, event: VerifiedWebhook, resolution: object
         ) -> Handle:
@@ -573,6 +579,7 @@ async def test_signed_saved_reconciliation_preserves_1024_call_control_end_to_en
     processor = TelnyxWebhookProcessor(
         verifier=TelnyxWebhookVerifier(public_key=public_key),
         resolver=lambda event: ResolvedWebhook(resolve_recording_webhook(event)),
+        duplicate_resolver=lambda event: ResolvedWebhook(resolve_recording_webhook(event)),
         finalizer_owner=Owner(),
     )
     try:

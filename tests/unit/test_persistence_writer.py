@@ -361,12 +361,15 @@ async def test_startup_and_periodic_quick_check_are_owner_executed_without_publi
 ) -> None:
     clock_value = 10.0
     checks: list[float] = []
+    second_check = asyncio.Event()
 
     def clock() -> float:
         return clock_value
 
     def on_check(when: float) -> None:
         checks.append(when)
+        if len(checks) == 2:
+            second_check.set()
 
     writer, task = await start_writer(
         tmp_path / "voice.sqlite",
@@ -379,6 +382,7 @@ async def test_startup_and_periodic_quick_check_are_owner_executed_without_publi
 
     clock_value = 16.0
     await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+    await asyncio.wait_for(second_check.wait(), timeout=1)
     assert checks == [10.0, 16.0]
     assert await writer.quick_check() is True
     await stop_writer(writer, task)

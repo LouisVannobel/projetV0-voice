@@ -651,6 +651,14 @@ class FakeFinalizerOwner:
         self.after_commit = after_commit
         self.tasks: list[asyncio.Task[Any]] = []
 
+    async def classify_webhook_receipt(self, event: Any) -> str:
+        if isinstance(self.writer, PersistenceWriter):
+            return await self.writer.classify_webhook_receipt(
+                event_id=event.event_id,
+                semantic_fingerprint_sha256=event.semantic_fingerprint_sha256,
+            )
+        return "missing"
+
     def start_webhook_finalization(self, event: Any, resolution: Any) -> _FinalizationHandle:
         task = asyncio.create_task(self._run(event, resolution))
         self.tasks.append(task)
@@ -728,6 +736,7 @@ def processor_with_fake_owner(
     return module.TelnyxWebhookProcessor(
         verifier=verifier,
         resolver=wrapped,
+        duplicate_resolver=wrapped,
         finalizer_owner=FakeFinalizerOwner(
             module=module,
             writer=writer,

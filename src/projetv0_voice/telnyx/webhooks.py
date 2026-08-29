@@ -19,12 +19,17 @@ from uuid import UUID
 
 from pydantic import SecretStr
 
-from projetv0_voice.admission import WebhookFinalizationHandle, WebhookFinalizerOwner
+from projetv0_voice.admission import (
+    CallAdmissionRejected,
+    WebhookFinalizationHandle,
+    WebhookFinalizerOwner,
+)
 from projetv0_voice.models import (
     MAX_PROVIDER_RECORDING_ID_CHARS,
     VoiceOperationV1,
     is_valid_provider_recording_id,
 )
+from projetv0_voice.persistence.commands import PersistenceError
 from projetv0_voice.telnyx.call_control import MAX_CALL_CONTROL_ID_CHARS
 
 MAX_WEBHOOK_BODY_BYTES = 65_536
@@ -422,8 +427,13 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
             or event_type in {"call.initiated", "call.answered", "call.hangup"}
         ) and call_control_id is None:
             return None
-        direction = _optional_direction(payload)
-        call_state = _optional_call_state(payload)
+        direction: Literal["incoming"] | None = None
+        call_state: Literal["parked", "answered"] | None = None
+        if event_type == "call.initiated":
+            direction = _optional_direction(payload)
+            call_state = _optional_call_state(payload)
+        elif event_type == "call.answered":
+            call_state = _optional_call_state(payload)
         if event_type == "call.initiated" and (
             direction != "incoming" or call_state != "parked"
         ):
@@ -582,7 +592,7 @@ class TelnyxWebhookVerifier:
 class TelnyxWebhookProcessor:
     """Verify, resolve, and synchronously transfer finalization to the process owner."""
 
-    __slots__ = ("_finalizer_owner", "_resolver", "_verifier")
+    __slots__ = ("_duplicate_resolver", "_finalizer_owner", "_resolver", "_verifier")
 
     def __init__(
         self,
@@ -590,9 +600,11 @@ class TelnyxWebhookProcessor:
         verifier: TelnyxWebhookVerifier,
         resolver: WebhookResolver,
         finalizer_owner: WebhookFinalizerOwner,
+        duplicate_resolver: WebhookResolver | None = None,
     ) -> None:
         self._verifier = verifier
         self._resolver = resolver
+        self._duplicate_resolver = duplicate_resolver
         self._finalizer_owner = finalizer_owner
 
     def __repr__(self) -> str:
@@ -648,10 +660,35 @@ class TelnyxWebhookProcessor:
             return WebhookDisposition(500)
 
         try:
-            resolution = self._resolver(event)
-            if inspect.isawaitable(resolution):
-                resolution = await resolution
+            classification = await self._finalizer_owner.classify_webhook_receipt(event)
+        except (PersistenceError, TimeoutError):
+            return WebhookDisposition(503)
         except Exception:
+            return WebhookDisposition(500)
+        if classification == "conflict":
+            return WebhookDisposition(400)
+        if classification == "duplicate":
+            if self._duplicate_resolver is None:
+                resolution: ResolvedWebhook | Awaitable[ResolvedWebhook] = ResolvedWebhook(None)
+            else:
+                try:
+                    resolution = self._duplicate_resolver(event)
+                    if inspect.isawaitable(resolution):
+                        resolution = await resolution
+                except CallAdmissionRejected as error:
+                    return WebhookDisposition(error.status_code)
+                except Exception:
+                    return WebhookDisposition(500)
+        elif classification == "missing":
+            try:
+                resolution = self._resolver(event)
+                if inspect.isawaitable(resolution):
+                    resolution = await resolution
+            except CallAdmissionRejected as error:
+                return WebhookDisposition(error.status_code)
+            except Exception:
+                return WebhookDisposition(500)
+        else:
             return WebhookDisposition(500)
         if not isinstance(resolution, ResolvedWebhook):
             return WebhookDisposition(500)

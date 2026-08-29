@@ -10,7 +10,7 @@ import pytest
 
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
-from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.persistence.commands import FatalPersistenceError, PersistenceCommand
 from projetv0_voice.persistence.schema import SCHEMA_SQL, V1_SCHEMA_SQL
 from projetv0_voice.persistence.writer import PersistenceWriter
 
@@ -273,3 +273,101 @@ async def test_webhook_ticket_survives_waiter_cancellation_and_never_resolves_pr
         assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM call_leases").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_receipt_classifier_is_owner_queued_and_uses_only_exact_identity(
+    tmp_path: Path,
+) -> None:
+    writer, task = await _start_writer(tmp_path / "classification.sqlite")
+
+    assert (
+        await writer.classify_webhook_receipt(
+            event_id="event-1", semantic_fingerprint_sha256=b"f" * 32
+        )
+        == "missing"
+    )
+    await writer.submit_webhook(
+        receipt=_receipt("event-1"), lease=None, operation=None
+    ).wait()
+
+    assert (
+        await writer.classify_webhook_receipt(
+            event_id="event-1", semantic_fingerprint_sha256=b"f" * 32
+        )
+        == "duplicate"
+    )
+    assert (
+        await writer.classify_webhook_receipt(
+            event_id="event-1", semantic_fingerprint_sha256=b"g" * 32
+        )
+        == "conflict"
+    )
+    assert (
+        await writer.classify_webhook_receipt(
+            event_id="event-2", semantic_fingerprint_sha256=b"f" * 32
+        )
+        == "missing"
+    )
+    await _stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_postcommit_quick_check_failure_cannot_replace_webhook_result(
+    tmp_path: Path,
+) -> None:
+    clock = 0.0
+    checks = iter(("ok", "not ok"))
+
+    def advance_after_mutation(name: str) -> None:
+        nonlocal clock
+        if name == "after_mutation_before_commit":
+            clock = 31.0
+
+    writer = PersistenceWriter(
+        tmp_path / "postcommit-health.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        monotonic=lambda: clock,
+        quick_check_result=lambda: next(checks),
+        failpoint=advance_after_mutation,
+    )
+    owner = asyncio.create_task(writer.run())
+    assert await writer.wait_ready()
+
+    ticket = writer.submit_webhook(
+        receipt=_receipt("event-1"), lease=_lease(), operation=_operation()
+    )
+    result = await ticket.wait()
+
+    assert (result.receipt, result.effect) == ("first", "applied")
+    await owner
+    assert writer.fatal_fault is not None
+    assert writer.fatal_fault.code == "quick_check_failed"
+
+
+@pytest.mark.asyncio
+async def test_webhook_submit_queue_full_is_synchronous_and_constant_safe(
+    tmp_path: Path,
+) -> None:
+    writer = PersistenceWriter(
+        tmp_path / "queue-full.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+    )
+    for number in range(256):
+        writer.submit_webhook(
+            receipt=_receipt(f"event-{number}"),
+            lease=None,
+            operation=None,
+        )
+
+    with pytest.raises(FatalPersistenceError, match="queue_full") as raised:
+        writer.submit_webhook(
+            receipt=_receipt("event-overflow"),
+            lease=None,
+            operation=None,
+        )
+
+    assert writer.queue_size == 256
+    assert writer.fatal_fault is not None
+    assert writer.fatal_fault.code == "queue_full"
+    assert "event-overflow" not in repr(raised.value)
