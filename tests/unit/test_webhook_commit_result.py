@@ -371,3 +371,26 @@ async def test_webhook_submit_queue_full_is_synchronous_and_constant_safe(
     assert writer.fatal_fault is not None
     assert writer.fatal_fault.code == "queue_full"
     assert "event-overflow" not in repr(raised.value)
+
+
+def test_public_control_timeout_latch_is_constant_safe_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    faults: list[object] = []
+    writer = PersistenceWriter(
+        tmp_path / "timeout-latch.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        fatal_handler=faults.append,
+    )
+
+    first = writer.latch_control_commit_timeout()
+    second = writer.latch_control_commit_timeout()
+
+    assert isinstance(first, FatalPersistenceError)
+    assert isinstance(second, FatalPersistenceError)
+    assert first.args == ("control_commit_timeout",)
+    assert second.args == ("control_commit_timeout",)
+    assert writer.fatal_fault is not None
+    assert writer.fatal_fault.code == "control_commit_timeout"
+    assert writer.is_degraded is True
+    assert len(faults) == 1

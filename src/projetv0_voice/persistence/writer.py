@@ -369,7 +369,12 @@ class PersistenceWriter:
             future.add_done_callback(self._consume_control_commit_exception)
             raise
         except TimeoutError:
-            raise self._signal_fatal("control_commit_timeout") from None
+            raise self.latch_control_commit_timeout() from None
+
+    def latch_control_commit_timeout(self) -> FatalPersistenceError:
+        """Latch the public constant-safe fatal state for a control COMMIT timeout."""
+
+        return self._signal_fatal("control_commit_timeout")
 
     def submit_webhook(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,7 @@ def _registry(
     admission_expires_at: datetime | None = None,
     utcnow: Any = lambda: NOW,
     background_task_factory: Any = None,
+    writer: Any = None,
 ) -> tuple[Any, CallControl]:
     from projetv0_voice.admission import CallRegistry
 
@@ -146,7 +148,7 @@ def _registry(
         kwargs["background_task_factory"] = background_task_factory
     return (
         CallRegistry(
-            writer=Writer(),
+            writer=writer or Writer(),
             call_control=control,
             tenant_id="tenant-a",
             agent_id="agent-a",
@@ -925,3 +927,218 @@ async def test_reaper_and_answer_evidence_at_deadline_cannot_resurrect_generatio
     assert await registry.live_call_count() == 0
     assert control.streams == []
     await asyncio.gather(answer_owner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_exact_duplicate_during_terminal_cleanup_is_200_without_action() -> None:
+    from projetv0_voice.admission import CallAdmissionRejected
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    registry, control = _registry(capacity=1)
+    initiated = await registry.resolve_webhook(_initiated())
+    await registry.reconcile_after_commit(
+        _initiated(), initiated, WebhookCommitResult("first", "applied")
+    )
+    generation = await registry.generation_handle("control-a")
+    assert generation is not None
+    drain_requested = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    class DrainOwner:
+        def request_drain(self) -> None:
+            drain_requested.set()
+
+        async def wait(self) -> None:
+            await release_drain.wait()
+
+    assert await registry.attach_session_owner(generation, object(), DrainOwner())
+    hangup = await registry.resolve_webhook(_hangup())
+    terminal = asyncio.create_task(
+        registry.reconcile_after_commit(
+            _hangup(), hangup, WebhookCommitResult("first", "applied")
+        )
+    )
+    await drain_requested.wait()
+
+    duplicate = await registry.resolve_duplicate_webhook(_initiated())
+    duplicate_result = await registry.reconcile_after_commit(
+        _initiated(), duplicate, WebhookCommitResult("duplicate", "duplicate")
+    )
+    mismatched = dataclasses.replace(_initiated(), call_leg_id="leg-other")
+    with pytest.raises(CallAdmissionRejected, match="call_identity_conflict"):
+        await registry.resolve_duplicate_webhook(mismatched)
+
+    assert duplicate_result.status_code == 200
+    assert duplicate.effect is None
+    assert duplicate.reservation is None
+    assert len(control.answers) == 1
+    assert control.streams == []
+    release_drain.set()
+    await terminal
+
+
+@pytest.mark.asyncio
+async def test_linked_placeholder_late_fail_closed_commit_schedules_exact_abort() -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    registry, control = _registry(capacity=1)
+    answered = await registry.resolve_webhook(_answered())
+    initiated = await registry.resolve_webhook(_initiated())
+    await registry.reconcile_after_commit(
+        _initiated(), initiated, WebhookCommitResult("first", "applied")
+    )
+    linked = await registry.generation_handle("control-a")
+
+    confirmation = await registry.confirm_late_after_fail_closed(
+        _answered(), answered, WebhookCommitResult("first", "applied")
+    )
+    await registry.join_until_empty()
+
+    assert linked is not None
+    assert confirmation.generation == linked
+    assert confirmation.abort_scheduled is True
+    assert control.streams == []
+    assert len(control.hangups) == 1
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_unlinked_placeholder_late_fail_closed_commit_stays_generationless() -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    registry, control = _registry(capacity=1)
+    answered = await registry.resolve_webhook(_answered())
+
+    confirmation = await registry.confirm_late_after_fail_closed(
+        _answered(), answered, WebhookCommitResult("first", "applied")
+    )
+    await registry.join_until_empty()
+
+    assert confirmation.generation is None
+    assert confirmation.abort_scheduled is False
+    assert control.hangups == []
+    assert await registry.placeholder_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_positive_answer_evidence_survives_provider_task_cancellation() -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    entered = asyncio.Event()
+
+    class BlockingAnswer(CallControl):
+        async def answer(self, *_: object, **__: object) -> CallControlResult:
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    registry, _ = _registry(capacity=1, control=BlockingAnswer())
+    initiated = await registry.resolve_webhook(_initiated())
+    provider = asyncio.create_task(
+        registry.reconcile_after_commit(
+            _initiated(), initiated, WebhookCommitResult("first", "applied")
+        )
+    )
+    await entered.wait()
+    answered = await registry.resolve_webhook(_answered())
+    await registry.reconcile_after_commit(
+        _answered(), answered, WebhookCommitResult("first", "applied")
+    )
+
+    provider.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await provider
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    assert snapshot.answer_state == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_abandonment_waiting_registry_lock_still_releases() -> None:
+    registry, _ = _registry(capacity=1)
+    resolution = await registry.resolve_webhook(_initiated())
+    assert resolution.reservation is not None
+    await registry._lock.acquire()  # type: ignore[attr-defined]
+    resolution.reservation.abandon_before_submit()
+    await asyncio.sleep(0)
+    owner_tasks = tuple(registry._background_owner._tasks)  # type: ignore[attr-defined]
+    assert len(owner_tasks) == 1
+    owner_tasks[0].cancel()
+    await asyncio.sleep(0)
+    registry._lock.release()  # type: ignore[attr-defined]
+
+    await registry.join_until_empty()
+
+    assert await registry.snapshot("control-a") is None
+    assert await registry.live_call_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_registry_never_calls_writer_provider_or_lifecycle_owner_under_lock() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    registry_ref: dict[str, Any] = {}
+
+    def assert_unlocked() -> None:
+        assert registry_ref["registry"]._lock.locked() is False
+
+    class InstrumentedWriter:
+        async def commit_lease(self, **_: object) -> None:
+            assert_unlocked()
+
+    class InstrumentedControl(CallControl):
+        async def answer(self, *_: object, **__: object) -> CallControlResult:
+            assert_unlocked()
+            return CallControlResult("accepted")
+
+        async def start_streaming(self, *_: object, **__: object) -> CallControlResult:
+            assert_unlocked()
+            return CallControlResult("accepted")
+
+        async def hangup(self, *_: object, **__: object) -> CallControlResult:
+            assert_unlocked()
+            return CallControlResult("accepted")
+
+    def task_factory(coroutine: Any, name: str) -> asyncio.Task[None]:
+        assert_unlocked()
+        return asyncio.create_task(coroutine, name=name)
+
+    registry, _ = _registry(
+        capacity=1,
+        control=InstrumentedControl(),
+        writer=InstrumentedWriter(),
+        background_task_factory=task_factory,
+    )
+    registry_ref["registry"] = registry
+    initiated = await registry.resolve_webhook(_initiated())
+    await registry.reconcile_after_commit(
+        _initiated(), initiated, WebhookCommitResult("first", "applied")
+    )
+    answered = await registry.resolve_webhook(_answered())
+    await registry.reconcile_after_commit(
+        _answered(), answered, WebhookCommitResult("first", "applied")
+    )
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a",
+        token_digest=snapshot.token_digest,
+    )
+    assert claim is not None
+    generation = await registry.generation_handle("control-a")
+    assert generation is not None
+
+    class LifecycleOwner:
+        def request_drain(self) -> None:
+            assert_unlocked()
+
+        async def wait(self) -> None:
+            assert_unlocked()
+
+    assert await registry.attach_session_owner(generation, object(), LifecycleOwner())
+    hangup = await registry.resolve_webhook(_hangup())
+    await registry.reconcile_after_commit(
+        _hangup(), hangup, WebhookCommitResult("first", "applied")
+    )
+    assert await registry.snapshot("control-a") is None

@@ -862,7 +862,7 @@ async def test_timeout_then_late_commit_uses_fail_closed_confirmation_only(
     await commit_blocked.wait()
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(asyncio.shield(ticket.wait()), timeout=0.01)
-    writer._signal_fatal("control_commit_timeout")  # type: ignore[attr-defined]
+    writer.latch_control_commit_timeout()
     release_commit.set()
     result = await ticket.wait()
 

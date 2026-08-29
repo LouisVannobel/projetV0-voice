@@ -351,6 +351,17 @@ class _PlaceholderReservation:
         self._settled = True
         self._abandon_event.set()
 
+    async def confirm_fail_closed(self, result: WebhookCommitValue) -> None:
+        if self._settled:
+            return
+        await self._registry._settle_placeholder(
+            self,
+            result,
+            promote_linked_evidence=False,
+        )
+        self._settled = True
+        self._abandon_event.set()
+
     async def _run_abandonment(self) -> None:
         await self._abandon_event.wait()
         if self._settled:
@@ -812,13 +823,14 @@ class CallRegistry:
             entry = self._by_control.get(event.call_control_id)
             if entry is not None:
                 if (
-                    entry.terminal_event is not None
-                    or entry.call_leg_id != event.call_leg_id
+                    entry.call_leg_id != event.call_leg_id
                     or entry.call_session_id != event.call_session_id
                     or event.event_type == "call.initiated"
                     and entry.initiated_at != event.occurred_at.astimezone(UTC)
                 ):
                     raise CallAdmissionRejected("call_identity_conflict")
+                if entry.terminal_event is not None:
+                    return ResolvedWebhook(None)
                 entry.precommit_refcount += 1
             elif event.event_type == "call.answered":
                 placeholder = self._answered_placeholders.get(event.call_control_id)
@@ -1015,6 +1027,8 @@ class CallRegistry:
         self,
         reservation: _PlaceholderReservation,
         result: WebhookCommitValue | None,
+        *,
+        promote_linked_evidence: bool = True,
     ) -> None:
         completion: asyncio.Future[WebhookDisposition] | None = None
         async with self._lock:
@@ -1035,7 +1049,8 @@ class CallRegistry:
                 placeholder.durable = True
                 linked = placeholder.linked_entry
                 if (
-                    linked is not None
+                    promote_linked_evidence
+                    and linked is not None
                     and self._by_control.get(linked.call_control_id) is linked
                     and linked.terminal_event is None
                 ):
@@ -1063,8 +1078,10 @@ class CallRegistry:
         from projetv0_voice.telnyx.webhooks import WebhookDisposition
 
         reservation = resolution.reservation
-        if isinstance(reservation, CallReservation | _PlaceholderReservation):
+        if isinstance(reservation, CallReservation):
             await reservation.confirm(result)
+        elif isinstance(reservation, _PlaceholderReservation):
+            await reservation.confirm_fail_closed(result)
         if isinstance(result, QualificationRunConsumed):
             return WebhookDisposition(503)
         if result.effect == "existing_terminal":
@@ -1128,8 +1145,10 @@ class CallRegistry:
     ) -> FailClosedWebhookConfirmation:
         del event
         reservation = resolution.reservation
-        if isinstance(reservation, CallReservation | _PlaceholderReservation):
+        if isinstance(reservation, CallReservation):
             await reservation.confirm(result)
+        elif isinstance(reservation, _PlaceholderReservation):
+            await reservation.confirm_fail_closed(result)
         generation: CallGenerationHandle | None = None
         abort_scheduled = False
         if isinstance(reservation, CallReservation):
@@ -1144,6 +1163,29 @@ class CallRegistry:
                     reservation._entry,
                     reservation._generation,
                 )
+        elif isinstance(reservation, _PlaceholderReservation):
+            linked = reservation._placeholder.linked_entry
+            if linked is not None:
+                generation = CallGenerationHandle(
+                    linked.call_control_id, linked.generation
+                )
+                if isinstance(result, WebhookCommitResult) and (
+                    result.receipt,
+                    result.effect,
+                ) == ("first", "applied"):
+                    abort_scheduled = self._schedule_abort_exact(
+                        linked,
+                        linked.generation,
+                    )
+            else:
+                async with self._lock:
+                    placeholder = self._answered_placeholders.get(
+                        reservation._placeholder.call_control_id
+                    )
+                    if placeholder is reservation._placeholder:
+                        self._answered_placeholders.pop(
+                            placeholder.call_control_id, None
+                        )
         return FailClosedWebhookConfirmation(generation, abort_scheduled)
 
     async def _run_action(
@@ -1606,16 +1648,17 @@ class CallRegistry:
             or len(token_digest) != 32
         ):
             return
-        coroutine = self._abort_if_matches(
-            call_control_id=call_control_id,
-            token_digest=token_digest,
-            expected_entry=None,
-            expected_generation=None,
-        )
-        if not self._background_owner.spawn(
-            coroutine, name="voice-matching-lease-abort"
+        if self._lock.locked():
+            self._internal_failure_code = "abort_capture_lock_busy"
+            return
+        entry = self._by_control.get(call_control_id)
+        if (
+            entry is None
+            or entry.terminal_event is not None
+            or not hmac.compare_digest(entry.token_digest, token_digest)
         ):
-            self._internal_failure_code = "background_task_registration_failed"
+            return
+        self._schedule_abort_exact(entry, entry.generation)
 
     def _schedule_abort_exact(self, entry: _CallEntry, generation: UUID) -> bool:
         coroutine = self._abort_if_matches(

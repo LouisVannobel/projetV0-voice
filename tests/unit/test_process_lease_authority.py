@@ -70,6 +70,7 @@ def _registry(
     control: CallControl,
     clock: Any,
     utcnow: Any = lambda: NOW,
+    background_task_factory: Any = None,
 ) -> Any:
     from projetv0_voice.admission import CallRegistry
 
@@ -80,8 +81,15 @@ def _registry(
             "22222222-2222-4222-8222-222222222222",
             "33333333-3333-4333-8333-333333333333",
             "44444444-4444-4444-8444-444444444444",
+            "55555555-5555-4555-8555-555555555555",
+            "66666666-6666-4666-8666-666666666666",
+            "77777777-7777-4777-8777-777777777777",
+            "88888888-8888-4888-8888-888888888888",
         )
     )
+    kwargs: dict[str, object] = {}
+    if background_task_factory is not None:
+        kwargs["background_task_factory"] = background_task_factory
     return CallRegistry(
         writer=writer,
         call_control=control,
@@ -96,6 +104,7 @@ def _registry(
         monotonic=clock,
         token_factory=lambda _: "A" * 43,
         uuid_factory=lambda: next(ids),
+        **kwargs,
     )
 
 
@@ -361,3 +370,53 @@ async def test_authenticated_wss_evidence_wins_every_late_streaming_outcome(
     assert snapshot is not None
     assert snapshot.streaming_state == "accepted"
     assert snapshot.lease_state == "active"
+
+
+@pytest.mark.asyncio
+async def test_delayed_public_abort_cannot_hit_replacement_with_reused_digest() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    release_delayed = asyncio.Event()
+
+    def delayed_factory(
+        coroutine: Any,
+        name: str,
+    ) -> asyncio.Task[None]:
+        async def delayed() -> None:
+            await release_delayed.wait()
+            await coroutine
+
+        return asyncio.create_task(delayed(), name=name)
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    registry._background_owner._task_factory = delayed_factory  # type: ignore[attr-defined]
+    authority = ProcessLeaseAuthority(registry)
+
+    authority.schedule_abort_if_matches(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+    hangup = _event("call.hangup", "event-hangup")
+    hangup_resolution = await registry.resolve_webhook(hangup)
+    await registry.reconcile_after_commit(
+        hangup,
+        hangup_resolution,
+        WebhookCommitResult("first", "applied"),
+    )
+    replacement_event = _event("call.initiated", "event-replacement")
+    replacement = await registry.resolve_webhook(replacement_event)
+    assert replacement.reservation is not None
+    await replacement.reservation.confirm(  # type: ignore[attr-defined]
+        WebhookCommitResult("first", "applied")
+    )
+    replacement_handle = await registry.generation_handle("control-a")
+
+    release_delayed.set()
+    await registry.join_until_empty()
+
+    assert replacement_handle is not None
+    assert await registry.generation_handle("control-a") == replacement_handle
+    assert await registry.snapshot("control-a") is not None
