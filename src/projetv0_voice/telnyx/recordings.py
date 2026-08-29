@@ -186,7 +186,6 @@ class ProviderRecordingV1:
     def __post_init__(self) -> None:
         text_values = (
             self.recording_id,
-            self.call_control_id,
             self.call_leg_id,
             self.call_session_id,
             self.channels,
@@ -196,6 +195,11 @@ class ProviderRecordingV1:
         )
         if (
             any(value is not None and not isinstance(value, str) for value in text_values)
+            or self.call_control_id is not None
+            and (
+                not isinstance(self.call_control_id, str)
+                or not 0 < len(self.call_control_id) <= MAX_CALL_CONTROL_ID_CHARS
+            )
             or self.recording_id is not None
             and not is_valid_provider_recording_id(self.recording_id)
             or any(

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import importlib
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from nacl.signing import SigningKey
 from pydantic import SecretStr
 
+import projetv0_voice.telnyx.call_control as call_control_module
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
@@ -17,6 +23,7 @@ from projetv0_voice.persistence.commands import (
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.session import CallIdentity
 from projetv0_voice.telnyx.call_control import (
+    CallControlClient,
     CallControlResult,
     RecordingCatalogTransientError,
 )
@@ -28,14 +35,19 @@ from projetv0_voice.telnyx.recordings import (
     encode_recording_correlation,
     resolve_recording_webhook,
 )
-from projetv0_voice.telnyx.webhooks import VerifiedWebhook, WebhookDisposition
+from projetv0_voice.telnyx.webhooks import (
+    TelnyxWebhookProcessor,
+    TelnyxWebhookVerifier,
+    VerifiedWebhook,
+    WebhookDisposition,
+)
 
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
 CALL_ID = UUID("12345678-1234-4234-8234-1234567890ab")
 KEY = bytes(range(32))
 
 
-def identity() -> CallIdentity:
+def identity(call_control_id: str = "v3:control-1") -> CallIdentity:
     return CallIdentity(
         call_id=CALL_ID,
         durable_generation="generation-ignored",
@@ -43,7 +55,7 @@ def identity() -> CallIdentity:
         lease_claim=object(),
         deployment_id="agent-révision-7",
         registry_handle=object(),
-        telnyx_call_control_id="v3:control-1",
+        telnyx_call_control_id=call_control_id,
         telnyx_call_leg_id="leg-1",
         telnyx_call_session_id="session-1",
         stream_id="stream-ignored",
@@ -413,3 +425,174 @@ async def test_redelivery_after_local_deletion_reconstructs_byte_identical_enric
         timeout_seconds=2.0,
     ) == WebhookDisposition(500)
     await task
+
+
+@pytest.mark.asyncio
+async def test_signed_saved_reconciliation_preserves_1024_call_control_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    call_control_id = "c" * 1024
+    correlation = build_recording_correlation(
+        identity(call_control_id),
+        retention_days=30,
+        required=False,
+    )
+    body = json.dumps(
+        {
+            "data": {
+                "id": "event-long-control-1",
+                "event_type": "call.recording.saved",
+                "occurred_at": "2026-08-29T12:02:00Z",
+                "payload": {
+                    "call_leg_id": "leg-1",
+                    "call_session_id": "session-1",
+                    "client_state": encode_recording_correlation(
+                        correlation
+                    ).get_secret_value(),
+                    "recording_started_at": "2026-08-29T12:00:00Z",
+                    "recording_ended_at": "2026-08-29T12:01:00Z",
+                    "channels": "dual",
+                    "public_recording_urls": {
+                        "wav": "https://RAW-URL-SENTINEL"
+                    },
+                },
+            }
+        }
+    ).encode("utf-8")
+    timestamp = 1_777_118_400
+    signing_key = SigningKey.generate()
+    public_key = base64.b64encode(bytes(signing_key.verify_key)).decode("ascii")
+    signature = base64.b64encode(
+        signing_key.sign(f"{timestamp}|".encode() + body).signature
+    ).decode("ascii")
+    headers = [
+        ("Telnyx-Signature-Ed25519", signature),
+        ("Telnyx-Timestamp", str(timestamp)),
+    ]
+    verification = importlib.import_module("telnyx.lib.webhook_verification")
+    monkeypatch.setattr(verification.time, "time", lambda: float(timestamp))
+
+    class PoisonRow:
+        id = "recording_Ab-12"
+        call_leg_id = "leg-1"
+        call_session_id = "session-1"
+        channels = "dual"
+        status = "completed"
+        source = "call"
+        initiated_by = "StartCallRecordingAPI"
+        recording_started_at = "2026-08-29T12:00:00Z"
+        recording_ended_at = "2026-08-29T12:01:00Z"
+
+        @property
+        def call_control_id(self) -> str:
+            return call_control_id
+
+        @property
+        def download_urls(self) -> object:
+            raise AssertionError("recording URL must never be read")
+
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[PoisonRow()],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.list_calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            self.list_calls.append(dict(kwargs))
+            return OnePageAwaitable()
+
+    class FakeSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=SimpleNamespace())
+
+        async def close(self) -> None:
+            return None
+
+    sdk = FakeSDK()
+    monkeypatch.setattr(call_control_module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    telnyx_client = CallControlClient(api_key="offline-test-key")
+    writer, writer_task = await start_writer(tmp_path / "long-control.sqlite")
+
+    async def after_commit(
+        event: VerifiedWebhook,
+        effect: object,
+    ) -> WebhookDisposition | None:
+        return await after_recording_webhook_commit(
+            event,
+            effect,  # type: ignore[arg-type]
+            telnyx=telnyx_client,
+            writer=writer,
+            local_drain=no_drain,
+            monotonic=lambda: 10.0,
+            timeout_seconds=2.0,
+        )
+
+    processor = TelnyxWebhookProcessor(
+        verifier=TelnyxWebhookVerifier(public_key=public_key),
+        writer=writer,
+        resolver=resolve_recording_webhook,
+        utcnow=lambda: NOW + timedelta(minutes=2),
+        after_commit=after_commit,
+    )
+    try:
+        first_response = await processor.process(body=body, headers=headers)
+        assert first_response == WebhookDisposition(200)
+        first_batch = await writer.read_relay_batch(
+            batch_size=10,
+            now=NOW + timedelta(minutes=4),
+            lease_seconds=5,
+        )
+        base = next(
+            item
+            for item in first_batch
+            if item.operation.payload.telnyx_recording_id is None
+        )
+        enrichment = next(
+            item
+            for item in first_batch
+            if item.operation.payload.telnyx_recording_id == "recording_Ab-12"
+        )
+        assert base.operation.payload.status == "saved"
+        assert enrichment.operation.payload.status == "saved"
+        assert sdk.recordings.list_calls[0]["filter"]["call_control_id"] == (
+            call_control_id
+        )
+        first_bytes = canonical_operation_bytes(enrichment.operation)
+        assert (
+            await writer.ack_outbox(
+                queue_id=enrichment.queue_id,
+                expected_claim_attempt=enrichment.claim_attempt,
+            )
+        ).applied is True
+
+        second_response = await processor.process(body=body, headers=headers)
+        assert second_response == WebhookDisposition(200)
+        second_batch = await writer.read_relay_batch(
+            batch_size=10,
+            now=NOW + timedelta(minutes=5),
+            lease_seconds=5,
+        )
+        rebuilt = next(
+            item
+            for item in second_batch
+            if item.operation.payload.telnyx_recording_id == "recording_Ab-12"
+        )
+        assert canonical_operation_bytes(rebuilt.operation) == first_bytes
+        assert rebuilt.operation.occurred_at == enrichment.operation.occurred_at
+        assert len(sdk.recordings.list_calls) == 2
+    finally:
+        if not writer_task.done():
+            await writer.drain(timeout_seconds=2)
+        await writer_task
+        await telnyx_client.aclose()

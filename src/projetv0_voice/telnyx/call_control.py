@@ -237,10 +237,10 @@ def _raise_recording_catalog_failure(kind: CatalogFailureKind) -> NoReturn:
     raise RecordingCatalogInvalidError("recording_catalog_invalid") from None
 
 
-def _strict_catalog_text(value: object) -> str | None:
+def _strict_catalog_text(value: object, maximum: int = 256) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not 0 < len(value) <= 256:
+    if not isinstance(value, str) or not 0 < len(value) <= maximum:
         raise _RecordingCatalogInvalid
     return value
 
@@ -270,7 +270,8 @@ def _catalog_item(value: object) -> ProviderRecordingV1:
         return ProviderRecordingV1(
             recording_id=_strict_catalog_text(getattr(value, "id", None)),
             call_control_id=_strict_catalog_text(
-                getattr(value, "call_control_id", None)
+                getattr(value, "call_control_id", None),
+                MAX_CALL_CONTROL_ID_CHARS,
             ),
             call_leg_id=_strict_catalog_text(getattr(value, "call_leg_id", None)),
             call_session_id=_strict_catalog_text(

@@ -574,6 +574,143 @@ async def test_recording_catalog_adapter_awaits_exactly_one_page_and_never_reads
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("length", [257, 1024])
+async def test_catalog_list_and_retrieve_preserve_long_call_control_id(
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+) -> None:
+    module = call_control()
+    call_control_id = "c" * length
+    row = SimpleNamespace(
+        id="recording_Ab-12",
+        call_control_id=call_control_id,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        channels="dual",
+        status="completed",
+        source="call",
+        initiated_by="StartCallRecordingAPI",
+        recording_started_at="2026-08-29T12:00:00Z",
+        recording_ended_at="2026-08-29T12:01:00Z",
+    )
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[row],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.list_calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            self.list_calls.append(dict(kwargs))
+            return OnePageAwaitable()
+
+        async def retrieve(self, recording_id: str, **kwargs: object) -> object:
+            assert recording_id == "recording_Ab-12"
+            assert kwargs == {"timeout": 0.75}
+            return SimpleNamespace(data=row)
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = CatalogSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    listed = await client.list_recordings_one_page(
+        call_control_id=call_control_id,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        start_gte_iso="2026-08-29T11:59:55Z",
+        start_lte_iso="2026-08-29T12:00:05Z",
+        end_gte_iso="2026-08-29T12:00:55Z",
+        end_lte_iso="2026-08-29T12:01:05Z",
+        timeout_seconds=0.75,
+    )
+    retrieved = await client.retrieve_recording(
+        "recording_Ab-12",
+        timeout_seconds=0.75,
+    )
+
+    assert listed.items[0].call_control_id == call_control_id
+    assert retrieved.call_control_id == call_control_id
+    assert sdk.recordings.list_calls[0]["filter"]["call_control_id"] == call_control_id
+
+
+@pytest.mark.asyncio
+async def test_catalog_list_and_retrieve_reject_returned_call_control_id_over_1024(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    row = SimpleNamespace(
+        id="recording_Ab-12",
+        call_control_id="c" * 1025,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        channels="dual",
+        status="completed",
+        source="call",
+        initiated_by="StartCallRecordingAPI",
+        recording_started_at="2026-08-29T12:00:00Z",
+        recording_ended_at="2026-08-29T12:01:00Z",
+    )
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[row],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def list(self, **_: object) -> OnePageAwaitable:
+            return OnePageAwaitable()
+
+        async def retrieve(self, *_: object, **__: object) -> object:
+            return SimpleNamespace(data=row)
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: CatalogSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(module.RecordingCatalogInvalidError):
+        await client.list_recordings_one_page(
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id="leg-1",
+            call_session_id="session-1",
+            start_gte_iso="2026-08-29T11:59:55Z",
+            start_lte_iso="2026-08-29T12:00:05Z",
+            end_gte_iso="2026-08-29T12:00:55Z",
+            end_lte_iso="2026-08-29T12:01:05Z",
+            timeout_seconds=0.75,
+        )
+    with pytest.raises(module.RecordingCatalogInvalidError):
+        await client.retrieve_recording("recording_Ab-12", timeout_seconds=0.75)
+
+
+@pytest.mark.asyncio
 async def test_recording_retrieve_404_is_transient_not_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

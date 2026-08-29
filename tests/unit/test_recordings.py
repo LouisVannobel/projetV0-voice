@@ -309,6 +309,46 @@ def test_catalog_and_delete_results_accept_256_url_safe_opaque_recording_id() ->
     assert deleted.recording_id == provider_id
 
 
+@pytest.mark.parametrize("length", [257, 1024])
+def test_provider_recording_accepts_call_control_id_through_1024(length: int) -> None:
+    from projetv0_voice.telnyx.recordings import ProviderRecordingV1
+
+    call_control_id = "c" * length
+    item = ProviderRecordingV1(
+        recording_id="recording_Ab-12",
+        call_control_id=call_control_id,
+        call_leg_id=LEG_ID,
+        call_session_id=SESSION_ID,
+        channels="dual",
+        status="completed",
+        source="call",
+        initiated_by="StartCallRecordingAPI",
+        recording_started_at=NOW,
+        recording_ended_at=NOW + timedelta(minutes=1),
+    )
+
+    assert item.call_control_id == call_control_id
+    assert call_control_id not in repr(item)
+
+
+def test_provider_recording_rejects_call_control_id_over_1024() -> None:
+    from projetv0_voice.telnyx.recordings import ProviderRecordingV1
+
+    with pytest.raises(ValueError, match="provider_recording_invalid"):
+        ProviderRecordingV1(
+            recording_id="recording_Ab-12",
+            call_control_id="c" * 1025,
+            call_leg_id=LEG_ID,
+            call_session_id=SESSION_ID,
+            channels="dual",
+            status="completed",
+            source="call",
+            initiated_by="StartCallRecordingAPI",
+            recording_started_at=NOW,
+            recording_ended_at=NOW + timedelta(minutes=1),
+        )
+
+
 @pytest.mark.parametrize("provider_id", [".", ".."])
 def test_catalog_and_delete_results_reject_exact_dot_segments(provider_id: str) -> None:
     from projetv0_voice.telnyx.recordings import ProviderRecordingV1

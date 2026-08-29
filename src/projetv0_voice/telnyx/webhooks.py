@@ -28,6 +28,7 @@ from projetv0_voice.persistence.commands import (
     PersistenceCommand,
     PersistenceError,
 )
+from projetv0_voice.telnyx.call_control import MAX_CALL_CONTROL_ID_CHARS
 
 MAX_WEBHOOK_BODY_BYTES = 65_536
 MAX_EVENT_ID_CHARS = 256
@@ -244,6 +245,16 @@ def _optional_provider_id(payload: Mapping[str, object], name: str) -> str | Non
     return bounded
 
 
+def _optional_call_control_id(payload: Mapping[str, object]) -> str | None:
+    value = payload.get("call_control_id")
+    if value is None:
+        return None
+    bounded = _bounded_string(value, MAX_CALL_CONTROL_ID_CHARS)
+    if bounded is None:
+        raise ValueError("invalid_call_control_id")
+    return bounded
+
+
 def _optional_recording_id(payload: Mapping[str, object]) -> str | None:
     value = payload.get("recording_id")
     if value is None:
@@ -359,7 +370,7 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             return None
         normalized_time = occurred_at.astimezone(UTC)
-        call_control_id = _optional_provider_id(payload, "call_control_id")
+        call_control_id = _optional_call_control_id(payload)
         if event_type in required_types and call_control_id is None:
             return None
         call_leg_id = _optional_provider_id(payload, "call_leg_id")

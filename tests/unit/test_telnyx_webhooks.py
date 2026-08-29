@@ -319,7 +319,6 @@ def test_fresh_signature_accepts_old_occurred_at_without_using_it_for_freshness(
     [
         event_body(event_id="x" * 257),
         event_body(event_type="x" * 129),
-        event_body(payload={"call_control_id": "x" * 257}),
     ],
 )
 def test_minimal_envelope_identifiers_have_fixed_structural_bounds(
@@ -329,6 +328,51 @@ def test_minimal_envelope_identifiers_have_fixed_structural_bounds(
     verifier, headers = verifier_for(monkeypatch, body)
 
     with pytest.raises(module.InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
+@pytest.mark.parametrize("length", [257, 1024])
+@pytest.mark.parametrize("required", [False, True])
+def test_signed_call_control_id_preserves_1024_bound_and_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+    required: bool,
+) -> None:
+    call_control_id = "c" * length
+    event_type = "call.initiated" if required else "call.recording.saved"
+    body = event_body(
+        event_type=event_type,
+        payload={"call_control_id": call_control_id},
+    )
+    verifier, headers = verifier_for(
+        monkeypatch,
+        body,
+        required_types=frozenset({event_type}) if required else frozenset(),
+    )
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.call_control_id == call_control_id
+    assert call_control_id not in repr(verified)
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_signed_call_control_id_rejects_1025_characters(
+    monkeypatch: pytest.MonkeyPatch,
+    required: bool,
+) -> None:
+    event_type = "call.initiated" if required else "call.recording.saved"
+    body = event_body(
+        event_type=event_type,
+        payload={"call_control_id": "c" * 1025},
+    )
+    verifier, headers = verifier_for(
+        monkeypatch,
+        body,
+        required_types=frozenset({event_type}) if required else frozenset(),
+    )
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
         verifier.verify(body=body, headers=headers)
 
 
