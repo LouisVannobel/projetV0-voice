@@ -392,8 +392,12 @@ async def test_delayed_public_abort_cannot_hit_replacement_with_reused_digest() 
     control = CallControl()
     registry = _registry(writer, control, lambda: 100.0)
     await _durable_waiting_wss(registry)
-    registry._background_owner._task_factory = delayed_factory  # type: ignore[attr-defined]
     authority = ProcessLeaseAuthority(registry)
+    writer.active_error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await authority.claim_once(call_control_id="control-a", token_digest=DIGEST)
+    writer.active_error = None
+    registry._background_owner._task_factory = delayed_factory  # type: ignore[attr-defined]
 
     authority.schedule_abort_if_matches(
         call_control_id="control-a",
@@ -419,4 +423,77 @@ async def test_delayed_public_abort_cannot_hit_replacement_with_reused_digest() 
 
     assert replacement_handle is not None
     assert await registry.generation_handle("control-a") == replacement_handle
+    assert await registry.snapshot("control-a") is not None
+
+
+@pytest.mark.asyncio
+async def test_public_abort_schedules_exact_target_while_registry_lock_is_contended() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    control = CallControl(streaming_outcome="outcome_unknown")
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    authority = ProcessLeaseAuthority(registry)
+    writer.active_error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await authority.claim_once(call_control_id="control-a", token_digest=DIGEST)
+
+    class GuardedRegistryMap(dict[str, Any]):
+        def get(self, key: str, default: Any = None) -> Any:
+            assert registry._lock.locked() is True  # type: ignore[attr-defined]
+            return super().get(key, default)
+
+    registry._by_control = GuardedRegistryMap(registry._by_control)  # type: ignore[attr-defined]
+    await registry._lock.acquire()  # type: ignore[attr-defined]
+    authority.schedule_abort_if_matches(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+    registry._lock.release()  # type: ignore[attr-defined]
+    await registry.join_until_empty()
+
+    assert len(control.hangups) == 1
+    assert await registry.snapshot("control-a") is None
+    assert await registry.live_call_count() == 0
+    assert authority.internal_failure_code is None
+
+
+def test_public_abort_without_published_target_latches_fixed_failure() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    registry = _registry(Writer(), CallControl(), lambda: 100.0)
+    authority = ProcessLeaseAuthority(registry)
+
+    authority.schedule_abort_if_matches(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+
+    assert authority.internal_failure_code == "abort_target_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_public_abort_task_creation_failure_closes_and_latches() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    authority = ProcessLeaseAuthority(registry)
+    writer.active_error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await authority.claim_once(call_control_id="control-a", token_digest=DIGEST)
+
+    def fail_task_creation(*_: object, **__: object) -> asyncio.Task[None]:
+        raise RuntimeError("synthetic task creation failure")
+
+    registry._background_owner._task_factory = fail_task_creation  # type: ignore[attr-defined]
+    authority.schedule_abort_if_matches(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+
+    assert authority.internal_failure_code == "abort_target_unavailable"
+    assert registry.internal_failure_code == "background_task_registration_failed"
     assert await registry.snapshot("control-a") is not None

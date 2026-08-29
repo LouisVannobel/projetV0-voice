@@ -223,6 +223,9 @@ class _CallEntry:
     session: object | None = field(default=None, repr=False)
     session_owner: object | None = field(default=None, repr=False)
     resources_released: bool = False
+    abort_target_clearers: list[
+        tuple[_AbortTarget, Callable[[_AbortTarget], None]]
+    ] = field(default_factory=list, repr=False)
 
 
 @dataclass(slots=True, repr=False)
@@ -388,6 +391,17 @@ class ProcessLeaseClaim:
 
     def __repr__(self) -> str:
         return "ProcessLeaseClaim()"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _AbortTarget:
+    entry: _CallEntry = field(repr=False)
+    generation: UUID
+    call_control_id: str = field(repr=False)
+    token_digest: bytes = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "AbortTarget()"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1399,6 +1413,9 @@ class CallRegistry:
         )
 
     async def complete_terminal_cleanup(self, generation: CallGenerationHandle) -> bool:
+        abort_target_clearers: tuple[
+            tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...
+        ] = ()
         async with self._lock:
             entry = self._by_control.get(generation.call_control_id)
             if (
@@ -1411,9 +1428,14 @@ class CallRegistry:
                 entry.capacity_released = True
                 self._permits_used -= 1
             entry.resources_released = True
+            abort_target_clearers = tuple(entry.abort_target_clearers)
+            entry.abort_target_clearers.clear()
             self._by_control.pop(entry.call_control_id, None)
             self._by_call_id.pop(entry.call_id, None)
-            return True
+        for abort_target, clearer in abort_target_clearers:
+            with contextlib.suppress(BaseException):
+                clearer(abort_target)
+        return True
 
     async def _terminalize_after_hangup(self, call_control_id: str) -> None:
         async with self._lock:
@@ -1569,7 +1591,12 @@ class CallRegistry:
             return None if placeholder is None else placeholder.deadline
 
     async def claim_once(
-        self, *, call_control_id: str, token_digest: bytes
+        self,
+        *,
+        call_control_id: str,
+        token_digest: bytes,
+        abort_target_publisher: Callable[[_AbortTarget], None],
+        abort_target_clearer: Callable[[_AbortTarget], None],
     ) -> ProcessLeaseClaim | None:
         if (
             not isinstance(call_control_id, str)
@@ -1598,6 +1625,16 @@ class CallRegistry:
                 return None
             entry.lease_state = "claiming"
             generation = entry.generation
+            abort_target = _AbortTarget(
+                entry=entry,
+                generation=entry.generation,
+                call_control_id=entry.call_control_id,
+                token_digest=entry.token_digest,
+            )
+            abort_target_publisher(abort_target)
+            entry.abort_target_clearers.append(
+                (abort_target, abort_target_clearer)
+            )
         await self._writer.commit_lease(
             call_control_id=entry.call_control_id,
             call_id=entry.call_id,
@@ -1638,60 +1675,32 @@ class CallRegistry:
             completion.set_result(WebhookDisposition(200))
         return claim
 
-    def schedule_abort_if_matches(
-        self, *, call_control_id: str, token_digest: bytes
-    ) -> None:
-        if (
-            not isinstance(call_control_id, str)
-            or not call_control_id
-            or type(token_digest) is not bytes
-            or len(token_digest) != 32
-        ):
-            return
-        if self._lock.locked():
-            self._internal_failure_code = "abort_capture_lock_busy"
-            return
-        entry = self._by_control.get(call_control_id)
-        if (
-            entry is None
-            or entry.terminal_event is not None
-            or not hmac.compare_digest(entry.token_digest, token_digest)
-        ):
-            return
-        self._schedule_abort_exact(entry, entry.generation)
-
     def _schedule_abort_exact(self, entry: _CallEntry, generation: UUID) -> bool:
-        coroutine = self._abort_if_matches(
-            call_control_id=entry.call_control_id,
-            token_digest=entry.token_digest,
-            expected_entry=entry,
-            expected_generation=generation,
+        return self._schedule_abort_target(
+            _AbortTarget(
+                entry=entry,
+                generation=generation,
+                call_control_id=entry.call_control_id,
+                token_digest=entry.token_digest,
+            ),
+            name="voice-fail-closed-lease-abort",
         )
-        scheduled = self._background_owner.spawn(
-            coroutine, name="voice-fail-closed-lease-abort"
-        )
+
+    def _schedule_abort_target(self, target: _AbortTarget, *, name: str) -> bool:
+        coroutine = self._abort_target(target)
+        scheduled = self._background_owner.spawn(coroutine, name=name)
         if not scheduled:
             self._internal_failure_code = "background_task_registration_failed"
         return scheduled
 
-    async def _abort_if_matches(
-        self,
-        *,
-        call_control_id: str,
-        token_digest: bytes,
-        expected_entry: _CallEntry | None,
-        expected_generation: UUID | None,
-    ) -> None:
+    async def _abort_target(self, target: _AbortTarget) -> None:
         async with self._lock:
-            entry = self._by_control.get(call_control_id)
+            entry = self._by_control.get(target.call_control_id)
             if (
-                entry is None
+                entry is not target.entry
+                or entry.generation != target.generation
                 or entry.terminal_event is not None
-                or not hmac.compare_digest(entry.token_digest, token_digest)
-                or expected_entry is not None
-                and entry is not expected_entry
-                or expected_generation is not None
-                and entry.generation != expected_generation
+                or not hmac.compare_digest(entry.token_digest, target.token_digest)
             ):
                 return
             work = self._mark_terminal_locked(
@@ -1760,15 +1769,31 @@ class CallRegistry:
 class ProcessLeaseAuthority:
     """Concrete Task 6 authority backed by one process-local CallRegistry."""
 
-    __slots__ = ("_registry",)
+    __slots__ = ("_abort_target", "_internal_failure_code", "_registry")
 
     def __init__(self, registry: CallRegistry) -> None:
         if not isinstance(registry, CallRegistry):
             raise ValueError("lease_authority_config_invalid")
         self._registry = registry
+        self._abort_target: _AbortTarget | None = None
+        self._internal_failure_code: str | None = None
 
     def __repr__(self) -> str:
         return "ProcessLeaseAuthority()"
+
+    @property
+    def internal_failure_code(self) -> str | None:
+        return self._internal_failure_code
+
+    def _publish_abort_target(self, target: _AbortTarget) -> None:
+        if self._abort_target is not None and self._abort_target is not target:
+            self._internal_failure_code = "abort_target_unavailable"
+            return
+        self._abort_target = target
+
+    def _clear_abort_target(self, target: _AbortTarget) -> None:
+        if self._abort_target is target:
+            self._abort_target = None
 
     async def claim_once(
         self, *, call_control_id: str, token_digest: bytes
@@ -1776,13 +1801,28 @@ class ProcessLeaseAuthority:
         return await self._registry.claim_once(
             call_control_id=call_control_id,
             token_digest=token_digest,
+            abort_target_publisher=self._publish_abort_target,
+            abort_target_clearer=self._clear_abort_target,
         )
 
     def schedule_abort_if_matches(
         self, *, call_control_id: str, token_digest: bytes
     ) -> None:
-        with contextlib.suppress(BaseException):
-            self._registry.schedule_abort_if_matches(
-                call_control_id=call_control_id,
-                token_digest=token_digest,
-            )
+        try:
+            target = self._abort_target
+            if (
+                target is None
+                or target.call_control_id != call_control_id
+                or type(token_digest) is not bytes
+                or len(token_digest) != 32
+                or not hmac.compare_digest(target.token_digest, token_digest)
+            ):
+                self._internal_failure_code = "abort_target_unavailable"
+                return
+            if not self._registry._schedule_abort_target(
+                target,
+                name="voice-matching-lease-abort",
+            ):
+                self._internal_failure_code = "abort_target_unavailable"
+        except BaseException:
+            self._internal_failure_code = "abort_target_unavailable"
