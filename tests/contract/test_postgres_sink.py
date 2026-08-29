@@ -614,6 +614,17 @@ async def test_purge_lease_accepts_256_url_safe_opaque_provider_id() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", [".", ".."])
+async def test_purge_lease_rejects_recording_dot_segments(provider_id: str) -> None:
+    sink, _, _, _ = sink_with_rows(
+        [purge_row(telnyx_recording_id=provider_id)]
+    )
+
+    with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):
+        await sink.lease_recording_purges("worker-1", 30, 1)
+
+
+@pytest.mark.asyncio
 async def test_purge_lease_rejects_more_rows_than_requested_batch() -> None:
     sink, _, _, _ = sink_with_rows([purge_row(), purge_row(recording_id=str(UUID(int=12)))])
     with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):

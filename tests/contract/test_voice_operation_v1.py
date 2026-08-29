@@ -12,6 +12,7 @@ from projetv0_voice.models import (
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
+    is_valid_provider_recording_id,
 )
 
 NOW = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
@@ -272,6 +273,20 @@ def test_recording_provider_id_accepts_256_url_safe_opaque_characters() -> None:
     )
 
     assert parsed.telnyx_recording_id == provider_id
+
+
+def test_shared_provider_recording_id_rejects_dot_segments_but_keeps_embedded_dot() -> None:
+    assert is_valid_provider_recording_id("rec.part") is True
+    assert is_valid_provider_recording_id(".") is False
+    assert is_valid_provider_recording_id("..") is False
+
+
+@pytest.mark.parametrize("provider_id", [".", ".."])
+def test_recording_model_rejects_exact_dot_segments(provider_id: str) -> None:
+    with pytest.raises(ValidationError, match="telnyx_recording_id"):
+        RecordingUpsertPayloadV1.model_validate(
+            recording_payload(telnyx_recording_id=provider_id)
+        )
 
 
 @pytest.mark.parametrize(

@@ -309,6 +309,27 @@ def test_catalog_and_delete_results_accept_256_url_safe_opaque_recording_id() ->
     assert deleted.recording_id == provider_id
 
 
+@pytest.mark.parametrize("provider_id", [".", ".."])
+def test_catalog_and_delete_results_reject_exact_dot_segments(provider_id: str) -> None:
+    from projetv0_voice.telnyx.recordings import ProviderRecordingV1
+
+    with pytest.raises(ValueError, match="provider_recording_invalid"):
+        ProviderRecordingV1(
+            recording_id=provider_id,
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id=LEG_ID,
+            call_session_id=SESSION_ID,
+            channels="dual",
+            status="completed",
+            source="call",
+            initiated_by="StartCallRecordingAPI",
+            recording_started_at=NOW,
+            recording_ended_at=NOW + timedelta(minutes=1),
+        )
+    with pytest.raises(ValueError, match="provider_delete_result_invalid"):
+        ProviderDeleteResultV1("deleted", provider_id)
+
+
 class StubWriter:
     def __init__(self, results: list[object] | None = None) -> None:
         self.results = list(results or [])
@@ -1299,6 +1320,30 @@ async def test_purge_rejects_malformed_provider_id_without_provider_io_and_acks_
     assert api.calls == []
     assert sink.ack_calls[0][2] == "failed"
     assert "RAW-URL-SENTINEL" not in repr(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", [".", ".."])
+async def test_purge_dot_segments_are_local_failed_without_provider_dispatch(
+    provider_id: str,
+) -> None:
+    lease = purge_lease(1, telnyx_recording_id=provider_id)
+    sink = PurgeSink([lease])
+    api = DeleteApi([])
+
+    result = await purge_recordings_once(
+        worker_id="worker-1",
+        lease_seconds=30,
+        batch_size=1,
+        telnyx=api,
+        sink=sink,  # type: ignore[arg-type]
+        utcnow=clock(NOW, NOW + timedelta(milliseconds=1)),
+    )
+
+    assert result.failed == 1
+    assert result.retry == 0
+    assert api.calls == []
+    assert sink.ack_calls[0][2] == "failed"
 
 
 @pytest.mark.asyncio

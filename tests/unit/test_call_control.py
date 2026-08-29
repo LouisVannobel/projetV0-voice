@@ -292,6 +292,17 @@ def test_recording_stop_provider_id_uses_shared_url_safe_opaque_contract() -> No
         )
 
 
+@pytest.mark.parametrize("provider_id", [".", ".."])
+def test_recording_stop_rejects_exact_dot_segments(provider_id: str) -> None:
+    module = call_control()
+
+    with pytest.raises(ValidationError, match="recording_id"):
+        module.RecordingStopV1(
+            client_state=SecretStr(CLIENT_STATE),
+            recording_id=provider_id,
+        )
+
+
 def test_stream_transport_fields_are_absent_from_dumps_and_safe_in_repr_and_str() -> None:
     module = call_control()
     streaming = module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)
@@ -594,6 +605,42 @@ async def test_recording_retrieve_404_is_transient_not_invalid(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert "RAW-BODY-SENTINEL" not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", [".", ".."])
+async def test_recording_retrieve_and_delete_reject_dot_segments_without_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_id: str,
+) -> None:
+    module = call_control()
+    calls: list[str] = []
+
+    class ForbiddenRecordings:
+        async def retrieve(self, *_: object, **__: object) -> object:
+            calls.append("retrieve")
+            raise AssertionError("retrieve must not dispatch")
+
+        async def delete(self, *_: object, **__: object) -> object:
+            calls.append("delete")
+            raise AssertionError("delete must not dispatch")
+
+    class DotSegmentSDK:
+        def __init__(self) -> None:
+            self.recordings = ForbiddenRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: DotSegmentSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(module.CallControlInputError, match="call_control_input_invalid"):
+        await client.retrieve_recording(provider_id, timeout_seconds=0.75)
+    with pytest.raises(module.CallControlInputError, match="call_control_input_invalid"):
+        await client.delete_recording(provider_id, timeout_seconds=0.75)
+    assert calls == []
 
 
 @pytest.mark.asyncio

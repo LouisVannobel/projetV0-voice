@@ -504,6 +504,21 @@ def test_signed_recording_id_accepts_256_url_safe_opaque_characters(
     assert verified.recording_id == provider_id
 
 
+@pytest.mark.parametrize("provider_id", [".", ".."])
+def test_signed_recording_id_rejects_exact_dot_segments(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_id: str,
+) -> None:
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={"recording_id": provider_id},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
 def test_explicit_handled_type_may_require_call_control_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

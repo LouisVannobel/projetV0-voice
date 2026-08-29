@@ -38,6 +38,7 @@ def is_valid_provider_recording_id(value: object) -> TypeGuard[str]:
     return (
         isinstance(value, str)
         and 0 < len(value) <= MAX_PROVIDER_RECORDING_ID_CHARS
+        and value not in {".", ".."}
         and all(character in _PROVIDER_RECORDING_ID_CHARS for character in value)
     )
 
