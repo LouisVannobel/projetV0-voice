@@ -278,9 +278,12 @@ async def test_service_bundle_preserves_child_cancel_after_sibling_success() -> 
         close_timeout_seconds=1.0,
     )
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as cancelled:
         await bundle.aclose()
+    assert cancelled.value.args == ("stt-child-cancel",)
     assert llm_client.completed.is_set()
+    assert stt_client.calls == 1
+    assert llm_client.calls == 1
 
     stt_client.child_cancel = False
     await bundle.aclose()

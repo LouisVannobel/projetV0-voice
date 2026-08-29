@@ -124,6 +124,9 @@ class PublicSttHttpClient(Protocol):
     async def aclose(self) -> None: ...
 
 
+_CloseOutcome = Literal[True] | BaseException
+
+
 @dataclass(slots=True)
 class ServiceBundle:
     """Per-call inference services and the two retained client owners."""
@@ -153,7 +156,7 @@ class ServiceBundle:
 
     async def aclose(self) -> None:
         async with self._lock:
-            close_jobs: list[asyncio.Task[None]] = []
+            close_jobs: list[asyncio.Task[_CloseOutcome]] = []
             if not self._stt_closed:
                 close_jobs.append(
                     asyncio.create_task(
@@ -176,9 +179,9 @@ class ServiceBundle:
                 for task in close_jobs:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*close_jobs, return_exceptions=True)
+                await asyncio.gather(*close_jobs)
                 raise cancellation
-            results = await asyncio.gather(*close_jobs, return_exceptions=True)
+            results = await asyncio.gather(*close_jobs)
 
             child_cancellation = next(
                 (
@@ -193,13 +196,21 @@ class ServiceBundle:
             if any(isinstance(result, BaseException) for result in results):
                 raise ServiceLifecycleError("service_close_failed")
 
-    async def _close_stt_client(self) -> None:
-        await self._bounded_close(self.stt_http_client.aclose)
+    async def _close_stt_client(self) -> _CloseOutcome:
+        try:
+            await self._bounded_close(self.stt_http_client.aclose)
+        except BaseException as error:
+            return error
         self._stt_closed = True
+        return True
 
-    async def _close_llm_client(self) -> None:
-        await self._bounded_close(self._close_pinned_llm_client)
+    async def _close_llm_client(self) -> _CloseOutcome:
+        try:
+            await self._bounded_close(self._close_pinned_llm_client)
+        except BaseException as error:
+            return error
         self._llm_closed = True
+        return True
 
     async def _bounded_close(self, close: Callable[[], Awaitable[None]]) -> None:
         try:
