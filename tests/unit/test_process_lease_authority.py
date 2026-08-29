@@ -13,16 +13,24 @@ from projetv0_voice.telnyx.webhooks import VerifiedWebhook
 
 NOW = datetime(2026, 8, 29, 10, tzinfo=UTC)
 DIGEST = bytes.fromhex("0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a")
+DIGEST_B = bytes.fromhex("412dc46cc9e3cb26f29f7c1415c556349af62904c5d15b0a2d8cfdc5cfa22b34")
 
 
-def _event(event_type: str, event_id: str) -> VerifiedWebhook:
+def _event(
+    event_type: str,
+    event_id: str,
+    *,
+    call_control_id: str = "control-a",
+    call_leg_id: str = "leg-a",
+    call_session_id: str = "session-a",
+) -> VerifiedWebhook:
     return VerifiedWebhook(
         event_id=event_id,
         event_type=event_type,
         occurred_at=NOW,
-        call_control_id="control-a",
-        call_leg_id="leg-a",
-        call_session_id="session-a",
+        call_control_id=call_control_id,
+        call_leg_id=call_leg_id,
+        call_session_id=call_session_id,
         recording_id=None,
         stream_id=None,
         client_state=None,
@@ -71,6 +79,8 @@ def _registry(
     clock: Any,
     utcnow: Any = lambda: NOW,
     background_task_factory: Any = None,
+    capacity: int = 1,
+    token_factory: Any = None,
 ) -> Any:
     from projetv0_voice.admission import CallRegistry
 
@@ -90,19 +100,22 @@ def _registry(
     kwargs: dict[str, object] = {}
     if background_task_factory is not None:
         kwargs["background_task_factory"] = background_task_factory
+    selected_token_factory = (
+        (lambda _: "A" * 43) if token_factory is None else token_factory
+    )
     return CallRegistry(
         writer=writer,
         call_control=control,
         tenant_id="tenant-a",
         agent_id="agent-a",
         deployment_id="agent-a",
-        capacity=1,
+        capacity=capacity,
         lease_ttl_seconds=30,
         stream_url="wss://voice.invalid/telnyx/stream",
         retention_days=7,
         utcnow=utcnow,
         monotonic=clock,
-        token_factory=lambda _: "A" * 43,
+        token_factory=selected_token_factory,
         uuid_factory=lambda: next(ids),
         **kwargs,
     )
@@ -115,6 +128,38 @@ async def _durable_waiting_wss(registry: Any) -> None:
         initiated, resolution, WebhookCommitResult("first", "applied")
     )
     answered = _event("call.answered", "event-b")
+    resolution = await registry.resolve_webhook(answered)
+    await registry.reconcile_after_commit(
+        answered, resolution, WebhookCommitResult("first", "applied")
+    )
+
+
+async def _durable_waiting_wss_for(
+    registry: Any,
+    *,
+    call_control_id: str,
+    call_leg_id: str,
+    call_session_id: str,
+    event_prefix: str,
+) -> None:
+    initiated = _event(
+        "call.initiated",
+        f"{event_prefix}-initiated",
+        call_control_id=call_control_id,
+        call_leg_id=call_leg_id,
+        call_session_id=call_session_id,
+    )
+    resolution = await registry.resolve_webhook(initiated)
+    await registry.reconcile_after_commit(
+        initiated, resolution, WebhookCommitResult("first", "applied")
+    )
+    answered = _event(
+        "call.answered",
+        f"{event_prefix}-answered",
+        call_control_id=call_control_id,
+        call_leg_id=call_leg_id,
+        call_session_id=call_session_id,
+    )
     resolution = await registry.resolve_webhook(answered)
     await registry.reconcile_after_commit(
         answered, resolution, WebhookCommitResult("first", "applied")
@@ -497,3 +542,142 @@ async def test_public_abort_task_creation_failure_closes_and_latches() -> None:
     assert authority.internal_failure_code == "abort_target_unavailable"
     assert registry.internal_failure_code == "background_task_registration_failed"
     assert await registry.snapshot("control-a") is not None
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_concurrent_claims_keep_independent_abort_handoffs() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    class BarrierWriter(Writer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_calls: set[str] = set()
+            self.both_active_started = asyncio.Event()
+            self.release_active = asyncio.Event()
+
+        async def commit_lease(self, **values: object) -> None:
+            if values["state"] == "active":
+                self.active_calls.add(str(values["call_control_id"]))
+                if self.active_calls == {"control-a", "control-b"}:
+                    self.both_active_started.set()
+                await self.release_active.wait()
+            await super().commit_lease(**values)
+
+    tokens = iter(("A" * 43, "B" * 43))
+    writer = BarrierWriter()
+    control = CallControl(streaming_outcome="outcome_unknown")
+    registry = _registry(
+        writer,
+        control,
+        lambda: 100.0,
+        capacity=2,
+        token_factory=lambda _: next(tokens),
+    )
+    await _durable_waiting_wss_for(
+        registry,
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        event_prefix="event-a",
+    )
+    await _durable_waiting_wss_for(
+        registry,
+        call_control_id="control-b",
+        call_leg_id="leg-b",
+        call_session_id="session-b",
+        event_prefix="event-b",
+    )
+    authority = ProcessLeaseAuthority(registry)
+    claim_a = asyncio.create_task(
+        authority.claim_once(call_control_id="control-a", token_digest=DIGEST)
+    )
+    claim_b = asyncio.create_task(
+        authority.claim_once(call_control_id="control-b", token_digest=DIGEST_B)
+    )
+    await writer.both_active_started.wait()
+    writer.release_active.set()
+
+    assert await claim_a is not None
+    assert await claim_b is not None
+    authority.schedule_abort_if_matches(
+        call_control_id="control-b",
+        token_digest=DIGEST_B,
+    )
+    await registry.join_until_empty()
+
+    snapshot_a = await registry.snapshot("control-a")
+    assert snapshot_a is not None
+    assert snapshot_a.lease_state == "active"
+    assert await registry.snapshot("control-b") is None
+    assert [call_control_id for call_control_id, _ in control.hangups] == ["control-b"]
+    assert authority.internal_failure_code is None
+
+
+@pytest.mark.asyncio
+async def test_abort_target_publication_failure_rolls_back_before_active_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    authority = ProcessLeaseAuthority(registry)
+
+    def refuse_publication(
+        _authority: ProcessLeaseAuthority,
+        _target: object,
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        ProcessLeaseAuthority,
+        "_publish_abort_target",
+        refuse_publication,
+    )
+
+    claim = await authority.claim_once(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+
+    assert claim is None
+    assert writer.commits == []
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    assert snapshot.lease_state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_repeated_public_abort_schedule_creates_at_most_one_task() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    writer.active_error = asyncio.CancelledError()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    authority = ProcessLeaseAuthority(registry)
+    with pytest.raises(asyncio.CancelledError):
+        await authority.claim_once(call_control_id="control-a", token_digest=DIGEST)
+
+    created_names: list[str] = []
+
+    def counting_factory(
+        coroutine: Any,
+        name: str,
+    ) -> asyncio.Task[None]:
+        created_names.append(name)
+        return asyncio.create_task(coroutine, name=name)
+
+    registry._background_owner._task_factory = counting_factory  # type: ignore[attr-defined]
+    authority.schedule_abort_if_matches(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+    authority.schedule_abort_if_matches(
+        call_control_id="control-a",
+        token_digest=DIGEST,
+    )
+    await registry.join_until_empty()
+
+    assert created_names == ["voice-matching-lease-abort"]

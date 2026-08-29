@@ -404,6 +404,15 @@ class _AbortTarget:
         return "AbortTarget()"
 
 
+@dataclass(slots=True, repr=False)
+class _AbortHandoff:
+    target: _AbortTarget = field(repr=False)
+    scheduled: bool = False
+
+    def __repr__(self) -> str:
+        return "AbortHandoff()"
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class CallGenerationHandle:
     """Opaque generation-checked registry handle for later lifecycle owners."""
@@ -1595,7 +1604,7 @@ class CallRegistry:
         *,
         call_control_id: str,
         token_digest: bytes,
-        abort_target_publisher: Callable[[_AbortTarget], None],
+        abort_target_publisher: Callable[[_AbortTarget], bool],
         abort_target_clearer: Callable[[_AbortTarget], None],
     ) -> ProcessLeaseClaim | None:
         if (
@@ -1631,7 +1640,9 @@ class CallRegistry:
                 call_control_id=entry.call_control_id,
                 token_digest=entry.token_digest,
             )
-            abort_target_publisher(abort_target)
+            if not abort_target_publisher(abort_target):
+                entry.lease_state = "pending"
+                return None
             entry.abort_target_clearers.append(
                 (abort_target, abort_target_clearer)
             )
@@ -1769,13 +1780,21 @@ class CallRegistry:
 class ProcessLeaseAuthority:
     """Concrete Task 6 authority backed by one process-local CallRegistry."""
 
-    __slots__ = ("_abort_target", "_internal_failure_code", "_registry")
+    __slots__ = (
+        "_abort_handoff_capacity",
+        "_abort_handoffs",
+        "_abort_handoffs_lock",
+        "_internal_failure_code",
+        "_registry",
+    )
 
     def __init__(self, registry: CallRegistry) -> None:
         if not isinstance(registry, CallRegistry):
             raise ValueError("lease_authority_config_invalid")
         self._registry = registry
-        self._abort_target: _AbortTarget | None = None
+        self._abort_handoff_capacity = registry._capacity
+        self._abort_handoffs: dict[tuple[str, bytes], _AbortHandoff] = {}
+        self._abort_handoffs_lock = threading.Lock()
         self._internal_failure_code: str | None = None
 
     def __repr__(self) -> str:
@@ -1785,15 +1804,52 @@ class ProcessLeaseAuthority:
     def internal_failure_code(self) -> str | None:
         return self._internal_failure_code
 
-    def _publish_abort_target(self, target: _AbortTarget) -> None:
-        if self._abort_target is not None and self._abort_target is not target:
-            self._internal_failure_code = "abort_target_unavailable"
-            return
-        self._abort_target = target
+    def _publish_abort_target(self, target: _AbortTarget) -> bool:
+        key = (target.call_control_id, target.token_digest)
+        with self._abort_handoffs_lock:
+            handoff = self._abort_handoffs.get(key)
+            if handoff is not None:
+                if handoff.target is target:
+                    return True
+                self._internal_failure_code = "abort_target_unavailable"
+                return False
+            if len(self._abort_handoffs) >= self._abort_handoff_capacity:
+                self._internal_failure_code = "abort_target_unavailable"
+                return False
+            self._abort_handoffs[key] = _AbortHandoff(target)
+        return True
 
     def _clear_abort_target(self, target: _AbortTarget) -> None:
-        if self._abort_target is target:
-            self._abort_target = None
+        key = (target.call_control_id, target.token_digest)
+        with self._abort_handoffs_lock:
+            handoff = self._abort_handoffs.get(key)
+            if handoff is not None and handoff.target is target:
+                self._abort_handoffs.pop(key, None)
+
+    def _capture_abort_target_once(
+        self,
+        *,
+        call_control_id: str,
+        token_digest: bytes,
+    ) -> _AbortTarget | None:
+        if (
+            not isinstance(call_control_id, str)
+            or not call_control_id
+            or type(token_digest) is not bytes
+            or len(token_digest) != 32
+        ):
+            self._internal_failure_code = "abort_target_unavailable"
+            return None
+        key = (call_control_id, token_digest)
+        with self._abort_handoffs_lock:
+            handoff = self._abort_handoffs.get(key)
+            if handoff is None:
+                self._internal_failure_code = "abort_target_unavailable"
+                return None
+            if handoff.scheduled:
+                return None
+            handoff.scheduled = True
+            return handoff.target
 
     async def claim_once(
         self, *, call_control_id: str, token_digest: bytes
@@ -1809,15 +1865,11 @@ class ProcessLeaseAuthority:
         self, *, call_control_id: str, token_digest: bytes
     ) -> None:
         try:
-            target = self._abort_target
-            if (
-                target is None
-                or target.call_control_id != call_control_id
-                or type(token_digest) is not bytes
-                or len(token_digest) != 32
-                or not hmac.compare_digest(target.token_digest, token_digest)
-            ):
-                self._internal_failure_code = "abort_target_unavailable"
+            target = self._capture_abort_target_once(
+                call_control_id=call_control_id,
+                token_digest=token_digest,
+            )
+            if target is None:
                 return
             if not self._registry._schedule_abort_target(
                 target,
