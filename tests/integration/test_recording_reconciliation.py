@@ -263,6 +263,28 @@ async def test_missing_scalar_with_valid_id_allows_exactly_one_full_retrieve() -
 
 
 @pytest.mark.asyncio
+async def test_retrieve_not_yet_indexed_is_503_after_one_fallback() -> None:
+    event = saved_event()
+    api = CatalogApi(
+        ProviderRecordingPageV1(1, 1, (catalog_item(source=None),)),
+        retrieve=RecordingCatalogTransientError("recording_catalog_transient"),
+    )
+
+    result = await after_recording_webhook_commit(
+        event,
+        resolve_recording_webhook(event),
+        telnyx=api,
+        writer=CapturingWriter(),
+        local_drain=no_drain,
+        monotonic=lambda: 10.0,
+        timeout_seconds=2.0,
+    )
+
+    assert result == WebhookDisposition(503)
+    assert api.retrieve_calls == [("recording_Ab-12", 1.0)]
+
+
+@pytest.mark.asyncio
 async def test_provider_transient_is_503_and_writer_identity_conflict_is_500() -> None:
     event = saved_event()
     transient = CatalogApi(RecordingCatalogTransientError("recording_catalog_transient"))

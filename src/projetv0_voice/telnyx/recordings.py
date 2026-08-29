@@ -7,7 +7,6 @@ import base64
 import binascii
 import hashlib
 import json
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -16,7 +15,11 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
 
-from projetv0_voice.models import RecordingUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.models import (
+    RecordingUpsertPayloadV1,
+    VoiceOperationV1,
+    is_valid_provider_recording_id,
+)
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
     PersistenceCommand,
@@ -24,6 +27,8 @@ from projetv0_voice.persistence.commands import (
     canonical_operation_bytes,
 )
 from projetv0_voice.persistence.postgres_sink import (
+    POOL_ACQUIRE_TIMEOUT_SECONDS,
+    SQL_TRANSACTION_TIMEOUT_SECONDS,
     OperationConflictError,
     OperationSinkCommitAmbiguousError,
     OperationSinkContractError,
@@ -42,6 +47,7 @@ from projetv0_voice.session import (
     RecordingStartState,
 )
 from projetv0_voice.telnyx.call_control import (
+    ATTEMPT_DEADLINE_SECONDS,
     MAX_CALL_CONTROL_ID_CHARS,
     CallControlResult,
     RecordingCatalogInvalidError,
@@ -68,9 +74,17 @@ RECONCILE_TIMESTAMP_SLOP_SECONDS = 5.0
 RECORDING_LIST_DEADLINE_SECONDS = 1.0
 RECORDING_RETRIEVE_DEADLINE_SECONDS = 1.0
 RECORDING_DELETE_DEADLINE_SECONDS = 1.0
-PURGE_ACK_RESERVE_SECONDS = 1.0
+REQUIRED_HANGUP_OVERHEAD_SECONDS = 0.1
+REQUIRED_HANGUP_RESERVE_SECONDS = (
+    2 * ATTEMPT_DEADLINE_SECONDS + REQUIRED_HANGUP_OVERHEAD_SECONDS
+)
+PURGE_ACK_OVERHEAD_SECONDS = 0.5
+PURGE_ACK_RESERVE_SECONDS = (
+    POOL_ACQUIRE_TIMEOUT_SECONDS
+    + SQL_TRANSACTION_TIMEOUT_SECONDS
+    + PURGE_ACK_OVERHEAD_SECONDS
+)
 PURGE_CLOCK_SKEW_RESERVE_SECONDS = 0.25
-_PROVIDER_RECORDING_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 _CAPSULE_KEYS = frozenset(
     {
@@ -119,7 +133,7 @@ class ProviderDeleteResultV1:
             or self.outcome == "deleted"
             and (
                 not isinstance(self.recording_id, str)
-                or _PROVIDER_RECORDING_ID.fullmatch(self.recording_id) is None
+                or not is_valid_provider_recording_id(self.recording_id)
             )
             or self.outcome != "deleted"
             and self.recording_id is not None
@@ -183,7 +197,7 @@ class ProviderRecordingV1:
         if (
             any(value is not None and not isinstance(value, str) for value in text_values)
             or self.recording_id is not None
-            and _PROVIDER_RECORDING_ID.fullmatch(self.recording_id) is None
+            and not is_valid_provider_recording_id(self.recording_id)
             or any(
                 value is not None
                 and (not value or len(value) > MAX_PROVIDER_ID_CHARS)
@@ -723,8 +737,9 @@ async def _join_owned_action(
     *,
     name: str,
 ) -> tuple[CallControlResult | None, asyncio.CancelledError | None, bool]:
-    del name
     task: asyncio.Future[CallControlResult] = asyncio.ensure_future(awaitable)
+    if isinstance(task, asyncio.Task):
+        task.set_name(name)
     first_cancellation: asyncio.CancelledError | None = None
     while True:
         try:
@@ -1102,7 +1117,7 @@ async def after_recording_webhook_commit(
         await _await_with_deadline(
             drain_result,
             monotonic=monotonic,
-            deadline=deadline,
+            deadline=deadline - REQUIRED_HANGUP_RESERVE_SECONDS,
         )
     except asyncio.CancelledError as error:
         first_cancellation = error
@@ -1194,7 +1209,7 @@ async def purge_recordings_once(
             continue
         provider_id = lease.telnyx_recording_id
         outcome: PurgeOutcome
-        if _PROVIDER_RECORDING_ID.fullmatch(provider_id) is None:
+        if not is_valid_provider_recording_id(provider_id):
             outcome = "failed"
         else:
             try:
@@ -1218,12 +1233,13 @@ async def purge_recordings_once(
             expired += 1
             continue
         try:
-            await sink.ack_recording_purge(
-                lease.recording_id,
-                lease.lease_token,
-                outcome,
-                ack_at,
-            )
+            async with asyncio.timeout(PURGE_ACK_RESERVE_SECONDS):
+                await sink.ack_recording_purge(
+                    lease.recording_id,
+                    lease.lease_token,
+                    outcome,
+                    ack_at,
+                )
         except asyncio.CancelledError:
             raise
         except OperationSinkStaleLeaseError:

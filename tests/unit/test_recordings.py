@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -284,6 +285,28 @@ def test_provider_recording_metadata_rejects_url_shaped_recording_id() -> None:
             recording_started_at=NOW,
             recording_ended_at=NOW + timedelta(minutes=1),
         )
+
+
+def test_catalog_and_delete_results_accept_256_url_safe_opaque_recording_id() -> None:
+    from projetv0_voice.telnyx.recordings import ProviderRecordingV1
+
+    provider_id = "r." + "A" * 251 + "~_-"
+    catalog = ProviderRecordingV1(
+        recording_id=provider_id,
+        call_control_id=CALL_CONTROL_ID,
+        call_leg_id=LEG_ID,
+        call_session_id=SESSION_ID,
+        channels="dual",
+        status="completed",
+        source="call",
+        initiated_by="StartCallRecordingAPI",
+        recording_started_at=NOW,
+        recording_ended_at=NOW + timedelta(minutes=1),
+    )
+    deleted = ProviderDeleteResultV1("deleted", provider_id)
+
+    assert catalog.recording_id == provider_id
+    assert deleted.recording_id == provider_id
 
 
 class StubWriter:
@@ -773,6 +796,61 @@ async def test_local_drain_fault_cannot_suppress_shared_hangup(fault: str) -> No
 
 
 @pytest.mark.asyncio
+async def test_required_error_drain_timeout_reserves_and_joins_provider_hangup() -> None:
+    event = recording_event(
+        "call.recording.error",
+        provider_recording_id=None,
+        required=True,
+        started_at=None,
+        ended_at=None,
+        channels=None,
+    )
+    effect = resolve_recording_webhook(event)
+    drain_started = asyncio.Event()
+    drain_cancelled = asyncio.Event()
+    hangup_started = asyncio.Event()
+    hangup_release = asyncio.Event()
+    events: list[str] = []
+
+    async def blocked_drain(_call_id: UUID, _reason: str) -> None:
+        drain_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            drain_cancelled.set()
+
+    async def blocked_hangup() -> CallControlResult:
+        hangup_started.set()
+        await hangup_release.wait()
+        return CallControlResult("accepted")
+
+    api = TerminationApi(blocked_hangup, events)
+    pending = asyncio.create_task(
+        after_recording_webhook_commit(
+            event,
+            effect,
+            telnyx=api,
+            writer=StubWriter(),
+            local_drain=blocked_drain,
+            monotonic=time.monotonic,
+            timeout_seconds=1.15,
+        )
+    )
+    try:
+        await drain_started.wait()
+        await asyncio.wait_for(hangup_started.wait(), timeout=0.25)
+        assert drain_cancelled.is_set()
+        assert pending.done() is False
+        hangup_release.set()
+        assert await pending == WebhookDisposition(500)
+        assert events == ["hangup"]
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_required_error_cancellation_during_hangup_joins_attempt_before_propagating() -> None:
     event = recording_event(
         "call.recording.error",
@@ -965,6 +1043,13 @@ async def test_caller_cancellation_during_hangup_waits_for_owned_attempt_then_pr
         )
     )
     await entered.wait()
+    owned_hangups = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "voice-recording-hangup"
+    ]
+    assert len(owned_hangups) == 1
+    assert owned_hangups[0].done() is False
     pending.cancel("caller-cancelled")
     await asyncio.sleep(0)
 
@@ -972,6 +1057,7 @@ async def test_caller_cancellation_during_hangup_waits_for_owned_attempt_then_pr
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await pending
+    assert owned_hangups[0].done() is True
     assert api.events == ["hangup"]
     assert not any(
         task is not asyncio.current_task() and "hangup" in task.get_name()
@@ -1109,6 +1195,92 @@ async def test_purge_expiry_before_delete_and_after_delete_never_acks_uncertain_
 
 
 @pytest.mark.asyncio
+async def test_purge_does_not_delete_when_lease_cannot_cover_real_sink_ack_bound() -> None:
+    lease = purge_lease(1, lease_expires_at=NOW + timedelta(seconds=8))
+    sink = PurgeSink([lease])
+    api = DeleteApi([ProviderDeleteResultV1("deleted", "recording_1")])
+
+    result = await purge_recordings_once(
+        worker_id="worker-1",
+        lease_seconds=30,
+        batch_size=1,
+        telnyx=api,
+        sink=sink,  # type: ignore[arg-type]
+        utcnow=clock(NOW, NOW),
+    )
+
+    assert result.expired == 1
+    assert api.calls == []
+    assert sink.ack_calls == []
+
+
+@pytest.mark.asyncio
+async def test_purge_ack_timeout_stops_batch_without_same_token_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import projetv0_voice.telnyx.recordings as recordings_module
+
+    entered = asyncio.Event()
+
+    class BlockingAckSink(PurgeSink):
+        async def ack_recording_purge(
+            self,
+            recording_id: UUID,
+            lease_token: UUID,
+            outcome: str,
+            occurred_at: datetime,
+        ) -> None:
+            self.ack_calls.append((recording_id, lease_token, outcome, occurred_at))
+            entered.set()
+            await asyncio.Future()
+
+    monkeypatch.setattr(recordings_module, "PURGE_ACK_RESERVE_SECONDS", 0.01)
+    sink = BlockingAckSink([purge_lease(1), purge_lease(2)])
+    api = DeleteApi([ProviderDeleteResultV1("deleted", "recording_1")])
+
+    with pytest.raises(RecordingPurgeError, match="recording_purge_ack_failed"):
+        await asyncio.wait_for(
+            purge_recordings_once(
+                worker_id="worker-1",
+                lease_seconds=30,
+                batch_size=2,
+                telnyx=api,
+                sink=sink,  # type: ignore[arg-type]
+                utcnow=clock(NOW, NOW),
+            ),
+            timeout=0.1,
+        )
+
+    assert entered.is_set()
+    assert len(api.calls) == 1
+    assert len(sink.ack_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_purge_ack_cancellation_propagates_without_replay() -> None:
+    cancellation = asyncio.CancelledError("ack-cancelled")
+    sink = PurgeSink(
+        [purge_lease(1), purge_lease(2)],
+        ack_results=[cancellation],
+    )
+    api = DeleteApi([ProviderDeleteResultV1("deleted", "recording_1")])
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await purge_recordings_once(
+            worker_id="worker-1",
+            lease_seconds=30,
+            batch_size=2,
+            telnyx=api,
+            sink=sink,  # type: ignore[arg-type]
+            utcnow=clock(NOW, NOW),
+        )
+
+    assert raised.value is cancellation
+    assert len(api.calls) == 1
+    assert len(sink.ack_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_purge_rejects_malformed_provider_id_without_provider_io_and_acks_failed() -> None:
     malformed = purge_lease(1, telnyx_recording_id="https://RAW-URL-SENTINEL")
     sink = PurgeSink([malformed])
@@ -1127,6 +1299,27 @@ async def test_purge_rejects_malformed_provider_id_without_provider_io_and_acks_
     assert api.calls == []
     assert sink.ack_calls[0][2] == "failed"
     assert "RAW-URL-SENTINEL" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_purge_accepts_256_url_safe_opaque_provider_id() -> None:
+    provider_id = "r." + "A" * 251 + "~_-"
+    lease = purge_lease(1, telnyx_recording_id=provider_id)
+    sink = PurgeSink([lease])
+    api = DeleteApi([ProviderDeleteResultV1("deleted", provider_id)])
+
+    result = await purge_recordings_once(
+        worker_id="worker-1",
+        lease_seconds=30,
+        batch_size=1,
+        telnyx=api,
+        sink=sink,  # type: ignore[arg-type]
+        utcnow=clock(NOW, NOW + timedelta(milliseconds=1)),
+    )
+
+    assert result.deleted == 1
+    assert api.calls == [(provider_id, 1.0)]
+    assert sink.ack_calls[0][2] == "deleted"
 
 
 @pytest.mark.asyncio

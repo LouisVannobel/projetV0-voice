@@ -6,13 +6,18 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
 import telnyx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, field_validator
+
+from projetv0_voice.models import (
+    MAX_PROVIDER_RECORDING_ID_CHARS,
+    is_valid_provider_recording_id,
+)
 
 if TYPE_CHECKING:
     from projetv0_voice.telnyx.recordings import (
@@ -27,7 +32,7 @@ MAX_CALL_CONTROL_ID_CHARS = 1_024
 MAX_STREAM_URL_CHARS = 2_048
 MAX_STREAM_AUTH_TOKEN_CHARS = 4_000
 MAX_CLIENT_STATE_CHARS = 4_096
-MAX_RECORDING_ID_CHARS = 256
+MAX_RECORDING_ID_CHARS = MAX_PROVIDER_RECORDING_ID_CHARS
 
 CallControlOutcome = Literal[
     "accepted",
@@ -68,6 +73,10 @@ class RecordingCatalogTransientError(RecordingCatalogError):
 
 class RecordingCatalogInvalidError(RecordingCatalogError):
     """The catalog response cannot identify one recording safely."""
+
+
+class _RecordingCatalogInvalid(Exception):
+    """Internal sentinel reduced before any public error is constructed."""
 
 
 class _RedactedFrozenModel(BaseModel):
@@ -149,6 +158,13 @@ class RecordingStopV1(_RedactedFrozenModel):
         repr=False,
     )
 
+    @field_validator("recording_id")
+    @classmethod
+    def validate_recording_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_provider_recording_id(value):
+            raise ValueError("recording_id_invalid")
+        return value
+
 
 @dataclass(frozen=True, slots=True)
 class CallControlResult:
@@ -193,21 +209,39 @@ def _connection_observation(error: telnyx.APIConnectionError) -> _Observation:
     return _Observation("outcome_unknown", retry=True, ambiguous=True)
 
 
-def _recording_catalog_error(error: BaseException) -> RecordingCatalogError:
+CatalogFailureKind = Literal["transient", "invalid"]
+
+
+def _recording_catalog_failure_kind(
+    error: BaseException,
+    *,
+    not_found_transient: bool = False,
+) -> CatalogFailureKind:
     if isinstance(error, telnyx.APIStatusError):
-        if error.status_code in {408, 409, 429} or error.status_code >= 500:
-            return RecordingCatalogTransientError("recording_catalog_transient")
-        return RecordingCatalogInvalidError("recording_catalog_invalid")
+        if (
+            not_found_transient
+            and error.status_code == 404
+            or error.status_code in {408, 409, 429}
+            or error.status_code >= 500
+        ):
+            return "transient"
+        return "invalid"
     if isinstance(error, (telnyx.APIConnectionError, TimeoutError)):
-        return RecordingCatalogTransientError("recording_catalog_transient")
-    return RecordingCatalogInvalidError("recording_catalog_invalid")
+        return "transient"
+    return "invalid"
+
+
+def _raise_recording_catalog_failure(kind: CatalogFailureKind) -> NoReturn:
+    if kind == "transient":
+        raise RecordingCatalogTransientError("recording_catalog_transient") from None
+    raise RecordingCatalogInvalidError("recording_catalog_invalid") from None
 
 
 def _strict_catalog_text(value: object) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not 0 < len(value) <= 256:
-        raise RecordingCatalogInvalidError("recording_catalog_invalid")
+        raise _RecordingCatalogInvalid
     return value
 
 
@@ -215,13 +249,17 @@ def _strict_catalog_datetime(value: object) -> datetime | None:
     if value is None:
         return None
     if not isinstance(value, str) or not 0 < len(value) <= 64:
-        raise RecordingCatalogInvalidError("recording_catalog_invalid")
+        raise _RecordingCatalogInvalid
+    invalid = False
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        raise RecordingCatalogInvalidError("recording_catalog_invalid") from None
+        invalid = True
+        parsed = datetime.min
+    if invalid:
+        raise _RecordingCatalogInvalid from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise RecordingCatalogInvalidError("recording_catalog_invalid")
+        raise _RecordingCatalogInvalid
     return parsed.astimezone(UTC)
 
 
@@ -249,10 +287,11 @@ def _catalog_item(value: object) -> ProviderRecordingV1:
                 getattr(value, "recording_ended_at", None)
             ),
         )
-    except RecordingCatalogError:
+    except _RecordingCatalogInvalid:
         raise
     except Exception:
-        raise RecordingCatalogInvalidError("recording_catalog_invalid") from None
+        pass
+    raise _RecordingCatalogInvalid from None
 
 
 def _valid_catalog_filter_time(value: object) -> bool:
@@ -474,6 +513,8 @@ class CallControlClient:
             filters["call_leg_id"] = call_leg_id
         if call_session_id is not None:
             filters["call_session_id"] = call_session_id
+        failure: CatalogFailureKind | None = None
+        result: ProviderRecordingPageV1 | None = None
         try:
             paginator = self._client.recordings.list(
                 filter=cast(Any, filters),
@@ -486,22 +527,23 @@ class CallControlClient:
             page_number = None if meta is None else getattr(meta, "page_number", None)
             total_pages = None if meta is None else getattr(meta, "total_pages", None)
             if page_number is not None and type(page_number) is not int:
-                raise RecordingCatalogInvalidError("recording_catalog_invalid")
+                raise _RecordingCatalogInvalid
             if total_pages is not None and type(total_pages) is not int:
-                raise RecordingCatalogInvalidError("recording_catalog_invalid")
+                raise _RecordingCatalogInvalid
             data = getattr(page, "data", None)
             if not isinstance(data, list):
-                raise RecordingCatalogInvalidError("recording_catalog_invalid")
+                raise _RecordingCatalogInvalid
             items = tuple(_catalog_item(item) for item in data)
-            return ProviderRecordingPageV1(page_number, total_pages, items)
+            result = ProviderRecordingPageV1(page_number, total_pages, items)
         except asyncio.CancelledError:
             raise
-        except RecordingCatalogError:
-            raise
-        except BaseException as error:
-            safe_error = _recording_catalog_error(error)
-            del error
-            raise safe_error from None
+        except Exception as error:
+            failure = _recording_catalog_failure_kind(error)
+        if failure is not None:
+            _raise_recording_catalog_failure(failure)
+        if result is None:
+            _raise_recording_catalog_failure("invalid")
+        return result
 
     async def retrieve_recording(
         self,
@@ -512,27 +554,32 @@ class CallControlClient:
         if self._closing or self._closed:
             raise CallControlClosedError("call_control_client_closed")
         if (
-            not isinstance(recording_id, str)
-            or not 0 < len(recording_id) <= MAX_RECORDING_ID_CHARS
+            not is_valid_provider_recording_id(recording_id)
             or type(timeout_seconds) not in {float, int}
             or not 0 < timeout_seconds <= 1.0
         ):
             raise CallControlInputError("call_control_input_invalid")
+        failure: CatalogFailureKind | None = None
+        result: ProviderRecordingV1 | None = None
         try:
             async with asyncio.timeout(float(timeout_seconds)):
                 response = await self._client.recordings.retrieve(
                     recording_id,
                     timeout=float(timeout_seconds),
                 )
-            return _catalog_item(getattr(response, "data", None))
+            result = _catalog_item(getattr(response, "data", None))
         except asyncio.CancelledError:
             raise
-        except RecordingCatalogError:
-            raise
-        except BaseException as error:
-            safe_error = _recording_catalog_error(error)
-            del error
-            raise safe_error from None
+        except Exception as error:
+            failure = _recording_catalog_failure_kind(
+                error,
+                not_found_transient=True,
+            )
+        if failure is not None:
+            _raise_recording_catalog_failure(failure)
+        if result is None:
+            _raise_recording_catalog_failure("invalid")
+        return result
 
     async def delete_recording(
         self,
@@ -545,8 +592,7 @@ class CallControlClient:
         if self._closing or self._closed:
             raise CallControlClosedError("call_control_client_closed")
         if (
-            not isinstance(recording_id, str)
-            or not 0 < len(recording_id) <= MAX_RECORDING_ID_CHARS
+            not is_valid_provider_recording_id(recording_id)
             or type(timeout_seconds) not in {float, int}
             or not 0 < timeout_seconds <= 1.0
         ):

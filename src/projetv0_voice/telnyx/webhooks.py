@@ -9,7 +9,6 @@ import hashlib
 import importlib
 import inspect
 import json
-import re
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -19,7 +18,11 @@ from uuid import UUID
 
 from pydantic import SecretStr
 
-from projetv0_voice.models import VoiceOperationV1
+from projetv0_voice.models import (
+    MAX_PROVIDER_RECORDING_ID_CHARS,
+    VoiceOperationV1,
+    is_valid_provider_recording_id,
+)
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
     PersistenceCommand,
@@ -29,9 +32,8 @@ from projetv0_voice.persistence.commands import (
 MAX_WEBHOOK_BODY_BYTES = 65_536
 MAX_EVENT_ID_CHARS = 256
 MAX_EVENT_TYPE_CHARS = 128
-MAX_PROVIDER_ID_CHARS = 256
+MAX_PROVIDER_ID_CHARS = MAX_PROVIDER_RECORDING_ID_CHARS
 MAX_CLIENT_STATE_B64_CHARS = 4_096
-_PROVIDER_RECORDING_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _LEASE_KEYS = frozenset(
     {
         "action",
@@ -246,7 +248,7 @@ def _optional_recording_id(payload: Mapping[str, object]) -> str | None:
     value = payload.get("recording_id")
     if value is None:
         return None
-    if not isinstance(value, str) or _PROVIDER_RECORDING_ID.fullmatch(value) is None:
+    if not is_valid_provider_recording_id(value):
         raise ValueError("invalid_recording_id")
     return value
 

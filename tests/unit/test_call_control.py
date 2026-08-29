@@ -124,6 +124,16 @@ def status_error(status_code: int) -> telnyx.APIStatusError:
     )
 
 
+def not_found_error() -> telnyx.NotFoundError:
+    request = httpx.Request("GET", "https://api.telnyx.com/v2/recordings/RAW-SENTINEL")
+    response = httpx.Response(404, request=request, text="RAW-BODY-SENTINEL")
+    return telnyx.NotFoundError(
+        "RAW-NOT-FOUND-SENTINEL",
+        response=response,
+        body={"secret": "RAW-BODY-SENTINEL"},
+    )
+
+
 def response_validation_error() -> telnyx.APIResponseValidationError:
     request = httpx.Request("POST", "https://api.telnyx.com/v2/calls/RAW-REQUEST-SENTINEL")
     response = httpx.Response(200, request=request, text="RAW-BODY-SENTINEL")
@@ -262,6 +272,23 @@ def test_request_models_are_strict_frozen_and_input_redacting() -> None:
             play_beep=True,
             client_state=SecretStr(CLIENT_STATE),
             trim="trim-silence",
+        )
+
+
+def test_recording_stop_provider_id_uses_shared_url_safe_opaque_contract() -> None:
+    module = call_control()
+    provider_id = "r." + "A" * 251 + "~_-"
+
+    accepted = module.RecordingStopV1(
+        client_state=SecretStr(CLIENT_STATE),
+        recording_id=provider_id,
+    )
+    assert accepted.recording_id == provider_id
+
+    with pytest.raises(ValidationError, match="recording_id"):
+        module.RecordingStopV1(
+            client_state=SecretStr(CLIENT_STATE),
+            recording_id="segment/child",
         )
 
 
@@ -533,6 +560,129 @@ async def test_recording_catalog_adapter_awaits_exactly_one_page_and_never_reads
     assert len(result.items) == 1
     assert result.items[0].recording_id == "recording_Ab-12"
     assert result.items[0].recording_started_at == datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_recording_retrieve_404_is_transient_not_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+
+    class FakeRecordings:
+        async def retrieve(self, recording_id: str, **kwargs: object) -> object:
+            del recording_id, kwargs
+            raise not_found_error()
+
+    class RetrieveSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = RetrieveSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(
+        module.RecordingCatalogTransientError,
+        match="recording_catalog_transient",
+    ) as raised:
+        await client.retrieve_recording("recording_Ab-12", timeout_seconds=0.75)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "RAW-BODY-SENTINEL" not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "error_name"),
+    [
+        ("provider_status", "RecordingCatalogTransientError"),
+        ("invalid_datetime", "RecordingCatalogInvalidError"),
+        ("poison_scalar", "RecordingCatalogInvalidError"),
+    ],
+)
+async def test_recording_list_errors_discard_provider_exception_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    error_name: str,
+) -> None:
+    module = call_control()
+
+    class PoisonRow:
+        id = "recording_Ab-12"
+        call_leg_id = "leg-1"
+        call_session_id = "session-1"
+        channels = "dual"
+        status = "completed"
+        source = "call"
+        initiated_by = "StartCallRecordingAPI"
+        recording_started_at = "2026-08-29T12:00:00Z"
+        recording_ended_at = "2026-08-29T12:01:00Z"
+
+        @property
+        def call_control_id(self) -> str:
+            if scenario == "poison_scalar":
+                raise RuntimeError("RAW-SCALAR-SENTINEL")
+            return CALL_CONTROL_ID
+
+    row = PoisonRow()
+    if scenario == "invalid_datetime":
+        row.recording_started_at = "RAW-DATETIME-SENTINEL"
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[row],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            del kwargs
+            if scenario == "provider_status":
+                raise status_error(500)
+            return OnePageAwaitable()
+
+    class ListSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: ListSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+    error_type = getattr(module, error_name)
+
+    with pytest.raises(error_type) as raised:
+        await client.list_recordings_one_page(
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id="leg-1",
+            call_session_id="session-1",
+            start_gte_iso="2026-08-29T11:59:55Z",
+            start_lte_iso="2026-08-29T12:00:05Z",
+            end_gte_iso="2026-08-29T12:00:55Z",
+            end_lte_iso="2026-08-29T12:01:05Z",
+            timeout_seconds=0.75,
+        )
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    rendered = repr(raised.value)
+    for sentinel in (
+        "RAW-BODY-SENTINEL",
+        "RAW-SCALAR-SENTINEL",
+        "RAW-DATETIME-SENTINEL",
+    ):
+        assert sentinel not in rendered
 
 
 @pytest.mark.asyncio

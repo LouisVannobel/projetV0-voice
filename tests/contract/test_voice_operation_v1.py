@@ -263,6 +263,38 @@ def test_recording_provider_id_rejects_url_shaped_values() -> None:
         )
 
 
+def test_recording_provider_id_accepts_256_url_safe_opaque_characters() -> None:
+    provider_id = "r." + "A" * 251 + "~_-"
+    assert len(provider_id) == 256
+
+    parsed = RecordingUpsertPayloadV1.model_validate(
+        recording_payload(telnyx_recording_id=provider_id)
+    )
+
+    assert parsed.telnyx_recording_id == provider_id
+
+
+@pytest.mark.parametrize(
+    "provider_id",
+    [
+        "x" * 257,
+        "segment/child",
+        r"segment\child",
+        "with space",
+        "with\tcontrol",
+        "recording?query",
+        "recording#fragment",
+    ],
+)
+def test_recording_provider_id_rejects_overbound_path_and_unsafe_text(
+    provider_id: str,
+) -> None:
+    with pytest.raises(ValidationError, match="telnyx_recording_id"):
+        RecordingUpsertPayloadV1.model_validate(
+            recording_payload(telnyx_recording_id=provider_id)
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

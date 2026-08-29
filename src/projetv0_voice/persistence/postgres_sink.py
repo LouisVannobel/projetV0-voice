@@ -13,7 +13,7 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
-from projetv0_voice.models import VoiceOperationV1
+from projetv0_voice.models import VoiceOperationV1, is_valid_provider_recording_id
 
 INGEST_SQL = "SELECT voice.ingest_operation_v1(%s::jsonb)"
 LEASE_PURGES_SQL = "SELECT * FROM voice.lease_recording_purge_v1(%s,%s,%s)"
@@ -28,7 +28,6 @@ _PURGE_OUTCOMES: frozenset[str] = frozenset(
     {"deleted", "not_found", "retry", "failed"}
 )
 _WORKER_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
-_TELNYX_RECORDING_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _PAYLOAD_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -354,10 +353,7 @@ class PsycopgOperationSink:
                     result["lease_token"], "purge_lease_result_invalid"
                 )
                 provider_id = result["telnyx_recording_id"]
-                if (
-                    not isinstance(provider_id, str)
-                    or _TELNYX_RECORDING_ID.fullmatch(provider_id) is None
-                ):
+                if not is_valid_provider_recording_id(provider_id):
                     raise OperationSinkContractError("purge_lease_result_invalid")
                 attempt = result["purge_attempt"]
                 if type(attempt) is not int or not 1 <= attempt <= 1_000_000:

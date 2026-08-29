@@ -489,6 +489,21 @@ def test_signed_recording_id_rejects_url_shape_before_resolver(
         verifier.verify(body=body, headers=headers)
 
 
+def test_signed_recording_id_accepts_256_url_safe_opaque_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_id = "r." + "A" * 251 + "~_-"
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={"recording_id": provider_id},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.recording_id == provider_id
+
+
 def test_explicit_handled_type_may_require_call_control_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

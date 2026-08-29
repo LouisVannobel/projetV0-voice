@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import string
 from datetime import UTC, datetime
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, TypeGuard
 from uuid import UUID
 
 from pydantic import (
@@ -27,6 +28,18 @@ def _require_exact_int(value: object) -> object:
 
 SchemaVersionV1 = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
 PositiveInt = Annotated[int, Field(gt=0), BeforeValidator(_require_exact_int)]
+MAX_PROVIDER_RECORDING_ID_CHARS = 256
+_PROVIDER_RECORDING_ID_CHARS = frozenset(
+    string.ascii_letters + string.digits + "-._~"
+)
+
+
+def is_valid_provider_recording_id(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MAX_PROVIDER_RECORDING_ID_CHARS
+        and all(character in _PROVIDER_RECORDING_ID_CHARS for character in value)
+    )
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -158,12 +171,7 @@ class TurnUpsertPayloadV1(_StrictFrozenModel):
 class RecordingUpsertPayloadV1(_StrictFrozenModel):
     recording_id: UUID
     status: Literal["off", "pending", "active", "saved", "failed", "purged"]
-    telnyx_recording_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9_-]+$",
-    )
+    telnyx_recording_id: str | None = None
     channels: Literal["dual"] | None
     format: Literal["wav"] | None
     started_at: datetime | None
@@ -176,6 +184,13 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
     _normalize_datetimes = field_validator(
         "started_at", "ended_at", "retention_until", mode="after"
     )(_optional_utc_datetime)
+
+    @field_validator("telnyx_recording_id")
+    @classmethod
+    def validate_provider_recording_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_provider_recording_id(value):
+            raise ValueError("provider recording ID is invalid")
+        return value
 
     @model_validator(mode="after")
     def validate_recording(self) -> Self:
