@@ -21,6 +21,7 @@ from projetv0_voice.persistence.commands import (
     CommandConflictError,
     FatalPersistenceError,
     PersistenceCommand,
+    PersistenceError,
 )
 from projetv0_voice.persistence.writer import PersistenceWriter
 
@@ -40,11 +41,17 @@ def event_body(
     payload: dict[str, object] | None = None,
     extra: dict[str, object] | None = None,
 ) -> bytes:
+    selected_payload = dict(payload) if payload is not None else {"call_control_id": "control-1"}
+    if event_type == "call.initiated":
+        selected_payload.setdefault("direction", "incoming")
+        selected_payload.setdefault("state", "parked")
+    elif event_type == "call.answered":
+        selected_payload.setdefault("state", "answered")
     data: dict[str, object] = {
         "id": event_id,
         "event_type": event_type,
         "occurred_at": occurred_at,
-        "payload": payload if payload is not None else {"call_control_id": "control-1"},
+        "payload": selected_payload,
     }
     data.update(extra or {})
     return json.dumps({"data": data, "provider_extra": "ignored"}).encode()
@@ -621,6 +628,115 @@ class StubWriter:
             raise self.error
 
 
+class _FinalizationHandle:
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self.task = task
+
+    async def wait(self) -> Any:
+        return await self.task
+
+
+class FakeFinalizerOwner:
+    def __init__(
+        self,
+        *,
+        module: Any,
+        writer: Any,
+        utcnow: Any,
+        after_commit: Any = None,
+    ) -> None:
+        self.module = module
+        self.writer = writer
+        self.utcnow = utcnow
+        self.after_commit = after_commit
+        self.tasks: list[asyncio.Task[Any]] = []
+
+    def start_webhook_finalization(self, event: Any, resolution: Any) -> _FinalizationHandle:
+        task = asyncio.create_task(self._run(event, resolution))
+        self.tasks.append(task)
+        return _FinalizationHandle(task)
+
+    async def _run(self, event: Any, resolution: Any) -> Any:
+        effect = resolution.effect
+        receipt = {
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "call_control_id": event.call_control_id,
+            "occurred_at": event.occurred_at,
+            "received_at": self.utcnow(),
+            "semantic_fingerprint_sha256": event.semantic_fingerprint_sha256,
+        }
+        try:
+            if isinstance(self.writer, PersistenceWriter):
+                ticket = self.writer.submit_webhook(
+                    receipt=receipt,
+                    lease=None if effect is None else effect.lease,
+                    operation=None if effect is None else effect.operation,
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(ticket.wait()),
+                        timeout=self.writer.control_commit_timeout_seconds,
+                    )
+                except TimeoutError:
+                    self.writer._signal_fatal("control_commit_timeout")  # type: ignore[attr-defined]
+                    return self.module.WebhookDisposition(503)
+            else:
+                await self.writer.commit_control(
+                    PersistenceCommand(
+                        "webhook_effect",
+                        {
+                            "receipt": receipt,
+                            "lease": None if effect is None else effect.lease,
+                            "operation": None if effect is None else effect.operation,
+                        },
+                        None,
+                    )
+                )
+        except CommandConflictError as error:
+            return self.module.WebhookDisposition(
+                400 if error.args == ("webhook_identity_conflict",) else 500
+            )
+        except (PersistenceError, TimeoutError):
+            return self.module.WebhookDisposition(503)
+        except Exception:
+            return self.module.WebhookDisposition(500)
+        if self.after_commit is not None:
+            disposition = await self.after_commit(event, effect)
+            if disposition is not None:
+                return disposition
+        return self.module.WebhookDisposition(200)
+
+
+def processor_with_fake_owner(
+    *,
+    module: Any,
+    verifier: Any,
+    writer: Any,
+    resolver: Any,
+    utcnow: Any,
+    after_commit: Any = None,
+) -> Any:
+    def wrapped(event: Any) -> Any:
+        value = resolver(event)
+        if value is None:
+            return module.ResolvedWebhook(None)
+        if isinstance(value, module.WebhookDurableEffect):
+            return module.ResolvedWebhook(value)
+        return value
+
+    return module.TelnyxWebhookProcessor(
+        verifier=verifier,
+        resolver=wrapped,
+        finalizer_owner=FakeFinalizerOwner(
+            module=module,
+            writer=writer,
+            utcnow=utcnow,
+            after_commit=after_commit,
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_processor_awaits_after_commit_and_accepts_only_recording_dispositions() -> None:
     module = webhooks()
@@ -656,7 +772,8 @@ async def test_processor_awaits_after_commit_and_accepts_only_recording_disposit
         order.append("after_commit")
         return module.WebhookDisposition(503)
 
-    response = await module.TelnyxWebhookProcessor(
+    response = await processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(),
         writer=OrderedWriter(),
         resolver=lambda _: None,
@@ -682,7 +799,8 @@ async def test_processor_commits_one_atomic_receipt_only_effect_before_empty_200
         resolved.append(event)
         return None
 
-    processor = module.TelnyxWebhookProcessor(
+    processor = processor_with_fake_owner(
+        module=module,
         verifier=verifier,
         writer=writer,
         resolver=resolver,
@@ -768,7 +886,8 @@ async def test_processor_has_exact_empty_safe_status_matrix(source: str, expecte
             raise RuntimeError("RAW-RESOLVER-SENTINEL")
         return None
 
-    response = await module.TelnyxWebhookProcessor(
+    response = await processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(), writer=writer, resolver=resolver, utcnow=lambda: NOW
     ).process(body=b"RAW-BODY-SENTINEL", headers=[])
 
@@ -806,7 +925,8 @@ async def test_processor_rejects_async_or_invalid_resolver_without_committing() 
 
     for resolver in (async_resolver, lambda _: SimpleNamespace(lease=None, operation=None)):
         writer = StubWriter()
-        response = await module.TelnyxWebhookProcessor(
+        response = await processor_with_fake_owner(
+            module=module,
             verifier=StubVerifier(), writer=writer, resolver=resolver, utcnow=lambda: NOW
         ).process(body=b"{}", headers=[])
         assert (response.status_code, response.body) == (500, b"")
@@ -894,7 +1014,8 @@ async def test_concurrent_duplicate_processor_calls_commit_one_durable_effect(
         },
         operation=call_operation(),
     )
-    processor = module.TelnyxWebhookProcessor(
+    processor = processor_with_fake_owner(
+        module=module,
         verifier=verifier,
         writer=writer,
         resolver=lambda _: effect,
@@ -973,7 +1094,8 @@ async def test_real_writer_late_commit_requires_restart_then_redelivery_is_dupli
     )
     writer_task = asyncio.create_task(writer.run())
     assert await writer.wait_ready() is True
-    processor = module.TelnyxWebhookProcessor(
+    processor = processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(),
         writer=writer,
         resolver=lambda _: effect,
@@ -994,7 +1116,8 @@ async def test_real_writer_late_commit_requires_restart_then_redelivery_is_dupli
     await writer_task
 
     restarted, restarted_task = await start_writer(database)
-    restarted_processor = module.TelnyxWebhookProcessor(
+    restarted_processor = processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(),
         writer=restarted,
         resolver=lambda _: effect,

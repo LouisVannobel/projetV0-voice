@@ -761,7 +761,7 @@ async def test_just_over_64_kib_is_fatal_and_never_inserted(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_journal(
+async def test_schema_has_exact_v2_tables_required_columns_checks_and_delete_journal(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -789,7 +789,12 @@ async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
         user_version = connection.execute("PRAGMA user_version").fetchone()
 
-    assert tables == {"call_leases", "webhook_receipts", "outbox"}
+    assert tables == {
+        "call_leases",
+        "webhook_receipts",
+        "outbox",
+        "qualification_runs",
+    }
     assert "natural_key" not in ddl
     assert "delivered_at" not in ddl
     assert "generic" not in ddl
@@ -801,7 +806,7 @@ async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_
     assert "provider_enrichment_fingerprint_sha256" in ddl
     assert "length(semantic_fingerprint_sha256) = 32" in ddl
     assert journal_mode == ("delete",)
-    assert user_version == (1,)
+    assert user_version == (2,)
 
 
 @pytest.mark.asyncio

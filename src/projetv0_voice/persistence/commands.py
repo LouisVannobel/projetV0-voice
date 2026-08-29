@@ -46,6 +46,7 @@ class PersistenceCommand:
         "lease",
         "outbox",
         "relay_batch",
+        "qualification_run_status",
         "shutdown",
     ]
     payload: Mapping[str, object] = field(repr=False)

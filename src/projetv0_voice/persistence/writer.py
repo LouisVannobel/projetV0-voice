@@ -44,7 +44,12 @@ from projetv0_voice.persistence.commands import (
     operation_aad_from_metadata,
     require_operation,
 )
-from projetv0_voice.persistence.schema import SCHEMA_SQL, SCHEMA_VERSION
+from projetv0_voice.persistence.schema import (
+    QUALIFICATION_RUNS_SQL,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+    V1_SCHEMA_SQL,
+)
 
 PERSISTENCE_QUEUE_MAX_ITEMS = 256
 CONTROL_COMMIT_TIMEOUT_SECONDS = 1.5
@@ -82,12 +87,12 @@ def _normalize_schema_sql(sql: str) -> str:
     )
 
 
-def _expected_schema_objects() -> dict[tuple[str, str], str]:
+def _expected_schema_objects(schema_sql: str) -> dict[tuple[str, str], str]:
     expected: dict[tuple[str, str], str] = {}
-    for statement in SCHEMA_SQL.split(";"):
+    for statement in schema_sql.split(";"):
         compact = " ".join(statement.split())
         matched = re.match(
-            r"^CREATE (TABLE|INDEX) IF NOT EXISTS ([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^CREATE (TABLE|INDEX)(?: IF NOT EXISTS)? ([A-Za-z_][A-Za-z0-9_]*)\b",
             compact,
             flags=re.IGNORECASE,
         )
@@ -95,17 +100,28 @@ def _expected_schema_objects() -> dict[tuple[str, str], str]:
             expected[(matched.group(1).casefold(), matched.group(2))] = _normalize_schema_sql(
                 statement
             )
-    if set(expected) != {
+    if not {
         ("table", "call_leases"),
         ("table", "webhook_receipts"),
         ("table", "outbox"),
         ("index", "outbox_due_fifo_idx"),
-    }:
+    }.issubset(expected):
         raise RuntimeError("invalid_expected_sqlite_schema")
     return expected
 
 
-_EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects()
+_EXPECTED_V1_SCHEMA_OBJECTS = _expected_schema_objects(V1_SCHEMA_SQL)
+_EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
+if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
+    ("table", "call_leases"),
+    ("table", "webhook_receipts"),
+    ("table", "outbox"),
+    ("index", "outbox_due_fifo_idx"),
+} or set(_EXPECTED_SCHEMA_OBJECTS) != {
+    *_EXPECTED_V1_SCHEMA_OBJECTS,
+    ("table", "qualification_runs"),
+}:
+    raise RuntimeError("invalid_expected_sqlite_schema")
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +161,42 @@ class RelayClaimResult:
 class CleanupResult:
     receipts: int
     leases: int
+
+
+WebhookReceiptKind = Literal["first", "duplicate"]
+WebhookEffectKind = Literal["applied", "duplicate", "existing_terminal"]
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookCommitResult:
+    receipt: WebhookReceiptKind
+    effect: WebhookEffectKind
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationRunConsumed:
+    pass
+
+
+WebhookCommitValue = WebhookCommitResult | QualificationRunConsumed
+
+
+class WebhookCommitTicket:
+    """Opaque independently-awaitable completion for one webhook transaction."""
+
+    __slots__ = ("_result",)
+
+    def __init__(self, result: asyncio.Future[WebhookCommitValue]) -> None:
+        self._result = result
+
+    def __repr__(self) -> str:
+        return "WebhookCommitTicket()"
+
+    def done(self) -> bool:
+        return self._result.done()
+
+    async def wait(self) -> WebhookCommitValue:
+        return await asyncio.shield(self._result)
 
 
 def _utc_now() -> datetime:
@@ -317,6 +369,71 @@ class PersistenceWriter:
             raise
         except TimeoutError:
             raise self._signal_fatal("control_commit_timeout") from None
+
+    def submit_webhook(
+        self,
+        *,
+        receipt: Mapping[str, object],
+        lease: Mapping[str, object] | None,
+        operation: VoiceOperationV1 | None,
+        qualification_run_id: UUID | None = None,
+    ) -> WebhookCommitTicket:
+        """Synchronously transfer one webhook transaction to the writer owner."""
+
+        if not self._accepting or self._degraded:
+            raise self._new_safe_error(
+                self.fatal_fault.code if self.fatal_fault else "persistence_degraded"
+            )
+        if not isinstance(receipt, Mapping):
+            raise CommandSerializationError("invalid_webhook_receipt")
+        if lease is not None and not isinstance(lease, Mapping):
+            raise CommandSerializationError("invalid_lease_command")
+        if operation is not None and not isinstance(operation, VoiceOperationV1):
+            raise CommandSerializationError("invalid_outbox_command")
+        if qualification_run_id is not None and not isinstance(qualification_run_id, UUID):
+            raise CommandSerializationError("invalid_qualification_run")
+        result: asyncio.Future[WebhookCommitValue] = (
+            asyncio.get_running_loop().create_future()
+        )
+        command = PersistenceCommand(
+            "webhook_effect",
+            {
+                "receipt": receipt,
+                "lease": lease,
+                "operation": operation,
+                "qualification_run_id": qualification_run_id,
+                "result": result,
+            },
+            None,
+            enqueued_at=self._monotonic(),
+        )
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull as error:
+            safe_error = self._signal_fatal("queue_full", source=error)
+            result.set_exception(safe_error)
+            result.exception()
+            raise safe_error from None
+        self._track_pending(command)
+        return WebhookCommitTicket(result)
+
+    async def qualification_run_consumed(self, run_id: UUID) -> bool:
+        if not isinstance(run_id, UUID):
+            raise CommandSerializationError("invalid_qualification_run")
+        result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "qualification_run_status",
+                    {"run_id": run_id, "result": result},
+                    None,
+                )
+            )
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
 
     @staticmethod
     def _consume_control_commit_exception(result: asyncio.Future[None]) -> None:
@@ -566,15 +683,15 @@ class PersistenceWriter:
                 ):
                     raise FatalPersistenceError("queue_oldest_age_exceeded")
 
-                should_stop = await self._process_command(current_command)
+                should_stop, command_result = await self._process_command(current_command)
                 if should_stop:
-                    self._resolve_success(current_command)
+                    self._resolve_success(current_command, command_result)
                     self._queue.task_done()
                     current_owned = False
                     current_command = None
                     break
                 await self._run_periodic_check_if_due()
-                self._resolve_success(current_command)
+                self._resolve_success(current_command, command_result)
                 self._queue.task_done()
                 current_owned = False
                 current_command = None
@@ -661,7 +778,29 @@ class PersistenceWriter:
         existing_version = self._pragma_int(await self._pragma_scalar("user_version"))
         existing_schema = await self._application_schema_objects()
         if existing_schema:
-            if (
+            if existing_version == 1 and existing_schema == _EXPECTED_V1_SCHEMA_OBJECTS:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    await connection.execute(QUALIFICATION_RUNS_SQL)
+                    await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    if (
+                        self._pragma_int(await self._pragma_scalar("user_version"))
+                        != SCHEMA_VERSION
+                        or await self._application_schema_objects()
+                        != _EXPECTED_SCHEMA_OBJECTS
+                    ):
+                        raise FatalPersistenceError("sqlite_schema_mismatch")
+                    await self._call_failpoint("after_v1_migration_before_commit")
+                    await connection.commit()
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await connection.rollback()
+                    raise
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await connection.rollback()
+                    raise FatalPersistenceError("sqlite_schema_mismatch") from None
+            elif (
                 existing_version != SCHEMA_VERSION
                 or existing_schema != _EXPECTED_SCHEMA_OBJECTS
             ):
@@ -768,23 +907,26 @@ class PersistenceWriter:
         if inspect.isawaitable(result):
             await result
 
-    async def _process_command(self, command: PersistenceCommand) -> bool:
+    async def _process_command(self, command: PersistenceCommand) -> tuple[bool, object | None]:
         if command.kind == "shutdown":
-            return True
+            return True, None
 
         connection = self._require_owner_connection()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            command_result: object | None = None
             if command.kind == "outbox":
                 await self._insert_outbox(require_operation(command.payload))
             elif command.kind == "lease":
                 await self._apply_lease(command.payload)
             elif command.kind == "webhook_effect":
-                await self._apply_webhook_effect(command.payload)
+                command_result = await self._apply_webhook_effect(command.payload)
             elif command.kind == "webhook_enrichment":
                 await self._apply_webhook_enrichment(command.payload)
             elif command.kind == "relay_batch":
                 await self._apply_relay_command(command.payload)
+            elif command.kind == "qualification_run_status":
+                command_result = await self._qualification_run_consumed(command.payload)
             else:
                 raise CommandSerializationError("unknown_persistence_command")
             await self._call_failpoint("after_mutation_before_commit")
@@ -794,7 +936,7 @@ class PersistenceWriter:
             with contextlib.suppress(Exception):
                 await connection.rollback()
             raise
-        return False
+        return False, command_result
 
     async def _insert_outbox(self, operation: VoiceOperationV1) -> None:
         connection = self._require_owner_connection()
@@ -863,26 +1005,39 @@ class PersistenceWriter:
         )
         return decode_operation(plaintext)
 
-    async def _apply_webhook_effect(self, payload: Mapping[str, object]) -> None:
+    async def _apply_webhook_effect(self, payload: Mapping[str, object]) -> WebhookCommitValue:
         receipt = payload.get("receipt")
         if not isinstance(receipt, Mapping):
             raise CommandSerializationError("invalid_webhook_receipt")
-        is_new = await self._insert_receipt(receipt)
-        if not is_new:
-            return
+        normalized_receipt = self._normalized_receipt(receipt)
+        if await self._receipt_exists(normalized_receipt):
+            return WebhookCommitResult("duplicate", "duplicate")
+        qualification_run_id = payload.get("qualification_run_id")
+        if qualification_run_id is not None:
+            if not isinstance(qualification_run_id, UUID):
+                raise CommandSerializationError("invalid_qualification_run")
+            if await self._qualification_run_is_consumed(qualification_run_id):
+                return QualificationRunConsumed()
+        await self._insert_new_receipt(normalized_receipt)
+        if qualification_run_id is not None:
+            await self._consume_qualification_run(qualification_run_id)
         lease = payload.get("lease")
         operation = payload.get("operation")
         if lease is not None:
             if not isinstance(lease, Mapping):
                 raise CommandSerializationError("invalid_lease_command")
+            if await self._same_identity_is_terminal(lease):
+                return WebhookCommitResult("first", "existing_terminal")
             await self._apply_lease(lease)
         if operation is not None:
             if not isinstance(operation, VoiceOperationV1):
                 raise CommandSerializationError("invalid_outbox_command")
             await self._insert_outbox(operation)
+        return WebhookCommitResult("first", "applied")
 
-    async def _insert_receipt(self, receipt: Mapping[str, object]) -> bool:
-        connection = self._require_owner_connection()
+    def _normalized_receipt(
+        self, receipt: Mapping[str, object]
+    ) -> tuple[str, str, str | None, str, str, bytes]:
         try:
             event_id = self._required_str(receipt, "event_id")
             event_type = self._required_str(receipt, "event_type")
@@ -896,26 +1051,20 @@ class PersistenceWriter:
                 raise CommandSerializationError("invalid_webhook_receipt")
         except (KeyError, TypeError) as error:
             raise CommandSerializationError("invalid_webhook_receipt") from error
-        cursor = await connection.execute(
-            """
-            INSERT OR IGNORE INTO webhook_receipts (
-                event_id, event_type, call_control_id, occurred_at, received_at,
-                semantic_fingerprint_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id,
-                event_type,
-                call_control,
-                occurred_at,
-                received_at,
-                semantic_fingerprint,
-            ),
+        return (
+            event_id,
+            event_type,
+            call_control,
+            occurred_at,
+            received_at,
+            semantic_fingerprint,
         )
-        inserted = cursor.rowcount == 1
-        await cursor.close()
-        if inserted:
-            return True
+
+    async def _receipt_exists(
+        self, receipt: tuple[str, str, str | None, str, str, bytes]
+    ) -> bool:
+        connection = self._require_owner_connection()
+        event_id, event_type, call_control, occurred_at, _, semantic_fingerprint = receipt
         cursor = await connection.execute(
             """
             SELECT event_type, call_control_id, occurred_at, semantic_fingerprint_sha256
@@ -925,9 +1074,77 @@ class PersistenceWriter:
         )
         row = await cursor.fetchone()
         await cursor.close()
+        if row is None:
+            return False
         if row != (event_type, call_control, occurred_at, semantic_fingerprint):
             raise CommandConflictError("webhook_identity_conflict")
-        return False
+        return True
+
+    async def _insert_new_receipt(
+        self, receipt: tuple[str, str, str | None, str, str, bytes]
+    ) -> None:
+        connection = self._require_owner_connection()
+        event_id, event_type, call_control, occurred_at, received_at, semantic_fingerprint = receipt
+        cursor = await connection.execute(
+            """
+            INSERT OR IGNORE INTO webhook_receipts (
+                event_id, event_type, call_control_id, occurred_at, received_at,
+                semantic_fingerprint_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            receipt,
+        )
+        inserted = cursor.rowcount == 1
+        await cursor.close()
+        if not inserted:
+            raise CommandConflictError("webhook_identity_conflict")
+
+    async def _qualification_run_is_consumed(self, run_id: UUID) -> bool:
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT 1 FROM qualification_runs WHERE run_id = ?",
+            (str(run_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row == (1,)
+
+    async def _consume_qualification_run(self, run_id: UUID) -> None:
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "INSERT INTO qualification_runs (run_id, consumed_at) VALUES (?, ?)",
+            (str(run_id), _iso(self._utcnow())),
+        )
+        if cursor.rowcount != 1:
+            await cursor.close()
+            raise CommandConflictError("qualification_run_conflict")
+        await cursor.close()
+
+    async def _qualification_run_consumed(self, payload: Mapping[str, object]) -> bool:
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, UUID):
+            raise CommandSerializationError("invalid_qualification_run")
+        return await self._qualification_run_is_consumed(run_id)
+
+    async def _same_identity_is_terminal(self, lease: Mapping[str, object]) -> bool:
+        call_control_id = self._required_str(lease, "call_control_id")
+        call_id = self._required_uuid(lease, "call_id")
+        tenant_id = self._required_str(lease, "tenant_id")
+        agent_id = self._required_str(lease, "agent_id")
+        token_hash = lease.get("token_hash")
+        if type(token_hash) is not bytes or len(token_hash) != 32:
+            raise CommandSerializationError("invalid_lease_command")
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            """
+            SELECT call_id, tenant_id, agent_id, state, token_hash
+            FROM call_leases WHERE call_control_id = ?
+            """,
+            (call_control_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row == (str(call_id), tenant_id, agent_id, "terminal", token_hash)
 
     async def _apply_webhook_enrichment(self, payload: Mapping[str, object]) -> None:
         receipt = payload.get("receipt")
@@ -1299,7 +1516,10 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_command_payload")
         return value
 
-    def _resolve_success(self, command: PersistenceCommand) -> None:
+    def _resolve_success(self, command: PersistenceCommand, value: object | None) -> None:
+        result = command.payload.get("result")
+        if isinstance(result, asyncio.Future) and not result.done() and value is not None:
+            result.set_result(value)
         if command.committed is not None and not command.committed.done():
             command.committed.set_result(None)
 

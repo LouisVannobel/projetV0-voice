@@ -30,7 +30,11 @@ from projetv0_voice.pipeline import (
     build_pipeline,
     build_runtime,
 )
-from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
+from projetv0_voice.qualified_profile import (
+    QualificationCandidateProfileV1,
+    QualifiedDeploymentProfileV1,
+    RuntimeDeploymentProfileV1,
+)
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
 
 
@@ -447,7 +451,7 @@ class CallSession:
         *,
         identity: CallIdentity,
         manifest: AgentManifestV1,
-        profile: QualifiedDeploymentProfileV1,
+        profile: RuntimeDeploymentProfileV1,
         services: ServiceBundle,
         writer: SessionWriter,
         keyring: CryptoKeyring,
@@ -460,7 +464,10 @@ class CallSession:
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         if (
-            profile.deployment_id != identity.deployment_id
+            not isinstance(
+                profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
+            )
+            or profile.deployment_id != identity.deployment_id
             or not isinstance(idle_timeout_seconds, int | float)
             or isinstance(idle_timeout_seconds, bool)
             or not math.isfinite(idle_timeout_seconds)

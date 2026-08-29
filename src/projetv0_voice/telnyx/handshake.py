@@ -18,7 +18,11 @@ from pipecat.transports.websocket.fastapi import (
 from pydantic import SecretStr
 from starlette.websockets import WebSocket
 
-from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
+from projetv0_voice.qualified_profile import (
+    QualificationCandidateProfileV1,
+    QualifiedDeploymentProfileV1,
+    RuntimeDeploymentProfileV1,
+)
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
 TOKEN_HEADER = b"x-telnyx-streaming-auth-token"
@@ -340,13 +344,15 @@ class AuthenticatedTelnyxHandshakeService:
     def __init__(
         self,
         *,
-        profile: QualifiedDeploymentProfileV1,
+        profile: RuntimeDeploymentProfileV1,
         lease_authority: LeaseAuthority,
         unauthenticated_gate: UnauthenticatedGate,
         timeout_seconds: float,
     ) -> None:
         if (
-            not isinstance(profile, QualifiedDeploymentProfileV1)
+            not isinstance(
+                profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
+            )
             or profile.token_locator_id != TOKEN_LOCATOR_ID
             or not isinstance(timeout_seconds, int | float)
             or isinstance(timeout_seconds, bool)

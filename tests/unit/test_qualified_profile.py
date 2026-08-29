@@ -21,6 +21,7 @@ from projetv0_voice.qualified_profile import (
     QualifiedDeploymentProfileV1,
     canonical_inference_profile_sha256,
     canonical_model_schema_json,
+    canonical_qualified_profile_sha256,
     load_qualification_candidate_profile,
     load_qualification_override,
     load_qualified_deployment_profile,
@@ -66,6 +67,8 @@ def qualified_data(now: datetime | None = None) -> dict[str, object]:
         "inference_profile_sha256": canonical_inference_profile_sha256(inference),
         "inference": inference.model_dump(mode="json"),
         "token_locator_id": DOCUMENTED_TOKEN_LOCATOR,
+        "telnyx_api_key_sha256": HEX_A,
+        "telnyx_data_locality": "EU",
         "telnyx_handshake_fixture_sha256": HEX_C,
         "disclosure_mark_timeout_ms": 5000,
         "call_lease_ttl_seconds": 30,
@@ -88,6 +91,7 @@ def candidate_data(now: datetime | None = None) -> dict[str, object]:
         "inference_profile_sha256": data["inference_profile_sha256"],
         "inference": data["inference"],
         "token_locator_id": data["token_locator_id"],
+        "telnyx_api_key_sha256": data["telnyx_api_key_sha256"],
         "telnyx_handshake_fixture_sha256": data["telnyx_handshake_fixture_sha256"],
         "disclosure_mark_timeout_ms": 10000,
         "call_lease_ttl_seconds": 30,
@@ -153,7 +157,7 @@ def remove_directory_link(link: Path) -> None:
         link.unlink()
 
 
-def expected_hashes() -> dict[str, str]:
+def expected_hashes() -> dict[str, object]:
     profile = InferenceProfileV1.model_validate(inference_data())
     return {
         "expected_deployment_id": "voice-agent-a",
@@ -161,6 +165,15 @@ def expected_hashes() -> dict[str, str]:
         "expected_image_digest": IMAGE,
         "expected_agent_bundle_sha256": HEX_B,
         "expected_inference_profile_sha256": canonical_inference_profile_sha256(profile),
+        "ownership_check": lambda _: True,
+    }
+
+
+def override_bindings(now: datetime) -> dict[str, object]:
+    return {
+        "expected_deployment_id": "voice-agent-a",
+        "expected_qualified_profile_sha256": HEX_B,
+        "strict_qualified_at": now - timedelta(days=1),
     }
 
 
@@ -282,6 +295,119 @@ def test_qualified_profile_loader_accepts_exact_digest_bindings(tmp_path: Path) 
         profile.deployment_id = "changed"  # type: ignore[misc]
 
 
+def test_task10_profiles_bind_telnyx_locality_ttl_and_strict_profile_hash() -> None:
+    strict_data = qualified_data()
+    strict_data.update(
+        {
+            "telnyx_api_key_sha256": HEX_A,
+            "telnyx_data_locality": "EU",
+            "call_lease_ttl_seconds": 300,
+        }
+    )
+    strict = QualifiedDeploymentProfileV1.model_validate(strict_data)
+    assert strict.telnyx_api_key_sha256 == HEX_A
+    assert strict.telnyx_data_locality == "EU"
+
+    candidate = candidate_data()
+    candidate["telnyx_api_key_sha256"] = HEX_A
+    assert (
+        QualificationCandidateProfileV1.model_validate(candidate).telnyx_api_key_sha256
+        == HEX_A
+    )
+
+    override = QualificationOverrideV1.model_validate(
+        {
+            "schema_version": 1,
+            "run_id": str(RUN_ID),
+            "deployment_id": "voice-agent-a",
+            "qualified_profile_sha256": HEX_B,
+            "benchmark_max_calls": 15,
+            "created_at": "2026-08-29T09:00:00Z",
+            "expires_at": "2026-08-29T11:00:00Z",
+        }
+    )
+    assert (override.deployment_id, override.qualified_profile_sha256) == (
+        "voice-agent-a",
+        HEX_B,
+    )
+
+    for invalid_ttl in (4, 301):
+        invalid = dict(strict_data)
+        invalid["call_lease_ttl_seconds"] = invalid_ttl
+        with pytest.raises(ValidationError, match="call_lease_ttl_seconds"):
+            QualifiedDeploymentProfileV1.model_validate(invalid)
+
+
+def test_strict_and_candidate_use_the_same_injected_safe_owner_loader(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    strict_path = write_json(tmp_path / "strict.json", qualified_data(now))
+    candidate_path = write_json(tmp_path / "candidate.json", candidate_data(now))
+
+    with pytest.raises(ValueError, match="root-owned"):
+        load_qualified_deployment_profile(
+            strict_path,
+            **{**expected_hashes(), "ownership_check": lambda _: False},
+        )
+    with pytest.raises(ValueError, match="root-owned"):
+        load_qualification_candidate_profile(
+            candidate_path,
+            qualification_mode=True,
+            expected_run_id=RUN_ID,
+            expected_benchmark_did_hash=HEX_C,
+            manifest=manifest(),
+            now=now,
+            **{**expected_hashes(), "ownership_check": lambda _: False},
+        )
+
+    if os.name != "nt":
+        strict_path.chmod(0o666)
+        with pytest.raises(ValueError, match="group or other writable"):
+            load_qualified_deployment_profile(
+                strict_path,
+                **{**expected_hashes(), "ownership_check": lambda _: True},
+            )
+
+
+def test_override_loader_binds_canonical_strict_profile_and_exact_time_order(
+    tmp_path: Path,
+) -> None:
+    strict = QualifiedDeploymentProfileV1.model_validate(qualified_data())
+    strict_hash = canonical_qualified_profile_sha256(strict)
+    now = datetime(2026, 8, 29, 10, tzinfo=UTC)
+    data = {
+        "schema_version": 1,
+        "run_id": str(RUN_ID),
+        "deployment_id": strict.deployment_id,
+        "qualified_profile_sha256": strict_hash,
+        "benchmark_max_calls": 15,
+        "created_at": (now - timedelta(seconds=1)).isoformat(),
+        "expires_at": (now + timedelta(seconds=1)).isoformat(),
+    }
+    path = write_json(tmp_path / "override.json", data)
+    kwargs = {
+        "qualification_mode": True,
+        "expected_run_id": RUN_ID,
+        "expected_deployment_id": strict.deployment_id,
+        "expected_qualified_profile_sha256": strict_hash,
+        "strict_qualified_at": strict.qualified_at,
+        "ownership_check": lambda _: True,
+        "now": now,
+    }
+
+    assert load_qualification_override(path, **kwargs).benchmark_max_calls == 15
+    for field, value in (
+        ("deployment_id", "voice-agent-b"),
+        ("qualified_profile_sha256", HEX_B),
+        ("created_at", now.isoformat()),
+        ("expires_at", now.isoformat()),
+    ):
+        write_json(path, {**data, field: value})
+        with pytest.raises(ValueError):
+            load_qualification_override(path, **kwargs)
+
+
 def test_profile_models_accept_only_documented_telnyx_token_locator() -> None:
     for model, data in (
         (QualifiedDeploymentProfileV1, qualified_data()),
@@ -390,6 +516,7 @@ def test_fake_profiles_are_explicit_test_fixtures_with_consistent_hashes() -> No
         "expected_image_digest": IMAGE,
         "expected_agent_bundle_sha256": HEX_B,
         "expected_inference_profile_sha256": fixture_hash,
+        "ownership_check": lambda _: True,
     }
 
     qualified = load_qualified_deployment_profile(
@@ -510,6 +637,8 @@ def test_profiles_reject_numeric_datetime_coercion(invalid_datetime: object) -> 
     override = {
         "schema_version": 1,
         "run_id": str(RUN_ID),
+        "deployment_id": "voice-agent-a",
+        "qualified_profile_sha256": HEX_B,
         "benchmark_max_calls": 15,
         "created_at": invalid_datetime,
         "expires_at": "2099-01-01T00:00:00Z",
@@ -667,8 +796,10 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
     data = {
         "schema_version": 1,
         "run_id": str(RUN_ID),
+        "deployment_id": "voice-agent-a",
+        "qualified_profile_sha256": HEX_B,
         "benchmark_max_calls": 15,
-        "created_at": now.isoformat(),
+        "created_at": (now - timedelta(seconds=1)).isoformat(),
         "expires_at": (now + timedelta(hours=1)).isoformat(),
     }
     path = write_json(tmp_path / "override.json", data)
@@ -678,6 +809,7 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             path,
             qualification_mode=True,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now,
         ).benchmark_max_calls
@@ -688,6 +820,7 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             path,
             qualification_mode=True,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: False,
             now=now,
         )
@@ -696,6 +829,7 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             path,
             qualification_mode=True,
             expected_run_id=uuid4(),
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now,
         )
@@ -704,6 +838,7 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             path,
             qualification_mode=True,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now + timedelta(hours=2),
         )
@@ -712,6 +847,7 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             path,
             qualification_mode=False,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now,
         )
@@ -720,6 +856,7 @@ def test_override_loader_requires_root_ownership_run_binding_and_freshness(tmp_p
             path,
             qualification_mode=True,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now - timedelta(seconds=1),
         )
@@ -732,8 +869,10 @@ def test_override_ownership_check_receives_the_open_file_stat(tmp_path: Path) ->
         {
             "schema_version": 1,
             "run_id": str(RUN_ID),
+            "deployment_id": "voice-agent-a",
+            "qualified_profile_sha256": HEX_B,
             "benchmark_max_calls": 15,
-            "created_at": now.isoformat(),
+            "created_at": (now - timedelta(seconds=1)).isoformat(),
             "expires_at": (now + timedelta(hours=1)).isoformat(),
         },
     )
@@ -743,6 +882,7 @@ def test_override_ownership_check_receives_the_open_file_stat(tmp_path: Path) ->
         path,
         qualification_mode=True,
         expected_run_id=RUN_ID,
+        **override_bindings(now),
         ownership_check=lambda file_stat: received.append(file_stat) is None,
         now=now,
     )
@@ -761,8 +901,10 @@ def test_override_atomic_open_rejects_a_path_swap(
         {
             "schema_version": 1,
             "run_id": str(RUN_ID),
+            "deployment_id": "voice-agent-a",
+            "qualified_profile_sha256": HEX_B,
             "benchmark_max_calls": 15,
-            "created_at": now.isoformat(),
+            "created_at": (now - timedelta(seconds=1)).isoformat(),
             "expires_at": (now + timedelta(hours=1)).isoformat(),
         },
     )
@@ -779,6 +921,7 @@ def test_override_atomic_open_rejects_a_path_swap(
             path,
             qualification_mode=True,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now,
         )
@@ -793,8 +936,10 @@ def test_override_loader_reads_from_open_fd_not_path(
         {
             "schema_version": 1,
             "run_id": str(RUN_ID),
+            "deployment_id": "voice-agent-a",
+            "qualified_profile_sha256": HEX_B,
             "benchmark_max_calls": 20,
-            "created_at": now.isoformat(),
+            "created_at": (now - timedelta(seconds=1)).isoformat(),
             "expires_at": (now + timedelta(hours=1)).isoformat(),
         },
     )
@@ -807,6 +952,7 @@ def test_override_loader_reads_from_open_fd_not_path(
         path,
         qualification_mode=True,
         expected_run_id=RUN_ID,
+        **override_bindings(now),
         ownership_check=lambda _: True,
         now=now,
     )
@@ -822,8 +968,10 @@ def test_override_loader_rejects_reparse_ancestor_and_oversized_file(tmp_path: P
         {
             "schema_version": 1,
             "run_id": str(RUN_ID),
+            "deployment_id": "voice-agent-a",
+            "qualified_profile_sha256": HEX_B,
             "benchmark_max_calls": 15,
-            "created_at": now.isoformat(),
+            "created_at": (now - timedelta(seconds=1)).isoformat(),
             "expires_at": (now + timedelta(hours=1)).isoformat(),
         },
     )
@@ -835,6 +983,7 @@ def test_override_loader_rejects_reparse_ancestor_and_oversized_file(tmp_path: P
                 linked / "override.json",
                 qualification_mode=True,
                 expected_run_id=RUN_ID,
+                **override_bindings(now),
                 ownership_check=lambda _: True,
                 now=now,
             )
@@ -848,6 +997,7 @@ def test_override_loader_rejects_reparse_ancestor_and_oversized_file(tmp_path: P
             oversized,
             qualification_mode=True,
             expected_run_id=RUN_ID,
+            **override_bindings(now),
             ownership_check=lambda _: True,
             now=now,
         )
@@ -858,6 +1008,8 @@ def test_override_rejects_unsupported_limit_and_impossible_time_order() -> None:
     base = {
         "schema_version": 1,
         "run_id": str(RUN_ID),
+        "deployment_id": "voice-agent-a",
+        "qualified_profile_sha256": HEX_B,
         "benchmark_max_calls": 15,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=1)).isoformat(),

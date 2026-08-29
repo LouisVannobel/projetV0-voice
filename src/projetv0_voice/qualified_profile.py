@@ -58,6 +58,9 @@ CandidateTimeout = Annotated[Literal[10000], BeforeValidator(_require_exact_int)
 CandidateLeaseTtl = Annotated[Literal[30], BeforeValidator(_require_exact_int)]
 CandidateMaxCalls = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
 OverrideMaxCalls = Annotated[Literal[15, 20], BeforeValidator(_require_exact_int)]
+StrictLeaseTtl = Annotated[
+    int, Field(ge=5, le=300), BeforeValidator(_require_exact_int)
+]
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -173,11 +176,13 @@ class QualifiedDeploymentProfileV1(_StrictFrozenProfile):
     inference_profile_sha256: Sha256
     inference: InferenceProfileV1
     token_locator_id: TokenLocatorId
+    telnyx_api_key_sha256: Sha256
+    telnyx_data_locality: Literal["EU"]
     telnyx_handshake_fixture_sha256: Sha256
     disclosure_mark_timeout_ms: Annotated[
         int, Field(ge=3000, le=10000), BeforeValidator(_require_exact_int)
     ]
-    call_lease_ttl_seconds: PositiveInt
+    call_lease_ttl_seconds: StrictLeaseTtl
     qualified_at: datetime
 
     _validate_qualified_at_input = field_validator("qualified_at", mode="before")(
@@ -198,6 +203,7 @@ class QualificationCandidateProfileV1(_StrictFrozenProfile):
     inference_profile_sha256: Sha256
     inference: InferenceProfileV1
     token_locator_id: TokenLocatorId
+    telnyx_api_key_sha256: Sha256
     telnyx_handshake_fixture_sha256: Sha256
     disclosure_mark_timeout_ms: CandidateTimeout
     call_lease_ttl_seconds: CandidateLeaseTtl
@@ -212,6 +218,8 @@ class QualificationCandidateProfileV1(_StrictFrozenProfile):
 class QualificationOverrideV1(_StrictFrozenProfile):
     schema_version: SchemaVersionV1
     run_id: UUID
+    deployment_id: str = Field(min_length=1)
+    qualified_profile_sha256: Sha256
     benchmark_max_calls: OverrideMaxCalls
     created_at: datetime
     expires_at: datetime
@@ -230,7 +238,21 @@ class QualificationOverrideV1(_StrictFrozenProfile):
         return self
 
 
+RuntimeDeploymentProfileV1 = QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
+
+
 def canonical_inference_profile_sha256(profile: InferenceProfileV1) -> str:
+    canonical = json.dumps(
+        profile.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def canonical_qualified_profile_sha256(profile: QualifiedDeploymentProfileV1) -> str:
     canonical = json.dumps(
         profile.model_dump(mode="json"),
         ensure_ascii=False,
@@ -255,13 +277,7 @@ def canonical_model_schema_json(model: type[BaseModel]) -> str:
     )
 
 
-def _read_json_model[ModelT: BaseModel](path: Path, model: type[ModelT]) -> ModelT:
-    if not path.is_file():
-        raise ValueError(f"profile file does not exist: {path}")
-    return model.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-_MAX_OVERRIDE_BYTES = 65_536
+_MAX_PROFILE_BYTES = 65_536
 
 
 def _is_symlink_or_junction(path: Path) -> bool:
@@ -282,32 +298,35 @@ def _has_reparse_component(path: Path) -> bool:
     )
 
 
-def _read_override_atomic(
+def _read_profile_atomic[ModelT: BaseModel](
     path: Path,
+    model: type[ModelT],
     ownership_check: Callable[[os.stat_result], bool],
-) -> QualificationOverrideV1:
+) -> ModelT:
     if _has_reparse_component(path):
-        raise ValueError("qualification override path must not contain a symlink or junction")
+        raise ValueError("profile artifact path must not contain a symlink or junction")
     try:
         before_open = path.lstat()
     except FileNotFoundError as error:
-        raise ValueError("qualification override file does not exist") from error
+        raise ValueError("profile artifact file does not exist") from error
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ValueError("qualification override could not be opened safely") from error
+        raise ValueError("profile artifact could not be opened safely") from error
     try:
         opened_stat = os.fstat(descriptor)
         if (before_open.st_dev, before_open.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
-            raise ValueError("qualification override changed before atomic open")
+            raise ValueError("profile artifact changed before atomic open")
         if not stat.S_ISREG(opened_stat.st_mode):
-            raise ValueError("qualification override must be a regular file")
+            raise ValueError("profile artifact must be a regular file")
         if not ownership_check(opened_stat):
-            raise ValueError("qualification override must be root-owned")
+            raise ValueError("profile artifact must be root-owned")
+        if os.name != "nt" and opened_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError("profile artifact must not be group or other writable")
         chunks: list[bytes] = []
-        remaining = _MAX_OVERRIDE_BYTES + 1
+        remaining = _MAX_PROFILE_BYTES + 1
         while remaining:
             chunk = os.read(descriptor, min(remaining, 8192))
             if not chunk:
@@ -315,11 +334,11 @@ def _read_override_atomic(
             chunks.append(chunk)
             remaining -= len(chunk)
         content = b"".join(chunks)
-        if len(content) > _MAX_OVERRIDE_BYTES:
-            raise ValueError("qualification override file is too large")
+        if len(content) > _MAX_PROFILE_BYTES:
+            raise ValueError("profile artifact file is too large")
     finally:
         os.close(descriptor)
-    return QualificationOverrideV1.model_validate_json(content)
+    return model.model_validate_json(content)
 
 
 def _validate_bindings(
@@ -354,8 +373,9 @@ def load_qualified_deployment_profile(
     expected_image_digest: str,
     expected_agent_bundle_sha256: str,
     expected_inference_profile_sha256: str,
+    ownership_check: Callable[[os.stat_result], bool],
 ) -> QualifiedDeploymentProfileV1:
-    profile = _read_json_model(path, QualifiedDeploymentProfileV1)
+    profile = _read_profile_atomic(path, QualifiedDeploymentProfileV1, ownership_check)
     _validate_bindings(
         profile,
         expected_deployment_id=expected_deployment_id,
@@ -380,10 +400,11 @@ def load_qualification_candidate_profile(
     expected_inference_profile_sha256: str,
     manifest: AgentManifestV1,
     now: datetime,
+    ownership_check: Callable[[os.stat_result], bool],
 ) -> QualificationCandidateProfileV1:
     if not qualification_mode:
         raise ValueError("candidate profiles require explicit qualification mode")
-    profile = _read_json_model(path, QualificationCandidateProfileV1)
+    profile = _read_profile_atomic(path, QualificationCandidateProfileV1, ownership_check)
     current_time = _utc_datetime(now)
     if profile.expires_at <= current_time:
         raise ValueError("qualification candidate has expired")
@@ -413,15 +434,23 @@ def load_qualification_override(
     *,
     qualification_mode: bool,
     expected_run_id: UUID,
+    expected_deployment_id: str,
+    expected_qualified_profile_sha256: str,
+    strict_qualified_at: datetime,
     ownership_check: Callable[[os.stat_result], bool],
     now: datetime,
 ) -> QualificationOverrideV1:
     if not qualification_mode:
         raise ValueError("qualification overrides require explicit qualification mode")
-    override = _read_override_atomic(path, ownership_check)
+    override = _read_profile_atomic(path, QualificationOverrideV1, ownership_check)
     if override.run_id != expected_run_id:
         raise ValueError("qualification override run ID does not match")
+    if override.deployment_id != expected_deployment_id:
+        raise ValueError("qualification override deployment_id does not match")
+    if override.qualified_profile_sha256 != expected_qualified_profile_sha256:
+        raise ValueError("qualification override qualified profile hash does not match")
     current_time = _utc_datetime(now)
-    if not override.created_at <= current_time < override.expires_at:
+    qualified_at = _utc_datetime(strict_qualified_at)
+    if not qualified_at <= override.created_at < current_time < override.expires_at:
         raise ValueError("qualification override is not active")
     return override

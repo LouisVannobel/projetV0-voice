@@ -36,6 +36,7 @@ from projetv0_voice.telnyx.recordings import (
     resolve_recording_webhook,
 )
 from projetv0_voice.telnyx.webhooks import (
+    ResolvedWebhook,
     TelnyxWebhookProcessor,
     TelnyxWebhookVerifier,
     VerifiedWebhook,
@@ -538,12 +539,41 @@ async def test_signed_saved_reconciliation_preserves_1024_call_control_end_to_en
             timeout_seconds=2.0,
         )
 
+    class Handle:
+        def __init__(self, task: asyncio.Task[WebhookDisposition]) -> None:
+            self.task = task
+
+        async def wait(self) -> WebhookDisposition:
+            return await self.task
+
+    class Owner:
+        def start_webhook_finalization(
+            self, event: VerifiedWebhook, resolution: object
+        ) -> Handle:
+            async def finalize() -> WebhookDisposition:
+                effect = resolution.effect  # type: ignore[attr-defined]
+                ticket = writer.submit_webhook(
+                    receipt={
+                        "event_id": event.event_id,
+                        "event_type": event.event_type,
+                        "call_control_id": event.call_control_id,
+                        "occurred_at": event.occurred_at,
+                        "received_at": NOW + timedelta(minutes=2),
+                        "semantic_fingerprint_sha256": event.semantic_fingerprint_sha256,
+                    },
+                    lease=None if effect is None else effect.lease,
+                    operation=None if effect is None else effect.operation,
+                )
+                await ticket.wait()
+                disposition = await after_commit(event, effect)
+                return disposition or WebhookDisposition(200)
+
+            return Handle(asyncio.create_task(finalize()))
+
     processor = TelnyxWebhookProcessor(
         verifier=TelnyxWebhookVerifier(public_key=public_key),
-        writer=writer,
-        resolver=resolve_recording_webhook,
-        utcnow=lambda: NOW + timedelta(minutes=2),
-        after_commit=after_commit,
+        resolver=lambda event: ResolvedWebhook(resolve_recording_webhook(event)),
+        finalizer_owner=Owner(),
     )
     try:
         first_response = await processor.process(body=body, headers=headers)

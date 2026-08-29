@@ -173,6 +173,11 @@
       "title": "Schema Version",
       "type": "integer"
     },
+    "telnyx_api_key_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Telnyx Api Key Sha256",
+      "type": "string"
+    },
     "telnyx_handshake_fixture_sha256": {
       "pattern": "^[0-9a-f]{64}$",
       "title": "Telnyx Handshake Fixture Sha256",
@@ -196,6 +201,7 @@
     "inference_profile_sha256",
     "inference",
     "token_locator_id",
+    "telnyx_api_key_sha256",
     "telnyx_handshake_fixture_sha256",
     "disclosure_mark_timeout_ms",
     "call_lease_ttl_seconds",

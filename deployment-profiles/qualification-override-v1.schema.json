@@ -14,9 +14,19 @@
       "title": "Created At",
       "type": "string"
     },
+    "deployment_id": {
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
     "expires_at": {
       "format": "date-time",
       "title": "Expires At",
+      "type": "string"
+    },
+    "qualified_profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Qualified Profile Sha256",
       "type": "string"
     },
     "run_id": {
@@ -33,6 +43,8 @@
   "required": [
     "schema_version",
     "run_id",
+    "deployment_id",
+    "qualified_profile_sha256",
     "benchmark_max_calls",
     "created_at",
     "expires_at"
