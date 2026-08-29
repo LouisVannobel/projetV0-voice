@@ -40,7 +40,14 @@ class EncryptedCommandTooLarge(FatalPersistenceError):
 
 @dataclass(frozen=True, slots=True)
 class PersistenceCommand:
-    kind: Literal["webhook_effect", "lease", "outbox", "relay_batch", "shutdown"]
+    kind: Literal[
+        "webhook_effect",
+        "webhook_enrichment",
+        "lease",
+        "outbox",
+        "relay_batch",
+        "shutdown",
+    ]
     payload: Mapping[str, object] = field(repr=False)
     committed: asyncio.Future[None] | None = field(repr=False)
     enqueued_at: float = field(default_factory=time.monotonic)

@@ -158,7 +158,12 @@ class TurnUpsertPayloadV1(_StrictFrozenModel):
 class RecordingUpsertPayloadV1(_StrictFrozenModel):
     recording_id: UUID
     status: Literal["off", "pending", "active", "saved", "failed", "purged"]
-    telnyx_recording_id: str | None
+    telnyx_recording_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
     channels: Literal["dual"] | None
     format: Literal["wav"] | None
     started_at: datetime | None
@@ -186,10 +191,29 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
             raise ValueError("off recording cannot contain recording metadata")
         if self.status != "off" and (self.channels != "dual" or self.format != "wav"):
             raise ValueError("enabled recording requires dual-channel WAV metadata")
-        if self.status in {"active", "saved", "failed", "purged"} and self.started_at is None:
-            raise ValueError("active or final recording requires started_at")
-        if self.status in {"saved", "failed", "purged"} and self.ended_at is None:
-            raise ValueError("final recording requires ended_at")
+        timeline_present = self.started_at is not None or self.ended_at is not None
+        if timeline_present and (self.started_at is None or self.ended_at is None):
+            raise ValueError("recording timeline must be wholly present or absent")
+        if self.status in {"pending", "active"} and any(
+            item is not None
+            for item in (
+                self.telnyx_recording_id,
+                self.started_at,
+                self.ended_at,
+                self.retention_until,
+            )
+        ):
+            raise ValueError("pending or reserved active recording has no provider truth")
+        if self.status == "failed" and self.retention_until is not None:
+            raise ValueError("failed recording has no retention deadline")
+        if self.status in {"saved", "purged"} and (
+            self.started_at is None
+            or self.ended_at is None
+            or self.retention_until is None
+        ):
+            raise ValueError("saved or purged recording requires timeline and retention")
+        if self.status == "purged" and self.telnyx_recording_id is None:
+            raise ValueError("purged recording requires provider identity")
         if (
             self.started_at is not None
             and self.ended_at is not None

@@ -13,6 +13,7 @@ from uuid import UUID
 
 import pytest
 from nacl.signing import SigningKey
+from pydantic import SecretStr
 
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
@@ -383,6 +384,111 @@ def test_verified_webhook_is_canonical_minimal_frozen_and_input_redacting(
         verified.event_id = "changed"  # type: ignore[misc]
 
 
+def test_current_recording_saved_shape_extracts_only_url_free_semantic_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={
+            "call_leg_id": "leg-1",
+            "call_session_id": "session-1",
+            "client_state": "RAW-CLIENT-STATE-SENTINEL",
+            "recording_started_at": "2026-08-25T11:59:00Z",
+            "recording_ended_at": "2026-08-25T12:00:00Z",
+            "channels": "dual",
+            "public_recording_urls": {"wav": "https://RAW-URL-SENTINEL"},
+        },
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.call_control_id is None
+    assert verified.recording_id is None
+    assert verified.recording_started_at == NOW - timedelta(minutes=1)
+    assert verified.recording_ended_at == NOW
+    assert verified.recording_channels == "dual"
+    assert isinstance(verified.client_state, SecretStr)
+    assert verified.client_state.get_secret_value() == "RAW-CLIENT-STATE-SENTINEL"
+    assert len(verified.semantic_fingerprint_sha256) == 32
+    rendered = repr(verified)
+    for sentinel in (
+        "RAW-CLIENT-STATE-SENTINEL",
+        "RAW-URL-SENTINEL",
+        "leg-1",
+        "session-1",
+    ):
+        assert sentinel not in rendered
+    assert not hasattr(verified, "public_recording_urls")
+
+
+def test_recording_error_shape_ignores_reason_and_semantic_fingerprint_ignores_retry_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def body(*, attempt: int, reason: str, url: str) -> bytes:
+        return event_body(
+            event_type="call.recording.error",
+            payload={
+                "client_state": "RAW-CLIENT-STATE-SENTINEL",
+                "reason": reason,
+                "public_recording_urls": {"wav": url},
+            },
+            extra={"meta": {"attempt": attempt}},
+        )
+
+    first_body = body(attempt=1, reason="first", url="https://one.invalid")
+    second_body = body(attempt=9, reason="changed", url="https://two.invalid")
+    first_verifier, first_headers = verifier_for(monkeypatch, first_body)
+    first = first_verifier.verify(body=first_body, headers=first_headers)
+    second_verifier, second_headers = verifier_for(monkeypatch, second_body)
+    second = second_verifier.verify(body=second_body, headers=second_headers)
+
+    assert first.semantic_fingerprint_sha256 == second.semantic_fingerprint_sha256
+    assert first.recording_started_at is None
+    assert first.recording_ended_at is None
+    assert first.recording_channels is None
+    assert not hasattr(first, "reason")
+
+
+def test_semantic_fingerprint_changes_when_an_effect_driving_field_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints: list[bytes] = []
+    for client_state, ended_at in (
+        ("capsule-a", "2026-08-25T12:00:00Z"),
+        ("capsule-b", "2026-08-25T12:00:00Z"),
+        ("capsule-a", "2026-08-25T12:00:01Z"),
+    ):
+        body = event_body(
+            event_type="call.recording.saved",
+            payload={
+                "client_state": client_state,
+                "recording_started_at": "2026-08-25T11:59:00Z",
+                "recording_ended_at": ended_at,
+                "channels": "dual",
+            },
+        )
+        verifier, headers = verifier_for(monkeypatch, body)
+        fingerprints.append(
+            verifier.verify(body=body, headers=headers).semantic_fingerprint_sha256
+        )
+
+    assert len(set(fingerprints)) == 3
+
+
+def test_signed_recording_id_rejects_url_shape_before_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={"recording_id": "https://RAW-URL-SENTINEL"},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
 def test_explicit_handled_type_may_require_call_control_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -442,6 +548,53 @@ class StubWriter:
 
 
 @pytest.mark.asyncio
+async def test_processor_awaits_after_commit_and_accepts_only_recording_dispositions() -> None:
+    module = webhooks()
+    event = module.VerifiedWebhook(
+        event_id="event-1",
+        event_type="call.recording.saved",
+        occurred_at=NOW,
+        call_control_id=None,
+        call_leg_id=None,
+        call_session_id=None,
+        recording_id=None,
+        stream_id=None,
+        client_state=SecretStr("capsule"),
+        recording_started_at=NOW - timedelta(minutes=1),
+        recording_ended_at=NOW,
+        recording_channels="dual",
+        semantic_fingerprint_sha256=b"s" * 32,
+    )
+    order: list[str] = []
+
+    class StubVerifier:
+        def verify(self, **_: object) -> Any:
+            return event
+
+    class OrderedWriter(StubWriter):
+        async def commit_control(self, command: PersistenceCommand) -> None:
+            await super().commit_control(command)
+            order.append("committed")
+
+    async def after_commit(received: Any, effect: Any) -> Any:
+        assert received is event
+        assert effect is None
+        order.append("after_commit")
+        return module.WebhookDisposition(503)
+
+    response = await module.TelnyxWebhookProcessor(
+        verifier=StubVerifier(),
+        writer=OrderedWriter(),
+        resolver=lambda _: None,
+        utcnow=lambda: NOW,
+        after_commit=after_commit,
+    ).process(body=b"{}", headers=[])
+
+    assert response == module.WebhookDisposition(503)
+    assert order == ["committed", "after_commit"]
+
+
+@pytest.mark.asyncio
 async def test_processor_commits_one_atomic_receipt_only_effect_before_empty_200(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -476,6 +629,7 @@ async def test_processor_commits_one_atomic_receipt_only_effect_before_empty_200
             "call_control_id": None,
             "occurred_at": NOW,
             "received_at": NOW + timedelta(seconds=1),
+            "semantic_fingerprint_sha256": resolved[0].semantic_fingerprint_sha256,
         },
         "lease": None,
         "operation": None,
@@ -508,6 +662,11 @@ async def test_processor_has_exact_empty_safe_status_matrix(source: str, expecte
         call_session_id=None,
         recording_id=None,
         stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"s" * 32,
     )
 
     class StubVerifier:
@@ -557,6 +716,11 @@ async def test_processor_rejects_async_or_invalid_resolver_without_committing() 
         call_session_id=None,
         recording_id=None,
         stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"s" * 32,
     )
 
     class StubVerifier:
@@ -593,6 +757,7 @@ async def test_identical_duplicate_discards_entire_different_candidate_effect(
         "call_control_id": None,
         "occurred_at": NOW,
         "received_at": NOW,
+        "semantic_fingerprint_sha256": b"s" * 32,
     }
     first = PersistenceCommand(
         "webhook_effect",
@@ -695,6 +860,11 @@ async def test_real_writer_late_commit_requires_restart_then_redelivery_is_dupli
         call_session_id=None,
         recording_id=None,
         stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"s" * 32,
     )
 
     class StubVerifier:

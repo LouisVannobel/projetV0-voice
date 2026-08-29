@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import hashlib
 import inspect
 import re
 import sqlite3
@@ -780,6 +781,8 @@ class PersistenceWriter:
                 await self._apply_lease(command.payload)
             elif command.kind == "webhook_effect":
                 await self._apply_webhook_effect(command.payload)
+            elif command.kind == "webhook_enrichment":
+                await self._apply_webhook_enrichment(command.payload)
             elif command.kind == "relay_batch":
                 await self._apply_relay_command(command.payload)
             else:
@@ -888,15 +891,26 @@ class PersistenceWriter:
                 raise CommandSerializationError("invalid_webhook_receipt")
             occurred_at = _iso(self._required_datetime(receipt, "occurred_at"))
             received_at = _iso(self._required_datetime(receipt, "received_at"))
+            semantic_fingerprint = receipt.get("semantic_fingerprint_sha256")
+            if type(semantic_fingerprint) is not bytes or len(semantic_fingerprint) != 32:
+                raise CommandSerializationError("invalid_webhook_receipt")
         except (KeyError, TypeError) as error:
             raise CommandSerializationError("invalid_webhook_receipt") from error
         cursor = await connection.execute(
             """
             INSERT OR IGNORE INTO webhook_receipts (
-                event_id, event_type, call_control_id, occurred_at, received_at
-            ) VALUES (?, ?, ?, ?, ?)
+                event_id, event_type, call_control_id, occurred_at, received_at,
+                semantic_fingerprint_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (event_id, event_type, call_control, occurred_at, received_at),
+            (
+                event_id,
+                event_type,
+                call_control,
+                occurred_at,
+                received_at,
+                semantic_fingerprint,
+            ),
         )
         inserted = cursor.rowcount == 1
         await cursor.close()
@@ -904,16 +918,79 @@ class PersistenceWriter:
             return True
         cursor = await connection.execute(
             """
-            SELECT event_type, call_control_id, occurred_at
+            SELECT event_type, call_control_id, occurred_at, semantic_fingerprint_sha256
             FROM webhook_receipts WHERE event_id = ?
             """,
             (event_id,),
         )
         row = await cursor.fetchone()
         await cursor.close()
-        if row != (event_type, call_control, occurred_at):
+        if row != (event_type, call_control, occurred_at, semantic_fingerprint):
             raise CommandConflictError("webhook_identity_conflict")
         return False
+
+    async def _apply_webhook_enrichment(self, payload: Mapping[str, object]) -> None:
+        receipt = payload.get("receipt")
+        operation = payload.get("operation")
+        enrichment_fingerprint = payload.get("enrichment_fingerprint_sha256")
+        if (
+            not isinstance(receipt, Mapping)
+            or not isinstance(operation, VoiceOperationV1)
+            or not isinstance(operation.payload, RecordingUpsertPayloadV1)
+            or operation.payload.status != "saved"
+            or operation.payload.telnyx_recording_id is None
+            or type(enrichment_fingerprint) is not bytes
+            or len(enrichment_fingerprint) != 32
+            or enrichment_fingerprint
+            != hashlib.sha256(canonical_operation_bytes(operation)).digest()
+        ):
+            raise CommandSerializationError("invalid_webhook_enrichment")
+        event_id = self._required_str(receipt, "event_id")
+        event_type = self._required_str(receipt, "event_type")
+        call_control = receipt.get("call_control_id")
+        if call_control is not None and not isinstance(call_control, str):
+            raise CommandSerializationError("invalid_webhook_enrichment")
+        occurred_at = _iso(self._required_datetime(receipt, "occurred_at"))
+        semantic_fingerprint = receipt.get("semantic_fingerprint_sha256")
+        if type(semantic_fingerprint) is not bytes or len(semantic_fingerprint) != 32:
+            raise CommandSerializationError("invalid_webhook_enrichment")
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            """
+            SELECT event_type, call_control_id, occurred_at,
+                   semantic_fingerprint_sha256,
+                   provider_enrichment_fingerprint_sha256
+            FROM webhook_receipts WHERE event_id = ?
+            """,
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None or row[:4] != (
+            event_type,
+            call_control,
+            occurred_at,
+            semantic_fingerprint,
+        ):
+            raise CommandConflictError("webhook_identity_conflict")
+        bound_fingerprint = row[4]
+        if bound_fingerprint is None:
+            cursor = await connection.execute(
+                """
+                UPDATE webhook_receipts
+                SET provider_enrichment_fingerprint_sha256 = ?
+                WHERE event_id = ?
+                  AND provider_enrichment_fingerprint_sha256 IS NULL
+                """,
+                (enrichment_fingerprint, event_id),
+            )
+            if cursor.rowcount != 1:
+                await cursor.close()
+                raise CommandConflictError("webhook_enrichment_conflict")
+            await cursor.close()
+        elif bound_fingerprint != enrichment_fingerprint:
+            raise CommandConflictError("webhook_enrichment_conflict")
+        await self._insert_outbox(operation)
 
     async def _apply_lease(self, payload: Mapping[str, object]) -> None:
         if payload.get("action") != "upsert":

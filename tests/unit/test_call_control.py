@@ -6,6 +6,7 @@ import inspect
 import json
 import time
 from collections import deque
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, get_args
 from uuid import UUID, uuid4
@@ -22,6 +23,7 @@ from telnyx.types import (
 
 API_KEY = "RAW-API-KEY-SENTINEL"
 TOKEN = "RAW-STREAM-TOKEN-SENTINEL"
+CLIENT_STATE = "RAW-CLIENT-STATE-SENTINEL"
 URL = "wss://voice.example.test/telnyx/media"
 CALL_CONTROL_ID = "RAW-CALL-CONTROL-SENTINEL"
 COMMAND_ID = UUID("12345678-1234-4abc-8def-1234567890ab")
@@ -55,6 +57,9 @@ class FakeActions:
 
     async def start_recording(self, call_control_id: str, **kwargs: object) -> object:
         return await self._invoke("start_recording", call_control_id, kwargs)
+
+    async def stop_recording(self, call_control_id: str, **kwargs: object) -> object:
+        return await self._invoke("stop_recording", call_control_id, kwargs)
 
     async def hangup(self, call_control_id: str, **kwargs: object) -> object:
         return await self._invoke("hangup", call_control_id, kwargs)
@@ -141,8 +146,10 @@ def test_locked_sdk_surface_matches_task5_contract() -> None:
     assert set(get_args(StreamBidirectionalTargetLegs)) == {"both", "self", "opposite"}
     assert 8000 in get_args(StreamBidirectionalSamplingRate)
     recording = inspect.signature(AsyncActionsResource.start_recording)
+    recording_stop = inspect.signature(AsyncActionsResource.stop_recording)
     streaming = inspect.signature(AsyncActionsResource.start_streaming)
     assert "max_length" in recording.parameters
+    assert "recording_id" in recording_stop.parameters
     assert "stream_auth_token" in streaming.parameters
     assert inspect.signature(telnyx.AsyncTelnyx).parameters["max_retries"].default == 2
 
@@ -176,10 +183,25 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
     )
     await client.start_recording(
         CALL_CONTROL_ID,
-        module.RecordingStartV1(play_beep=False),
+        module.RecordingStartV1(
+            play_beep=False,
+            client_state=SecretStr(CLIENT_STATE),
+        ),
         command_id=COMMAND_ID,
     )
-    await client.hangup(CALL_CONTROL_ID, command_id=COMMAND_ID)
+    await client.stop_recording(
+        CALL_CONTROL_ID,
+        module.RecordingStopV1(
+            client_state=SecretStr(CLIENT_STATE),
+            recording_id=None,
+        ),
+        command_id=COMMAND_ID,
+    )
+    await client.hangup(
+        CALL_CONTROL_ID,
+        command_id=COMMAND_ID,
+        client_state=SecretStr(CLIENT_STATE),
+    )
     await client.aclose()
 
     command = str(COMMAND_ID)
@@ -187,6 +209,7 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/answer", b""),
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/streaming_start", b""),
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/record_start", b""),
+        ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/record_stop", b""),
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/hangup", b""),
     ]
     assert [body for _, _, body, _ in requests] == [
@@ -204,6 +227,7 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
         },
         {
             "channels": "dual",
+            "client_state": CLIENT_STATE,
             "command_id": command,
             "format": "wav",
             "max_length": 0,
@@ -212,14 +236,18 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
             "timeout_secs": 0,
             "transcription": False,
         },
-        {"command_id": command},
+        {"client_state": CLIENT_STATE, "command_id": command},
+        {"client_state": CLIENT_STATE, "command_id": command},
     ]
 
 
 def test_request_models_are_strict_frozen_and_input_redacting() -> None:
     module = call_control()
     streaming = module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)
-    recording = module.RecordingStartV1(play_beep=True)
+    recording = module.RecordingStartV1(
+        play_beep=True,
+        client_state=SecretStr(CLIENT_STATE),
+    )
 
     assert streaming.stream_url == URL
     assert isinstance(streaming.stream_auth_token, SecretStr)
@@ -230,7 +258,11 @@ def test_request_models_are_strict_frozen_and_input_redacting() -> None:
     with pytest.raises(ValidationError, match="frozen"):
         streaming.stream_url = "wss://changed.example.test"  # type: ignore[misc]
     with pytest.raises(ValidationError):
-        module.RecordingStartV1(play_beep=True, trim="trim-silence")
+        module.RecordingStartV1(
+            play_beep=True,
+            client_state=SecretStr(CLIENT_STATE),
+            trim="trim-silence",
+        )
 
 
 def test_stream_transport_fields_are_absent_from_dumps_and_safe_in_repr_and_str() -> None:
@@ -301,7 +333,10 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     constructions, instances = install_fake(monkeypatch, module, [ok_response()] * 4)
     client = module.CallControlClient(api_key=API_KEY)
     streaming = module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)
-    recording = module.RecordingStartV1(play_beep=True)
+    recording = module.RecordingStartV1(
+        play_beep=True,
+        client_state=SecretStr(CLIENT_STATE),
+    )
 
     results = [
         await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID),
@@ -343,6 +378,7 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
         "timeout_secs": 0,
         "transcription": False,
         "play_beep": True,
+        "client_state": CLIENT_STATE,
         "command_id": command,
         "timeout": calls[2][2]["timeout"],
     }
@@ -355,6 +391,196 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     rendered = repr(client) + "".join(repr(result) for result in results)
     for secret in (API_KEY, TOKEN, URL, CALL_CONTROL_ID, str(COMMAND_ID)):
         assert secret not in rendered
+
+
+@pytest.mark.asyncio
+async def test_recording_actions_send_one_redacted_capsule_and_omit_unknown_recording_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    _, instances = install_fake(monkeypatch, module, [ok_response()] * 3)
+    client = module.CallControlClient(api_key=API_KEY)
+    capsule = SecretStr(CLIENT_STATE)
+
+    await client.start_recording(
+        CALL_CONTROL_ID,
+        module.RecordingStartV1(play_beep=False, client_state=capsule),
+        command_id=COMMAND_ID,
+    )
+    await client.stop_recording(
+        CALL_CONTROL_ID,
+        module.RecordingStopV1(client_state=capsule, recording_id=None),
+        command_id=COMMAND_ID,
+    )
+    await client.hangup(
+        CALL_CONTROL_ID,
+        command_id=COMMAND_ID,
+        client_state=capsule,
+    )
+
+    calls = instances[0].actions.calls
+    assert [call[:2] for call in calls] == [
+        ("start_recording", CALL_CONTROL_ID),
+        ("stop_recording", CALL_CONTROL_ID),
+        ("hangup", CALL_CONTROL_ID),
+    ]
+    assert calls[0][2]["client_state"] == CLIENT_STATE
+    assert calls[1][2]["client_state"] == CLIENT_STATE
+    assert "recording_id" not in calls[1][2]
+    assert calls[2][2]["client_state"] == CLIENT_STATE
+    request = module.RecordingStopV1(client_state=capsule, recording_id=None)
+    assert request.model_dump() == {}
+    assert CLIENT_STATE not in repr(request) + str(request)
+
+
+@pytest.mark.asyncio
+async def test_recording_catalog_adapter_awaits_exactly_one_page_and_never_reads_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    await_count = 0
+
+    class PoisonRow:
+        id = "recording_Ab-12"
+        call_control_id = CALL_CONTROL_ID
+        call_leg_id = "leg-1"
+        call_session_id = "session-1"
+        channels = "dual"
+        status = "completed"
+        source = "call"
+        initiated_by = "StartCallRecordingAPI"
+        recording_started_at = "2026-08-29T12:00:00Z"
+        recording_ended_at = "2026-08-29T12:01:00Z"
+
+        @property
+        def download_urls(self) -> object:
+            raise AssertionError("recording URL must never be read")
+
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[PoisonRow()],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            nonlocal await_count
+            await_count += 1
+            if await_count != 1:
+                raise AssertionError("paginator awaited more than once")
+            if False:
+                yield None
+            return page
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("paginator iteration is forbidden")
+
+        async def get_next_page(self) -> object:
+            raise AssertionError("next page is forbidden")
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            self.calls.append(dict(kwargs))
+            return OnePageAwaitable()
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = CatalogSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    result = await client.list_recordings_one_page(
+        call_control_id=CALL_CONTROL_ID,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        start_gte_iso="2026-08-29T11:59:55Z",
+        start_lte_iso="2026-08-29T12:00:05Z",
+        end_gte_iso="2026-08-29T12:00:55Z",
+        end_lte_iso="2026-08-29T12:01:05Z",
+        timeout_seconds=0.75,
+    )
+
+    assert await_count == 1
+    assert sdk.recordings.calls == [
+        {
+            "filter": {
+                "call_control_id": CALL_CONTROL_ID,
+                "call_leg_id": "leg-1",
+                "call_session_id": "session-1",
+                "start_time": {
+                    "gte": "2026-08-29T11:59:55Z",
+                    "lte": "2026-08-29T12:00:05Z",
+                },
+                "end_time": {
+                    "gte": "2026-08-29T12:00:55Z",
+                    "lte": "2026-08-29T12:01:05Z",
+                },
+            },
+            "page_size": 2,
+            "timeout": 0.75,
+        }
+    ]
+    assert result.page_number == 1
+    assert result.total_pages == 1
+    assert len(result.items) == 1
+    assert result.items[0].recording_id == "recording_Ab-12"
+    assert result.items[0].recording_started_at == datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_recording_delete_extracts_only_exact_id_and_maps_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            self.responses: deque[object] = deque(
+                [
+                    SimpleNamespace(data=SimpleNamespace(id="recording_Ab-12")),
+                    status_error(404),
+                ]
+            )
+
+        async def delete(self, recording_id: str, **kwargs: object) -> object:
+            self.calls.append((recording_id, dict(kwargs)))
+            result = self.responses.popleft()
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    class DeleteSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = DeleteSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    deleted = await client.delete_recording("recording_Ab-12", timeout_seconds=0.75)
+    missing = await client.delete_recording("recording_Ab-12", timeout_seconds=0.75)
+
+    assert deleted.outcome == "deleted"
+    assert deleted.recording_id == "recording_Ab-12"
+    assert missing.outcome == "not_found"
+    assert missing.recording_id is None
+    assert sdk.recordings.calls == [
+        ("recording_Ab-12", {"timeout": 0.75}),
+        ("recording_Ab-12", {"timeout": 0.75}),
+    ]
 
 
 @pytest.mark.asyncio

@@ -26,7 +26,14 @@ CREATE TABLE IF NOT EXISTS webhook_receipts (
     event_type TEXT NOT NULL,
     call_control_id TEXT,
     occurred_at TEXT NOT NULL,
-    received_at TEXT NOT NULL
+    received_at TEXT NOT NULL,
+    semantic_fingerprint_sha256 BLOB NOT NULL
+        CHECK (length(semantic_fingerprint_sha256) = 32),
+    provider_enrichment_fingerprint_sha256 BLOB
+        CHECK (
+            provider_enrichment_fingerprint_sha256 IS NULL
+            OR length(provider_enrichment_fingerprint_sha256) = 32
+        )
 );
 
 CREATE TABLE IF NOT EXISTS outbox (

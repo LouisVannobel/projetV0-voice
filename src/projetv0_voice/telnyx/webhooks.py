@@ -5,15 +5,19 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import hashlib
 import importlib
 import inspect
 import json
-from collections.abc import Callable, Collection, Mapping, Sequence
+import re
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType, ModuleType
-from typing import NoReturn, Protocol
+from typing import NoReturn, Protocol, cast
 from uuid import UUID
+
+from pydantic import SecretStr
 
 from projetv0_voice.models import VoiceOperationV1
 from projetv0_voice.persistence.commands import (
@@ -26,6 +30,8 @@ MAX_WEBHOOK_BODY_BYTES = 65_536
 MAX_EVENT_ID_CHARS = 256
 MAX_EVENT_TYPE_CHARS = 128
 MAX_PROVIDER_ID_CHARS = 256
+MAX_CLIENT_STATE_B64_CHARS = 4_096
+_PROVIDER_RECORDING_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _LEASE_KEYS = frozenset(
     {
         "action",
@@ -76,6 +82,34 @@ class VerifiedWebhook:
     call_session_id: str | None = field(repr=False)
     recording_id: str | None = field(repr=False)
     stream_id: str | None = field(repr=False)
+    client_state: SecretStr | None = field(repr=False)
+    recording_started_at: datetime | None = field(repr=False)
+    recording_ended_at: datetime | None = field(repr=False)
+    recording_channels: str | None = field(repr=False)
+    semantic_fingerprint_sha256: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self.client_state is not None
+            and not isinstance(self.client_state, SecretStr)
+            or self.recording_started_at is not None
+            and (
+                not isinstance(self.recording_started_at, datetime)
+                or self.recording_started_at.tzinfo is None
+                or self.recording_started_at.utcoffset() is None
+            )
+            or self.recording_ended_at is not None
+            and (
+                not isinstance(self.recording_ended_at, datetime)
+                or self.recording_ended_at.tzinfo is None
+                or self.recording_ended_at.utcoffset() is None
+            )
+            or self.recording_channels is not None
+            and not _valid_recording_channels(self.recording_channels)
+            or type(self.semantic_fingerprint_sha256) is not bytes
+            or len(self.semantic_fingerprint_sha256) != 32
+        ):
+            raise ValueError("verified_webhook_invalid")
 
     def __repr__(self) -> str:
         return "VerifiedWebhook()"
@@ -157,6 +191,10 @@ class _Writer(Protocol):
 
 
 WebhookResolver = Callable[[VerifiedWebhook], WebhookDurableEffect | None]
+WebhookAfterCommit = Callable[
+    [VerifiedWebhook, WebhookDurableEffect | None],
+    Awaitable[WebhookDisposition | None],
+]
 
 
 def _raise_constant(error_type: type[WebhookError], code: str) -> NoReturn:
@@ -204,6 +242,95 @@ def _optional_provider_id(payload: Mapping[str, object], name: str) -> str | Non
     return bounded
 
 
+def _optional_recording_id(payload: Mapping[str, object]) -> str | None:
+    value = payload.get("recording_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or _PROVIDER_RECORDING_ID.fullmatch(value) is None:
+        raise ValueError("invalid_recording_id")
+    return value
+
+
+def _optional_client_state(payload: Mapping[str, object]) -> SecretStr | None:
+    value = payload.get("client_state")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 0 < len(value) <= MAX_CLIENT_STATE_B64_CHARS:
+        raise ValueError("invalid_client_state")
+    return SecretStr(value)
+
+
+def _optional_utc_datetime(payload: Mapping[str, object], name: str) -> datetime | None:
+    value = payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 0 < len(value) <= 64:
+        raise ValueError("invalid_recording_time")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("invalid_recording_time")
+    return parsed.astimezone(UTC)
+
+
+def _valid_recording_channels(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 16
+
+
+def _optional_recording_channels(payload: Mapping[str, object]) -> str | None:
+    value = payload.get("channels")
+    if value is None:
+        return None
+    if not _valid_recording_channels(value):
+        raise ValueError("invalid_recording_channels")
+    return cast(str, value)
+
+
+def _canonical_time(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _semantic_fingerprint(
+    *,
+    event_id: str,
+    event_type: str,
+    occurred_at: datetime,
+    call_control_id: str | None,
+    call_leg_id: str | None,
+    call_session_id: str | None,
+    recording_id: str | None,
+    stream_id: str | None,
+    client_state: SecretStr | None,
+    recording_started_at: datetime | None,
+    recording_ended_at: datetime | None,
+    recording_channels: str | None,
+) -> bytes:
+    encoded = json.dumps(
+        [
+            "projetv0.voice.webhook.semantic",
+            1,
+            event_id,
+            event_type,
+            _canonical_time(occurred_at),
+            call_control_id,
+            call_leg_id,
+            call_session_id,
+            recording_id,
+            stream_id,
+            None if client_state is None else client_state.get_secret_value(),
+            _canonical_time(recording_started_at),
+            _canonical_time(recording_ended_at),
+            recording_channels,
+        ],
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).digest()
+
+
 def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWebhook | None:
     try:
         parsed = json.loads(
@@ -233,15 +360,41 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
         call_control_id = _optional_provider_id(payload, "call_control_id")
         if event_type in required_types and call_control_id is None:
             return None
+        call_leg_id = _optional_provider_id(payload, "call_leg_id")
+        call_session_id = _optional_provider_id(payload, "call_session_id")
+        recording_id = _optional_recording_id(payload)
+        stream_id = _optional_provider_id(payload, "stream_id")
+        client_state = _optional_client_state(payload)
+        recording_started_at = _optional_utc_datetime(payload, "recording_started_at")
+        recording_ended_at = _optional_utc_datetime(payload, "recording_ended_at")
+        recording_channels = _optional_recording_channels(payload)
         return VerifiedWebhook(
             event_id=event_id,
             event_type=event_type,
             occurred_at=normalized_time,
             call_control_id=call_control_id,
-            call_leg_id=_optional_provider_id(payload, "call_leg_id"),
-            call_session_id=_optional_provider_id(payload, "call_session_id"),
-            recording_id=_optional_provider_id(payload, "recording_id"),
-            stream_id=_optional_provider_id(payload, "stream_id"),
+            call_leg_id=call_leg_id,
+            call_session_id=call_session_id,
+            recording_id=recording_id,
+            stream_id=stream_id,
+            client_state=client_state,
+            recording_started_at=recording_started_at,
+            recording_ended_at=recording_ended_at,
+            recording_channels=recording_channels,
+            semantic_fingerprint_sha256=_semantic_fingerprint(
+                event_id=event_id,
+                event_type=event_type,
+                occurred_at=normalized_time,
+                call_control_id=call_control_id,
+                call_leg_id=call_leg_id,
+                call_session_id=call_session_id,
+                recording_id=recording_id,
+                stream_id=stream_id,
+                client_state=client_state,
+                recording_started_at=recording_started_at,
+                recording_ended_at=recording_ended_at,
+                recording_channels=recording_channels,
+            ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -355,7 +508,7 @@ class TelnyxWebhookVerifier:
 class TelnyxWebhookProcessor:
     """Resolve one verified event into one atomic local writer command."""
 
-    __slots__ = ("_resolver", "_utcnow", "_verifier", "_writer")
+    __slots__ = ("_after_commit", "_resolver", "_utcnow", "_verifier", "_writer")
 
     def __init__(
         self,
@@ -364,11 +517,13 @@ class TelnyxWebhookProcessor:
         writer: _Writer,
         resolver: WebhookResolver,
         utcnow: Callable[[], datetime],
+        after_commit: WebhookAfterCommit | None = None,
     ) -> None:
         self._verifier = verifier
         self._writer = writer
         self._resolver = resolver
         self._utcnow = utcnow
+        self._after_commit = after_commit
 
     def __repr__(self) -> str:
         return "TelnyxWebhookProcessor()"
@@ -419,6 +574,7 @@ class TelnyxWebhookProcessor:
                         "call_control_id": event.call_control_id,
                         "occurred_at": event.occurred_at,
                         "received_at": received_at.astimezone(UTC),
+                        "semantic_fingerprint_sha256": event.semantic_fingerprint_sha256,
                     },
                     "lease": lease,
                     "operation": operation,
@@ -434,4 +590,18 @@ class TelnyxWebhookProcessor:
             return WebhookDisposition(503)
         except Exception:
             return WebhookDisposition(500)
+        if self._after_commit is not None:
+            try:
+                disposition = await self._after_commit(event, effect)
+            except Exception:
+                return WebhookDisposition(500)
+            if disposition is None:
+                return WebhookDisposition(200)
+            if (
+                not isinstance(disposition, WebhookDisposition)
+                or disposition.status_code not in {200, 500, 503}
+                or disposition.body != b""
+            ):
+                return WebhookDisposition(500)
+            return disposition
         return WebhookDisposition(200)

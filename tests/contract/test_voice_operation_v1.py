@@ -190,6 +190,80 @@ def test_off_recording_snapshot_accepts_all_nullable_metadata_as_null() -> None:
 
 
 @pytest.mark.parametrize(
+    ("status", "provider_id", "started_at", "ended_at", "retention_until"),
+    [
+        ("pending", None, None, None, None),
+        ("active", None, None, None, None),
+        ("failed", None, None, None, None),
+        ("failed", "recording-test-id", NOW, NOW + timedelta(minutes=3), None),
+        (
+            "saved",
+            None,
+            NOW,
+            NOW + timedelta(minutes=3),
+            NOW + timedelta(days=7),
+        ),
+        (
+            "purged",
+            "recording-test-id",
+            NOW,
+            NOW + timedelta(minutes=3),
+            NOW + timedelta(days=7),
+        ),
+    ],
+)
+def test_recording_truth_table_accepts_only_frozen_v1_shapes(
+    status: str,
+    provider_id: str | None,
+    started_at: datetime | None,
+    ended_at: datetime | None,
+    retention_until: datetime | None,
+) -> None:
+    parsed = RecordingUpsertPayloadV1.model_validate(
+        recording_payload(
+            status=status,
+            telnyx_recording_id=provider_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            retention_until=retention_until,
+        )
+    )
+
+    assert parsed.status == status
+    assert parsed.telnyx_recording_id == provider_id
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"status": "pending", "started_at": NOW},
+        {"status": "active", "telnyx_recording_id": "recording-test-id"},
+        {"status": "failed", "started_at": NOW, "ended_at": None},
+        {"status": "failed", "retention_until": NOW + timedelta(days=7)},
+        {"status": "saved", "started_at": None},
+        {"status": "saved", "retention_until": None},
+        {"status": "purged", "telnyx_recording_id": None},
+        {
+            "status": "saved",
+            "retention_until": NOW + timedelta(minutes=3),
+        },
+    ],
+)
+def test_recording_truth_table_rejects_half_timeline_and_impossible_metadata(
+    updates: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        RecordingUpsertPayloadV1.model_validate(recording_payload(**updates))
+
+
+def test_recording_provider_id_rejects_url_shaped_values() -> None:
+    with pytest.raises(ValidationError, match="telnyx_recording_id"):
+        RecordingUpsertPayloadV1.model_validate(
+            recording_payload(telnyx_recording_id="https://RAW-URL-SENTINEL")
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("nonce_b64", "not base64!"),
