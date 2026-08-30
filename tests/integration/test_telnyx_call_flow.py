@@ -15,6 +15,7 @@ import pytest
 from nacl.signing import SigningKey
 
 from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.persistence.schema import V1_SCHEMA_SQL
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.telnyx.call_control import CallControlResult
 from projetv0_voice.telnyx.webhooks import (
@@ -25,6 +26,72 @@ from projetv0_voice.telnyx.webhooks import (
 )
 
 TIMESTAMP = 1_777_118_400
+
+_TASK9_FINGERPRINT_CASES = (
+    (
+        "call.recording.saved",
+        {
+            "call_control_id": "control-a",
+            "call_leg_id": "leg-a",
+            "call_session_id": "session-a",
+            "recording_id": "recording-a",
+            "stream_id": "stream-a",
+            "client_state": "Y2xpZW50",
+            "recording_started_at": "2026-08-29T10:00:01Z",
+            "recording_ended_at": "2026-08-29T10:00:02Z",
+            "channels": "dual",
+        },
+        "ee386beef0b2150270123fb7b921b95c38c019141fb7eb06d51b23411774a68f",
+        "ee386beef0b2150270123fb7b921b95c38c019141fb7eb06d51b23411774a68f",
+        None,
+    ),
+    (
+        "call.recording.error",
+        {"call_control_id": "control-a", "recording_id": "recording-a"},
+        "4adff04e91ddab242b7da27455c53e47281da8ad4e212a2f7310412482890e91",
+        "4adff04e91ddab242b7da27455c53e47281da8ad4e212a2f7310412482890e91",
+        None,
+    ),
+    (
+        "call.hangup",
+        {"call_control_id": "control-a"},
+        "fbb8378f2552106a0ec14b9a7283f4cad06d54e2949aef52607f99dc1c86f6f2",
+        "fbb8378f2552106a0ec14b9a7283f4cad06d54e2949aef52607f99dc1c86f6f2",
+        None,
+    ),
+    (
+        "future.event",
+        {"provider_field": "ignored"},
+        "bd2b9c69b44a94fa3ed2bf5214edfcd6054190cc52740b3ba118889596fd8943",
+        "bd2b9c69b44a94fa3ed2bf5214edfcd6054190cc52740b3ba118889596fd8943",
+        None,
+    ),
+    (
+        "call.initiated",
+        {
+            "call_control_id": "control-a",
+            "call_leg_id": "leg-a",
+            "call_session_id": "session-a",
+            "direction": "incoming",
+            "state": "parked",
+        },
+        "ed766819519ec6f7ec9c479a643f9d72b232ac0d4722341cbfb4350ee812098c",
+        "2759dd9333080e63bec2d57b9bbe5d02354c9cdfe052bd2b0c34a73eb6f5c13a",
+        "ed766819519ec6f7ec9c479a643f9d72b232ac0d4722341cbfb4350ee812098c",
+    ),
+    (
+        "call.answered",
+        {
+            "call_control_id": "control-a",
+            "call_leg_id": "leg-a",
+            "call_session_id": "session-a",
+            "state": "answered",
+        },
+        "dada33a9b81ebeff7cf7312684749ac363b48dce7502c94ac823ca687c00a085",
+        "83e464f83cbd9fd77ba4e5ca0d8cfc263cb2f29131ff6e0866e746842505a8c7",
+        "dada33a9b81ebeff7cf7312684749ac363b48dce7502c94ac823ca687c00a085",
+    ),
+)
 
 
 def _signed(
@@ -178,6 +245,183 @@ def test_unrelated_direction_and_state_are_ignored_for_non_action_events(
 
     assert event.direction is None
     assert event.call_state is None
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload", "legacy_hex", "current_hex", "alias_hex"),
+    _TASK9_FINGERPRINT_CASES,
+)
+def test_task9_fingerprint_bytes_remain_primary_or_one_verified_action_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    payload: dict[str, object],
+    legacy_hex: str,
+    current_hex: str,
+    alias_hex: str | None,
+) -> None:
+    verifier, body, headers = _signed(
+        monkeypatch, event_type=event_type, payload=payload
+    )
+
+    event = verifier.verify(body=body, headers=headers)
+
+    assert event.semantic_fingerprint_sha256 == bytes.fromhex(current_hex)
+    assert event.legacy_v1_semantic_fingerprint_sha256 == (
+        None if alias_hex is None else bytes.fromhex(alias_hex)
+    )
+    if event_type in {"call.initiated", "call.answered"}:
+        assert event.semantic_fingerprint_sha256 != bytes.fromhex(legacy_hex)
+        changed_payload = {**payload, "call_leg_id": "leg-changed"}
+        changed_verifier, changed_body, changed_headers = _signed(
+            monkeypatch,
+            event_type=event_type,
+            payload=changed_payload,
+        )
+        changed = changed_verifier.verify(
+            body=changed_body,
+            headers=changed_headers,
+        )
+        assert changed.semantic_fingerprint_sha256 != event.semantic_fingerprint_sha256
+        assert (
+            changed.legacy_v1_semantic_fingerprint_sha256
+            != event.legacy_v1_semantic_fingerprint_sha256
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "payload", "legacy_hex", "_current_hex", "_alias_hex"),
+    _TASK9_FINGERPRINT_CASES,
+)
+async def test_real_v1_migration_redelivery_accepts_only_verified_fingerprint_set(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+    payload: dict[str, object],
+    legacy_hex: str,
+    _current_hex: str,
+    _alias_hex: str | None,
+) -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+    from projetv0_voice.telnyx.webhooks import ResolvedWebhook, VerifiedWebhook
+
+    verifier, body, headers = _signed(
+        monkeypatch, event_type=event_type, payload=payload
+    )
+    verified = verifier.verify(body=body, headers=headers)
+    database = tmp_path / f"legacy-{event_type.replace('.', '-')}.sqlite"
+    legacy_fingerprint = bytes.fromhex(legacy_hex)
+    with sqlite3.connect(database) as connection:
+        connection.executescript(V1_SCHEMA_SQL)
+        connection.execute(
+            """
+            INSERT INTO webhook_receipts (
+                event_id, event_type, call_control_id, occurred_at, received_at,
+                semantic_fingerprint_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                verified.event_id,
+                verified.event_type,
+                verified.call_control_id,
+                "2026-08-29T10:00:00Z",
+                "2026-08-29T10:00:00Z",
+                legacy_fingerprint,
+            ),
+        )
+
+    writer = PersistenceWriter(
+        database,
+        CryptoKeyring({1: bytes(range(32))}, active_version=1),
+    )
+    writer_task = asyncio.create_task(writer.run())
+    assert await writer.wait_ready()
+    missing_resolutions = 0
+    duplicate_resolutions = 0
+
+    async def reject_missing(_: VerifiedWebhook) -> ResolvedWebhook:
+        nonlocal missing_resolutions
+        missing_resolutions += 1
+        raise AssertionError("legacy duplicate must not enter missing admission")
+
+    async def reconcile_duplicate(_: VerifiedWebhook) -> ResolvedWebhook:
+        nonlocal duplicate_resolutions
+        duplicate_resolutions += 1
+        return ResolvedWebhook(None)
+
+    class Handle:
+        def __init__(self, task: asyncio.Task[WebhookDisposition]) -> None:
+            self.task = task
+
+        async def wait(self) -> WebhookDisposition:
+            return await self.task
+
+    class Owner:
+        def __init__(self) -> None:
+            self.results: list[WebhookCommitResult] = []
+
+        async def classify_webhook_receipt(self, event: VerifiedWebhook) -> str:
+            return await writer.classify_webhook_receipt(
+                event_id=event.event_id,
+                semantic_fingerprint_sha256=event.semantic_fingerprint_sha256,
+                legacy_v1_semantic_fingerprint_sha256=(
+                    event.legacy_v1_semantic_fingerprint_sha256
+                ),
+            )
+
+        def start_webhook_finalization(
+            self, event: VerifiedWebhook, resolution: ResolvedWebhook
+        ) -> Handle:
+            assert resolution.effect is None
+
+            async def finalize() -> WebhookDisposition:
+                result = await writer.submit_webhook(
+                    receipt={
+                        "event_id": event.event_id,
+                        "event_type": event.event_type,
+                        "call_control_id": event.call_control_id,
+                        "occurred_at": event.occurred_at,
+                        "received_at": event.occurred_at,
+                        "semantic_fingerprint_sha256": (
+                            event.semantic_fingerprint_sha256
+                        ),
+                    },
+                    lease=None,
+                    operation=None,
+                    legacy_v1_semantic_fingerprint_sha256=(
+                        event.legacy_v1_semantic_fingerprint_sha256
+                    ),
+                ).wait()
+                assert isinstance(result, WebhookCommitResult)
+                self.results.append(result)
+                return WebhookDisposition(200)
+
+            return Handle(asyncio.create_task(finalize()))
+
+    owner = Owner()
+    disposition = await TelnyxWebhookProcessor(
+        verifier=verifier,
+        resolver=reject_missing,
+        duplicate_resolver=reconcile_duplicate,
+        finalizer_owner=owner,
+    ).process(body=body, headers=headers)
+
+    assert disposition.status_code == 200
+    assert missing_resolutions == 0
+    assert duplicate_resolutions == 1
+    assert len(owner.results) == 1
+    assert owner.results[0].receipt == "duplicate"
+    assert owner.results[0].effect == "duplicate"
+    assert writer.fatal_fault is None
+    await writer.drain(2)
+    await writer_task
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute(
+            "SELECT semantic_fingerprint_sha256 FROM webhook_receipts"
+        ).fetchone() == (legacy_fingerprint,)
+        assert connection.execute("SELECT COUNT(*) FROM call_leases").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (0,)
 
 
 @pytest.mark.asyncio

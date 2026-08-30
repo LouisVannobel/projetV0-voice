@@ -382,6 +382,7 @@ class PersistenceWriter:
         receipt: Mapping[str, object],
         lease: Mapping[str, object] | None,
         operation: VoiceOperationV1 | None,
+        legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
         qualification_run_id: UUID | None = None,
     ) -> WebhookCommitTicket:
         """Synchronously transfer one webhook transaction to the writer owner."""
@@ -396,6 +397,11 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_lease_command")
         if operation is not None and not isinstance(operation, VoiceOperationV1):
             raise CommandSerializationError("invalid_outbox_command")
+        if legacy_v1_semantic_fingerprint_sha256 is not None and (
+            type(legacy_v1_semantic_fingerprint_sha256) is not bytes
+            or len(legacy_v1_semantic_fingerprint_sha256) != 32
+        ):
+            raise CommandSerializationError("invalid_webhook_receipt")
         if qualification_run_id is not None and not isinstance(qualification_run_id, UUID):
             raise CommandSerializationError("invalid_qualification_run")
         result: asyncio.Future[WebhookCommitValue] = (
@@ -407,6 +413,9 @@ class PersistenceWriter:
                 "receipt": receipt,
                 "lease": lease,
                 "operation": operation,
+                "legacy_v1_semantic_fingerprint_sha256": (
+                    legacy_v1_semantic_fingerprint_sha256
+                ),
                 "qualification_run_id": qualification_run_id,
                 "result": result,
             },
@@ -446,12 +455,18 @@ class PersistenceWriter:
         *,
         event_id: str,
         semantic_fingerprint_sha256: bytes,
+        legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
     ) -> WebhookReceiptClassification:
         if (
             not isinstance(event_id, str)
             or not 0 < len(event_id) <= 256
             or type(semantic_fingerprint_sha256) is not bytes
             or len(semantic_fingerprint_sha256) != 32
+            or legacy_v1_semantic_fingerprint_sha256 is not None
+            and (
+                type(legacy_v1_semantic_fingerprint_sha256) is not bytes
+                or len(legacy_v1_semantic_fingerprint_sha256) != 32
+            )
         ):
             raise CommandSerializationError("invalid_webhook_receipt")
         result: asyncio.Future[WebhookReceiptClassification] = (
@@ -464,6 +479,9 @@ class PersistenceWriter:
                     {
                         "event_id": event_id,
                         "semantic_fingerprint_sha256": semantic_fingerprint_sha256,
+                        "legacy_v1_semantic_fingerprint_sha256": (
+                            legacy_v1_semantic_fingerprint_sha256
+                        ),
                         "result": result,
                     },
                     None,
@@ -986,6 +1004,11 @@ class PersistenceWriter:
         semantic_fingerprint = payload.get("semantic_fingerprint_sha256")
         if type(semantic_fingerprint) is not bytes or len(semantic_fingerprint) != 32:
             raise CommandSerializationError("invalid_webhook_receipt")
+        legacy_fingerprint = payload.get("legacy_v1_semantic_fingerprint_sha256")
+        if legacy_fingerprint is not None and (
+            type(legacy_fingerprint) is not bytes or len(legacy_fingerprint) != 32
+        ):
+            raise CommandSerializationError("invalid_webhook_receipt")
         connection = self._require_owner_connection()
         cursor = await connection.execute(
             "SELECT semantic_fingerprint_sha256 FROM webhook_receipts WHERE event_id = ?",
@@ -995,7 +1018,7 @@ class PersistenceWriter:
         await cursor.close()
         if row is None:
             return "missing"
-        if row == (semantic_fingerprint,):
+        if row == (semantic_fingerprint,) or row == (legacy_fingerprint,):
             return "duplicate"
         return "conflict"
 
@@ -1071,7 +1094,12 @@ class PersistenceWriter:
         if not isinstance(receipt, Mapping):
             raise CommandSerializationError("invalid_webhook_receipt")
         normalized_receipt = self._normalized_receipt(receipt)
-        if await self._receipt_exists(normalized_receipt):
+        legacy_fingerprint = payload.get("legacy_v1_semantic_fingerprint_sha256")
+        if legacy_fingerprint is not None and (
+            type(legacy_fingerprint) is not bytes or len(legacy_fingerprint) != 32
+        ):
+            raise CommandSerializationError("invalid_webhook_receipt")
+        if await self._receipt_exists(normalized_receipt, legacy_fingerprint):
             return WebhookCommitResult("duplicate", "duplicate")
         qualification_run_id = payload.get("qualification_run_id")
         if qualification_run_id is not None:
@@ -1122,7 +1150,9 @@ class PersistenceWriter:
         )
 
     async def _receipt_exists(
-        self, receipt: tuple[str, str, str | None, str, str, bytes]
+        self,
+        receipt: tuple[str, str, str | None, str, str, bytes],
+        legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
     ) -> bool:
         connection = self._require_owner_connection()
         event_id, event_type, call_control, occurred_at, _, semantic_fingerprint = receipt
@@ -1137,7 +1167,10 @@ class PersistenceWriter:
         await cursor.close()
         if row is None:
             return False
-        if row != (event_type, call_control, occurred_at, semantic_fingerprint):
+        if row[:3] != (event_type, call_control, occurred_at) or row[3] not in {
+            semantic_fingerprint,
+            legacy_v1_semantic_fingerprint_sha256,
+        }:
             raise CommandConflictError("webhook_identity_conflict")
         return True
 

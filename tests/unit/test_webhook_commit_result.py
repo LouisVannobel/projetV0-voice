@@ -10,7 +10,11 @@ import pytest
 
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
-from projetv0_voice.persistence.commands import FatalPersistenceError, PersistenceCommand
+from projetv0_voice.persistence.commands import (
+    CommandConflictError,
+    FatalPersistenceError,
+    PersistenceCommand,
+)
 from projetv0_voice.persistence.schema import SCHEMA_SQL, V1_SCHEMA_SQL
 from projetv0_voice.persistence.writer import PersistenceWriter
 
@@ -310,6 +314,99 @@ async def test_receipt_classifier_is_owner_queued_and_uses_only_exact_identity(
         == "missing"
     )
     await _stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_fingerprint_alias_is_authoritative_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-fingerprint.sqlite"
+    legacy_fingerprint = bytes.fromhex(
+        "ed766819519ec6f7ec9c479a643f9d72b232ac0d4722341cbfb4350ee812098c"
+    )
+    current_fingerprint = bytes.fromhex(
+        "2759dd9333080e63bec2d57b9bbe5d02354c9cdfe052bd2b0c34a73eb6f5c13a"
+    )
+    with sqlite3.connect(database) as connection:
+        connection.executescript(V1_SCHEMA_SQL)
+        connection.execute(
+            """
+            INSERT INTO webhook_receipts (
+                event_id, event_type, call_control_id, occurred_at, received_at,
+                semantic_fingerprint_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "event-a",
+                "call.initiated",
+                "control-a",
+                "2026-08-29T10:00:00Z",
+                "2026-08-29T10:00:00Z",
+                legacy_fingerprint,
+            ),
+        )
+
+    writer, task = await _start_writer(database)
+
+    classification = await writer.classify_webhook_receipt(
+        event_id="event-a",
+        semantic_fingerprint_sha256=current_fingerprint,
+        legacy_v1_semantic_fingerprint_sha256=legacy_fingerprint,
+    )
+    duplicate = await writer.submit_webhook(
+        receipt={
+            "event_id": "event-a",
+            "event_type": "call.initiated",
+            "call_control_id": "control-a",
+            "occurred_at": NOW,
+            "received_at": NOW,
+            "semantic_fingerprint_sha256": current_fingerprint,
+        },
+        lease=None,
+        operation=None,
+        legacy_v1_semantic_fingerprint_sha256=legacy_fingerprint,
+    ).wait()
+    fresh = await writer.submit_webhook(
+        receipt=_receipt("event-b", b"n" * 32),
+        lease=None,
+        operation=None,
+        legacy_v1_semantic_fingerprint_sha256=b"o" * 32,
+    ).wait()
+    changed_classification = await writer.classify_webhook_receipt(
+        event_id="event-a",
+        semantic_fingerprint_sha256=b"x" * 32,
+        legacy_v1_semantic_fingerprint_sha256=b"y" * 32,
+    )
+
+    assert classification == "duplicate"
+    assert duplicate.receipt == "duplicate"
+    assert duplicate.effect == "duplicate"
+    assert fresh.receipt == "first"
+    assert fresh.effect == "applied"
+    assert changed_classification == "conflict"
+    with pytest.raises(CommandConflictError, match="webhook_identity_conflict"):
+        await writer.submit_webhook(
+            receipt={
+                "event_id": "event-a",
+                "event_type": "call.initiated",
+                "call_control_id": "control-a",
+                "occurred_at": NOW,
+                "received_at": NOW,
+                "semantic_fingerprint_sha256": b"x" * 32,
+            },
+            lease=None,
+            operation=None,
+            legacy_v1_semantic_fingerprint_sha256=b"y" * 32,
+        ).wait()
+    await task
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT event_id, semantic_fingerprint_sha256
+            FROM webhook_receipts ORDER BY event_id
+            """
+        ).fetchall()
+    assert rows == [("event-a", legacy_fingerprint), ("event-b", b"n" * 32)]
 
 
 @pytest.mark.asyncio

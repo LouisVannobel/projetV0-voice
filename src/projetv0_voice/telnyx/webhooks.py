@@ -101,6 +101,9 @@ class VerifiedWebhook:
     recording_ended_at: datetime | None = field(repr=False)
     recording_channels: str | None = field(repr=False)
     semantic_fingerprint_sha256: bytes = field(repr=False)
+    legacy_v1_semantic_fingerprint_sha256: bytes | None = field(
+        default=None, repr=False
+    )
     direction: Literal["incoming"] | None = field(default=None, repr=False)
     call_state: Literal["parked", "answered"] | None = field(default=None, repr=False)
 
@@ -126,6 +129,11 @@ class VerifiedWebhook:
             or self.call_state not in {None, "parked", "answered"}
             or type(self.semantic_fingerprint_sha256) is not bytes
             or len(self.semantic_fingerprint_sha256) != 32
+            or self.legacy_v1_semantic_fingerprint_sha256 is not None
+            and (
+                type(self.legacy_v1_semantic_fingerprint_sha256) is not bytes
+                or len(self.legacy_v1_semantic_fingerprint_sha256) != 32
+            )
         ):
             raise ValueError("verified_webhook_invalid")
 
@@ -367,26 +375,28 @@ def _semantic_fingerprint(
     recording_channels: str | None,
     direction: Literal["incoming"] | None,
     call_state: Literal["parked", "answered"] | None,
+    include_action_fields: bool,
 ) -> bytes:
+    values: list[object] = [
+        "projetv0.voice.webhook.semantic",
+        1,
+        event_id,
+        event_type,
+        _canonical_time(occurred_at),
+        call_control_id,
+        call_leg_id,
+        call_session_id,
+        recording_id,
+        stream_id,
+        None if client_state is None else client_state.get_secret_value(),
+        _canonical_time(recording_started_at),
+        _canonical_time(recording_ended_at),
+        recording_channels,
+    ]
+    if include_action_fields and event_type in {"call.initiated", "call.answered"}:
+        values.extend((direction, call_state))
     encoded = json.dumps(
-        [
-            "projetv0.voice.webhook.semantic",
-            1,
-            event_id,
-            event_type,
-            _canonical_time(occurred_at),
-            call_control_id,
-            call_leg_id,
-            call_session_id,
-            recording_id,
-            stream_id,
-            None if client_state is None else client_state.get_secret_value(),
-            _canonical_time(recording_started_at),
-            _canonical_time(recording_ended_at),
-            recording_channels,
-            direction,
-            call_state,
-        ],
+        values,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
@@ -478,6 +488,28 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
                 recording_channels=recording_channels,
                 direction=direction,
                 call_state=call_state,
+                include_action_fields=True,
+            ),
+            legacy_v1_semantic_fingerprint_sha256=(
+                _semantic_fingerprint(
+                    event_id=event_id,
+                    event_type=event_type,
+                    occurred_at=normalized_time,
+                    call_control_id=call_control_id,
+                    call_leg_id=call_leg_id,
+                    call_session_id=call_session_id,
+                    recording_id=recording_id,
+                    stream_id=stream_id,
+                    client_state=client_state,
+                    recording_started_at=recording_started_at,
+                    recording_ended_at=recording_ended_at,
+                    recording_channels=recording_channels,
+                    direction=direction,
+                    call_state=call_state,
+                    include_action_fields=False,
+                )
+                if event_type in {"call.initiated", "call.answered"}
+                else None
             ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):

@@ -660,11 +660,12 @@ class CallRegistry:
             raise CallAdmissionRejected("call_event_invalid")
         return value.astimezone(UTC)
 
-    def _new_entry(self, event: VerifiedWebhook) -> _CallEntry:
+    def _new_entry(
+        self, event: VerifiedWebhook, *, minted_monotonic: float
+    ) -> _CallEntry:
         if event.call_control_id is None:
             raise CallAdmissionRejected("call_event_invalid")
         created_at = self._require_aware(self._utcnow())
-        minted_monotonic = self._monotonic()
         if not isinstance(minted_monotonic, int | float):
             raise CallAdmissionRejected("call_clock_invalid")
         raw_token = self._token_factory(32)
@@ -814,7 +815,16 @@ class CallRegistry:
                     or placeholder.call_session_id != event.call_session_id
                 ):
                     raise CallAdmissionRejected("call_identity_conflict")
-                entry = self._new_entry(event)
+                minted_monotonic = self._monotonic()
+                if not isinstance(minted_monotonic, int | float):
+                    raise CallAdmissionRejected("call_clock_invalid")
+                now = float(minted_monotonic)
+                if placeholder is not None and now >= placeholder.deadline:
+                    if self._answered_placeholders.get(event.call_control_id) is placeholder:
+                        self._answered_placeholders.pop(event.call_control_id, None)
+                    placeholder.linked_entry = None
+                    placeholder = None
+                entry = self._new_entry(event, minted_monotonic=now)
                 if placeholder is not None:
                     if placeholder.durable:
                         entry.answer_evidence = True
@@ -1069,18 +1079,28 @@ class CallRegistry:
                 result.receipt,
                 result.effect,
             ) == ("first", "applied"):
-                placeholder.durable = True
-                linked = placeholder.linked_entry
-                if (
-                    promote_linked_evidence
-                    and linked is not None
-                    and self._by_control.get(linked.call_control_id) is linked
-                    and linked.terminal_event is None
-                ):
-                    linked.answer_evidence = True
-                    linked.answer.state = "accepted"
-                    linked.answer.disposition = 200
-                    completion = linked.answer.completion
+                now = float(self._monotonic())
+                if now >= placeholder.deadline:
+                    if (
+                        self._answered_placeholders.get(placeholder.call_control_id)
+                        is placeholder
+                    ):
+                        self._answered_placeholders.pop(placeholder.call_control_id, None)
+                    placeholder.linked_entry = None
+                else:
+                    placeholder.durable = True
+                    linked = placeholder.linked_entry
+                    if (
+                        promote_linked_evidence
+                        and linked is not None
+                        and now < linked.token_deadline
+                        and self._by_control.get(linked.call_control_id) is linked
+                        and linked.terminal_event is None
+                    ):
+                        linked.answer_evidence = True
+                        linked.answer.state = "accepted"
+                        linked.answer.disposition = 200
+                        completion = linked.answer.completion
             if placeholder.precommit_refcount == 0 and not placeholder.durable:
                 self._answered_placeholders.pop(placeholder.call_control_id, None)
                 placeholder.linked_entry = None
@@ -1114,12 +1134,21 @@ class CallRegistry:
         if event.event_type == "call.answered":
             completion: asyncio.Future[WebhookDisposition] | None = None
             start_streaming = False
+            placeholder_deadline = (
+                reservation._placeholder.deadline
+                if isinstance(reservation, _PlaceholderReservation)
+                else None
+            )
             async with self._lock:
                 entry = self._by_control.get(event.call_control_id)
                 if entry is None or entry.terminal_event is not None:
                     return WebhookDisposition(200)
                 now = float(self._monotonic())
-                if now >= entry.token_deadline:
+                if (
+                    placeholder_deadline is not None
+                    and now >= placeholder_deadline
+                    or now >= entry.token_deadline
+                ):
                     return WebhookDisposition(200)
                 entry.answer_evidence = True
                 entry.answer.state = "accepted"
@@ -1168,9 +1197,12 @@ class CallRegistry:
     ) -> FailClosedWebhookConfirmation:
         del event
         reservation = resolution.reservation
+        linked_placeholder_entry: _CallEntry | None = None
         if isinstance(reservation, CallReservation):
             await reservation.confirm(result)
         elif isinstance(reservation, _PlaceholderReservation):
+            async with self._lock:
+                linked_placeholder_entry = reservation._placeholder.linked_entry
             await reservation.confirm_fail_closed(result)
         generation: CallGenerationHandle | None = None
         abort_scheduled = False
@@ -1187,7 +1219,7 @@ class CallRegistry:
                     reservation._generation,
                 )
         elif isinstance(reservation, _PlaceholderReservation):
-            linked = reservation._placeholder.linked_entry
+            linked = linked_placeholder_entry
             if linked is not None:
                 generation = CallGenerationHandle(
                     linked.call_control_id, linked.generation
@@ -1222,28 +1254,43 @@ class CallRegistry:
         raw_token: str | None = None
         entry: _CallEntry | None = None
         generation: UUID | None = None
+        deadline_work: _TerminalWork | None = None
         async with self._lock:
             if self._qualification_expired():
                 return WebhookDisposition(503)
             entry = self._by_control.get(call_control_id)
             if entry is None or entry.terminal_event is not None or not entry.durable:
                 return WebhookDisposition(200)
-            slot = entry.answer if action == "answer" else entry.streaming
-            if slot.state == "in_flight" and slot.completion is not None:
-                completion = slot.completion
-            elif slot.state in {"accepted", "unknown", "rejected"}:
-                return WebhookDisposition(slot.disposition)
+            now = float(self._monotonic())
+            if now >= entry.token_deadline and not (
+                entry.attached and entry.lease_state == "active"
+            ):
+                deadline_work = self._mark_terminal_locked(
+                    entry,
+                    reason="token_deadline",
+                    persist_terminal=True,
+                    cleanup_hangup=True,
+                )
             else:
-                if action == "streaming" and entry.raw_token is None:
-                    return WebhookDisposition(200)
-                owner = True
-                generation = entry.generation
-                command_id = slot.command_id
-                raw_token = entry.raw_token
-                completion = asyncio.get_running_loop().create_future()
-                slot.state = "in_flight"
-                slot.completion = completion
-                slot.owner_task = cast(asyncio.Task[object], asyncio.current_task())
+                slot = entry.answer if action == "answer" else entry.streaming
+                if slot.state == "in_flight" and slot.completion is not None:
+                    completion = slot.completion
+                elif slot.state in {"accepted", "unknown", "rejected"}:
+                    return WebhookDisposition(slot.disposition)
+                else:
+                    if action == "streaming" and entry.raw_token is None:
+                        return WebhookDisposition(200)
+                    owner = True
+                    generation = entry.generation
+                    command_id = slot.command_id
+                    raw_token = entry.raw_token
+                    completion = asyncio.get_running_loop().create_future()
+                    slot.state = "in_flight"
+                    slot.completion = completion
+                    slot.owner_task = cast(asyncio.Task[object], asyncio.current_task())
+        if deadline_work is not None:
+            await self._run_terminal_cleanup(deadline_work)
+            return WebhookDisposition(200)
         if not owner:
             if completion is None:
                 return WebhookDisposition(500)
@@ -1292,6 +1339,7 @@ class CallRegistry:
             disposition = WebhookDisposition(500)
         future_to_finish: asyncio.Future[WebhookDisposition] | None = None
         terminalize_rejected = False
+        result_deadline_work: _TerminalWork | None = None
         async with self._lock:
             current = self._by_control.get(call_control_id)
             if current is entry and current.generation == generation:
@@ -1304,6 +1352,7 @@ class CallRegistry:
                     if action == "answer"
                     else current.streaming_evidence
                 )
+                now = float(self._monotonic())
                 if current.terminal_event is not None:
                     disposition = WebhookDisposition(slot.disposition)
                 elif positive_evidence:
@@ -1312,6 +1361,16 @@ class CallRegistry:
                     disposition = WebhookDisposition(200)
                     if action == "streaming":
                         current.raw_token = None
+                elif now >= current.token_deadline and not (
+                    current.attached and current.lease_state == "active"
+                ):
+                    result_deadline_work = self._mark_terminal_locked(
+                        current,
+                        reason="token_deadline",
+                        persist_terminal=True,
+                        cleanup_hangup=True,
+                    )
+                    disposition = WebhookDisposition(slot.disposition)
                 else:
                     next_state: dict[str, ActionState] = {
                         "accepted": "accepted",
@@ -1331,6 +1390,20 @@ class CallRegistry:
                     terminalize_rejected = slot.state == "rejected"
         if future_to_finish is not None and not future_to_finish.done():
             future_to_finish.set_result(disposition)
+        if result_deadline_work is not None:
+            if cancelled:
+                cleanup = asyncio.create_task(
+                    self._run_terminal_cleanup(result_deadline_work),
+                    name="voice-action-deadline-cleanup",
+                )
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                await cleanup
+            else:
+                await self._run_terminal_cleanup(result_deadline_work)
         if terminalize_rejected and entry is not None and generation is not None:
             await self._terminalize_rejected(entry, generation)
         if cancelled:
