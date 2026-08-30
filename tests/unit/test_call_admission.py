@@ -748,6 +748,158 @@ async def test_cancelled_inflight_action_at_token_deadline_terminalizes_then_rer
 
 
 @pytest.mark.asyncio
+async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_reraise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    clock = [100.0]
+    writer = BlockingTerminalWriter()
+    real_create_task = asyncio.create_task
+
+    def fail_cleanup_registration(
+        coroutine: Any, name: str
+    ) -> asyncio.Task[None]:
+        if name == "voice-action-deadline-cleanup":
+            raise RuntimeError("synthetic cleanup registration failure")
+        return real_create_task(coroutine, name=name)
+
+    def reject_current_cleanup_registration(
+        coroutine: Any,
+        *,
+        name: str | None = None,
+        context: Any = None,
+    ) -> asyncio.Task[Any]:
+        if name == "voice-action-deadline-cleanup":
+            raise RuntimeError("synthetic cleanup registration failure")
+        return real_create_task(coroutine, name=name, context=context)
+
+    monkeypatch.setattr(asyncio, "create_task", reject_current_cleanup_registration)
+
+    class BlockingAnswer(CallControl):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.hangup_entered = asyncio.Event()
+
+        async def answer(
+            self, call_control_id: str, *, command_id: UUID
+        ) -> CallControlResult:
+            self.answers.append((call_control_id, command_id))
+            self.entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def hangup(
+            self,
+            call_control_id: str,
+            *,
+            command_id: UUID,
+            client_state: object = None,
+        ) -> CallControlResult:
+            result = await super().hangup(
+                call_control_id,
+                command_id=command_id,
+                client_state=client_state,
+            )
+            self.hangup_entered.set()
+            return result
+
+    control = BlockingAnswer()
+    registry, _ = _registry(
+        capacity=1,
+        monotonic=lambda: clock[0],
+        control=control,
+        writer=writer,
+        background_task_factory=fail_cleanup_registration,
+    )
+    cleanup_coroutines: list[Any] = []
+    run_terminal_cleanup = registry._run_terminal_cleanup  # type: ignore[attr-defined]
+
+    def track_terminal_cleanup(work: Any) -> Any:
+        coroutine = run_terminal_cleanup(work)
+        cleanup_coroutines.append(coroutine)
+        return coroutine
+
+    registry._run_terminal_cleanup = track_terminal_cleanup  # type: ignore[attr-defined,method-assign]
+
+    registry_lock_held = False
+    try:
+        initiated = await registry.resolve_webhook(_initiated())
+        owner = asyncio.create_task(
+            registry.reconcile_after_commit(
+                _initiated(), initiated, WebhookCommitResult("first", "applied")
+            )
+        )
+        await control.entered.wait()
+        async with registry._lock:  # type: ignore[attr-defined]
+            entry = registry._by_control["control-a"]  # type: ignore[attr-defined]
+            assert entry.answer.completion is not None
+            joiner = asyncio.ensure_future(asyncio.shield(entry.answer.completion))
+
+        clock[0] = 130.0
+        owner.cancel()
+        writer_wait = asyncio.create_task(writer.entered.wait())
+        done, _ = await asyncio.wait(
+            {owner, writer_wait}, return_when=asyncio.FIRST_COMPLETED
+        )
+        cleanup_started = writer_wait in done
+        terminal_snapshot = await registry.snapshot("control-a")
+        if cleanup_started:
+            await registry._lock.acquire()  # type: ignore[attr-defined]
+            registry_lock_held = True
+            writer.release.set()
+            await control.hangup_entered.wait()
+            await asyncio.sleep(0)
+            owner.cancel()
+            await asyncio.sleep(0)
+            registry._lock.release()  # type: ignore[attr-defined]
+            registry_lock_held = False
+        else:
+            writer_wait.cancel()
+        owner_result = (await asyncio.gather(owner, return_exceptions=True))[0]
+        await asyncio.gather(writer_wait, return_exceptions=True)
+        joiner_status = (await joiner).status_code
+        final_snapshot = await registry.snapshot("control-a")
+        live_count = await registry.live_call_count()
+
+        observed = {
+            "cleanup_started": cleanup_started,
+            "internal_failure": registry.internal_failure_code,
+            "waiter_status": joiner_status,
+            "raw_token_erased_before_cleanup": (
+                terminal_snapshot is not None
+                and terminal_snapshot.raw_token_retained is False
+            ),
+            "terminal_persistence_count": len(writer.commits),
+            "cleanup_hangup_count": len(control.hangups),
+            "generation_absent": final_snapshot is None,
+            "live_count": live_count,
+            "cleanup_coroutines_closed": bool(cleanup_coroutines)
+            and all(coroutine.cr_frame is None for coroutine in cleanup_coroutines),
+            "owner_cancelled": isinstance(owner_result, asyncio.CancelledError),
+        }
+        assert observed == {
+            "cleanup_started": True,
+            "internal_failure": "background_task_registration_failed",
+            "waiter_status": 200,
+            "raw_token_erased_before_cleanup": True,
+            "terminal_persistence_count": 1,
+            "cleanup_hangup_count": 1,
+            "generation_absent": True,
+            "live_count": 0,
+            "cleanup_coroutines_closed": True,
+            "owner_cancelled": True,
+        }
+    finally:
+        writer.release.set()
+        if registry_lock_held:
+            registry._lock.release()  # type: ignore[attr-defined]
+        for coroutine in cleanup_coroutines:
+            coroutine.close()
+
+
+@pytest.mark.asyncio
 async def test_streaming_exception_is_unknown_erases_token_and_returns_500() -> None:
     from projetv0_voice.persistence.writer import WebhookCommitResult
 

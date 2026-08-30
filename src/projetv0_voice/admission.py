@@ -517,7 +517,9 @@ class _BackgroundTaskOwner:
         self._task_factory = task_factory
         self._tasks: set[asyncio.Task[None]] = set()
 
-    def spawn(self, coroutine: Coroutine[object, object, None], *, name: str) -> bool:
+    def start(
+        self, coroutine: Coroutine[object, object, None], *, name: str
+    ) -> asyncio.Task[None] | None:
         start_gate = asyncio.Event()
 
         async def run() -> None:
@@ -530,13 +532,13 @@ class _BackgroundTaskOwner:
                 if self._closed:
                     runner.close()
                     coroutine.close()
-                    return False
+                    return None
                 task = self._task_factory(runner, name)
                 self._tasks.add(task)
         except Exception:
             runner.close()
             coroutine.close()
-            return False
+            return None
 
         def discard(completed: asyncio.Task[None]) -> None:
             with self._lock:
@@ -544,7 +546,10 @@ class _BackgroundTaskOwner:
 
         task.add_done_callback(discard)
         start_gate.set()
-        return True
+        return task
+
+    def spawn(self, coroutine: Coroutine[object, object, None], *, name: str) -> bool:
+        return self.start(coroutine, name=name) is not None
 
     def close_registration(self) -> None:
         with self._lock:
@@ -1392,16 +1397,26 @@ class CallRegistry:
             future_to_finish.set_result(disposition)
         if result_deadline_work is not None:
             if cancelled:
-                cleanup = asyncio.create_task(
+                cleanup = self._background_owner.start(
                     self._run_terminal_cleanup(result_deadline_work),
                     name="voice-action-deadline-cleanup",
                 )
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
-                await cleanup
+                if cleanup is None:
+                    self._internal_failure_code = "background_task_registration_failed"
+                    while True:
+                        try:
+                            await self._run_terminal_cleanup(result_deadline_work)
+                            break
+                        except asyncio.CancelledError:
+                            continue
+                    self._internal_failure_code = "background_task_registration_failed"
+                else:
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    await cleanup
             else:
                 await self._run_terminal_cleanup(result_deadline_work)
         if terminalize_rejected and entry is not None and generation is not None:
@@ -1490,9 +1505,13 @@ class CallRegistry:
                     entry.call_control_id,
                     command_id=entry.hangup_command_id,
                 )
-        await self.complete_terminal_cleanup(
-            CallGenerationHandle(entry.call_control_id, work.generation)
-        )
+        generation = CallGenerationHandle(entry.call_control_id, work.generation)
+        while True:
+            try:
+                await self.complete_terminal_cleanup(generation)
+                break
+            except asyncio.CancelledError:
+                continue
 
     async def complete_terminal_cleanup(self, generation: CallGenerationHandle) -> bool:
         abort_target_clearers: tuple[
