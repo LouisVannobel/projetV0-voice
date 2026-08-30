@@ -440,17 +440,36 @@ class RuntimeMetricsObserver(BaseObserver):
                 continue
 
 
-@dataclass(frozen=True, slots=True)
 class _CallObservers:
-    latency: UserBotLatencyObserver
-    metrics: RuntimeMetricsObserver
+    """One-shot private owner for exactly one call's two native observers."""
 
-    def __post_init__(self) -> None:
+    __slots__ = ("_latency", "_metrics", "_state")
+
+    _OWNER_ATTRIBUTE = "_projetv0_call_observer_owner"
+    _NEW = 0
+    _SESSION_BOUND = 1
+    _CONSUMED = 2
+
+    def __init__(
+        self,
+        *,
+        latency: UserBotLatencyObserver,
+        metrics: RuntimeMetricsObserver,
+    ) -> None:
         if (
-            type(self.latency) is not UserBotLatencyObserver
-            or type(self.metrics) is not RuntimeMetricsObserver
+            type(latency) is not UserBotLatencyObserver
+            or type(metrics) is not RuntimeMetricsObserver
         ):
             raise ValueError("call_observers_invalid") from None
+        if (
+            getattr(latency, self._OWNER_ATTRIBUTE, None) is not None
+            or getattr(metrics, self._OWNER_ATTRIBUTE, None) is not None
+        ):
+            raise ValueError("call_observers_reused") from None
+
+        self._latency = latency
+        self._metrics = metrics
+        self._state = self._NEW
 
         async def record_turn_latency(
             _observer: UserBotLatencyObserver,
@@ -463,7 +482,7 @@ class _CallObservers:
                     and math.isfinite(latency)
                     and latency >= 0
                 ):
-                    self.metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
+                    self._metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
                         "turn", latency
                     )
             except Exception:
@@ -480,16 +499,52 @@ class _CallObservers:
                     and math.isfinite(latency)
                     and latency >= 0
                 ):
-                    self.metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
+                    self._metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
                         "first_speech", latency
                     )
             except Exception:
                 return
 
-        self.latency.add_event_handler("on_latency_measured", record_turn_latency)
-        self.latency.add_event_handler(
+        self._latency.add_event_handler("on_latency_measured", record_turn_latency)
+        self._latency.add_event_handler(
             "on_first_bot_speech_latency", record_first_speech_latency
         )
+        setattr(self._latency, self._OWNER_ATTRIBUTE, self)
+        setattr(self._metrics, self._OWNER_ATTRIBUTE, self)
+
+    @property
+    def latency(self) -> UserBotLatencyObserver:
+        return self._latency
+
+    @property
+    def metrics(self) -> RuntimeMetricsObserver:
+        return self._metrics
+
+    def _bind_session(
+        self,
+        *,
+        runtime_metrics: RuntimeMetrics,
+        services: PipelineServices,
+    ) -> None:
+        if self._state != self._NEW:
+            raise ValueError("call_observers_reused") from None
+        if (
+            self._metrics._runtime_metrics is not runtime_metrics
+            or self._metrics._stt is not services.stt
+            or self._metrics._llm is not services.llm
+            or self._metrics._tts is not services.tts
+        ):
+            raise ValueError("call_observers_binding_invalid") from None
+        self._state = self._SESSION_BOUND
+
+    def _consume(self) -> list[BaseObserver]:
+        if self._state == self._CONSUMED:
+            raise ValueError("call_observers_reused") from None
+        self._state = self._CONSUMED
+        return [self._latency, self._metrics]
+
+    def __repr__(self) -> str:
+        return "_CallObservers()"
 
 
 class PipelineTurnRecorder(Protocol):
@@ -658,6 +713,7 @@ def build_runtime(
         or type(observers) is not _CallObservers
     ):
         raise ValueError("call_runtime_config_invalid")
+    observer_list = observers._consume()  # noqa: SLF001
     task_manager = ObservedTaskManager(
         first_failure=first_failure,
         loop=asyncio.get_running_loop(),
@@ -665,7 +721,7 @@ def build_runtime(
     worker = PipelineWorker(
         pipeline,
         params=pipeline_params(),
-        observers=[observers.latency, observers.metrics],
+        observers=observer_list,
         enable_turn_tracking=True,
         enable_rtvi=False,
         enable_tracing=False,

@@ -370,12 +370,15 @@ class RuntimeMetrics:
         shutdown_task.result()
 
     async def _shutdown_provider(self) -> None:
+        failed = False
         try:
             await asyncio.to_thread(
                 self._provider.shutdown,
                 timeout_millis=_SHUTDOWN_TIMEOUT_MILLIS,
             )
         except Exception:
+            failed = True
+        if failed:
             raise RuntimeError("metrics_shutdown_failed") from None
 
     def _add(self, instrument: Any, attributes: dict[str, object]) -> None:

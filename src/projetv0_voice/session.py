@@ -489,7 +489,6 @@ class CallSession:
             or profile.deployment_id != identity.deployment_id
             or type(runtime_metrics) is not RuntimeMetrics
             or type(observers) is not _CallObservers
-            or observers.metrics._runtime_metrics is not runtime_metrics  # noqa: SLF001
             or not isinstance(idle_timeout_seconds, int | float)
             or isinstance(idle_timeout_seconds, bool)
             or not math.isfinite(idle_timeout_seconds)
@@ -500,6 +499,13 @@ class CallSession:
             or cleanup_phase_timeout_seconds <= 0
         ):
             raise ValueError("call_session_config_invalid")
+        try:
+            observers._bind_session(  # noqa: SLF001
+                runtime_metrics=runtime_metrics,
+                services=services,
+            )
+        except ValueError:
+            raise ValueError("call_session_config_invalid") from None
         self._identity = identity
         self._manifest = manifest
         self._profile = profile

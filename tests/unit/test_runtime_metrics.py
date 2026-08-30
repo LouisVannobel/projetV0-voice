@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import requests
+from loguru import logger
 from opentelemetry import metrics as global_metrics
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http import Compression
@@ -130,6 +131,75 @@ async def test_in_memory_provider_has_exact_resource_scope_filter_and_inventory(
     assert {thread.ident for thread in threading.enumerate()} == before_threads
 
     await owner.aclose()
+
+
+def test_closed_enum_catalogs_are_exact_and_complete() -> None:
+    expected = {
+        "session": frozenset({"closed", "failed", "drained"}),
+        "reason": frozenset(
+            {"capacity", "draining", "qualification", "persistence", "invalid"}
+        ),
+        "webhook_class": frozenset(
+            {
+                "initiated",
+                "answered",
+                "terminal",
+                "recording",
+                "unsupported",
+                "invalid",
+            }
+        ),
+        "receipt": frozenset({"none", "first", "duplicate"}),
+        "disposition": frozenset(
+            {
+                "ok",
+                "bad_request",
+                "forbidden",
+                "too_large",
+                "unavailable",
+                "internal_error",
+            }
+        ),
+        "action": frozenset({"answer", "streaming_start", "hangup"}),
+        "outcome": frozenset(
+            {
+                "accepted",
+                "rejected",
+                "rate_limited",
+                "retryable_not_sent",
+                "outcome_unknown",
+                "internal_error",
+            }
+        ),
+        "latency_kind": frozenset({"turn", "first_speech"}),
+        "service": frozenset({"stt", "llm", "tts"}),
+        "relay_status": frozenset(
+            {
+                "empty",
+                "delivered",
+                "retry_scheduled",
+                "stale_claim",
+                "claim_budget_expired",
+                "degraded",
+            }
+        ),
+        "recording_status": frozenset({"saved", "error", "purged"}),
+    }
+    actual = {
+        "session": metrics_module._SESSIONS,  # noqa: SLF001
+        "reason": metrics_module._REJECTION_REASONS,  # noqa: SLF001
+        "webhook_class": metrics_module._WEBHOOK_CLASSES,  # noqa: SLF001
+        "receipt": metrics_module._RECEIPTS,  # noqa: SLF001
+        "disposition": metrics_module._DISPOSITIONS,  # noqa: SLF001
+        "action": metrics_module._ACTIONS,  # noqa: SLF001
+        "outcome": metrics_module._OUTCOMES,  # noqa: SLF001
+        "latency_kind": metrics_module._LATENCY_KINDS,  # noqa: SLF001
+        "service": metrics_module._SERVICES,  # noqa: SLF001
+        "relay_status": metrics_module._RELAY_STATUSES,  # noqa: SLF001
+        "recording_status": metrics_module._RECORDING_STATUSES,  # noqa: SLF001
+    }
+
+    assert actual == expected
 
 
 @pytest.mark.asyncio
@@ -499,6 +569,117 @@ async def test_production_reader_has_real_thread_and_async_export_failure_is_sil
     assert exporter.exports == 1
     assert exporter.shutdowns == 1
     assert "async-export-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_real_failure_boundary_never_reflects_one_privacy_sentinel(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sentinel = "".join(("private", "-metric", "-sentinel"))
+
+    def assert_sentinel_absent(*values: object) -> None:
+        for value in values:
+            if sentinel in str(value) or sentinel in repr(value):
+                pytest.fail("privacy sentinel leaked", pytrace=False)
+
+    class _SentinelExporter(_LocalExporter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.metrics_data: object | None = None
+
+        def export(
+            self,
+            metrics_data: object,
+            timeout_millis: float = 10000,
+            **kwargs: object,
+        ) -> MetricExportResult:
+            del timeout_millis, kwargs
+            self.metrics_data = metrics_data
+            raise RuntimeError(sentinel)
+
+    class _SentinelInstrument:
+        def record(self, _value: object, _attributes: object) -> None:
+            raise RuntimeError(sentinel)
+
+    class _ShutdownFailure:
+        def __init__(self, provider: MeterProvider) -> None:
+            self._provider = provider
+
+        def shutdown(self, timeout_millis: float) -> None:
+            self._provider.shutdown(timeout_millis=timeout_millis)
+            raise RuntimeError(sentinel)
+
+    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    dependency_logging.configure_dependency_logging(token)
+    exporter = _SentinelExporter()
+    owner = metrics_module._build_production(  # noqa: SLF001
+        token,
+        endpoint=ENDPOINT,
+        exporter_factory=lambda **_kwargs: exporter,
+        reader_factory=PeriodicExportingMetricReader,
+        provider_factory=MeterProvider,
+        session_factory=requests.Session,
+    )
+    owner._user_bot_latency = _SentinelInstrument()  # type: ignore[assignment]  # noqa: SLF001
+    owner.record_user_bot_latency("turn", 0.25)
+    owner.record_disclosure_timeout()
+    provider = owner._provider  # noqa: SLF001
+    owner._provider = _ShutdownFailure(provider)  # noqa: SLF001
+    loguru_messages: list[str] = []
+    loguru_sink = logger.add(loguru_messages.append, format="{message}")
+    caplog.clear()
+    try:
+        with (
+            caplog.at_level(logging.DEBUG),
+            pytest.raises(RuntimeError, match="^metrics_shutdown_failed$") as caught,
+        ):
+            await owner.aclose()
+    finally:
+        logger.remove(loguru_sink)
+
+    stdout, stderr = capsys.readouterr()
+    assert owner.failure_code == "metrics_record_failed"
+    assert exporter.metrics_data is not None
+    assert_sentinel_absent(stdout, stderr, caplog.text, loguru_messages, owner)
+
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [caught.value]
+    seen: set[int] = set()
+    while pending:
+        error = pending.pop()
+        if error is None or id(error) in seen:
+            continue
+        seen.add(id(error))
+        chain.append(error)
+        pending.extend((error.__cause__, error.__context__))
+    assert_sentinel_absent(*chain)
+
+    exported = exporter.metrics_data
+    assert exported is not None
+    serialized_surfaces: list[object] = []
+    for resource_metrics in exported.resource_metrics:
+        serialized_surfaces.append(dict(resource_metrics.resource.attributes))
+        for scope_metrics in resource_metrics.scope_metrics:
+            serialized_surfaces.extend(
+                (
+                    scope_metrics.scope.name,
+                    scope_metrics.scope.version,
+                    scope_metrics.schema_url,
+                )
+            )
+            for metric in scope_metrics.metrics:
+                serialized_surfaces.extend((metric.name, metric.description, metric.unit))
+                for point in metric.data.data_points:
+                    serialized_surfaces.extend(
+                        (
+                            dict(point.attributes),
+                            getattr(point, "value", None),
+                            getattr(point, "sum", None),
+                            list(point.exemplars),
+                        )
+                    )
+    assert_sentinel_absent(*serialized_surfaces)
 
 
 class _BlockingProvider(_FakeProvider):

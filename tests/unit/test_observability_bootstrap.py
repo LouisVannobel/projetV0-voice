@@ -143,6 +143,7 @@ def test_guard_returns_opaque_frozen_token_for_valid_endpoint(endpoint: str) -> 
 
 def _run_isolated(code: str, extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     env = {
+        "APPDATA": os.environ.get("APPDATA", ""),
         "PATH": os.environ.get("PATH", ""),
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
         "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
@@ -155,7 +156,7 @@ def _run_isolated(code: str, extra_env: dict[str, str]) -> subprocess.CompletedP
         capture_output=True,
         text=True,
         env=env,
-        timeout=10,
+        timeout=30,
     )
 
 
@@ -201,7 +202,9 @@ import json
 import os
 import sys
 sys.path.insert(0, os.environ["PYTHONPATH"])
-third_party = ("loguru", "opentelemetry", "requests", "pipecat")
+third_party = (
+    "loguru", "opentelemetry", "requests", "pipecat", "openai", "httpx", "telnyx"
+)
 import projetv0_voice.observability_bootstrap as bootstrap
 phase_guard = [name for name in third_party if name in sys.modules]
 import projetv0_voice.dependency_logging as dependency_logging
@@ -209,13 +212,43 @@ phase_logging_import = [name for name in third_party if name in sys.modules]
 token = bootstrap.validate_observability_environment()
 dependency_logging.configure_dependency_logging(token)
 phase_configured = [name for name in third_party if name in sys.modules]
-print(json.dumps([phase_guard, phase_logging_import, phase_configured]))
+import projetv0_voice.metrics
+phase_metrics = [name for name in third_party if name in sys.modules]
+import projetv0_voice.pipeline
+phase_pipeline = [name for name in third_party if name in sys.modules]
+import projetv0_voice.inference.services
+import projetv0_voice.inference.openrouter_tts
+import projetv0_voice.telnyx.call_control
+phase_providers = [name for name in third_party if name in sys.modules]
+print(json.dumps([
+    phase_guard,
+    phase_logging_import,
+    phase_configured,
+    phase_metrics,
+    phase_pipeline,
+    phase_providers,
+]))
 """,
         {"VOICE_OTLP_HTTP_ENDPOINT": VALID_ENDPOINT},
     )
 
-    assert result.returncode == 0
-    assert json.loads(result.stdout) == [[], [], ["loguru"]]
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        [],
+        [],
+        ["loguru"],
+        ["loguru", "opentelemetry", "requests"],
+        ["loguru", "opentelemetry", "requests", "pipecat", "openai", "httpx"],
+        [
+            "loguru",
+            "opentelemetry",
+            "requests",
+            "pipecat",
+            "openai",
+            "httpx",
+            "telnyx",
+        ],
+    ]
     assert result.stderr == ""
 
 

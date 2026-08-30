@@ -881,8 +881,71 @@ def test_closed_observer_holder_rejects_subclasses_duplicates_and_arbitrary_sequ
             llm=stt,
             tts=tts,
         )
+    holder, _ = _call_observers(
+        stt=stt,
+        llm=llm,
+        tts=tts,
+        runtime_metrics=owner,
+    )
+    fresh_metrics = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+    )
+    with pytest.raises(ValueError, match="^call_observers_reused$"):
+        pipeline_module._CallObservers(  # noqa: SLF001
+            latency=holder.latency,
+            metrics=fresh_metrics,
+        )
+    with pytest.raises(ValueError, match="^call_observers_reused$"):
+        pipeline_module._CallObservers(  # noqa: SLF001
+            latency=UserBotLatencyObserver(),
+            metrics=holder.metrics,
+        )
+    assert repr(holder) == "_CallObservers()"
+    assert str(holder) == "_CallObservers()"
     assert "observers" not in inspect.signature(pipeline_module.CallRuntime).parameters
     assert "observer_factory" not in inspect.signature(pipeline_module.build_runtime).parameters
+    owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_build_runtime_rejects_reused_holder() -> None:
+    owner = RuntimeMetrics.in_memory()
+    holder, _ = _call_observers(
+        stt=FrameProcessor(name="stt"),
+        llm=FrameProcessor(name="llm"),
+        tts=FrameProcessor(name="tts"),
+        runtime_metrics=owner,
+    )
+    first_failure = pipeline_module.FirstFailure()
+    pipeline_module.build_runtime(
+        pipeline=pipeline_module.ObservedPipeline(
+            [_SetupProbe()],
+            first_failure=first_failure,
+        ),
+        first_failure=first_failure,
+        greeting="Disclosure.",
+        mark_name="mark",
+        idle_timeout_seconds=60.0,
+        observers=holder,
+    )
+    second_failure = pipeline_module.FirstFailure()
+
+    with pytest.raises(ValueError, match="^call_observers_reused$"):
+        pipeline_module.build_runtime(
+            pipeline=pipeline_module.ObservedPipeline(
+                [_SetupProbe()],
+                first_failure=second_failure,
+            ),
+            first_failure=second_failure,
+            greeting="Disclosure.",
+            mark_name="mark",
+            idle_timeout_seconds=60.0,
+            observers=holder,
+        )
+
     owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 

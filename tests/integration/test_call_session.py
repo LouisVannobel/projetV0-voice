@@ -1040,31 +1040,37 @@ def _session(
     terminal_release: asyncio.Event | None = None,
     lease_started: asyncio.Event | None = None,
     lease_release: asyncio.Event | None = None,
+    services_override: _SessionServices | None = None,
+    observers_override: object | None = None,
 ) -> tuple[object, FrameProcessor, _LeaseTerminalizer, _SessionWriter, _Transport]:
     transport = _Transport(events, echo_ack=echo_ack)
-    stt: FrameProcessor = (
-        _SegmentedSessionStt()
-        if segmented_stt
-        else _PassProcessor("stt", events, nested_failure=nested_failure)
-    )
-    llm = _PassProcessor("llm", events)
-    tts = tts_override or (
-        _PartialFailingTts("tts", events)
-        if partial_tts_failure
-        else _OfflineTts("tts", events)
-    )
-    bundle = _SessionServices(
-        stt=stt,
-        llm=llm,
-        tts=tts,
-        events=events,
-        close_started=service_close_started,
-        close_release=service_close_release,
-        close_cancelled=service_close_cancelled,
-        cleanup_fault=(
-            cleanup_fault_kind if cleanup_fault_phase == "services" else None
-        ),
-    )
+    if services_override is None:
+        stt: FrameProcessor = (
+            _SegmentedSessionStt()
+            if segmented_stt
+            else _PassProcessor("stt", events, nested_failure=nested_failure)
+        )
+        llm = _PassProcessor("llm", events)
+        tts = tts_override or (
+            _PartialFailingTts("tts", events)
+            if partial_tts_failure
+            else _OfflineTts("tts", events)
+        )
+        bundle = _SessionServices(
+            stt=stt,
+            llm=llm,
+            tts=tts,
+            events=events,
+            close_started=service_close_started,
+            close_release=service_close_release,
+            close_cancelled=service_close_cancelled,
+            cleanup_fault=(
+                cleanup_fault_kind if cleanup_fault_phase == "services" else None
+            ),
+        )
+    else:
+        bundle = services_override
+        stt = bundle.stt
     writer = writer_override or _SessionWriter(
         events,
         cleanup_fault=(
@@ -1102,7 +1108,7 @@ def _session(
         ),
         lease_terminalizer=lease,
         runtime_metrics=_TEST_RUNTIME_METRICS,
-        observers=_session_observers(bundle),
+        observers=observers_override or _session_observers(bundle),
         idle_timeout_seconds=60.0,
         cleanup_phase_timeout_seconds=0.05,
         task_factory=task_factory,
@@ -1111,6 +1117,43 @@ def _session(
     )
     session.handshake = _handshake(transport, lease_claim, call_int=call_int)
     return session, stt, lease, writer, transport
+
+
+def test_call_session_rejects_mismatched_service_identity_and_reused_holder() -> None:
+    events: list[str] = []
+    services = _SessionServices(
+        stt=_PassProcessor("stt", events),
+        llm=_PassProcessor("llm", events),
+        tts=_OfflineTts("tts", events),
+        events=events,
+    )
+    unrelated = _SessionServices(
+        stt=_PassProcessor("other-stt", events),
+        llm=_PassProcessor("other-llm", events),
+        tts=_OfflineTts("other-tts", events),
+        events=events,
+    )
+    mismatched = _session_observers(unrelated)
+    with pytest.raises(ValueError, match="^call_session_config_invalid$"):
+        _session(
+            events=events,
+            services_override=services,
+            observers_override=mismatched,
+        )
+
+    holder = _session_observers(services)
+    _session(
+        events=events,
+        services_override=services,
+        observers_override=holder,
+    )
+    with pytest.raises(ValueError, match="^call_session_config_invalid$"):
+        _session(
+            events=events,
+            call_int=2,
+            services_override=services,
+            observers_override=holder,
+        )
 
 
 def _real_cleanup_session(
