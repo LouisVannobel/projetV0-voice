@@ -748,14 +748,33 @@ async def test_cancelled_inflight_action_at_token_deadline_terminalizes_then_rer
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "repeated_cancel_phase",
+    ["terminal_persistence", "cleanup_hangup", "exact_removal"],
+)
 async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_reraise(
     monkeypatch: pytest.MonkeyPatch,
+    repeated_cancel_phase: str,
 ) -> None:
     from projetv0_voice.persistence.writer import WebhookCommitResult
 
     clock = [100.0]
-    writer = BlockingTerminalWriter()
     real_create_task = asyncio.create_task
+
+    class CompletionWriter:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.completed = asyncio.Event()
+            self.commits: list[dict[str, object]] = []
+
+        async def commit_lease(self, **values: object) -> None:
+            self.commits.append(values)
+            self.entered.set()
+            await self.release.wait()
+            self.completed.set()
+
+    writer = CompletionWriter()
 
     def fail_cleanup_registration(
         coroutine: Any, name: str
@@ -781,6 +800,8 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
             super().__init__()
             self.entered = asyncio.Event()
             self.hangup_entered = asyncio.Event()
+            self.hangup_release = asyncio.Event()
+            self.hangup_completed = asyncio.Event()
 
         async def answer(
             self, call_control_id: str, *, command_id: UUID
@@ -797,13 +818,12 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
             command_id: UUID,
             client_state: object = None,
         ) -> CallControlResult:
-            result = await super().hangup(
-                call_control_id,
-                command_id=command_id,
-                client_state=client_state,
-            )
+            del client_state
+            self.hangups.append((call_control_id, command_id))
             self.hangup_entered.set()
-            return result
+            await self.hangup_release.wait()
+            self.hangup_completed.set()
+            return CallControlResult("accepted")
 
     control = BlockingAnswer()
     registry, _ = _registry(
@@ -816,12 +836,17 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
     cleanup_coroutines: list[Any] = []
     run_terminal_cleanup = registry._run_terminal_cleanup  # type: ignore[attr-defined]
 
-    def track_terminal_cleanup(work: Any) -> Any:
-        coroutine = run_terminal_cleanup(work)
+    def track_terminal_cleanup(work: Any, **kwargs: object) -> Any:
+        coroutine = run_terminal_cleanup(work, **kwargs)
         cleanup_coroutines.append(coroutine)
         return coroutine
 
     registry._run_terminal_cleanup = track_terminal_cleanup  # type: ignore[attr-defined,method-assign]
+
+    if repeated_cancel_phase == "cleanup_hangup":
+        writer.release.set()
+    else:
+        control.hangup_release.set()
 
     registry_lock_held = False
     try:
@@ -846,15 +871,25 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
         cleanup_started = writer_wait in done
         terminal_snapshot = await registry.snapshot("control-a")
         if cleanup_started:
-            await registry._lock.acquire()  # type: ignore[attr-defined]
-            registry_lock_held = True
-            writer.release.set()
-            await control.hangup_entered.wait()
-            await asyncio.sleep(0)
-            owner.cancel()
-            await asyncio.sleep(0)
-            registry._lock.release()  # type: ignore[attr-defined]
-            registry_lock_held = False
+            if repeated_cancel_phase == "terminal_persistence":
+                owner.cancel()
+                await asyncio.sleep(0)
+                writer.release.set()
+            elif repeated_cancel_phase == "cleanup_hangup":
+                await control.hangup_entered.wait()
+                owner.cancel()
+                await asyncio.sleep(0)
+                control.hangup_release.set()
+            else:
+                await registry._lock.acquire()  # type: ignore[attr-defined]
+                registry_lock_held = True
+                writer.release.set()
+                await control.hangup_completed.wait()
+                await asyncio.sleep(0)
+                owner.cancel()
+                await asyncio.sleep(0)
+                registry._lock.release()  # type: ignore[attr-defined]
+                registry_lock_held = False
         else:
             writer_wait.cancel()
         owner_result = (await asyncio.gather(owner, return_exceptions=True))[0]
@@ -871,8 +906,14 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
                 terminal_snapshot is not None
                 and terminal_snapshot.raw_token_retained is False
             ),
-            "terminal_persistence_count": len(writer.commits),
-            "cleanup_hangup_count": len(control.hangups),
+            "terminal_persistence_completed": writer.completed.is_set(),
+            "terminal_persistence_same_work": bool(writer.commits)
+            and len(writer.commits) <= 2
+            and all(commit == writer.commits[0] for commit in writer.commits),
+            "cleanup_hangup_completed": control.hangup_completed.is_set(),
+            "cleanup_hangup_same_command": bool(control.hangups)
+            and len(control.hangups) <= 2
+            and all(hangup == control.hangups[0] for hangup in control.hangups),
             "generation_absent": final_snapshot is None,
             "live_count": live_count,
             "cleanup_coroutines_closed": bool(cleanup_coroutines)
@@ -884,8 +925,10 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
             "internal_failure": "background_task_registration_failed",
             "waiter_status": 200,
             "raw_token_erased_before_cleanup": True,
-            "terminal_persistence_count": 1,
-            "cleanup_hangup_count": 1,
+            "terminal_persistence_completed": True,
+            "terminal_persistence_same_work": True,
+            "cleanup_hangup_completed": True,
+            "cleanup_hangup_same_command": True,
             "generation_absent": True,
             "live_count": 0,
             "cleanup_coroutines_closed": True,
@@ -893,6 +936,7 @@ async def test_cancelled_deadline_cleanup_registration_failure_finishes_before_r
         }
     finally:
         writer.release.set()
+        control.hangup_release.set()
         if registry_lock_held:
             registry._lock.release()  # type: ignore[attr-defined]
         for coroutine in cleanup_coroutines:

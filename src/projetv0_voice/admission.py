@@ -1405,7 +1405,10 @@ class CallRegistry:
                     self._internal_failure_code = "background_task_registration_failed"
                     while True:
                         try:
-                            await self._run_terminal_cleanup(result_deadline_work)
+                            await self._run_terminal_cleanup(
+                                result_deadline_work,
+                                retry_cancelled_io=True,
+                            )
                             break
                         except asyncio.CancelledError:
                             continue
@@ -1466,7 +1469,9 @@ class CallRegistry:
             cleanup_hangup=cleanup_hangup,
         )
 
-    async def _run_terminal_cleanup(self, work: _TerminalWork) -> None:
+    async def _run_terminal_cleanup(
+        self, work: _TerminalWork, *, retry_cancelled_io: bool = False
+    ) -> None:
         for owner in work.action_owners:
             owner.cancel()
         if work.action_owners:
@@ -1485,26 +1490,39 @@ class CallRegistry:
         entry = work.entry
         closed_at = self._require_aware(self._utcnow())
         if work.persist_terminal:
-            try:
-                await self._writer.commit_lease(
-                    call_control_id=entry.call_control_id,
-                    call_id=entry.call_id,
-                    tenant_id=self._tenant_id,
-                    agent_id=self._agent_id,
-                    state="terminal",
-                    token_hash=entry.token_digest,
-                    created_at=entry.created_at,
-                    expires_at=entry.expires_at,
-                    closed_at=closed_at,
-                )
-            except BaseException:
-                self._internal_failure_code = "terminal_persistence_failed"
+            while True:
+                try:
+                    await self._writer.commit_lease(
+                        call_control_id=entry.call_control_id,
+                        call_id=entry.call_id,
+                        tenant_id=self._tenant_id,
+                        agent_id=self._agent_id,
+                        state="terminal",
+                        token_hash=entry.token_digest,
+                        created_at=entry.created_at,
+                        expires_at=entry.expires_at,
+                        closed_at=closed_at,
+                    )
+                except asyncio.CancelledError:
+                    if retry_cancelled_io:
+                        continue
+                    self._internal_failure_code = "terminal_persistence_failed"
+                except BaseException:
+                    self._internal_failure_code = "terminal_persistence_failed"
+                break
         if work.cleanup_hangup:
-            with contextlib.suppress(BaseException):
-                await self._call_control.hangup(
-                    entry.call_control_id,
-                    command_id=entry.hangup_command_id,
-                )
+            while True:
+                try:
+                    await self._call_control.hangup(
+                        entry.call_control_id,
+                        command_id=entry.hangup_command_id,
+                    )
+                except asyncio.CancelledError:
+                    if retry_cancelled_io:
+                        continue
+                except BaseException:
+                    pass
+                break
         generation = CallGenerationHandle(entry.call_control_id, work.generation)
         while True:
             try:
