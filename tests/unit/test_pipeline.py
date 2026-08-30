@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import math
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from dataclasses import FrozenInstanceError
 from importlib import import_module
 from importlib.metadata import version
 from types import SimpleNamespace
@@ -908,6 +909,110 @@ def test_closed_observer_holder_rejects_subclasses_duplicates_and_arbitrary_sequ
     assert "observers" not in inspect.signature(pipeline_module.CallRuntime).parameters
     assert "observer_factory" not in inspect.signature(pipeline_module.build_runtime).parameters
     owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+def _holder_in_phase(
+    phase: str,
+) -> tuple[object, RuntimeMetrics, SimpleNamespace]:
+    owner = RuntimeMetrics.in_memory()
+    services = SimpleNamespace(
+        stt=FrameProcessor(name=f"{phase}-stt"),
+        llm=FrameProcessor(name=f"{phase}-llm"),
+        tts=FrameProcessor(name=f"{phase}-tts"),
+    )
+    holder, _ = _call_observers(
+        stt=services.stt,
+        llm=services.llm,
+        tts=services.tts,
+        runtime_metrics=owner,
+    )
+    if phase in {"session_bound", "consumed"}:
+        holder._bind_session(  # type: ignore[attr-defined]  # noqa: SLF001
+            runtime_metrics=owner,
+            services=services,
+        )
+    if phase == "consumed":
+        failure = pipeline_module.FirstFailure()
+        pipeline_module.build_runtime(
+            pipeline=pipeline_module.ObservedPipeline(
+                [_SetupProbe()],
+                first_failure=failure,
+            ),
+            first_failure=failure,
+            greeting="Disclosure.",
+            mark_name="mark",
+            idle_timeout_seconds=60.0,
+            observers=holder,
+        )
+    return holder, owner, services
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["new", "session_bound", "consumed"])
+async def test_closed_observer_bindings_reject_normal_replacement(phase: str) -> None:
+    holder, owner, _services = _holder_in_phase(phase)
+    original_latency = holder.latency  # type: ignore[attr-defined]
+    original_metrics = holder.metrics  # type: ignore[attr-defined]
+    replacement_metrics = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=FrameProcessor(name="replacement-stt"),
+        llm=FrameProcessor(name="replacement-llm"),
+        tts=FrameProcessor(name="replacement-tts"),
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        holder.latency = UserBotLatencyObserver()  # type: ignore[attr-defined]
+    with pytest.raises(FrozenInstanceError):
+        holder.metrics = replacement_metrics  # type: ignore[attr-defined]
+    with pytest.raises(FrozenInstanceError):
+        holder._latency = UserBotLatencyObserver()  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(FrozenInstanceError):
+        holder._metrics = replacement_metrics  # type: ignore[attr-defined]  # noqa: SLF001
+
+    assert holder.latency is original_latency  # type: ignore[attr-defined]
+    assert holder.metrics is original_metrics  # type: ignore[attr-defined]
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["new", "session_bound", "consumed"])
+async def test_closed_observer_lifecycle_rejects_normal_reset(phase: str) -> None:
+    holder, owner, services = _holder_in_phase(phase)
+    original_state = holder._state  # type: ignore[attr-defined]  # noqa: SLF001
+
+    with pytest.raises(FrozenInstanceError):
+        holder._state = object()  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(FrozenInstanceError):
+        original_state._value = holder._NEW  # type: ignore[attr-defined]  # noqa: SLF001
+
+    assert holder._state is original_state  # type: ignore[attr-defined]  # noqa: SLF001
+    if phase == "new":
+        holder._bind_session(  # type: ignore[attr-defined]  # noqa: SLF001
+            runtime_metrics=owner,
+            services=services,
+        )
+        phase = "session_bound"
+    if phase == "session_bound":
+        with pytest.raises(ValueError, match="^call_observers_reused$"):
+            holder._bind_session(  # type: ignore[attr-defined]  # noqa: SLF001
+                runtime_metrics=owner,
+                services=services,
+            )
+    else:
+        failure = pipeline_module.FirstFailure()
+        with pytest.raises(ValueError, match="^call_observers_reused$"):
+            pipeline_module.build_runtime(
+                pipeline=pipeline_module.ObservedPipeline(
+                    [_SetupProbe()],
+                    first_failure=failure,
+                ),
+                first_failure=failure,
+                greeting="Disclosure.",
+                mark_name="mark",
+                idle_timeout_seconds=60.0,
+                observers=holder,
+            )
+    await owner.aclose()
 
 
 @pytest.mark.asyncio
