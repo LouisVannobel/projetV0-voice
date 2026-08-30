@@ -6,7 +6,9 @@ import asyncio
 import base64
 import hmac
 import math
+import time
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -20,6 +22,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.pipeline import (
@@ -27,6 +30,7 @@ from projetv0_voice.pipeline import (
     FirstFailure,
     ObservedPipeline,
     PipelineTransport,
+    _CallObservers,
     build_pipeline,
     build_runtime,
 )
@@ -257,6 +261,7 @@ class TurnRecorder:
         writer: TurnWriter,
         keyring: CryptoKeyring,
         first_failure: FirstFailure,
+        runtime_metrics: RuntimeMetrics,
         uuid_factory: Callable[[], UUID] = uuid4,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -264,6 +269,7 @@ class TurnRecorder:
         self._writer = writer
         self._keyring = keyring
         self._first_failure = first_failure
+        self._runtime_metrics = runtime_metrics
         self._uuid_factory = uuid_factory
         self._utcnow = utcnow
         self._accepting = True
@@ -301,10 +307,12 @@ class TurnRecorder:
     ) -> None:
         if not self._accepting or content is None or content == "":
             return
+        accepted = False
         try:
             plaintext = self._bounded_copy(content)
             if not plaintext:
                 return
+            accepted = True
             self._turn_no += 1
             turn_id = self._uuid_factory()
             encrypted = self._keyring.encrypt(
@@ -336,9 +344,18 @@ class TurnRecorder:
                 payload=payload,
             )
             if not self._writer.try_enqueue_turn(operation):
+                self._record_turn_lost()
                 self._first_failure.signal("writer_failed")
         except Exception:
+            if accepted:
+                self._record_turn_lost()
             self._first_failure.signal("persistence_failed")
+
+    def _record_turn_lost(self) -> None:
+        try:
+            self._runtime_metrics.record_transcript_turn_lost()
+        except Exception:
+            return
 
     @staticmethod
     def _bounded_copy(content: str) -> bytes:
@@ -457,6 +474,8 @@ class CallSession:
         keyring: CryptoKeyring,
         recording: RecordingBoundary,
         lease_terminalizer: LeaseTerminalizer,
+        runtime_metrics: RuntimeMetrics,
+        observers: _CallObservers,
         idle_timeout_seconds: float,
         cleanup_phase_timeout_seconds: float = 5.0,
         task_factory: SessionTaskFactory | None = None,
@@ -468,6 +487,9 @@ class CallSession:
                 profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
             )
             or profile.deployment_id != identity.deployment_id
+            or type(runtime_metrics) is not RuntimeMetrics
+            or type(observers) is not _CallObservers
+            or observers.metrics._runtime_metrics is not runtime_metrics  # noqa: SLF001
             or not isinstance(idle_timeout_seconds, int | float)
             or isinstance(idle_timeout_seconds, bool)
             or not math.isfinite(idle_timeout_seconds)
@@ -486,6 +508,8 @@ class CallSession:
         self._keyring = keyring
         self._recording = recording
         self._lease_terminalizer = lease_terminalizer
+        self._runtime_metrics = runtime_metrics
+        self._observers = observers
         self._idle_timeout_seconds = float(idle_timeout_seconds)
         self._cleanup_phase_timeout_seconds = float(cleanup_phase_timeout_seconds)
         self._task_factory = task_factory or self._default_task_factory
@@ -513,6 +537,7 @@ class CallSession:
             recording_enabled=self._manifest.recording_mode != "off",
             recording_required=self._manifest.recording_required,
             mark_timeout_seconds=self._profile.disclosure_mark_timeout_ms / 1000,
+            runtime_metrics=self._runtime_metrics,
             utcnow=self._utcnow,
             uuid_factory=self._uuid_factory,
         )
@@ -521,6 +546,7 @@ class CallSession:
             writer=self._writer,
             keyring=self._keyring,
             first_failure=first_failure,
+            runtime_metrics=self._runtime_metrics,
             uuid_factory=self._uuid_factory,
             utcnow=self._utcnow,
         )
@@ -551,6 +577,7 @@ class CallSession:
                 greeting=self._manifest.greeting,
                 mark_name=controller.mark_name,
                 idle_timeout_seconds=self._idle_timeout_seconds,
+                observers=self._observers,
             )
 
             async def observe_native_fatal(
@@ -992,6 +1019,8 @@ class DisclosureController:
         recording_enabled: bool,
         recording_required: bool,
         mark_timeout_seconds: float,
+        runtime_metrics: RuntimeMetrics,
+        monotonic: Callable[[], float] = time.monotonic,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
@@ -1002,6 +1031,8 @@ class DisclosureController:
             or not isinstance(mark_timeout_seconds, int | float)
             or isinstance(mark_timeout_seconds, bool)
             or mark_timeout_seconds <= 0
+            or type(runtime_metrics) is not RuntimeMetrics
+            or not callable(monotonic)
         ):
             raise ValueError("disclosure_config_invalid")
         self._identity = identity
@@ -1011,6 +1042,8 @@ class DisclosureController:
         self._recording_enabled = recording_enabled
         self._recording_required = recording_required
         self._mark_timeout_seconds = float(mark_timeout_seconds)
+        self._runtime_metrics = runtime_metrics
+        self._monotonic = monotonic
         self._utcnow = utcnow
         self._uuid_factory = uuid_factory
         self.disclosure_generation = uuid_factory()
@@ -1022,6 +1055,7 @@ class DisclosureController:
         self._input_closed = False
         self._audio_observed = False
         self._timeout_task: asyncio.Task[None] | None = None
+        self._mark_armed_at: float | None = None
         self._continuations: set[asyncio.Task[None]] = set()
 
     @property
@@ -1059,6 +1093,17 @@ class DisclosureController:
                     self._input_closed = True
                 failed = True
             else:
+                try:
+                    armed_at = self._monotonic()
+                    self._mark_armed_at = (
+                        float(armed_at)
+                        if isinstance(armed_at, int | float)
+                        and not isinstance(armed_at, bool)
+                        and math.isfinite(armed_at)
+                        else None
+                    )
+                except Exception:
+                    self._mark_armed_at = None
                 self.state = DisclosureState.MARK_PENDING
                 return True
         if failed:
@@ -1100,8 +1145,16 @@ class DisclosureController:
             ):
                 return False
             self.state = DisclosureState.ACK_COMMITTING
+            armed_at = self._mark_armed_at
+            self._mark_armed_at = None
+            if armed_at is not None:
+                with suppress(Exception):
+                    self._runtime_metrics.record_disclosure_ack(
+                        self._monotonic() - armed_at
+                    )
             timeout_task = self._timeout_task
             self._timeout_task = None
+            self._mark_armed_at = None
             if timeout_task is not None:
                 timeout_task.cancel()
             task = asyncio.create_task(
@@ -1122,6 +1175,7 @@ class DisclosureController:
                 self.state = DisclosureState.ABORTED
             timeout_task = self._timeout_task
             self._timeout_task = None
+            self._mark_armed_at = None
             if timeout_task is not None:
                 timeout_task.cancel()
         self._first_failure.signal(code)
@@ -1147,6 +1201,7 @@ class DisclosureController:
                 self.state = DisclosureState.ABORTED
             timeout_task = self._timeout_task
             self._timeout_task = None
+            self._mark_armed_at = None
             if timeout_task is not None:
                 timeout_task.cancel()
         if cancel_continuations:
@@ -1201,6 +1256,9 @@ class DisclosureController:
                 self.state = DisclosureState.ABORTED
                 self._input_closed = True
                 self._timeout_task = None
+                self._mark_armed_at = None
+            with suppress(Exception):
+                self._runtime_metrics.record_disclosure_timeout()
             self._first_failure.signal("disclosure_timeout")
         except asyncio.CancelledError:
             raise

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from importlib import import_module
 from importlib.metadata import version
@@ -18,6 +19,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    MetricsFrame,
     OutputTransportMessageFrame,
     StartFrame,
     TextFrame,
@@ -29,8 +31,12 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.metrics.metrics import ProcessingMetricsData, TTFBMetricsData
+from pipecat.observers.base_observer import FramePushed
+from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import IdleFrameObserver, PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMAssistantAggregator,
     LLMUserAggregator,
@@ -46,10 +52,56 @@ from pipecat.workers.runner import WorkerRunner
 from pydantic import SecretStr
 
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.qualified_profile import InferenceProfileV1
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 
 pipeline_module = import_module("projetv0_voice.pipeline")
+
+
+def _metric_map(owner: RuntimeMetrics) -> dict[str, object]:
+    collected = owner._metric_reader.get_metrics_data()  # noqa: SLF001
+    assert collected is not None
+    return {
+        metric.name: metric
+        for resource_metrics in collected.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+
+
+def _call_observers(
+    *,
+    stt: FrameProcessor,
+    llm: FrameProcessor,
+    tts: FrameProcessor,
+    runtime_metrics: RuntimeMetrics | None = None,
+) -> tuple[object, RuntimeMetrics]:
+    owner = runtime_metrics or RuntimeMetrics.in_memory()
+    latency = UserBotLatencyObserver()
+    metric_observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+    )
+    return pipeline_module._CallObservers(  # noqa: SLF001
+        latency=latency,
+        metrics=metric_observer,
+    ), owner
+
+
+_TEST_RUNTIME_METRICS = RuntimeMetrics.in_memory()
+
+
+def _default_call_observers() -> object:
+    holder, _owner = _call_observers(
+        stt=FrameProcessor(name="observer-stt"),
+        llm=FrameProcessor(name="observer-llm"),
+        tts=FrameProcessor(name="observer-tts"),
+        runtime_metrics=_TEST_RUNTIME_METRICS,
+    )
+    return holder
 
 
 class _CleanupProbe(FrameProcessor):
@@ -356,6 +408,7 @@ async def test_real_worker_finishes_after_observed_pipeline_cleanup_failure() ->
         greeting="Disclosure.",
         mark_name="mark",
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     started = asyncio.Event()
     finished = asyncio.Event()
@@ -424,7 +477,9 @@ def test_pipeline_parameters_are_frozen_to_eight_khz_metrics_contract() -> None:
     assert params.audio_in_sample_rate == 8000
     assert params.audio_out_sample_rate == 8000
     assert params.enable_metrics is True
-    assert params.enable_usage_metrics is True
+    assert params.enable_usage_metrics is False
+    assert params.report_only_initial_ttfb is False
+    assert params.send_initial_empty_metrics is False
 
 
 @pytest.mark.asyncio
@@ -612,6 +667,226 @@ def test_build_pipeline_has_exact_native_context_and_project_boundary_order() ->
 
 
 @pytest.mark.asyncio
+async def test_closed_call_observers_register_only_two_native_latency_events() -> None:
+    stt = FrameProcessor(name="stt")
+    llm = FrameProcessor(name="llm")
+    tts = FrameProcessor(name="tts")
+    holder, owner = _call_observers(stt=stt, llm=llm, tts=tts)
+    latency = holder.latency
+
+    assert type(latency) is UserBotLatencyObserver
+    assert type(holder.metrics) is pipeline_module.RuntimeMetricsObserver
+    assert len(latency._event_handlers["on_latency_measured"].handlers) == 1  # noqa: SLF001
+    assert len(latency._event_handlers["on_first_bot_speech_latency"].handlers) == 1  # noqa: SLF001
+    assert latency._event_handlers["on_latency_breakdown"].handlers == []  # noqa: SLF001
+
+    await latency._call_event_handler("on_latency_measured", 0.25)  # noqa: SLF001
+    await latency._call_event_handler("on_first_bot_speech_latency", 0.5)  # noqa: SLF001
+    await latency._call_event_handler("on_latency_measured", True)  # noqa: SLF001
+    await latency._call_event_handler("on_latency_measured", math.nan)  # noqa: SLF001
+    await latency.cleanup()
+
+    data = _metric_map(owner)
+    points = list(data["projetv0.voice.user_bot_latency"].data.data_points)
+    assert [(dict(point.attributes), point.count, point.sum) for point in points] == [
+        ({"latency_kind": "turn"}, 1, 0.25),
+        ({"latency_kind": "first_speech"}, 1, 0.5),
+    ]
+    assert owner.failure_code is None
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_metrics_observer_uses_service_identity_and_exact_ttfb_items() -> None:
+    stt = FrameProcessor(name="stt-secret-name")
+    llm = FrameProcessor(name="llm-secret-name")
+    tts = FrameProcessor(name="tts-secret-name")
+    destination = FrameProcessor(name="destination")
+    holder, owner = _call_observers(stt=stt, llm=llm, tts=tts)
+    observer = holder.metrics
+    mixed = MetricsFrame(
+        [
+            TTFBMetricsData.model_construct(
+                processor=object(),
+                model=object(),
+                value=0.2,
+            ),
+            ProcessingMetricsData(processor="ignored", value=8.0),
+            TTFBMetricsData.model_construct(processor="ignored", value=True),
+            TTFBMetricsData.model_construct(processor="ignored", value=math.nan),
+            TTFBMetricsData.model_construct(processor="ignored", value=math.inf),
+            TTFBMetricsData.model_construct(processor="ignored", value=0.0),
+            TTFBMetricsData.model_construct(processor="ignored", value=-1.0),
+            TTFBMetricsData.model_construct(processor="ignored", value=0.3),
+        ]
+    )
+
+    await observer.on_push_frame(
+        FramePushed(stt, destination, mixed, FrameDirection.DOWNSTREAM, 1)
+    )
+    await observer.on_push_frame(
+        FramePushed(
+            llm,
+            destination,
+            MetricsFrame([TTFBMetricsData(processor="x", value=0.4)]),
+            FrameDirection.DOWNSTREAM,
+            2,
+        )
+    )
+    await observer.on_push_frame(
+        FramePushed(
+            tts,
+            destination,
+            MetricsFrame([TTFBMetricsData(processor="x", value=0.5)]),
+            FrameDirection.DOWNSTREAM,
+            3,
+        )
+    )
+    await observer.on_push_frame(
+        FramePushed(stt, destination, mixed, FrameDirection.UPSTREAM, 4)
+    )
+    await observer.on_push_frame(
+        FramePushed(destination, stt, mixed, FrameDirection.DOWNSTREAM, 5)
+    )
+
+    points = list(_metric_map(owner)["projetv0.voice.service_ttfb"].data.data_points)
+    assert [(dict(point.attributes), point.count, point.sum) for point in points] == [
+        ({"service": "stt"}, 2, 0.5),
+        ({"service": "llm"}, 1, 0.4),
+        ({"service": "tts"}, 1, 0.5),
+    ]
+    assert owner.failure_code is None
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_metrics_observer_continues_per_item_after_metric_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stt = FrameProcessor(name="stt")
+    llm = FrameProcessor(name="llm")
+    tts = FrameProcessor(name="tts")
+    holder, owner = _call_observers(stt=stt, llm=llm, tts=tts)
+    calls: list[tuple[str, float]] = []
+
+    def fail_first(service: object, seconds: object) -> None:
+        calls.append((str(service), float(seconds)))
+        if len(calls) == 1:
+            raise RuntimeError("metric-forward-secret")
+
+    monkeypatch.setattr(owner, "record_service_ttfb", fail_first)
+    frame = MetricsFrame(
+        [
+            TTFBMetricsData(processor="ignored", value=0.1),
+            TTFBMetricsData(processor="ignored", value=0.2),
+        ]
+    )
+
+    await holder.metrics.on_push_frame(
+        FramePushed(stt, llm, frame, FrameDirection.DOWNSTREAM, 1)
+    )
+
+    assert calls == [("stt", 0.1), ("stt", 0.2)]
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_has_exact_four_observer_inventory_fresh_list_and_params() -> None:
+    first_failure = pipeline_module.FirstFailure()
+    first_probe = _SetupProbe()
+    first_holder, first_metrics = _call_observers(
+        stt=FrameProcessor(name="first-stt"),
+        llm=FrameProcessor(name="first-llm"),
+        tts=FrameProcessor(name="first-tts"),
+    )
+    first = pipeline_module.build_runtime(
+        pipeline=pipeline_module.ObservedPipeline([first_probe], first_failure=first_failure),
+        first_failure=first_failure,
+        greeting="Disclosure.",
+        mark_name="mark",
+        idle_timeout_seconds=60.0,
+        observers=first_holder,
+    )
+    second_failure = pipeline_module.FirstFailure()
+    second_holder, second_metrics = _call_observers(
+        stt=FrameProcessor(name="second-stt"),
+        llm=FrameProcessor(name="second-llm"),
+        tts=FrameProcessor(name="second-tts"),
+    )
+    second = pipeline_module.build_runtime(
+        pipeline=pipeline_module.ObservedPipeline([_SetupProbe()], first_failure=second_failure),
+        first_failure=second_failure,
+        greeting="Disclosure.",
+        mark_name="mark",
+        idle_timeout_seconds=60.0,
+        observers=second_holder,
+    )
+
+    first_inventory = first.worker._observer._observers  # noqa: SLF001
+    second_inventory = second.worker._observer._observers  # noqa: SLF001
+    assert [type(item) for item in first_inventory] == [
+        UserBotLatencyObserver,
+        pipeline_module.RuntimeMetricsObserver,
+        TurnTrackingObserver,
+        IdleFrameObserver,
+    ]
+    assert first_inventory[0] is first_holder.latency
+    assert first_inventory[1] is first_holder.metrics
+    assert first_inventory is not second_inventory
+    assert all(
+        left is not right
+        for left, right in zip(first_inventory, second_inventory, strict=True)
+    )
+    assert first.worker._enable_turn_tracking is True  # noqa: SLF001
+    assert first.worker._enable_tracing is False  # noqa: SLF001
+    assert first.worker._rtvi is None  # noqa: SLF001
+    assert first.worker._idle_timeout_secs == 60.0  # noqa: SLF001
+    assert first.worker._params == PipelineParams(  # noqa: SLF001
+        audio_in_sample_rate=8000,
+        audio_out_sample_rate=8000,
+        enable_metrics=True,
+        enable_usage_metrics=False,
+        report_only_initial_ttfb=False,
+        send_initial_empty_metrics=False,
+    )
+    assert not hasattr(first, "add_observer")
+
+    await first_metrics.aclose()
+    await second_metrics.aclose()
+
+
+def test_closed_observer_holder_rejects_subclasses_duplicates_and_arbitrary_sequences() -> None:
+    owner = RuntimeMetrics.in_memory()
+    stt = FrameProcessor(name="stt")
+    llm = FrameProcessor(name="llm")
+    tts = FrameProcessor(name="tts")
+
+    class _LatencySubclass(UserBotLatencyObserver):
+        pass
+
+    with pytest.raises(ValueError, match="^call_observers_invalid$"):
+        pipeline_module._CallObservers(  # noqa: SLF001
+            latency=_LatencySubclass(),
+            metrics=pipeline_module.RuntimeMetricsObserver(
+                runtime_metrics=owner,
+                stt=stt,
+                llm=llm,
+                tts=tts,
+            ),
+        )
+    with pytest.raises(ValueError, match="^runtime_metrics_observer_invalid$"):
+        pipeline_module.RuntimeMetricsObserver(
+            runtime_metrics=owner,
+            stt=stt,
+            llm=stt,
+            tts=tts,
+        )
+    assert "observers" not in inspect.signature(pipeline_module.CallRuntime).parameters
+    assert "observer_factory" not in inspect.signature(pipeline_module.build_runtime).parameters
+    owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pair() -> None:
     failure = pipeline_module.FirstFailure()
     probe = _SetupProbe()
@@ -621,6 +896,7 @@ async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pai
         greeting="Bonjour, appel automatise.",
         mark_name="expected-mark",
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     with pytest.raises(Exception, match="TaskManager is not initialized"):
         _ = runtime.worker.task_manager
@@ -634,7 +910,8 @@ async def test_runtime_propagates_runner_manager_and_queues_exact_disclosure_pai
     assert probe.start_frame.audio_in_sample_rate == 8000
     assert probe.start_frame.audio_out_sample_rate == 8000
     assert probe.start_frame.enable_metrics is True
-    assert probe.start_frame.enable_usage_metrics is True
+    assert probe.start_frame.enable_usage_metrics is False
+    assert probe.start_frame.report_only_initial_ttfb is False
 
     await asyncio.wait_for(probe.tts_speak_event.wait(), timeout=1)
     queued = [
@@ -671,6 +948,7 @@ async def test_build_runtime_returns_owned_unregistered_runtime_before_add_worke
         greeting="Disclosure.",
         mark_name="mark",
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     assert isinstance(built, pipeline_module.CallRuntime)
 
@@ -685,6 +963,7 @@ async def test_runtime_clear_is_once_specific_after_unrelated_interruption() -> 
         greeting="Disclosure.",
         mark_name="mark",
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     unrelated_reached = asyncio.Event()
 
@@ -734,6 +1013,7 @@ async def test_real_worker_sets_silero_to_eight_khz_and_vad_stop_segments_stt() 
         greeting="Disclosure seulement.",
         mark_name=controller.mark_name,
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     await runtime.runner.add_workers(runtime.worker)
     runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
@@ -818,6 +1098,7 @@ async def test_actual_task7_partial_tts_failure_never_forwards_disclosure_mark()
         greeting="Disclosure.",
         mark_name=controller.mark_name,
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     messages: list[str] = []
     log_sink = logger.add(messages.append, format="{message}")
@@ -891,6 +1172,7 @@ async def test_active_tts_fatal_error_retains_native_fatal_cancellation() -> Non
         greeting="Conversation active.",
         mark_name=controller.mark_name,
         idle_timeout_seconds=60.0,
+        observers=_default_call_observers(),
     )
     upstream_errors: list[ErrorFrame] = []
     error_reached = asyncio.Event()

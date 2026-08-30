@@ -17,6 +17,7 @@ from pipecat.transports.websocket.fastapi import (
 )
 from starlette.websockets import WebSocket, WebSocketState
 
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
@@ -24,6 +25,7 @@ pipeline_module = import_module("projetv0_voice.pipeline")
 session_module = import_module("projetv0_voice.session")
 
 NOW = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+_TEST_RUNTIME_METRICS = RuntimeMetrics.in_memory()
 
 
 class _Writer:
@@ -135,6 +137,7 @@ def _controller(
         recording_enabled=recording_enabled,
         recording_required=recording_required,
         mark_timeout_seconds=timeout,
+        runtime_metrics=_TEST_RUNTIME_METRICS,
         utcnow=lambda: NOW + timedelta(seconds=1),
         uuid_factory=_uuids(100 + call_int * 10),
     )
@@ -314,6 +317,7 @@ async def test_ack_continuation_failure_before_commit_is_consumed_and_signalled(
         recording_enabled=False,
         recording_required=False,
         mark_timeout_seconds=0.05,
+        runtime_metrics=_TEST_RUNTIME_METRICS,
         utcnow=lambda: NOW,
         uuid_factory=failing_uuid_factory,
     )

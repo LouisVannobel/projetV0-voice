@@ -12,6 +12,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
     "cryptography==50.0.0",
     "fastapi==0.141.1",
     "httpx==0.28.1",
+    "loguru==0.7.3",
     "opentelemetry-api==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.44.0",
     "opentelemetry-sdk==1.44.0",
@@ -20,6 +21,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
     "pydantic==2.13.4",
     "pynacl==1.6.2",
     "pyyaml==6.0.3",
+    "requests==2.34.2",
     "telnyx==4.176.0",
     "uvicorn[standard]==0.52.4",
 ]

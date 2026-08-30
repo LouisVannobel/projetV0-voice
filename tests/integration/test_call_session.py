@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import replace
@@ -28,6 +29,7 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
@@ -47,6 +49,7 @@ from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.inference.services import build_llm
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import VoiceOperationV1
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
@@ -334,6 +337,7 @@ def _uuid_factory():
 def test_turn_recorder_allocates_shared_fifo_encrypts_exact_aad_and_never_keeps_plaintext() -> None:
     writer = _TurnWriter()
     failure = pipeline_module.FirstFailure()
+    runtime_metrics = RuntimeMetrics.in_memory()
     key = b"k" * 32
     keyring = CryptoKeyring(
         {1: key},
@@ -345,6 +349,7 @@ def test_turn_recorder_allocates_shared_fifo_encrypts_exact_aad_and_never_keeps_
         writer=writer,
         keyring=keyring,
         first_failure=failure,
+        runtime_metrics=runtime_metrics,
         uuid_factory=_uuid_factory(),
         utcnow=lambda: NOW + timedelta(seconds=2),
     )
@@ -381,11 +386,14 @@ def test_turn_recorder_allocates_shared_fifo_encrypts_exact_aad_and_never_keeps_
     recorder.close()
     recorder.record_user("late-secret", NOW.isoformat())
     assert len(writer.operations) == 3
+    assert "projetv0.voice.transcript.turns_lost" not in _runtime_metric_map(runtime_metrics)
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 def test_turn_recorder_bounds_utf8_and_false_enqueue_signals_shared_fatal() -> None:
     writer = _TurnWriter(accepting=False)
     failure = pipeline_module.FirstFailure()
+    runtime_metrics = RuntimeMetrics.in_memory()
     keyring = CryptoKeyring(
         {1: b"k" * 32},
         active_version=1,
@@ -396,6 +404,7 @@ def test_turn_recorder_bounds_utf8_and_false_enqueue_signals_shared_fatal() -> N
         writer=writer,
         keyring=keyring,
         first_failure=failure,
+        runtime_metrics=runtime_metrics,
         uuid_factory=_uuid_factory(),
         utcnow=lambda: NOW,
     )
@@ -414,6 +423,57 @@ def test_turn_recorder_bounds_utf8_and_false_enqueue_signals_shared_fatal() -> N
         aad=b"turn:" + str(payload.turn_id).encode("ascii"),
     )
     assert len(plaintext) == session_module.MAX_TURN_TEXT_BYTES
+    lost = _runtime_metric_map(runtime_metrics)["projetv0.voice.transcript.turns_lost"]
+    assert list(lost.data.data_points)[0].value == 1
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("failure_point", ["encrypt", "build", "enqueue"])
+def test_turn_recorder_counts_each_accepted_turn_loss_once_and_ignores_empty(
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RaisingWriter(_TurnWriter):
+        def try_enqueue_turn(self, operation: object) -> bool:
+            self.operations.append(operation)
+            raise RuntimeError("enqueue-secret")
+
+    writer = _RaisingWriter() if failure_point == "enqueue" else _TurnWriter()
+    failure = pipeline_module.FirstFailure()
+    runtime_metrics = RuntimeMetrics.in_memory()
+    keyring = CryptoKeyring(
+        {1: b"k" * 32},
+        active_version=1,
+        nonce_factory=lambda size: b"n" * size,
+    )
+    if failure_point == "encrypt":
+        def fail_encrypt(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("encrypt-secret")
+
+        monkeypatch.setattr(CryptoKeyring, "encrypt", fail_encrypt)
+    elif failure_point == "build":
+        def fail_build(**_kwargs: object) -> object:
+            raise RuntimeError("build-secret")
+
+        monkeypatch.setattr(session_module, "TurnUpsertPayloadV1", fail_build)
+    recorder = session_module.TurnRecorder(
+        identity=_identity(),
+        writer=writer,
+        keyring=keyring,
+        first_failure=failure,
+        runtime_metrics=runtime_metrics,
+        uuid_factory=_uuid_factory(),
+        utcnow=lambda: NOW,
+    )
+
+    recorder.record_user("accepted-secret", NOW.isoformat())
+    recorder.record_assistant("", NOW.isoformat(), False)
+    recorder.record_user(None, NOW.isoformat())
+
+    lost = _runtime_metric_map(runtime_metrics)["projetv0.voice.transcript.turns_lost"]
+    assert list(lost.data.data_points)[0].value == 1
+    assert failure.code == "persistence_failed"
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 class _PassProcessor(FrameProcessor):
@@ -693,6 +753,142 @@ class _LeaseTerminalizer:
         self.events.append("lease-terminal")
 
 
+def _disclosure_controller(
+    *,
+    runtime_metrics: RuntimeMetrics,
+    mark_timeout_seconds: float,
+    monotonic: object,
+) -> tuple[object, object, _SessionWriter]:
+    events: list[str] = []
+    first_failure = pipeline_module.FirstFailure()
+    writer = _SessionWriter(events)
+    controller = session_module.DisclosureController(
+        identity=_identity(),
+        writer=writer,
+        first_failure=first_failure,
+        recording=_RecordingBoundary(events),
+        runtime_metrics=runtime_metrics,
+        recording_enabled=False,
+        recording_required=False,
+        mark_timeout_seconds=mark_timeout_seconds,
+        monotonic=monotonic,
+        utcnow=lambda: NOW,
+        uuid_factory=_uuid_factory(),
+    )
+    return controller, first_failure, writer
+
+
+@pytest.mark.asyncio
+async def test_disclosure_ack_samples_arm_time_and_records_once_before_continuation() -> None:
+    runtime_metrics = RuntimeMetrics.in_memory()
+    samples = iter((100.0, 100.25))
+    controller, first_failure, writer = _disclosure_controller(
+        runtime_metrics=runtime_metrics,
+        mark_timeout_seconds=1.0,
+        monotonic=lambda: next(samples),
+    )
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    await controller.mark_forwarded()
+
+    assert await controller.accept_mark(controller.mark_name) is True
+    ack = _runtime_metric_map(runtime_metrics)["projetv0.voice.disclosure.mark_ack"]
+    point = list(ack.data.data_points)[0]
+    assert point.count == 1
+    assert point.sum == 0.25
+    assert writer.disclosure_committed.is_set() is False
+    assert await controller.accept_mark(controller.mark_name) is False
+    await controller.join_continuations()
+
+    assert writer.disclosure_committed.is_set()
+    assert controller.state is session_module.DisclosureState.ACTIVE
+    assert first_failure.code is None
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_disclosure_fast_ack_before_mark_forwarded_uses_expected_mark_arm_sample() -> None:
+    runtime_metrics = RuntimeMetrics.in_memory()
+    samples = iter((400.0, 400.1))
+    controller, first_failure, writer = _disclosure_controller(
+        runtime_metrics=runtime_metrics,
+        mark_timeout_seconds=1.0,
+        monotonic=lambda: next(samples),
+    )
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+
+    assert await controller.accept_mark(controller.mark_name) is True
+    await controller.mark_forwarded()
+    await controller.join_continuations()
+
+    ack = _runtime_metric_map(runtime_metrics)["projetv0.voice.disclosure.mark_ack"]
+    point = list(ack.data.data_points)[0]
+    assert point.count == 1
+    assert point.sum == pytest.approx(0.1)
+    assert writer.disclosure_committed.is_set()
+    assert controller.state is session_module.DisclosureState.ACTIVE
+    assert first_failure.code is None
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_disclosure_timeout_records_once_only_on_pending_to_aborted() -> None:
+    runtime_metrics = RuntimeMetrics.in_memory()
+    controller, first_failure, _writer = _disclosure_controller(
+        runtime_metrics=runtime_metrics,
+        mark_timeout_seconds=0.01,
+        monotonic=lambda: 200.0,
+    )
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    await controller.mark_forwarded()
+
+    assert await asyncio.wait_for(first_failure.wait(), timeout=1) == "disclosure_timeout"
+    await controller.join_continuations()
+
+    timeout_metric = _runtime_metric_map(runtime_metrics)[
+        "projetv0.voice.disclosure.timeouts"
+    ]
+    assert list(timeout_metric.data.data_points)[0].value == 1
+    assert controller.state is session_module.DisclosureState.ABORTED
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metric_name", ["record_disclosure_ack", "record_disclosure_timeout"])
+async def test_disclosure_metric_fault_never_changes_state_or_persistence(
+    metric_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_metrics = RuntimeMetrics.in_memory()
+
+    def fail_metric(*_args: object) -> None:
+        raise RuntimeError("disclosure-metric-secret")
+
+    monkeypatch.setattr(runtime_metrics, metric_name, fail_metric)
+    controller, first_failure, writer = _disclosure_controller(
+        runtime_metrics=runtime_metrics,
+        mark_timeout_seconds=0.01,
+        monotonic=lambda: 300.0,
+    )
+    await controller.note_disclosure_audio()
+    assert await controller.arm_expected_mark() is True
+    await controller.mark_forwarded()
+
+    if metric_name == "record_disclosure_ack":
+        assert await controller.accept_mark(controller.mark_name) is True
+        await controller.join_continuations()
+        assert controller.state is session_module.DisclosureState.ACTIVE
+        assert writer.disclosure_committed.is_set()
+        assert first_failure.code is None
+    else:
+        assert await asyncio.wait_for(first_failure.wait(), timeout=1) == "disclosure_timeout"
+        await controller.join_continuations()
+        assert controller.state is session_module.DisclosureState.ABORTED
+    runtime_metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
 class _SessionServices:
     def __init__(
         self,
@@ -728,6 +924,46 @@ class _SessionServices:
                 raise
         await _apply_phase_fault(self._cleanup_fault, "services-cleanup-secret")
         self._events.extend(["services:stt", "services:llm"])
+
+
+_TEST_RUNTIME_METRICS = RuntimeMetrics.in_memory()
+
+
+def _runtime_metric_map(owner: RuntimeMetrics) -> dict[str, object]:
+    collected = owner._metric_reader.get_metrics_data()  # noqa: SLF001
+    assert collected is not None
+    return {
+        metric.name: metric
+        for resource_metrics in collected.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+
+
+def _session_observers(
+    services: _SessionServices,
+    runtime_metrics: RuntimeMetrics = _TEST_RUNTIME_METRICS,
+) -> object:
+    return pipeline_module._CallObservers(  # noqa: SLF001
+        latency=UserBotLatencyObserver(),
+        metrics=pipeline_module.RuntimeMetricsObserver(
+            runtime_metrics=runtime_metrics,
+            stt=services.stt,
+            llm=services.llm,
+            tts=services.tts,
+        ),
+    )
+
+
+def test_call_session_requires_one_concrete_closed_observer_holder() -> None:
+    parameter = inspect.signature(session_module.CallSession).parameters["observers"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.annotation == "_CallObservers"
+    metrics_parameter = inspect.signature(session_module.CallSession).parameters[
+        "runtime_metrics"
+    ]
+    assert metrics_parameter.default is inspect.Parameter.empty
+    assert metrics_parameter.annotation == "RuntimeMetrics"
 
 
 def _manifest() -> AgentManifestV1:
@@ -865,6 +1101,8 @@ def _session(
             ),
         ),
         lease_terminalizer=lease,
+        runtime_metrics=_TEST_RUNTIME_METRICS,
+        observers=_session_observers(bundle),
         idle_timeout_seconds=60.0,
         cleanup_phase_timeout_seconds=0.05,
         task_factory=task_factory,
@@ -949,6 +1187,8 @@ def _real_cleanup_session(
         ),
         recording=_RecordingBoundary(events),
         lease_terminalizer=lease,
+        runtime_metrics=_TEST_RUNTIME_METRICS,
+        observers=_session_observers(services),
         idle_timeout_seconds=60.0,
         cleanup_phase_timeout_seconds=0.25,
         utcnow=lambda: NOW + timedelta(seconds=5),
@@ -1070,6 +1310,8 @@ def _real_websocket_session(
         ),
         recording=_RecordingBoundary(events),
         lease_terminalizer=lease,
+        runtime_metrics=_TEST_RUNTIME_METRICS,
+        observers=_session_observers(services),
         idle_timeout_seconds=60.0,
         utcnow=lambda: NOW + timedelta(seconds=5),
         uuid_factory=_uuid_factory(),
@@ -1184,6 +1426,8 @@ def _actual_partial_tts_telnyx_session() -> tuple[
         ),
         recording=_RecordingBoundary(events),
         lease_terminalizer=lease,
+        runtime_metrics=_TEST_RUNTIME_METRICS,
+        observers=_session_observers(services),
         idle_timeout_seconds=60.0,
         cleanup_phase_timeout_seconds=0.25,
         utcnow=lambda: NOW + timedelta(seconds=5),

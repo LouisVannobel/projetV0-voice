@@ -20,6 +20,7 @@ from pipecat.frames.frames import (
     InputDTMFFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    MetricsFrame,
     StartFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -29,6 +30,9 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.metrics.metrics import TTFBMetricsData
+from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -45,6 +49,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 
 
@@ -384,6 +389,109 @@ class PipelineServices(Protocol):
     tts: FrameProcessor
 
 
+class RuntimeMetricsObserver(BaseObserver):
+    """Forward only identity-bound native service TTFB measurements."""
+
+    def __init__(
+        self,
+        *,
+        runtime_metrics: RuntimeMetrics,
+        stt: FrameProcessor,
+        llm: FrameProcessor,
+        tts: FrameProcessor,
+    ) -> None:
+        if (
+            type(runtime_metrics) is not RuntimeMetrics
+            or not all(isinstance(service, FrameProcessor) for service in (stt, llm, tts))
+            or len({id(stt), id(llm), id(tts)}) != 3
+        ):
+            raise ValueError("runtime_metrics_observer_invalid") from None
+        super().__init__()
+        self._runtime_metrics = runtime_metrics
+        self._stt = stt
+        self._llm = llm
+        self._tts = tts
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        if data.direction is not FrameDirection.DOWNSTREAM or type(data.frame) is not MetricsFrame:
+            return
+        if data.source is self._stt:
+            service = "stt"
+        elif data.source is self._llm:
+            service = "llm"
+        elif data.source is self._tts:
+            service = "tts"
+        else:
+            return
+        for item in data.frame.data:
+            try:
+                if type(item) is not TTFBMetricsData:
+                    continue
+                value = item.value
+                if (
+                    not isinstance(value, int | float)
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                    or value <= 0
+                ):
+                    continue
+                self._runtime_metrics.record_service_ttfb(service, value)
+            except Exception:
+                continue
+
+
+@dataclass(frozen=True, slots=True)
+class _CallObservers:
+    latency: UserBotLatencyObserver
+    metrics: RuntimeMetricsObserver
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.latency) is not UserBotLatencyObserver
+            or type(self.metrics) is not RuntimeMetricsObserver
+        ):
+            raise ValueError("call_observers_invalid") from None
+
+        async def record_turn_latency(
+            _observer: UserBotLatencyObserver,
+            latency: object,
+        ) -> None:
+            try:
+                if (
+                    isinstance(latency, int | float)
+                    and not isinstance(latency, bool)
+                    and math.isfinite(latency)
+                    and latency >= 0
+                ):
+                    self.metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
+                        "turn", latency
+                    )
+            except Exception:
+                return
+
+        async def record_first_speech_latency(
+            _observer: UserBotLatencyObserver,
+            latency: object,
+        ) -> None:
+            try:
+                if (
+                    isinstance(latency, int | float)
+                    and not isinstance(latency, bool)
+                    and math.isfinite(latency)
+                    and latency >= 0
+                ):
+                    self.metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
+                        "first_speech", latency
+                    )
+            except Exception:
+                return
+
+        self.latency.add_event_handler("on_latency_measured", record_turn_latency)
+        self.latency.add_event_handler(
+            "on_first_bot_speech_latency", record_first_speech_latency
+        )
+
+
 class PipelineTurnRecorder(Protocol):
     def record_user(self, content: str | None, timestamp: str) -> None: ...
 
@@ -534,6 +642,7 @@ def build_runtime(
     greeting: str,
     mark_name: str,
     idle_timeout_seconds: float,
+    observers: _CallObservers,
 ) -> CallRuntime:
     """Create and register one native worker/runner pair owned by the call."""
 
@@ -546,6 +655,7 @@ def build_runtime(
         or isinstance(idle_timeout_seconds, bool)
         or not math.isfinite(idle_timeout_seconds)
         or idle_timeout_seconds <= 0
+        or type(observers) is not _CallObservers
     ):
         raise ValueError("call_runtime_config_invalid")
     task_manager = ObservedTaskManager(
@@ -555,6 +665,8 @@ def build_runtime(
     worker = PipelineWorker(
         pipeline,
         params=pipeline_params(),
+        observers=[observers.latency, observers.metrics],
+        enable_turn_tracking=True,
         enable_rtvi=False,
         enable_tracing=False,
         idle_timeout_secs=float(idle_timeout_seconds),
@@ -606,7 +718,9 @@ def pipeline_params() -> PipelineParams:
         audio_in_sample_rate=8000,
         audio_out_sample_rate=8000,
         enable_metrics=True,
-        enable_usage_metrics=True,
+        enable_usage_metrics=False,
+        report_only_initial_ttfb=False,
+        send_initial_empty_metrics=False,
     )
 
 

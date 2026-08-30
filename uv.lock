@@ -1177,6 +1177,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "loguru" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
@@ -1185,6 +1186,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pynacl" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "telnyx" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1206,6 +1208,7 @@ requires-dist = [
     { name = "cryptography", specifier = "==50.0.0" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "loguru", specifier = "==0.7.3" },
     { name = "opentelemetry-api", specifier = "==1.44.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = "==1.44.0" },
     { name = "opentelemetry-sdk", specifier = "==1.44.0" },
@@ -1214,6 +1217,7 @@ requires-dist = [
     { name = "pydantic", specifier = "==2.13.4" },
     { name = "pynacl", specifier = "==1.6.2" },
     { name = "pyyaml", specifier = "==6.0.3" },
+    { name = "requests", specifier = "==2.34.2" },
     { name = "telnyx", specifier = "==4.176.0" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.52.4" },
 ]
