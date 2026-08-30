@@ -228,6 +228,16 @@ class _CallEntry:
     ] = field(default_factory=list, repr=False)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _LinkedAbortIdentity:
+    call_control_id: str = field(repr=False)
+    generation: UUID = field(repr=False)
+    token_digest: bytes = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "LinkedAbortIdentity()"
+
+
 @dataclass(slots=True, repr=False)
 class _AnsweredPlaceholder:
     call_control_id: str
@@ -238,6 +248,9 @@ class _AnsweredPlaceholder:
     precommit_refcount: int = 1
     durable: bool = False
     linked_entry: _CallEntry | None = field(default=None, repr=False)
+    linked_abort_identity: _LinkedAbortIdentity | None = field(
+        default=None, repr=False
+    )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -354,16 +367,23 @@ class _PlaceholderReservation:
         self._settled = True
         self._abandon_event.set()
 
-    async def confirm_fail_closed(self, result: WebhookCommitValue) -> None:
+    async def confirm_fail_closed(
+        self,
+        result: WebhookCommitValue,
+        *,
+        linked_abort_identity: _LinkedAbortIdentity | None = None,
+    ) -> _AbortTarget | None:
         if self._settled:
-            return
-        await self._registry._settle_placeholder(
+            return None
+        target = await self._registry._settle_placeholder(
             self,
             result,
             promote_linked_evidence=False,
+            linked_abort_identity=linked_abort_identity,
         )
         self._settled = True
         self._abandon_event.set()
+        return target
 
     async def _run_abandonment(self) -> None:
         await self._abandon_event.wait()
@@ -838,6 +858,11 @@ class CallRegistry:
                             self._answered_placeholders.pop(event.call_control_id, None)
                     else:
                         placeholder.linked_entry = entry
+                        placeholder.linked_abort_identity = _LinkedAbortIdentity(
+                            call_control_id=entry.call_control_id,
+                            generation=entry.generation,
+                            token_digest=entry.token_digest,
+                        )
                 self._by_control[entry.call_control_id] = entry
                 self._by_call_id[entry.call_id] = entry
                 self._permits_used += 1
@@ -1067,17 +1092,18 @@ class CallRegistry:
         result: WebhookCommitValue | None,
         *,
         promote_linked_evidence: bool = True,
-    ) -> None:
+        linked_abort_identity: _LinkedAbortIdentity | None = None,
+    ) -> _AbortTarget | None:
         completion: asyncio.Future[WebhookDisposition] | None = None
+        abort_target: _AbortTarget | None = None
         async with self._lock:
             if reservation._registry_applied:
-                return
-            placeholder = self._answered_placeholders.get(
-                reservation._placeholder.call_control_id
+                return None
+            placeholder = reservation._placeholder
+            mapped_placeholder = self._answered_placeholders.get(
+                placeholder.call_control_id
             )
-            if placeholder is not reservation._placeholder:
-                reservation._registry_applied = True
-                return
+            is_live_placeholder = mapped_placeholder is placeholder
             if placeholder.precommit_refcount > 0:
                 placeholder.precommit_refcount -= 1
             if isinstance(result, WebhookCommitResult) and (
@@ -1085,14 +1111,15 @@ class CallRegistry:
                 result.effect,
             ) == ("first", "applied"):
                 now = float(self._monotonic())
-                if now >= placeholder.deadline:
+                if is_live_placeholder and now >= placeholder.deadline:
                     if (
                         self._answered_placeholders.get(placeholder.call_control_id)
                         is placeholder
                     ):
                         self._answered_placeholders.pop(placeholder.call_control_id, None)
                     placeholder.linked_entry = None
-                else:
+                    is_live_placeholder = False
+                elif is_live_placeholder:
                     placeholder.durable = True
                     linked = placeholder.linked_entry
                     if (
@@ -1106,16 +1133,52 @@ class CallRegistry:
                         linked.answer.state = "accepted"
                         linked.answer.disposition = 200
                         completion = linked.answer.completion
-            if placeholder.precommit_refcount == 0 and not placeholder.durable:
-                self._answered_placeholders.pop(placeholder.call_control_id, None)
-                placeholder.linked_entry = None
-            elif placeholder.precommit_refcount == 0 and placeholder.linked_entry is not None:
-                self._answered_placeholders.pop(placeholder.call_control_id, None)
+            if placeholder.precommit_refcount == 0:
+                if (
+                    not placeholder.durable
+                    or placeholder.linked_entry is not None
+                    or not is_live_placeholder
+                ):
+                    if (
+                        self._answered_placeholders.get(placeholder.call_control_id)
+                        is placeholder
+                    ):
+                        self._answered_placeholders.pop(
+                            placeholder.call_control_id, None
+                        )
+                    placeholder.linked_entry = None
+                placeholder.linked_abort_identity = None
+            if (
+                linked_abort_identity is not None
+                and isinstance(result, WebhookCommitResult)
+                and (result.receipt, result.effect) == ("first", "applied")
+            ):
+                current = self._by_control.get(
+                    linked_abort_identity.call_control_id
+                )
+                if (
+                    current is not None
+                    and current.call_control_id
+                    == linked_abort_identity.call_control_id
+                    and current.generation == linked_abort_identity.generation
+                    and current.terminal_event is None
+                    and hmac.compare_digest(
+                        current.token_digest,
+                        linked_abort_identity.token_digest,
+                    )
+                ):
+                    abort_target = _AbortTarget(
+                        entry=current,
+                        generation=current.generation,
+                        call_control_id=current.call_control_id,
+                        token_digest=current.token_digest,
+                    )
             reservation._registry_applied = True
         if completion is not None and not completion.done():
             from projetv0_voice.telnyx.webhooks import WebhookDisposition
 
             completion.set_result(WebhookDisposition(200))
+        return abort_target
 
     async def reconcile_after_commit(
         self,
@@ -1202,13 +1265,19 @@ class CallRegistry:
     ) -> FailClosedWebhookConfirmation:
         del event
         reservation = resolution.reservation
-        linked_placeholder_entry: _CallEntry | None = None
+        linked_abort_identity: _LinkedAbortIdentity | None = None
+        linked_abort_target: _AbortTarget | None = None
         if isinstance(reservation, CallReservation):
             await reservation.confirm(result)
         elif isinstance(reservation, _PlaceholderReservation):
             async with self._lock:
-                linked_placeholder_entry = reservation._placeholder.linked_entry
-            await reservation.confirm_fail_closed(result)
+                linked_abort_identity = (
+                    reservation._placeholder.linked_abort_identity
+                )
+            linked_abort_target = await reservation.confirm_fail_closed(
+                result,
+                linked_abort_identity=linked_abort_identity,
+            )
         generation: CallGenerationHandle | None = None
         abort_scheduled = False
         if isinstance(reservation, CallReservation):
@@ -1223,29 +1292,31 @@ class CallRegistry:
                     reservation._entry,
                     reservation._generation,
                 )
-        elif isinstance(reservation, _PlaceholderReservation):
-            linked = linked_placeholder_entry
-            if linked is not None:
-                generation = CallGenerationHandle(
-                    linked.call_control_id, linked.generation
+        elif (
+            isinstance(reservation, _PlaceholderReservation)
+            and linked_abort_identity is not None
+        ):
+            identity = linked_abort_identity
+            generation = CallGenerationHandle(
+                identity.call_control_id, identity.generation
+            )
+            if isinstance(result, WebhookCommitResult) and (
+                result.receipt,
+                result.effect,
+            ) == ("first", "applied") and linked_abort_target is not None:
+                abort_scheduled = self._schedule_abort_target(
+                    linked_abort_target,
+                    name="voice-fail-closed-lease-abort",
                 )
-                if isinstance(result, WebhookCommitResult) and (
-                    result.receipt,
-                    result.effect,
-                ) == ("first", "applied"):
-                    abort_scheduled = self._schedule_abort_exact(
-                        linked,
-                        linked.generation,
+        elif isinstance(reservation, _PlaceholderReservation):
+            async with self._lock:
+                placeholder = self._answered_placeholders.get(
+                    reservation._placeholder.call_control_id
+                )
+                if placeholder is reservation._placeholder:
+                    self._answered_placeholders.pop(
+                        placeholder.call_control_id, None
                     )
-            else:
-                async with self._lock:
-                    placeholder = self._answered_placeholders.get(
-                        reservation._placeholder.call_control_id
-                    )
-                    if placeholder is reservation._placeholder:
-                        self._answered_placeholders.pop(
-                            placeholder.call_control_id, None
-                        )
         return FailClosedWebhookConfirmation(generation, abort_scheduled)
 
     async def _run_action(
@@ -1257,6 +1328,7 @@ class CallRegistry:
         completion: asyncio.Future[WebhookDisposition] | None = None
         command_id: UUID | None = None
         raw_token: str | None = None
+        streaming_request: StreamingStartV1 | None = None
         entry: _CallEntry | None = None
         generation: UUID | None = None
         deadline_work: _TerminalWork | None = None
@@ -1288,7 +1360,8 @@ class CallRegistry:
                     owner = True
                     generation = entry.generation
                     command_id = slot.command_id
-                    raw_token = entry.raw_token
+                    if action == "streaming":
+                        raw_token = entry.raw_token
                     completion = asyncio.get_running_loop().create_future()
                     slot.state = "in_flight"
                     slot.completion = completion
@@ -1305,19 +1378,24 @@ class CallRegistry:
         response_failure = False
         cancelled = False
         try:
-            if action == "answer":
-                call_result = await self._call_control.answer(
-                    call_control_id, command_id=cast(UUID, command_id)
-                )
-            else:
-                call_result = await self._call_control.start_streaming(
-                    call_control_id,
-                    StreamingStartV1(
+            try:
+                if action == "answer":
+                    call_result = await self._call_control.answer(
+                        call_control_id, command_id=cast(UUID, command_id)
+                    )
+                else:
+                    streaming_request = StreamingStartV1(
                         stream_url=self._stream_url,
                         stream_auth_token=SecretStr(cast(str, raw_token)),
-                    ),
-                    command_id=cast(UUID, command_id),
-                )
+                    )
+                    call_result = await self._call_control.start_streaming(
+                        call_control_id,
+                        streaming_request,
+                        command_id=cast(UUID, command_id),
+                    )
+            finally:
+                streaming_request = None
+                raw_token = None
             outcome = call_result.outcome
         except asyncio.CancelledError:
             outcome = "outcome_unknown"
@@ -1858,7 +1936,11 @@ class CallRegistry:
                 self._answered_placeholders.items()
             ):
                 if now >= placeholder.deadline:
-                    self._answered_placeholders.pop(call_control_id, None)
+                    if (
+                        self._answered_placeholders.get(call_control_id)
+                        is placeholder
+                    ):
+                        self._answered_placeholders.pop(call_control_id, None)
                     placeholder.linked_entry = None
                     expired_placeholders += 1
             for entry in tuple(self._by_control.values()):
