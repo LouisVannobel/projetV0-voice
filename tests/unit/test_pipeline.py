@@ -79,16 +79,11 @@ def _call_observers(
     runtime_metrics: RuntimeMetrics | None = None,
 ) -> tuple[object, RuntimeMetrics]:
     owner = runtime_metrics or RuntimeMetrics.in_memory()
-    latency = UserBotLatencyObserver()
-    metric_observer = pipeline_module.RuntimeMetricsObserver(
+    return pipeline_module._CallObservers(  # noqa: SLF001
         runtime_metrics=owner,
         stt=stt,
         llm=llm,
         tts=tts,
-    )
-    return pipeline_module._CallObservers(  # noqa: SLF001
-        latency=latency,
-        metrics=metric_observer,
     ), owner
 
 
@@ -673,10 +668,11 @@ async def test_closed_call_observers_register_only_two_native_latency_events() -
     llm = FrameProcessor(name="llm")
     tts = FrameProcessor(name="tts")
     holder, owner = _call_observers(stt=stt, llm=llm, tts=tts)
-    latency = holder.latency
+    observers = holder._consume()  # type: ignore[attr-defined]  # noqa: SLF001
+    latency = observers[0]
 
     assert type(latency) is UserBotLatencyObserver
-    assert type(holder.metrics) is pipeline_module.RuntimeMetricsObserver
+    assert type(observers[1]) is pipeline_module.RuntimeMetricsObserver
     assert len(latency._event_handlers["on_latency_measured"].handlers) == 1  # noqa: SLF001
     assert len(latency._event_handlers["on_first_bot_speech_latency"].handlers) == 1  # noqa: SLF001
     assert latency._event_handlers["on_latency_breakdown"].handlers == []  # noqa: SLF001
@@ -703,8 +699,13 @@ async def test_runtime_metrics_observer_uses_service_identity_and_exact_ttfb_ite
     llm = FrameProcessor(name="llm-secret-name")
     tts = FrameProcessor(name="tts-secret-name")
     destination = FrameProcessor(name="destination")
-    holder, owner = _call_observers(stt=stt, llm=llm, tts=tts)
-    observer = holder.metrics
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+    )
     mixed = MetricsFrame(
         [
             TTFBMetricsData.model_construct(
@@ -767,7 +768,13 @@ async def test_runtime_metrics_observer_continues_per_item_after_metric_fault(
     stt = FrameProcessor(name="stt")
     llm = FrameProcessor(name="llm")
     tts = FrameProcessor(name="tts")
-    holder, owner = _call_observers(stt=stt, llm=llm, tts=tts)
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+    )
     calls: list[tuple[str, float]] = []
 
     def fail_first(service: object, seconds: object) -> None:
@@ -783,7 +790,7 @@ async def test_runtime_metrics_observer_continues_per_item_after_metric_fault(
         ]
     )
 
-    await holder.metrics.on_push_frame(
+    await observer.on_push_frame(
         FramePushed(stt, llm, frame, FrameDirection.DOWNSTREAM, 1)
     )
 
@@ -831,12 +838,24 @@ async def test_runtime_has_exact_four_observer_inventory_fresh_list_and_params()
         TurnTrackingObserver,
         IdleFrameObserver,
     ]
-    assert first_inventory[0] is first_holder.latency
-    assert first_inventory[1] is first_holder.metrics
     assert first_inventory is not second_inventory
     assert all(
         left is not right
         for left, right in zip(first_inventory, second_inventory, strict=True)
+    )
+    assert not hasattr(first_holder, "latency")
+    assert not hasattr(first_holder, "metrics")
+    assert not hasattr(pipeline_module._CallObservers, "_OWNER_ATTRIBUTE")  # noqa: SLF001
+    assert all(
+        not hasattr(item, "_projetv0_call_observer_owner")
+        for item in first_inventory[:2]
+    )
+    first_latency = first_inventory[0]
+    assert first_latency._event_handlers["on_latency_breakdown"].handlers == []  # noqa: SLF001
+    assert len(first_latency._event_handlers["on_latency_measured"].handlers) == 1  # noqa: SLF001
+    assert (  # noqa: SLF001
+        len(first_latency._event_handlers["on_first_bot_speech_latency"].handlers)
+        == 1
     )
     assert first.worker._enable_turn_tracking is True  # noqa: SLF001
     assert first.worker._enable_tracing is False  # noqa: SLF001
@@ -856,27 +875,21 @@ async def test_runtime_has_exact_four_observer_inventory_fresh_list_and_params()
     await second_metrics.aclose()
 
 
-def test_closed_observer_holder_rejects_subclasses_duplicates_and_arbitrary_sequences() -> None:
+def test_closed_observer_holder_rejects_invalid_dependencies_and_is_opaque() -> None:
     owner = RuntimeMetrics.in_memory()
     stt = FrameProcessor(name="stt")
     llm = FrameProcessor(name="llm")
     tts = FrameProcessor(name="tts")
 
-    class _LatencySubclass(UserBotLatencyObserver):
-        pass
-
     with pytest.raises(ValueError, match="^call_observers_invalid$"):
         pipeline_module._CallObservers(  # noqa: SLF001
-            latency=_LatencySubclass(),
-            metrics=pipeline_module.RuntimeMetricsObserver(
-                runtime_metrics=owner,
-                stt=stt,
-                llm=llm,
-                tts=tts,
-            ),
+            runtime_metrics=object(),  # type: ignore[arg-type]
+            stt=stt,
+            llm=llm,
+            tts=tts,
         )
-    with pytest.raises(ValueError, match="^runtime_metrics_observer_invalid$"):
-        pipeline_module.RuntimeMetricsObserver(
+    with pytest.raises(ValueError, match="^call_observers_invalid$"):
+        pipeline_module._CallObservers(  # noqa: SLF001
             runtime_metrics=owner,
             stt=stt,
             llm=stt,
@@ -888,26 +901,47 @@ def test_closed_observer_holder_rejects_subclasses_duplicates_and_arbitrary_sequ
         tts=tts,
         runtime_metrics=owner,
     )
-    fresh_metrics = pipeline_module.RuntimeMetricsObserver(
+    assert repr(holder) == "_CallObservers()"
+    assert str(holder) == "_CallObservers()"
+    assert not hasattr(holder, "latency")
+    assert not hasattr(holder, "metrics")
+    assert "observers" not in inspect.signature(pipeline_module.CallRuntime).parameters
+    assert "observer_factory" not in inspect.signature(pipeline_module.build_runtime).parameters
+    owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+def test_call_observers_constructor_accepts_only_exact_dependencies() -> None:
+    assert tuple(inspect.signature(pipeline_module._CallObservers).parameters) == (  # noqa: SLF001
+        "runtime_metrics",
+        "stt",
+        "llm",
+        "tts",
+    )
+
+
+def test_call_observers_reject_prebuilt_observer_injection() -> None:
+    owner = RuntimeMetrics.in_memory()
+    stt = FrameProcessor(name="stt")
+    llm = FrameProcessor(name="llm")
+    tts = FrameProcessor(name="tts")
+    injected = UserBotLatencyObserver()
+
+    async def breakdown_sink(_observer: object, _breakdown: object) -> None:
+        raise AssertionError("breakdown callback must not be injectable")
+
+    injected.add_event_handler("on_latency_breakdown", breakdown_sink)
+    injected_metrics = pipeline_module.RuntimeMetricsObserver(
         runtime_metrics=owner,
         stt=stt,
         llm=llm,
         tts=tts,
     )
-    with pytest.raises(ValueError, match="^call_observers_reused$"):
-        pipeline_module._CallObservers(  # noqa: SLF001
-            latency=holder.latency,
-            metrics=fresh_metrics,
+
+    with pytest.raises(TypeError):
+        pipeline_module._CallObservers(  # type: ignore[call-arg]  # noqa: SLF001
+            latency=injected,
+            metrics=injected_metrics,
         )
-    with pytest.raises(ValueError, match="^call_observers_reused$"):
-        pipeline_module._CallObservers(  # noqa: SLF001
-            latency=UserBotLatencyObserver(),
-            metrics=holder.metrics,
-        )
-    assert repr(holder) == "_CallObservers()"
-    assert str(holder) == "_CallObservers()"
-    assert "observers" not in inspect.signature(pipeline_module.CallRuntime).parameters
-    assert "observer_factory" not in inspect.signature(pipeline_module.build_runtime).parameters
     owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
@@ -951,8 +985,8 @@ def _holder_in_phase(
 @pytest.mark.parametrize("phase", ["new", "session_bound", "consumed"])
 async def test_closed_observer_bindings_reject_normal_replacement(phase: str) -> None:
     holder, owner, _services = _holder_in_phase(phase)
-    original_latency = holder.latency  # type: ignore[attr-defined]
-    original_metrics = holder.metrics  # type: ignore[attr-defined]
+    original_latency = holder._latency  # type: ignore[attr-defined]  # noqa: SLF001
+    original_metrics = holder._metrics  # type: ignore[attr-defined]  # noqa: SLF001
     replacement_metrics = pipeline_module.RuntimeMetricsObserver(
         runtime_metrics=owner,
         stt=FrameProcessor(name="replacement-stt"),
@@ -961,16 +995,12 @@ async def test_closed_observer_bindings_reject_normal_replacement(phase: str) ->
     )
 
     with pytest.raises(FrozenInstanceError):
-        holder.latency = UserBotLatencyObserver()  # type: ignore[attr-defined]
-    with pytest.raises(FrozenInstanceError):
-        holder.metrics = replacement_metrics  # type: ignore[attr-defined]
-    with pytest.raises(FrozenInstanceError):
         holder._latency = UserBotLatencyObserver()  # type: ignore[attr-defined]  # noqa: SLF001
     with pytest.raises(FrozenInstanceError):
         holder._metrics = replacement_metrics  # type: ignore[attr-defined]  # noqa: SLF001
 
-    assert holder.latency is original_latency  # type: ignore[attr-defined]
-    assert holder.metrics is original_metrics  # type: ignore[attr-defined]
+    assert holder._latency is original_latency  # type: ignore[attr-defined]  # noqa: SLF001
+    assert holder._metrics is original_metrics  # type: ignore[attr-defined]  # noqa: SLF001
     await owner.aclose()
 
 
@@ -1059,7 +1089,7 @@ async def test_runtime_metrics_observer_rejects_post_bind_substitution(
     attribute: str,
 ) -> None:
     holder, owner, services = _holder_in_phase("session_bound")
-    observer = holder.metrics  # type: ignore[attr-defined]
+    observer = holder._metrics  # type: ignore[attr-defined]  # noqa: SLF001
     replacement_owner = RuntimeMetrics.in_memory()
     replacement_service = FrameProcessor(name="replacement")
     replacement: object = (
@@ -1084,6 +1114,55 @@ async def test_runtime_metrics_observer_rejects_post_bind_substitution(
     observer._task_manager = lifecycle_marker  # type: ignore[assignment]  # noqa: SLF001
     assert observer._task_manager is lifecycle_marker  # noqa: SLF001
     await replacement_owner.aclose()
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_metrics_binding_rejects_deletion_and_still_forwards() -> None:
+    owner = RuntimeMetrics.in_memory()
+    stt = FrameProcessor(name="stt")
+    llm = FrameProcessor(name="llm")
+    tts = FrameProcessor(name="tts")
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+    )
+    manager = TaskManager(loop=asyncio.get_running_loop())
+    await observer.setup(manager)
+    assert observer.task_manager is manager
+
+    for attribute in (
+        "_RuntimeMetricsObserver__binding",
+        "_binding",
+        "_runtime_metrics",
+        "_stt",
+        "_llm",
+        "_tts",
+    ):
+        with pytest.raises(FrozenInstanceError):
+            delattr(observer, attribute)
+
+    await observer.on_push_frame(
+        FramePushed(
+            source=stt,
+            destination=llm,
+            frame=MetricsFrame(
+                [TTFBMetricsData(processor="must-not-be-read", value=0.125)]
+            ),
+            direction=FrameDirection.DOWNSTREAM,
+            timestamp=1,
+        )
+    )
+    points = list(
+        _metric_map(owner)["projetv0.voice.service_ttfb"].data.data_points
+    )
+    assert [(dict(point.attributes), point.count, point.sum) for point in points] == [
+        ({"service": "stt"}, 1, 0.125)
+    ]
+
+    await observer.cleanup()
     await owner.aclose()
 
 

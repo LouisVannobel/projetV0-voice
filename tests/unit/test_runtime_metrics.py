@@ -12,9 +12,11 @@ import requests
 from loguru import logger
 from opentelemetry import metrics as global_metrics
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.common._internal.metrics_encoder import (
+    encode_metrics,
+)
 from opentelemetry.exporter.otlp.proto.http import Compression
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics._internal.exemplar import AlwaysOffExemplarFilter
+from opentelemetry.sdk.metrics import AlwaysOffExemplarFilter, MeterProvider
 from opentelemetry.sdk.metrics.export import (
     InMemoryMetricReader,
     MetricExporter,
@@ -319,6 +321,219 @@ async def test_semantic_methods_emit_only_exact_values_and_attribute_keys() -> N
 
 class _StringSubclass(str):
     pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _FloatSubclass(float):
+    pass
+
+
+class _RaisingIntFloat(int):
+    def __float__(self) -> float:
+        raise ValueError("numeric-hook-must-not-run")
+
+
+class _RaisingFloatConversion(float):
+    def __float__(self) -> float:
+        raise TypeError("numeric-hook-must-not-run")
+
+
+class _RaisingFloatComparison(float):
+    def __ge__(self, _other: object) -> bool:
+        raise RuntimeError("numeric-hook-must-not-run")
+
+
+def _observable_snapshot(owner: metrics_module.RuntimeMetrics) -> dict[str, int | float]:
+    data = _metric_map(owner)
+    names = (
+        "writer.queue_depth",
+        "writer.queue_oldest_age",
+        "writer.quick_check",
+        "outbox.depth",
+        "outbox.oldest_age",
+        "outbox.bytes",
+        "ready",
+    )
+    return {name: _point(data[PREFIX + name]).value for name in names}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        pytest.param(10**10000, id="oversized-int"),
+        pytest.param(_IntSubclass(1), id="int-subclass"),
+        pytest.param(_FloatSubclass(1.0), id="float-subclass"),
+        pytest.param(_RaisingIntFloat(1), id="raising-int-float"),
+        pytest.param(_RaisingFloatConversion(1.0), id="raising-float-conversion"),
+        pytest.param(_RaisingFloatComparison(1.0), id="raising-float-comparison"),
+    ],
+)
+@pytest.mark.parametrize(
+    "consume",
+    [
+        pytest.param(
+            lambda owner, value: owner.record_user_bot_latency("turn", value),
+            id="user-bot-latency",
+        ),
+        pytest.param(
+            lambda owner, value: owner.record_service_ttfb("stt", value),
+            id="service-ttfb",
+        ),
+        pytest.param(
+            lambda owner, value: owner.record_disclosure_ack(value),
+            id="disclosure-ack",
+        ),
+        pytest.param(
+            lambda owner, value: owner.record_event_loop_lag(value),
+            id="event-loop-lag",
+        ),
+        pytest.param(
+            lambda owner, value: owner.update_writer_state(
+                queue_depth=4,
+                oldest_age=value,
+                quick_check=False,
+            ),
+            id="writer-oldest-age",
+        ),
+        pytest.param(
+            lambda owner, value: owner.update_outbox_state(
+                depth=5,
+                oldest_age=value,
+                bytes_count=6,
+            ),
+            id="outbox-oldest-age",
+        ),
+    ],
+)
+async def test_float_numeric_consumers_reject_unsafe_values_atomically(
+    consume: Callable[[metrics_module.RuntimeMetrics, object], None],
+    invalid: object,
+) -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    owner.update_writer_state(queue_depth=2, oldest_age=1.5, quick_check=True)
+    owner.update_outbox_state(depth=3, oldest_age=2.5, bytes_count=4096)
+    owner.update_ready(True)
+    before = _observable_snapshot(owner)
+
+    consume(owner, invalid)
+
+    assert owner.failure_code == "metrics_record_failed"
+    assert _observable_snapshot(owner) == before
+    assert set(_metric_map(owner)) == {
+        PREFIX + "writer.queue_depth",
+        PREFIX + "writer.queue_oldest_age",
+        PREFIX + "writer.quick_check",
+        PREFIX + "outbox.depth",
+        PREFIX + "outbox.oldest_age",
+        PREFIX + "outbox.bytes",
+        PREFIX + "ready",
+    }
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "update",
+    [
+        pytest.param(
+            lambda owner, value: owner.update_writer_state(
+                queue_depth=value,
+                oldest_age=1.5,
+                quick_check=True,
+            ),
+            id="writer-queue-depth",
+        ),
+        pytest.param(
+            lambda owner, value: owner.update_outbox_state(
+                depth=value,
+                oldest_age=2.5,
+                bytes_count=4096,
+            ),
+            id="outbox-depth",
+        ),
+        pytest.param(
+            lambda owner, value: owner.update_outbox_state(
+                depth=3,
+                oldest_age=2.5,
+                bytes_count=value,
+            ),
+            id="outbox-bytes",
+        ),
+    ],
+)
+async def test_integer_gauges_accept_int64_max_and_encode(
+    update: Callable[[metrics_module.RuntimeMetrics, object], None],
+) -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory()
+
+    update(owner, (1 << 63) - 1)
+
+    assert owner.failure_code is None
+    collected = _reader(owner).get_metrics_data()
+    assert collected is not None
+    assert encode_metrics(collected) is not None
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        pytest.param(1 << 63, id="above-int64"),
+        pytest.param(10**10000, id="oversized-int"),
+    ],
+)
+@pytest.mark.parametrize(
+    "update",
+    [
+        pytest.param(
+            lambda owner, value: owner.update_writer_state(
+                queue_depth=value,
+                oldest_age=9.5,
+                quick_check=False,
+            ),
+            id="writer-queue-depth",
+        ),
+        pytest.param(
+            lambda owner, value: owner.update_outbox_state(
+                depth=value,
+                oldest_age=9.5,
+                bytes_count=99,
+            ),
+            id="outbox-depth",
+        ),
+        pytest.param(
+            lambda owner, value: owner.update_outbox_state(
+                depth=99,
+                oldest_age=9.5,
+                bytes_count=value,
+            ),
+            id="outbox-bytes",
+        ),
+    ],
+)
+async def test_integer_gauges_reject_out_of_range_atomically_and_still_encode(
+    update: Callable[[metrics_module.RuntimeMetrics, object], None],
+    invalid: object,
+) -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    owner.update_writer_state(queue_depth=2, oldest_age=1.5, quick_check=True)
+    owner.update_outbox_state(depth=3, oldest_age=2.5, bytes_count=4096)
+    owner.update_ready(True)
+    before = _observable_snapshot(owner)
+
+    update(owner, invalid)
+
+    assert owner.failure_code == "metrics_record_failed"
+    assert _observable_snapshot(owner) == before
+    collected = _reader(owner).get_metrics_data()
+    assert collected is not None
+    assert encode_metrics(collected) is not None
+    await owner.aclose()
 
 
 @pytest.mark.asyncio

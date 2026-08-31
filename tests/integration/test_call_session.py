@@ -29,7 +29,6 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
@@ -945,13 +944,10 @@ def _session_observers(
     runtime_metrics: RuntimeMetrics = _TEST_RUNTIME_METRICS,
 ) -> object:
     return pipeline_module._CallObservers(  # noqa: SLF001
-        latency=UserBotLatencyObserver(),
-        metrics=pipeline_module.RuntimeMetricsObserver(
-            runtime_metrics=runtime_metrics,
-            stt=services.stt,
-            llm=services.llm,
-            tts=services.tts,
-        ),
+        runtime_metrics=runtime_metrics,
+        stt=services.stt,
+        llm=services.llm,
+        tts=services.tts,
     )
 
 

@@ -7,7 +7,7 @@ import inspect
 import math
 from collections.abc import Coroutine, Sequence
 from contextvars import Context
-from dataclasses import FrozenInstanceError, dataclass, field
+from dataclasses import FrozenInstanceError, InitVar, dataclass, field
 from typing import Any, Protocol, cast
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -415,6 +415,18 @@ class RuntimeMetricsObserver(BaseObserver):
             raise FrozenInstanceError(f"cannot assign to field '{name}'")
         super().__setattr__(name, value)
 
+    def __delattr__(self, name: str) -> None:
+        if name in (
+            "_binding",
+            "_runtime_metrics",
+            "_stt",
+            "_llm",
+            "_tts",
+            "_RuntimeMetricsObserver__binding",
+        ):
+            raise FrozenInstanceError(f"cannot delete field '{name}'") from None
+        super().__delattr__(name)
+
     def __init__(
         self,
         *,
@@ -506,34 +518,48 @@ class _CallObserverState:
         return True
 
 
-@dataclass(frozen=True, slots=True, eq=False)
+@dataclass(frozen=True, slots=True, eq=False, kw_only=True)
 class _CallObservers:
     """One-shot private owner for exactly one call's two native observers."""
 
-    latency: UserBotLatencyObserver
-    metrics: RuntimeMetricsObserver
+    runtime_metrics: InitVar[RuntimeMetrics]
+    stt: InitVar[FrameProcessor]
+    llm: InitVar[FrameProcessor]
+    tts: InitVar[FrameProcessor]
+    _latency: UserBotLatencyObserver = field(init=False, repr=False)
+    _metrics: RuntimeMetricsObserver = field(init=False, repr=False)
     _state: _CallObserverState = field(
         default_factory=_CallObserverState,
         init=False,
         repr=False,
     )
 
-    _OWNER_ATTRIBUTE = "_projetv0_call_observer_owner"
     _NEW = 0
     _SESSION_BOUND = 1
     _CONSUMED = 2
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        runtime_metrics: RuntimeMetrics,
+        stt: FrameProcessor,
+        llm: FrameProcessor,
+        tts: FrameProcessor,
+    ) -> None:
         if (
-            type(self.latency) is not UserBotLatencyObserver
-            or type(self.metrics) is not RuntimeMetricsObserver
+            type(runtime_metrics) is not RuntimeMetrics
+            or not all(isinstance(service, FrameProcessor) for service in (stt, llm, tts))
+            or len({id(stt), id(llm), id(tts)}) != 3
         ):
             raise ValueError("call_observers_invalid") from None
-        if (
-            getattr(self.latency, self._OWNER_ATTRIBUTE, None) is not None
-            or getattr(self.metrics, self._OWNER_ATTRIBUTE, None) is not None
-        ):
-            raise ValueError("call_observers_reused") from None
+        latency_observer = UserBotLatencyObserver()  # type: ignore[no-untyped-call]
+        metrics_observer = RuntimeMetricsObserver(
+            runtime_metrics=runtime_metrics,
+            stt=stt,
+            llm=llm,
+            tts=tts,
+        )
+        object.__setattr__(self, "_latency", latency_observer)
+        object.__setattr__(self, "_metrics", metrics_observer)
 
         async def record_turn_latency(
             _observer: UserBotLatencyObserver,
@@ -546,9 +572,7 @@ class _CallObservers:
                     and math.isfinite(latency)
                     and latency >= 0
                 ):
-                    self.metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
-                        "turn", latency
-                    )
+                    runtime_metrics.record_user_bot_latency("turn", latency)
             except Exception:
                 return
 
@@ -563,18 +587,16 @@ class _CallObservers:
                     and math.isfinite(latency)
                     and latency >= 0
                 ):
-                    self.metrics._runtime_metrics.record_user_bot_latency(  # noqa: SLF001
+                    runtime_metrics.record_user_bot_latency(
                         "first_speech", latency
                     )
             except Exception:
                 return
 
-        self.latency.add_event_handler("on_latency_measured", record_turn_latency)
-        self.latency.add_event_handler(
+        latency_observer.add_event_handler("on_latency_measured", record_turn_latency)
+        latency_observer.add_event_handler(
             "on_first_bot_speech_latency", record_first_speech_latency
         )
-        setattr(self.latency, self._OWNER_ATTRIBUTE, self)
-        setattr(self.metrics, self._OWNER_ATTRIBUTE, self)
 
     def _bind_session(
         self,
@@ -585,10 +607,10 @@ class _CallObservers:
         if self._state._value != self._NEW:
             raise ValueError("call_observers_reused") from None
         if (
-            self.metrics._runtime_metrics is not runtime_metrics
-            or self.metrics._stt is not services.stt
-            or self.metrics._llm is not services.llm
-            or self.metrics._tts is not services.tts
+            self._metrics._runtime_metrics is not runtime_metrics
+            or self._metrics._stt is not services.stt
+            or self._metrics._llm is not services.llm
+            or self._metrics._tts is not services.tts
         ):
             raise ValueError("call_observers_binding_invalid") from None
         if not self._state._mark_session_bound():
@@ -597,7 +619,7 @@ class _CallObservers:
     def _consume(self) -> list[BaseObserver]:
         if not self._state._mark_consumed():
             raise ValueError("call_observers_reused") from None
-        return [self.latency, self.metrics]
+        return [self._latency, self._metrics]
 
     def __repr__(self) -> str:
         return "_CallObservers()"

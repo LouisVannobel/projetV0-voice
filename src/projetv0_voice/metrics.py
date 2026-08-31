@@ -12,8 +12,7 @@ import requests
 from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.metrics import CallbackOptions, Observation
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics._internal.exemplar import AlwaysOffExemplarFilter
+from opentelemetry.sdk.metrics import AlwaysOffExemplarFilter, MeterProvider
 from opentelemetry.sdk.metrics.export import (
     InMemoryMetricReader,
     PeriodicExportingMetricReader,
@@ -32,6 +31,7 @@ _EXPORT_TIMEOUT_SECONDS = 2.0
 _READER_EXPORT_TIMEOUT_MILLIS = 5000.0
 _SHUTDOWN_TIMEOUT_MILLIS = 10000.0
 _READER_INTERVAL_MILLIS = 30000.0
+_MAX_OTLP_INT = (1 << 63) - 1
 
 _SESSIONS = frozenset({"closed", "failed", "drained"})
 _REJECTION_REASONS = frozenset(
@@ -75,14 +75,16 @@ def _closed(value: object, allowed: frozenset[str]) -> bool:
 
 
 def _nonnegative_number(value: object) -> float | None:
-    if (
-        isinstance(value, int | float)
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
-    ):
-        return float(value)
-    return None
+    accepted: int | float
+    if type(value) is int or type(value) is float:
+        accepted = value
+    else:
+        return None
+    try:
+        number = float(accepted)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def _positive_number(value: object) -> float | None:
@@ -91,7 +93,7 @@ def _positive_number(value: object) -> float | None:
 
 
 def _nonnegative_integer(value: object) -> int | None:
-    return value if type(value) is int and value >= 0 else None
+    return value if type(value) is int and 0 <= value <= _MAX_OTLP_INT else None
 
 
 class RuntimeMetrics:
