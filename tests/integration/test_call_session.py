@@ -44,6 +44,7 @@ from pipecat.workers.runner import WorkerRunner
 from pydantic import SecretStr
 from starlette.websockets import WebSocket, WebSocketState
 
+from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
@@ -128,13 +129,24 @@ class _LlmClient:
 
 
 def _identity(lease_claim: object | None = None, *, call_int: int = 1) -> object:
+    claim = (
+        lease_claim
+        if isinstance(lease_claim, ProcessLeaseClaim)
+        else ProcessLeaseClaim(
+            call_control_id=f"call-control-{call_int}",
+            call_id=UUID(int=call_int),
+            generation=UUID(int=call_int),
+            token_digest=bytes([call_int]) * 32,
+            claimed_at=NOW,
+        )
+    )
     return session_module.CallIdentity(
         call_id=UUID(int=call_int),
-        durable_generation=f"generation-{call_int}",
-        lease_identity=f"lease-{call_int}",
-        lease_claim=lease_claim or object(),
+        generation=CallGenerationHandle(
+            f"call-control-{call_int}", UUID(int=call_int)
+        ),
+        lease_claim=claim,
         deployment_id="deployment-1",
-        registry_handle=f"registry-{call_int}",
         telnyx_call_control_id=f"call-control-{call_int}",
         telnyx_call_leg_id=f"call-leg-{call_int}",
         telnyx_call_session_id=f"call-session-{call_int}",
@@ -962,6 +974,30 @@ def test_call_session_requires_one_concrete_closed_observer_holder() -> None:
     assert metrics_parameter.annotation == "RuntimeMetrics"
 
 
+def test_call_identity_is_constant_safe_and_rejects_mismatched_authorities() -> None:
+    identity = _identity()
+    assert repr(identity) == "CallIdentity()"
+    with pytest.raises(ValueError, match="^call_identity_invalid$"):
+        replace(
+            identity,
+            generation=CallGenerationHandle(
+                identity.telnyx_call_control_id,
+                UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            ),
+        )
+    with pytest.raises(ValueError, match="^call_identity_invalid$"):
+        replace(
+            identity,
+            lease_claim=ProcessLeaseClaim(
+                call_control_id="other-control",
+                call_id=identity.call_id,
+                generation=identity.generation.generation,
+                token_digest=b"z" * 32,
+                claimed_at=identity.started_at,
+            ),
+        )
+
+
 def _manifest() -> AgentManifestV1:
     return AgentManifestV1.model_validate(
         {
@@ -1083,8 +1119,8 @@ def _session(
         started=lease_started,
         release=lease_release,
     )
-    lease_claim = object()
-    identity = _identity(lease_claim, call_int=call_int)
+    identity = _identity(call_int=call_int)
+    lease_claim = identity.lease_claim
     session = session_module.CallSession(
         identity=identity,
         manifest=_manifest(),
@@ -1212,9 +1248,10 @@ def _real_cleanup_session(
     )
     writer = _SessionWriter(events)
     lease = _LeaseTerminalizer(events)
-    lease_claim = object()
+    identity = _identity()
+    lease_claim = identity.lease_claim
     session = session_module.CallSession(
-        identity=_identity(lease_claim),
+        identity=identity,
         manifest=_manifest(),
         profile=_profile(),
         services=services,
@@ -1335,9 +1372,10 @@ def _real_websocket_session(
     )
     writer = _SessionWriter(events)
     lease = _LeaseTerminalizer(events)
-    lease_claim = object()
+    identity = _identity()
+    lease_claim = identity.lease_claim
     session = session_module.CallSession(
-        identity=_identity(lease_claim),
+        identity=identity,
         manifest=_manifest(),
         profile=_profile(),
         services=services,
@@ -1451,9 +1489,10 @@ def _actual_partial_tts_telnyx_session() -> tuple[
     )
     writer = _SessionWriter(events)
     lease = _LeaseTerminalizer(events)
-    lease_claim = object()
+    identity = _identity()
+    lease_claim = identity.lease_claim
     session = session_module.CallSession(
-        identity=_identity(lease_claim),
+        identity=identity,
         manifest=_manifest(),
         profile=_profile(),
         services=services,
@@ -1591,6 +1630,28 @@ async def test_terminal_outcome_is_frozen_before_irreversible_boundaries(
     assert terminal_operations[0].payload.status == "closed"
     assert terminal_operations[0].payload.end_reason == "closed"
     assert lease.calls == [("closed", "closed")]
+
+
+@pytest.mark.asyncio
+async def test_required_recording_drain_latches_before_first_await_and_dominates_failure() -> None:
+    events: list[str] = []
+    session, _stt, lease, writer, _transport = _session(events=events)
+
+    await session.request_drain("recording_required_error")
+    running = asyncio.create_task(session.run(session.handshake))
+
+    with pytest.raises(session_module.CallSessionError, match="^recording_required_error$"):
+        await running
+    terminal = next(
+        command.payload["operation"]
+        for command in writer.commands
+        if not isinstance(command, VoiceOperationV1)
+        and hasattr(command, "payload")
+        and command.payload["operation"].kind == "call.upsert"
+        and command.payload["operation"].payload.status == "failed"
+    )
+    assert terminal.payload.end_reason == "recording_required_error"
+    assert lease.calls == [("failed", "recording_required_error")]
 
 
 @pytest.mark.asyncio

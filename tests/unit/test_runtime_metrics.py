@@ -85,6 +85,79 @@ def _point(metric: Any) -> Any:
     return points[0]
 
 
+def _points(metric: Any) -> dict[tuple[tuple[str, object], ...], Any]:
+    return {
+        tuple(sorted(point.attributes.items())): point
+        for point in metric.data.data_points
+    }
+
+
+def test_call_metric_lease_balances_active_and_finishes_exactly_once() -> None:
+    samples = iter((10.0, 12.5))
+    owner = metrics_module.RuntimeMetrics.in_memory(
+        monotonic=lambda: next(samples)
+    )
+
+    lease = owner.begin_call()
+    active = _metric_map(owner)[PREFIX + "calls.active"]
+    assert _point(active).value == 1
+    assert repr(lease) == "CallMetricLease()"
+
+    lease.finish("failed")
+    lease.finish("drained")
+
+    values = _metric_map(owner)
+    assert _point(values[PREFIX + "calls.active"]).value == 0
+    total = _points(values[PREFIX + "calls.total"])
+    assert total[(("session", "failed"),)].value == 1
+    assert (("session", "drained"),) not in total
+    duration = _points(values[PREFIX + "sessions.duration"])
+    assert duration[(("session", "failed"),)].count == 1
+    assert duration[(("session", "failed"),)].sum == 2.5
+    owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("bad_clock", [math.inf, math.nan, -1.0, "bad"])
+def test_call_metric_lease_clock_fault_is_nonthrowing_and_skips_duration(
+    bad_clock: object,
+) -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: bad_clock)
+
+    lease = owner.begin_call()
+    lease.finish("closed")
+
+    values = _metric_map(owner)
+    assert _point(values[PREFIX + "calls.active"]).value == 0
+    assert _points(values[PREFIX + "calls.total"])[
+        (("session", "closed"),)
+    ].value == 1
+    assert PREFIX + "sessions.duration" not in values
+    assert owner.failure_code == "metrics_record_failed"
+    owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+def test_call_metric_finish_instrument_fault_cannot_skip_remaining_emissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=iter((1.0, 2.0)).__next__)
+
+    class BrokenCounter:
+        def add(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("metric-secret")
+
+    lease = owner.begin_call()
+    monkeypatch.setattr(owner, "_calls_total", BrokenCounter())
+    lease.finish("drained")
+
+    values = _metric_map(owner)
+    assert _point(values[PREFIX + "calls.active"]).value == 0
+    assert _points(values[PREFIX + "sessions.duration"])[
+        (("session", "drained"),)
+    ].sum == 1.0
+    assert owner.failure_code == "metrics_record_failed"
+    owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_two_in_memory_owners_are_local_and_leave_globals_unchanged() -> None:
     meter_global = global_metrics.get_meter_provider()

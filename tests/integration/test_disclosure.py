@@ -17,6 +17,7 @@ from pipecat.transports.websocket.fastapi import (
 )
 from starlette.websockets import WebSocket, WebSocketState
 
+from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
@@ -85,13 +86,18 @@ class _Recording:
 
 
 def _identity(call_int: int = 1) -> object:
+    generation = UUID(int=call_int)
     return session_module.CallIdentity(
         call_id=UUID(int=call_int),
-        durable_generation=f"generation-{call_int}",
-        lease_identity=f"lease-{call_int}",
-        lease_claim=object(),
+        generation=CallGenerationHandle(f"call-control-{call_int}", generation),
+        lease_claim=ProcessLeaseClaim(
+            call_control_id=f"call-control-{call_int}",
+            call_id=UUID(int=call_int),
+            generation=generation,
+            token_digest=bytes([call_int]) * 32,
+            claimed_at=NOW,
+        ),
         deployment_id=f"deployment-{call_int}",
-        registry_handle=f"registry-{call_int}",
         telnyx_call_control_id=f"call-control-{call_int}",
         telnyx_call_leg_id=f"call-leg-{call_int}",
         telnyx_call_session_id=f"call-session-{call_int}",

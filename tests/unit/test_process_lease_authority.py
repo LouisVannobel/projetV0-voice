@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import dataclasses
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -81,6 +82,7 @@ def _registry(
     background_task_factory: Any = None,
     capacity: int = 1,
     token_factory: Any = None,
+    prefix_factory: Any = lambda: 0,
 ) -> Any:
     from projetv0_voice.admission import CallRegistry
 
@@ -116,9 +118,75 @@ def _registry(
         utcnow=utcnow,
         monotonic=clock,
         token_factory=selected_token_factory,
+        prefix_factory=prefix_factory,
         uuid_factory=lambda: next(ids),
         **kwargs,
     )
+
+
+def _encoded_call_id(prefix: int, counter: int) -> UUID:
+    payload = (prefix << 32) | counter
+    high48 = payload >> 74
+    mid12 = (payload >> 62) & ((1 << 12) - 1)
+    low62 = payload & ((1 << 62) - 1)
+    return UUID(
+        int=(high48 << 80) | (4 << 76) | (mid12 << 64) | (0b10 << 62) | low62
+    )
+
+
+def test_process_call_id_allocator_encodes_boundaries_and_exhausts_permanently() -> None:
+    from projetv0_voice.admission import _ProcessCallIdAllocator
+
+    prefix = (1 << 90) - 1
+    allocator = _ProcessCallIdAllocator(prefix_factory=lambda: prefix)
+
+    first = allocator.next()
+    assert first == _encoded_call_id(prefix, 0)
+    assert (first.version, first.variant) == (4, "specified in RFC 4122")
+
+    allocator._counter = (1 << 32) - 1  # noqa: SLF001
+    last = allocator.next()
+    assert last == _encoded_call_id(prefix, (1 << 32) - 1)
+    with pytest.raises(RuntimeError, match="^call_identifier_exhausted$") as raised:
+        allocator.next()
+    assert raised.value.__cause__ is None
+    with pytest.raises(RuntimeError, match="^call_identifier_exhausted$"):
+        allocator.next()
+    assert repr(allocator) == "ProcessCallIdAllocator()"
+    assert not hasattr(allocator, "__dict__")
+    assert allocator.__slots__ == ("_counter", "_prefix")
+
+
+def test_process_call_id_allocator_prefixes_are_disjoint() -> None:
+    from projetv0_voice.admission import _ProcessCallIdAllocator
+
+    first = _ProcessCallIdAllocator(prefix_factory=lambda: 1)
+    second = _ProcessCallIdAllocator(prefix_factory=lambda: 2)
+
+    assert {first.next(), first.next()}.isdisjoint({second.next(), second.next()})
+
+
+@pytest.mark.asyncio
+async def test_failed_entry_construction_burns_allocated_call_identifier() -> None:
+    writer = Writer()
+    token_results = iter(("invalid", "A" * 43))
+    registry = _registry(
+        writer,
+        CallControl(),
+        lambda: 100.0,
+        token_factory=lambda _size: next(token_results),
+        prefix_factory=lambda: 7,
+    )
+
+    with pytest.raises(Exception, match="stream_token_invalid"):
+        await registry.resolve_webhook(_event("call.initiated", "failed"))
+    resolution = await registry.resolve_webhook(
+        _event("call.initiated", "success")
+    )
+
+    assert resolution.effect is not None
+    assert resolution.effect.lease is not None
+    assert resolution.effect.lease["call_id"] == _encoded_call_id(7, 1)
 
 
 async def _durable_waiting_wss(registry: Any) -> None:
@@ -164,6 +232,274 @@ async def _durable_waiting_wss_for(
     await registry.reconcile_after_commit(
         answered, resolution, WebhookCommitResult("first", "applied")
     )
+
+
+class _ConstructionOwner:
+    def __init__(self) -> None:
+        self.causes: list[str] = []
+        self.closed = asyncio.Event()
+
+    def request_drain(self, cause: str) -> None:
+        self.causes.append(cause)
+
+    async def wait(self) -> None:
+        await self.closed.wait()
+
+
+class _WaitBarrierEvent(asyncio.Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_entered = asyncio.Event()
+
+    async def wait(self) -> bool:
+        self.wait_entered.set()
+        return await super().wait()
+
+
+async def _blocked_owner_task(release: asyncio.Event) -> None:
+    await release.wait()
+
+
+@pytest.mark.asyncio
+async def test_atomic_consume_publishes_exact_immutable_claim_time_grant_once() -> None:
+    from projetv0_voice.admission import (
+        CallGenerationHandle,
+        ProcessLeaseAuthority,
+    )
+
+    wall_clock = NOW
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0, utcnow=lambda: wall_clock)
+    await _durable_waiting_wss(registry)
+    wall_clock = NOW.replace(minute=7)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    wall_clock = NOW.replace(hour=12)
+    release = asyncio.Event()
+    tasks = [
+        asyncio.create_task(_blocked_owner_task(release), name=f"candidate-{index}")
+        for index in range(10)
+    ]
+    owners = [_ConstructionOwner() for _ in tasks]
+    try:
+        grants = await asyncio.gather(
+            *(
+                registry.consume_claim_for_construction(
+                    claim,
+                    "stream-exact",
+                    owner,
+                    task,
+                )
+                for owner, task in zip(owners, tasks, strict=True)
+            )
+        )
+        winners = [grant for grant in grants if grant is not None]
+        assert len(winners) == 1
+        grant = winners[0]
+        assert grant.call_id == claim.call_id
+        assert isinstance(grant.generation, CallGenerationHandle)
+        assert grant.lease_claim is claim
+        assert grant.deployment_id == "agent-a"
+        assert grant.telnyx_call_control_id == "control-a"
+        assert grant.telnyx_call_leg_id == "leg-a"
+        assert grant.telnyx_call_session_id == "session-a"
+        assert grant.stream_id == "stream-exact"
+        assert grant.started_at == NOW.replace(minute=7)
+        assert grant.retention_until == NOW.replace(minute=7) + timedelta(days=7)
+        assert repr(grant) == "CallConstructionGrant()"
+        assert not hasattr(grant, "__dict__")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            grant.stream_id = "changed"
+        with pytest.raises(
+            ValueError, match="^call_construction_grant_invalid$"
+        ):
+            dataclasses.replace(grant, deployment_id="")
+        with pytest.raises(
+            ValueError, match="^call_construction_grant_invalid$"
+        ):
+            dataclasses.replace(
+                grant,
+                generation=CallGenerationHandle(
+                    "control-a",
+                    UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+                ),
+            )
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_consume_requires_open_registration_live_deadline_and_retained_task() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    now = 100.0
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: now)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    release = asyncio.Event()
+    done_task = asyncio.create_task(asyncio.sleep(0))
+    await done_task
+    live_task = asyncio.create_task(_blocked_owner_task(release))
+    try:
+        assert (
+            await registry.consume_claim_for_construction(
+                claim, "stream-a", owner, done_task
+            )
+            is None
+        )
+        now = 130.0
+        assert (
+            await registry.consume_claim_for_construction(
+                claim, "stream-a", owner, live_task
+            )
+            is None
+        )
+        now = 129.999
+        await registry.close_session_owner_registration()
+        assert (
+            await registry.consume_claim_for_construction(
+                claim, "stream-a", owner, live_task
+            )
+            is None
+        )
+    finally:
+        release.set()
+        await live_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "commit_result",
+    [
+        WebhookCommitResult("first", "applied"),
+        WebhookCommitResult("duplicate", "duplicate"),
+    ],
+)
+async def test_provider_pending_commit_precedes_freeze_and_owns_external_completion(
+    commit_result: WebhookCommitResult,
+) -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    start_owner = asyncio.Event()
+    authority_ready = asyncio.Event()
+    authority_box: list[object] = []
+
+    async def owner_flow() -> None:
+        await start_owner.wait()
+        task = asyncio.current_task()
+        assert task is not None
+        authority = await registry.reserve_or_read_terminal(
+            grant,
+            owner,
+            task,
+            TerminalProposal(
+                status="failed",
+                reason="session_construction_failed",
+                metric_class="failed",
+                cleanup_hangup=True,
+            ),
+        )
+        authority_box.append(authority)
+        authority_ready.set()
+
+    owner_task = asyncio.create_task(owner_flow())
+    grant = await registry.consume_claim_for_construction(
+        claim, "stream-a", owner, owner_task
+    )
+    assert grant is not None
+    hangup = _event("call.hangup", "hangup-a")
+    resolution = await registry.resolve_webhook(hangup)
+    assert resolution.reservation is not None
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    barrier = _WaitBarrierEvent()
+    entry.terminal_settled_event = barrier
+
+    start_owner.set()
+    await barrier.wait_entered.wait()
+    assert authority_ready.is_set() is False
+    await resolution.reservation.confirm(commit_result)
+    await authority_ready.wait()
+    await owner_task
+
+    authority = authority_box[0]
+    assert repr(authority) == "TerminalAuthority()"
+    assert authority.status == "closed"
+    assert authority.reason == "telnyx_hangup"
+    assert authority.metric_class == "closed"
+    assert authority.persist_call is False
+    assert authority.persist_lease is False
+    assert authority.cleanup_hangup is False
+    assert await registry.complete_reserved_terminal(authority) is True
+    assert await registry.snapshot("control-a") is None
+    assert control.hangups == []
+
+
+@pytest.mark.asyncio
+async def test_local_terminal_authority_is_first_writer_and_completes_fixed_work_once() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    start_owner = asyncio.Event()
+    completion_box: list[bool] = []
+
+    async def owner_flow() -> None:
+        await start_owner.wait()
+        task = asyncio.current_task()
+        assert task is not None
+        authority = await registry.reserve_or_read_terminal(
+            grant,
+            owner,
+            task,
+            TerminalProposal(
+                status="failed",
+                reason="session_construction_failed",
+                metric_class="failed",
+                cleanup_hangup=True,
+            ),
+        )
+        assert authority.persist_call is True
+        assert authority.persist_lease is True
+        assert authority.cleanup_hangup is True
+        completion_box.append(await registry.complete_reserved_terminal(authority))
+
+    owner_task = asyncio.create_task(owner_flow())
+    grant = await registry.consume_claim_for_construction(
+        claim, "stream-a", owner, owner_task
+    )
+    assert grant is not None
+    start_owner.set()
+    await owner_task
+
+    assert completion_box == [True]
+    assert [commit["state"] for commit in writer.commits] == ["active", "terminal"]
+    assert len(control.hangups) == 1
+    assert await registry.complete_reserved_terminal(object()) is False
+    assert await registry.snapshot("control-a") is None
 
 
 @pytest.mark.asyncio

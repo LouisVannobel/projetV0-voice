@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -96,14 +97,41 @@ def _nonnegative_integer(value: object) -> int | None:
     return value if type(value) is int and 0 <= value <= _MAX_OTLP_INT else None
 
 
+class _CallMetricLease:
+    """Single-finish owner for one call's active, total, and duration metrics."""
+
+    __slots__ = ("_finished", "_owner", "_started_at")
+
+    def __init__(self, owner: RuntimeMetrics, started_at: float | None) -> None:
+        self._owner = owner
+        self._started_at = started_at
+        self._finished = False
+
+    def __repr__(self) -> str:
+        return "CallMetricLease()"
+
+    def finish(self, metric_class: object) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._owner._finish_call_metric(self._started_at, metric_class)  # noqa: SLF001
+
+
 class RuntimeMetrics:
     """Own one local meter provider and a closed set of voice metrics."""
 
-    def __init__(self, *, provider: Any, metric_reader: Any) -> None:
+    def __init__(
+        self,
+        *,
+        provider: Any,
+        metric_reader: Any,
+        monotonic: Callable[[], object] = time.monotonic,
+    ) -> None:
         self._provider = provider
         self._metric_reader = metric_reader
         self._failure_code: str | None = None
         self._shutdown_task: asyncio.Task[None] | None = None
+        self._monotonic = monotonic
 
         self._writer_queue_depth_value = 0
         self._writer_queue_oldest_age_value = 0.0
@@ -200,7 +228,11 @@ class RuntimeMetrics:
         )
 
     @classmethod
-    def in_memory(cls) -> RuntimeMetrics:
+    def in_memory(
+        cls,
+        *,
+        monotonic: Callable[[], object] = time.monotonic,
+    ) -> RuntimeMetrics:
         """Create an independent local owner without an export thread."""
 
         reader = InMemoryMetricReader()
@@ -210,7 +242,7 @@ class RuntimeMetrics:
             exemplar_filter=AlwaysOffExemplarFilter(),
             shutdown_on_exit=False,
         )
-        return cls(provider=provider, metric_reader=reader)
+        return cls(provider=provider, metric_reader=reader, monotonic=monotonic)
 
     @classmethod
     def production(cls, token: ObservabilityBootstrapToken) -> RuntimeMetrics:
@@ -223,8 +255,18 @@ class RuntimeMetrics:
         return _build_production(token, endpoint=endpoint)
 
     @classmethod
-    def _from_provider(cls, provider: Any, metric_reader: Any) -> RuntimeMetrics:
-        return cls(provider=provider, metric_reader=metric_reader)
+    def _from_provider(
+        cls,
+        provider: Any,
+        metric_reader: Any,
+        *,
+        monotonic: Callable[[], object] = time.monotonic,
+    ) -> RuntimeMetrics:
+        return cls(
+            provider=provider,
+            metric_reader=metric_reader,
+            monotonic=monotonic,
+        )
 
     @property
     def failure_code(self) -> str | None:
@@ -235,6 +277,43 @@ class RuntimeMetrics:
             self._latch_failure()
             return
         self._add(self._admission_rejections, {"reason": reason})
+
+    def begin_call(self) -> _CallMetricLease:
+        """Begin one call without letting metric or clock faults escape."""
+
+        self._add_value(self._calls_active, 1, {})
+        return _CallMetricLease(self, self._sample_monotonic())
+
+    def _finish_call_metric(
+        self,
+        started_at: float | None,
+        metric_class: object,
+    ) -> None:
+        ended_at = self._sample_monotonic()
+        self._add_value(self._calls_active, -1, {})
+        if not _closed(metric_class, _SESSIONS):
+            self._latch_failure()
+            return
+        attributes = {"session": metric_class}
+        self._add(self._calls_total, attributes)
+        if started_at is None or ended_at is None:
+            return
+        duration = ended_at - started_at
+        if not math.isfinite(duration) or duration < 0:
+            self._latch_failure()
+            return
+        self._record(self._sessions_duration, duration, attributes)
+
+    def _sample_monotonic(self) -> float | None:
+        try:
+            sample = self._monotonic()
+        except BaseException:
+            self._latch_failure()
+            return None
+        value = _nonnegative_number(sample)
+        if value is None:
+            self._latch_failure()
+        return value
 
     def record_webhook(
         self,
@@ -384,9 +463,17 @@ class RuntimeMetrics:
             raise RuntimeError("metrics_shutdown_failed") from None
 
     def _add(self, instrument: Any, attributes: dict[str, object]) -> None:
+        self._add_value(instrument, 1, attributes)
+
+    def _add_value(
+        self,
+        instrument: Any,
+        value: int,
+        attributes: dict[str, object],
+    ) -> None:
         try:
-            instrument.add(1, attributes)
-        except Exception:
+            instrument.add(value, attributes)
+        except BaseException:
             self._latch_failure()
 
     def _record(
@@ -397,7 +484,7 @@ class RuntimeMetrics:
     ) -> None:
         try:
             instrument.record(value, attributes)
-        except Exception:
+        except BaseException:
             self._latch_failure()
 
     def _latch_failure(self) -> None:

@@ -617,7 +617,7 @@ async def test_signed_initiated_flows_through_async_registry_and_postcommit_owne
     disposition = await processor.process(body=body, headers=headers)
     assert disposition.status_code == 200
     assert control.answers == [
-        ("control-a", UUID("22222222-2222-4222-8222-222222222222"))
+        ("control-a", UUID("11111111-1111-4111-8111-111111111111"))
     ]
     await writer.drain(2)
     await writer_task

@@ -14,6 +14,7 @@ from nacl.signing import SigningKey
 from pydantic import SecretStr
 
 import projetv0_voice.telnyx.call_control as call_control_module
+from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
@@ -49,13 +50,18 @@ KEY = bytes(range(32))
 
 
 def identity(call_control_id: str = "v3:control-1") -> CallIdentity:
+    generation = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     return CallIdentity(
         call_id=CALL_ID,
-        durable_generation="generation-ignored",
-        lease_identity="lease-ignored",
-        lease_claim=object(),
+        generation=CallGenerationHandle(call_control_id, generation),
+        lease_claim=ProcessLeaseClaim(
+            call_control_id=call_control_id,
+            call_id=CALL_ID,
+            generation=generation,
+            token_digest=b"d" * 32,
+            claimed_at=NOW,
+        ),
         deployment_id="agent-révision-7",
-        registry_handle=object(),
         telnyx_call_control_id=call_control_id,
         telnyx_call_leg_id="leg-1",
         telnyx_call_session_id="session-1",

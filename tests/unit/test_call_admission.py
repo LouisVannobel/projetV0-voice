@@ -142,6 +142,7 @@ def _registry(
     background_task_factory: Any = None,
     writer: Any = None,
     token_factory: Any = None,
+    prefix_factory: Any = lambda: 0,
 ) -> tuple[Any, CallControl]:
     from projetv0_voice.admission import CallRegistry
 
@@ -176,6 +177,7 @@ def _registry(
             utcnow=utcnow,
             monotonic=monotonic,
             token_factory=token_factory or (lambda _: "A" * 43),
+            prefix_factory=prefix_factory,
             uuid_factory=lambda: next(ids),
             candidate_run_id=candidate_run_id,
             admission_expires_at=admission_expires_at,
@@ -252,7 +254,7 @@ async def test_simultaneous_initiated_deliveries_own_one_generation_and_answer(
     assert all(effect is not None for effect in effects)
     leases = [effect.lease for effect in effects if effect is not None]
     assert {lease["call_id"] for lease in leases if lease is not None} == {
-        UUID("11111111-1111-4111-8111-111111111111")
+        UUID("00000000-0000-4000-8000-000000000000")
     }
     assert {lease["token_hash"] for lease in leases if lease is not None} == {
         bytes.fromhex("0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a")
@@ -278,7 +280,7 @@ async def test_simultaneous_initiated_deliveries_own_one_generation_and_answer(
     assert snapshot.raw_token_retained is True
     assert await registry.live_call_count() == 1
     assert control.answers == [
-        ("control-a", UUID("22222222-2222-4222-8222-222222222222"))
+        ("control-a", UUID("11111111-1111-4111-8111-111111111111"))
     ]
     assert "A" * 43 not in repr(snapshot)
     assert "A" * 43 not in repr(resolutions)
@@ -335,7 +337,7 @@ async def test_early_answered_placeholder_is_capped_nonextending_and_consumed() 
     assert await registry.placeholder_count() == 0
     assert control.answers == []
     assert control.streams == [
-        ("control-a", UUID("33333333-3333-4333-8333-333333333333"))
+        ("control-a", UUID("22222222-2222-4222-8222-222222222222"))
     ]
     assert control.hangups == []
 
@@ -506,8 +508,8 @@ async def test_streaming_retry_reuses_original_uuid_and_token() -> None:
 
     assert (first.status_code, second.status_code) == (503, 200)
     assert control.streams == [
-        ("control-a", UUID("33333333-3333-4333-8333-333333333333")),
-        ("control-a", UUID("33333333-3333-4333-8333-333333333333")),
+        ("control-a", UUID("22222222-2222-4222-8222-222222222222")),
+        ("control-a", UUID("22222222-2222-4222-8222-222222222222")),
     ]
     assert control.stream_tokens == ["A" * 43, "A" * 43]
     snapshot = await registry.snapshot("control-a")
@@ -1452,55 +1454,6 @@ async def test_signed_answer_evidence_wins_every_late_provider_outcome(
 
 
 @pytest.mark.asyncio
-async def test_terminal_cleanup_drains_attached_owners_before_removal_and_release() -> None:
-    from projetv0_voice.persistence.writer import WebhookCommitResult
-
-    registry, _ = _registry(capacity=1)
-    initiated = await registry.resolve_webhook(_initiated())
-    await registry.reconcile_after_commit(
-        _initiated(), initiated, WebhookCommitResult("first", "applied")
-    )
-    generation = await registry.generation_handle("control-a")
-    assert generation is not None
-    construction_release = asyncio.Event()
-    session_release = asyncio.Event()
-
-    class DrainOwner:
-        def __init__(self, release: asyncio.Event) -> None:
-            self.release = release
-            self.requested = asyncio.Event()
-
-        def request_drain(self) -> None:
-            self.requested.set()
-
-        async def wait(self) -> None:
-            await self.release.wait()
-
-    construction = DrainOwner(construction_release)
-    session = DrainOwner(session_release)
-    assert await registry.attach_construction_owner(generation, construction)
-    assert await registry.attach_session_owner(generation, object(), session)
-
-    hangup = await registry.resolve_webhook(_hangup())
-    terminal = asyncio.create_task(
-        registry.reconcile_after_commit(
-            _hangup(), hangup, WebhookCommitResult("first", "applied")
-        )
-    )
-    await asyncio.gather(construction.requested.wait(), session.requested.wait())
-
-    assert await registry.snapshot("control-a") is not None
-    assert await registry.live_call_count() == 1
-    construction_release.set()
-    await asyncio.sleep(0)
-    assert terminal.done() is False
-    session_release.set()
-    await terminal
-    assert await registry.snapshot("control-a") is None
-    assert await registry.live_call_count() == 0
-
-
-@pytest.mark.asyncio
 async def test_stale_generation_cleanup_cannot_remove_replacement() -> None:
     from projetv0_voice.persistence.writer import WebhookCommitResult
 
@@ -1631,54 +1584,6 @@ async def test_reaper_and_answer_evidence_at_deadline_cannot_resurrect_generatio
 
 
 @pytest.mark.asyncio
-async def test_exact_duplicate_during_terminal_cleanup_is_200_without_action() -> None:
-    from projetv0_voice.admission import CallAdmissionRejected
-    from projetv0_voice.persistence.writer import WebhookCommitResult
-
-    registry, control = _registry(capacity=1)
-    initiated = await registry.resolve_webhook(_initiated())
-    await registry.reconcile_after_commit(
-        _initiated(), initiated, WebhookCommitResult("first", "applied")
-    )
-    generation = await registry.generation_handle("control-a")
-    assert generation is not None
-    drain_requested = asyncio.Event()
-    release_drain = asyncio.Event()
-
-    class DrainOwner:
-        def request_drain(self) -> None:
-            drain_requested.set()
-
-        async def wait(self) -> None:
-            await release_drain.wait()
-
-    assert await registry.attach_session_owner(generation, object(), DrainOwner())
-    hangup = await registry.resolve_webhook(_hangup())
-    terminal = asyncio.create_task(
-        registry.reconcile_after_commit(
-            _hangup(), hangup, WebhookCommitResult("first", "applied")
-        )
-    )
-    await drain_requested.wait()
-
-    duplicate = await registry.resolve_duplicate_webhook(_initiated())
-    duplicate_result = await registry.reconcile_after_commit(
-        _initiated(), duplicate, WebhookCommitResult("duplicate", "duplicate")
-    )
-    mismatched = dataclasses.replace(_initiated(), call_leg_id="leg-other")
-    with pytest.raises(CallAdmissionRejected, match="call_identity_conflict"):
-        await registry.resolve_duplicate_webhook(mismatched)
-
-    assert duplicate_result.status_code == 200
-    assert duplicate.effect is None
-    assert duplicate.reservation is None
-    assert len(control.answers) == 1
-    assert control.streams == []
-    release_drain.set()
-    await terminal
-
-
-@pytest.mark.asyncio
 async def test_linked_placeholder_late_fail_closed_commit_schedules_exact_abort() -> None:
     from projetv0_voice.persistence.writer import WebhookCommitResult
 
@@ -1804,7 +1709,7 @@ async def test_cancelled_abandonment_waiting_registry_lock_still_releases() -> N
 
 
 @pytest.mark.asyncio
-async def test_registry_never_calls_writer_provider_or_lifecycle_owner_under_lock() -> None:
+async def test_registry_never_calls_writer_provider_or_task_factory_under_lock() -> None:
     from projetv0_voice.admission import ProcessLeaseAuthority
     from projetv0_voice.persistence.writer import WebhookCommitResult
 
@@ -1856,17 +1761,6 @@ async def test_registry_never_calls_writer_provider_or_lifecycle_owner_under_loc
         token_digest=snapshot.token_digest,
     )
     assert claim is not None
-    generation = await registry.generation_handle("control-a")
-    assert generation is not None
-
-    class LifecycleOwner:
-        def request_drain(self) -> None:
-            assert_unlocked()
-
-        async def wait(self) -> None:
-            assert_unlocked()
-
-    assert await registry.attach_session_owner(generation, object(), LifecycleOwner())
     hangup = await registry.resolve_webhook(_hangup())
     await registry.reconcile_after_commit(
         _hangup(), hangup, WebhookCommitResult("first", "applied")

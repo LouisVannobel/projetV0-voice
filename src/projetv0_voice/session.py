@@ -20,9 +20,15 @@ from pipecat.frames.frames import ErrorFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.admission import (
+    CallGenerationHandle,
+    ProcessLeaseClaim,
+    TerminalAuthority,
+    TerminalProposal,
+)
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.metrics import RuntimeMetrics
+from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.pipeline import (
@@ -73,11 +79,9 @@ class RecordingStartResult:
 @dataclass(frozen=True, slots=True)
 class CallIdentity:
     call_id: UUID = field(repr=False)
-    durable_generation: str = field(repr=False)
-    lease_identity: str = field(repr=False)
-    lease_claim: object = field(repr=False)
-    deployment_id: str
-    registry_handle: object = field(repr=False)
+    generation: CallGenerationHandle = field(repr=False)
+    lease_claim: ProcessLeaseClaim = field(repr=False)
+    deployment_id: str = field(repr=False)
     telnyx_call_control_id: str = field(repr=False)
     telnyx_call_leg_id: str | None = field(repr=False)
     telnyx_call_session_id: str | None = field(repr=False)
@@ -86,16 +90,24 @@ class CallIdentity:
     retention_until: datetime
 
     def __post_init__(self) -> None:
-        required_text = (
-            self.durable_generation,
-            self.lease_identity,
-            self.deployment_id,
-            self.telnyx_call_control_id,
-            self.stream_id,
-        )
+        required_text = (self.deployment_id, self.telnyx_call_control_id, self.stream_id)
         if (
             not isinstance(self.call_id, UUID)
+            or not isinstance(self.generation, CallGenerationHandle)
+            or not isinstance(self.lease_claim, ProcessLeaseClaim)
+            or self.generation.call_control_id != self.telnyx_call_control_id
+            or self.generation.generation != self.lease_claim.generation
+            or self.lease_claim.call_control_id != self.telnyx_call_control_id
+            or self.lease_claim.call_id != self.call_id
+            or self.lease_claim.claimed_at != self.started_at
             or any(not isinstance(value, str) or not value for value in required_text)
+            or self.telnyx_call_leg_id is not None
+            and (type(self.telnyx_call_leg_id) is not str or not self.telnyx_call_leg_id)
+            or self.telnyx_call_session_id is not None
+            and (
+                type(self.telnyx_call_session_id) is not str
+                or not self.telnyx_call_session_id
+            )
             or self.started_at.tzinfo is None
             or self.started_at.utcoffset() is None
             or self.retention_until.tzinfo is None
@@ -105,7 +117,7 @@ class CallIdentity:
             raise ValueError("call_identity_invalid")
 
     def __repr__(self) -> str:
-        return f"CallIdentity(deployment_id={self.deployment_id!r})"
+        return "CallIdentity()"
 
 
 class ControlWriter(Protocol):
@@ -384,6 +396,17 @@ class LeaseTerminalizer(Protocol):
     ) -> None: ...
 
 
+class RegistryTerminalizer(Protocol):
+    async def reserve_or_read(
+        self,
+        proposed: TerminalProposal,
+    ) -> TerminalAuthority: ...
+
+    async def complete(self, authority: TerminalAuthority) -> bool: ...
+
+    def note_failure(self, code: str) -> None: ...
+
+
 class SessionWriter(ControlWriter, TurnWriter, Protocol):
     fatal_event: asyncio.Event
 
@@ -421,6 +444,16 @@ class _TerminalOutcome:
         if self._frozen is None and self._reason == "closed":
             self._reason = "external_cancel"
 
+    def note_runtime_reason(self, reason: str | None) -> None:
+        if self._frozen is None and self._reason == "closed" and reason is not None:
+            self._reason = reason
+
+    def request_reason(self, reason: str) -> None:
+        if self._frozen is None and (
+            reason == "recording_required_error" or self._reason == "closed"
+        ):
+            self._reason = reason
+
     def promote_failure(self, code: str | None) -> None:
         if self._frozen is None and self._reason == "closed" and code is not None:
             self._reason = code
@@ -431,6 +464,16 @@ class _TerminalOutcome:
                 status="closed" if self._reason == "closed" else "failed",
                 reason=self._reason,
             )
+        return self._frozen
+
+    def freeze_authoritative(
+        self,
+        *,
+        status: Literal["closed", "failed"],
+        reason: str,
+    ) -> _FrozenTerminalOutcome:
+        if self._frozen is None:
+            self._frozen = _FrozenTerminalOutcome(status=status, reason=reason)
         return self._frozen
 
 
@@ -474,6 +517,8 @@ class CallSession:
         keyring: CryptoKeyring,
         recording: RecordingBoundary,
         lease_terminalizer: LeaseTerminalizer,
+        registry_terminalizer: RegistryTerminalizer | None = None,
+        metric_lease: _CallMetricLease | None = None,
         runtime_metrics: RuntimeMetrics,
         observers: _CallObservers,
         idle_timeout_seconds: float,
@@ -514,6 +559,8 @@ class CallSession:
         self._keyring = keyring
         self._recording = recording
         self._lease_terminalizer = lease_terminalizer
+        self._registry_terminalizer = registry_terminalizer
+        self._metric_lease = metric_lease
         self._runtime_metrics = runtime_metrics
         self._observers = observers
         self._idle_timeout_seconds = float(idle_timeout_seconds)
@@ -526,6 +573,7 @@ class CallSession:
         self._drain_requested = False
         self._drain_claimed = False
         self._drain_lock = asyncio.Lock()
+        self._terminal_outcome = _TerminalOutcome("closed")
 
     async def run(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if self._run_started:
@@ -632,7 +680,8 @@ class CallSession:
         except Exception:
             reason = first_failure.code or "call_failed"
             first_failure.signal(reason)
-        terminal_outcome = _TerminalOutcome(reason or "closed")
+        terminal_outcome = self._terminal_outcome
+        terminal_outcome.note_runtime_reason(reason)
         cleanup = self._cleanup_owned_state(
             controller=controller,
             recorder=recorder,
@@ -660,8 +709,19 @@ class CallSession:
         if final_error is not None:
             raise CallSessionError(final_error)
 
-    async def request_drain(self) -> None:
+    async def request_drain(self, reason: str | None = None) -> None:
         """End the active per-call runner through its public cancellation surface."""
+
+        if reason is not None:
+            if type(reason) is not str or reason not in {
+                "recording_required_error",
+                "process_draining",
+                "external_cancel",
+                "token_deadline",
+                "session_construction_failed",
+            }:
+                raise ValueError("call_drain_reason_invalid") from None
+            self._terminal_outcome.request_reason(reason)
 
         runner: WorkerRunner | None = None
         async with self._drain_lock:
@@ -671,6 +731,42 @@ class CallSession:
                 runner = self._active_runner
         if runner is not None:
             await runner.cancel(reason="drain")
+
+    async def aclose_unstarted(self) -> None:
+        """Close transferred resources and terminalize before `run` starts."""
+
+        if self._run_started:
+            return
+        self._run_started = True
+        first_failure = FirstFailure(shared_failure_event=self._writer.fatal_event)
+        terminal_outcome = self._terminal_outcome
+        terminal_outcome.note_runtime_reason("session_construction_failed")
+        processors = (self._services.tts, self._services.llm, self._services.stt)
+        for processor in processors:
+            await self._attempt(
+                processor.cleanup,
+                first_failure,
+                "pipeline_cleanup_failed",
+            )
+        await self._attempt(
+            lambda: self._recording.cleanup(
+                self._identity,
+                recording_may_be_active=False,
+                reason=terminal_outcome.reason,
+            ),
+            first_failure,
+            "recording_cleanup_failed",
+        )
+        await self._attempt(
+            self._services.aclose,
+            first_failure,
+            "service_close_failed",
+        )
+        await self._finish_durable_boundaries(
+            first_failure=first_failure,
+            terminal_outcome=terminal_outcome,
+            disclosure_completed=False,
+        )
 
     async def _replay_pending_drain(self) -> None:
         runner: WorkerRunner | None = None
@@ -936,6 +1032,35 @@ class CallSession:
         disclosure_completed: bool,
     ) -> None:
         self._promote_cleanup_failure(terminal_outcome, first_failure)
+        if (
+            self._registry_terminalizer is not None
+            and self._metric_lease is not None
+        ):
+            proposed = self._terminal_proposal(terminal_outcome.reason)
+            authority = await self._registry_terminalizer.reserve_or_read(proposed)
+            frozen = terminal_outcome.freeze_authoritative(
+                status=authority.status,
+                reason=authority.reason,
+            )
+            self._metric_lease.finish(authority.metric_class)
+            if authority.persist_call and not self._writer.fatal_event.is_set():
+                await self._attempt(
+                    lambda: self._commit_terminal_call(
+                        status=frozen.status,
+                        reason=frozen.reason,
+                        disclosure_completed=disclosure_completed,
+                        operation_id=authority.completion_token,
+                        ended_at=authority._closed_at,  # noqa: SLF001
+                    ),
+                    first_failure,
+                    "persistence_failed",
+                )
+                if first_failure.code == "persistence_failed":
+                    self._registry_terminalizer.note_failure(
+                        "terminal_persistence_failed"
+                    )
+            await self._registry_terminalizer.complete(authority)
+            return
         frozen = terminal_outcome.freeze()
         if not self._writer.fatal_event.is_set():
             await self._attempt(
@@ -958,6 +1083,29 @@ class CallSession:
         )
 
     @staticmethod
+    def _terminal_proposal(reason: str) -> TerminalProposal:
+        if reason == "recording_required_error":
+            return TerminalProposal(
+                status="failed",
+                reason=reason,
+                metric_class="failed",
+                cleanup_hangup=False,
+            )
+        if reason == "process_draining":
+            return TerminalProposal(
+                status="closed",
+                reason=reason,
+                metric_class="drained",
+                cleanup_hangup=True,
+            )
+        return TerminalProposal(
+            status="closed" if reason == "closed" else "failed",
+            reason=reason,
+            metric_class="closed" if reason == "closed" else "failed",
+            cleanup_hangup=True,
+        )
+
+    @staticmethod
     def _promote_cleanup_failure(
         terminal_outcome: _TerminalOutcome,
         first_failure: FirstFailure,
@@ -970,14 +1118,20 @@ class CallSession:
         status: Literal["closed", "failed"],
         reason: str,
         disclosure_completed: bool,
+        operation_id: UUID | None = None,
+        ended_at: datetime | None = None,
     ) -> None:
-        ended_at = self._utcnow().astimezone(UTC)
+        terminal_at = (
+            self._utcnow().astimezone(UTC)
+            if ended_at is None
+            else ended_at.astimezone(UTC)
+        )
         operation = VoiceOperationV1(
             schema_version=1,
-            operation_id=self._uuid_factory(),
+            operation_id=operation_id or self._uuid_factory(),
             deployment_id=self._identity.deployment_id,
             call_id=self._identity.call_id,
-            occurred_at=ended_at,
+            occurred_at=terminal_at,
             kind="call.upsert",
             payload=CallUpsertPayloadV1(
                 telnyx_call_control_id=self._identity.telnyx_call_control_id,
@@ -986,7 +1140,7 @@ class CallSession:
                 status=status,
                 disclosure_state="completed" if disclosure_completed else "failed",
                 started_at=self._identity.started_at,
-                ended_at=ended_at,
+                ended_at=terminal_at,
                 end_reason=reason,
                 retention_until=self._identity.retention_until,
             ),

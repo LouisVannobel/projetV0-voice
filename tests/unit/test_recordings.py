@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.models import RecordingUpsertPayloadV1
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.persistence.postgres_sink import (
@@ -64,13 +65,18 @@ _DEFAULT_CLIENT_STATE = object()
 
 
 def identity(**updates: object) -> CallIdentity:
+    generation = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     values: dict[str, object] = {
         "call_id": CALL_ID,
-        "durable_generation": "generation-ignored",
-        "lease_identity": "lease-ignored",
-        "lease_claim": object(),
+        "generation": CallGenerationHandle(CALL_CONTROL_ID, generation),
+        "lease_claim": ProcessLeaseClaim(
+            call_control_id=CALL_CONTROL_ID,
+            call_id=CALL_ID,
+            generation=generation,
+            token_digest=b"d" * 32,
+            claimed_at=NOW,
+        ),
         "deployment_id": DEPLOYMENT_ID,
-        "registry_handle": object(),
         "telnyx_call_control_id": CALL_CONTROL_ID,
         "telnyx_call_leg_id": LEG_ID,
         "telnyx_call_session_id": SESSION_ID,
@@ -115,12 +121,17 @@ def test_recording_identity_action_and_capsule_golden_vectors_are_frozen() -> No
 
 def test_identity_excludes_mutable_call_runtime_values_and_actions_are_distinct() -> None:
     first = build_recording_correlation(identity(), retention_days=30, required=True)
+    changed_generation = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     changed = build_recording_correlation(
         identity(
-            durable_generation="changed-generation",
-            lease_identity="changed-lease",
-            lease_claim=object(),
-            registry_handle=object(),
+            generation=CallGenerationHandle(CALL_CONTROL_ID, changed_generation),
+            lease_claim=ProcessLeaseClaim(
+                call_control_id=CALL_CONTROL_ID,
+                call_id=CALL_ID,
+                generation=changed_generation,
+                token_digest=b"e" * 32,
+                claimed_at=NOW + timedelta(hours=1),
+            ),
             stream_id="changed-stream",
             started_at=NOW + timedelta(hours=1),
             retention_until=NOW + timedelta(days=90),
