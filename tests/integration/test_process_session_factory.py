@@ -348,6 +348,30 @@ class _RealWriter:
             if self.terminal_faults:
                 raise self.terminal_faults.pop(0)
 
+
+class _Task9SequencedWriter(_RealWriter):
+    def __init__(
+        self,
+        outcomes: list[BaseException | None],
+        *,
+        blocked_attempts: frozenset[int],
+    ) -> None:
+        super().__init__()
+        self.outcomes = outcomes
+        self.blocked_attempts = blocked_attempts
+        self.started = [asyncio.Event() for _ in outcomes]
+        self.releases = [asyncio.Event() for _ in outcomes]
+
+    async def commit_control(self, command: object) -> None:
+        index = len(self.control_commits)
+        self.control_commits.append(command)
+        self.started[index].set()
+        if index in self.blocked_attempts:
+            await self.releases[index].wait()
+        outcome = self.outcomes[index]
+        if outcome is not None:
+            raise outcome
+
     def try_enqueue_turn(self, _operation: object) -> bool:
         return True
 
@@ -1106,6 +1130,69 @@ async def test_unconsumed_task9_writer_failure_retains_authority_and_capacity() 
     assert registry.internal_failure_code == "terminal_persistence_failed"
     assert [commit["state"] for commit in writer.lease_commits] == ["active"]
     assert control.hangups == []
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordinary_failure", [False, True])
+async def test_task9_cancellation_rethrows_after_success_or_latched_failure(
+    ordinary_failure: bool,
+) -> None:
+    writer = _Task9SequencedWriter(
+        (
+            [None, RuntimeError("task9-retry-secret")]
+            if ordinary_failure
+            else [None, None, None]
+        ),
+        blocked_attempts=(
+            frozenset({0}) if ordinary_failure else frozenset({0, 1, 2})
+        ),
+    )
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory()
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=[],
+    )
+    draining = asyncio.create_task(
+        factory.drain_call_by_id(
+            claim.call_id,
+            "recording_required_error",
+        )
+    )
+    await writer.started[0].wait()
+    draining.cancel("task9-first-cancel")
+    await writer.started[1].wait()
+    if not ordinary_failure:
+        draining.cancel("task9-second-cancel")
+        await writer.started[2].wait()
+        writer.releases[2].set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await draining
+
+    assert cancelled.value.args == ("task9-first-cancel",)
+    operations = [
+        command.payload["operation"]  # type: ignore[union-attr]
+        for command in writer.control_commits
+    ]
+    assert len({operation.operation_id for operation in operations}) == 1
+    assert len({operation.occurred_at for operation in operations}) == 1
+    assert all(operation.payload == operations[0].payload for operation in operations)
+    assert control.hangups == []
+    if ordinary_failure:
+        assert registry.internal_failure_code == "terminal_persistence_failed"
+        assert await registry.snapshot("control-a") is not None
+        assert [commit["state"] for commit in writer.lease_commits] == ["active"]
+    else:
+        assert await registry.snapshot("control-a") is None
+        assert [commit["state"] for commit in writer.lease_commits] == [
+            "active",
+            "terminal",
+        ]
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 

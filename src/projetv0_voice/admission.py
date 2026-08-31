@@ -322,7 +322,7 @@ class CallReservation:
         "_generation",
         "_registry",
         "_registry_applied",
-        "_cancellation",
+        "_settlement_task",
         "_settled",
         "_terminal_occurred_at",
     )
@@ -345,7 +345,7 @@ class CallReservation:
         self._abandon_requested = False
         self._abandon_event = asyncio.Event()
         self._registry_applied = False
-        self._cancellation: asyncio.CancelledError | None = None
+        self._settlement_task: asyncio.Task[None] | None = None
 
     def __repr__(self) -> str:
         return "CallReservation()"
@@ -356,25 +356,34 @@ class CallReservation:
         self._abandon_requested = True
         self._abandon_event.set()
 
-    async def confirm(self, result: WebhookCommitValue) -> None:
+    async def confirm(
+        self,
+        result: WebhookCommitValue,
+    ) -> asyncio.CancelledError | None:
         if self._settled:
-            return
+            return None
         if self._event_type == "call.hangup":
-            settlement = asyncio.create_task(
-                self._registry._settle_reservation(self, result),
-                name="voice-provider-terminal-settlement",
-            )
+            settlement = self._settlement_task
+            if settlement is None:
+                settlement = asyncio.create_task(
+                    self._registry._settle_reservation(self, result),
+                    name="voice-provider-terminal-settlement",
+                )
+                self._settlement_task = settlement
+            cancellation: asyncio.CancelledError | None = None
             while not settlement.done():
                 try:
                     await asyncio.shield(settlement)
                 except asyncio.CancelledError as error:
-                    if self._cancellation is None:
-                        self._cancellation = error
+                    if cancellation is None:
+                        cancellation = error
             settlement.result()
         else:
             await self._registry._settle_reservation(self, result)
+            cancellation = None
         self._settled = True
         self._abandon_event.set()
+        return cancellation
 
     async def _run_abandonment(self) -> None:
         await self._abandon_event.wait()
@@ -898,6 +907,7 @@ class CallRegistry:
         self._permits_used = 0
         self._background_owner = _BackgroundTaskOwner(background_task_factory)
         self._session_owner_registration_open = True
+        self._session_close_task: asyncio.Task[None] | None = None
         self._internal_failure_code: str | None = None
 
     def __repr__(self) -> str:
@@ -1542,8 +1552,9 @@ class CallRegistry:
         from projetv0_voice.telnyx.webhooks import WebhookDisposition
 
         reservation = resolution.reservation
+        reservation_cancellation: asyncio.CancelledError | None = None
         if isinstance(reservation, CallReservation):
-            await reservation.confirm(result)
+            reservation_cancellation = await reservation.confirm(result)
         elif isinstance(reservation, _PlaceholderReservation):
             await reservation.confirm_fail_closed(result)
         if isinstance(result, QualificationRunConsumed):
@@ -1552,11 +1563,7 @@ class CallRegistry:
             if event.event_type == "call.hangup" and event.call_control_id is not None:
                 await self._finish_provider_terminal_envelope(
                     event.call_control_id,
-                    (
-                        reservation._cancellation
-                        if isinstance(reservation, CallReservation)
-                        else None
-                    ),
+                    reservation_cancellation,
                 )
             return WebhookDisposition(200)
         if event.call_control_id is None:
@@ -1593,11 +1600,7 @@ class CallRegistry:
         if event.event_type == "call.hangup":
             await self._finish_provider_terminal_envelope(
                 event.call_control_id,
-                (
-                    reservation._cancellation
-                    if isinstance(reservation, CallReservation)
-                    else None
-                ),
+                reservation_cancellation,
             )
             return WebhookDisposition(200)
         if event.event_type != "call.initiated":
@@ -2172,6 +2175,48 @@ class CallRegistry:
         return claim
 
     async def close_session_owner_registration(self) -> None:
+        cancellation: asyncio.CancelledError | None = None
+        close_task: asyncio.Task[None]
+        while True:
+            try:
+                async with self._lock:
+                    self._session_owner_registration_open = False
+                    retained = self._session_close_task
+                    if retained is None:
+                        coroutine = self._close_session_owner_registration_core()
+                        try:
+                            retained = asyncio.create_task(
+                                coroutine,
+                                name="voice-session-owner-close",
+                            )
+                        except BaseException:
+                            coroutine.close()
+                            raise
+                        self._session_close_task = retained
+                    close_task = retained
+                break
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+            except BaseException:
+                break
+        close_error: BaseException | None = None
+        try:
+            close_task.result()
+        except BaseException as error:
+            close_error = error
+        if cancellation is not None:
+            raise cancellation
+        if close_error is not None:
+            raise close_error
+
+    async def _close_session_owner_registration_core(self) -> None:
         authorities: list[TerminalAuthority] = []
         owners: list[_SessionLifecycleOwner] = []
         cancellation: asyncio.CancelledError | None = None
@@ -2270,6 +2315,10 @@ class CallRegistry:
                 )
                 if cancellation is None and persistence_cancellation is not None:
                     cancellation = persistence_cancellation
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+                continue
             except BaseException as error:
                 if failure is None:
                     failure = error
@@ -2328,6 +2377,8 @@ class CallRegistry:
                 continue
             except BaseException:
                 self._note_terminal_failure("terminal_persistence_failed")
+                if cancellation is not None:
+                    raise cancellation from None
                 raise RuntimeError("terminal_persistence_failed") from None
             return cancellation
 

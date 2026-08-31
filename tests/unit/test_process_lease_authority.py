@@ -268,6 +268,21 @@ class _WaitBarrierEvent(asyncio.Event):
         return await super().wait()
 
 
+class _TwoWaiterEvent(asyncio.Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiters = 0
+        self.first_waiter = asyncio.Event()
+        self.two_waiters = asyncio.Event()
+
+    async def wait(self) -> bool:
+        self.waiters += 1
+        self.first_waiter.set()
+        if self.waiters >= 2:
+            self.two_waiters.set()
+        return await super().wait()
+
+
 class _SecondAcquireBarrierLock:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -288,6 +303,69 @@ class _SecondAcquireBarrierLock:
 
     def locked(self) -> bool:
         return self._lock.locked()
+
+
+class _AcquireNoticeLock:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.entered = asyncio.Event()
+
+    async def __aenter__(self) -> _AcquireNoticeLock:
+        self.entered.set()
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+
+class _SequencedCloseWriter(Writer):
+    def __init__(
+        self,
+        outcomes: list[BaseException | None],
+        *,
+        blocked_attempts: frozenset[int] = frozenset(),
+    ) -> None:
+        super().__init__()
+        self.outcomes = outcomes
+        self.blocked_attempts = blocked_attempts
+        self.attempts: list[object] = []
+        self.started = [asyncio.Event() for _ in outcomes]
+        self.releases = [asyncio.Event() for _ in outcomes]
+
+    async def commit_control(self, command: object) -> None:
+        index = len(self.attempts)
+        self.attempts.append(command)
+        self.control_commits.append(command)
+        self.started[index].set()
+        if index in self.blocked_attempts:
+            await self.releases[index].wait()
+        outcome = self.outcomes[index]
+        if outcome is not None:
+            raise outcome
+
+
+class _BlockingHangupControl(CallControl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hangup_started = asyncio.Event()
+        self.hangup_release = asyncio.Event()
+
+    async def hangup(
+        self,
+        call_control_id: str,
+        *,
+        command_id: UUID,
+        client_state: object = None,
+    ) -> CallControlResult:
+        del client_state
+        self.hangups.append((call_control_id, command_id))
+        self.hangup_started.set()
+        await self.hangup_release.wait()
+        return CallControlResult("accepted")
 
 
 async def _blocked_owner_task(release: asyncio.Event) -> None:
@@ -1028,6 +1106,244 @@ async def test_process_close_waits_for_active_unconsumed_provider_pending_author
 
     assert waited_for_provider
     assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_close_cancel_then_retry_failure_preserves_first_cancel_and_fixed_work() -> None:
+    writer = _SequencedCloseWriter(
+        [
+            asyncio.CancelledError("writer-attempt-cancel"),
+            RuntimeError("writer-ordinary-secret"),
+        ],
+        blocked_attempts=frozenset({0}),
+    )
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    closing = asyncio.create_task(registry.close_session_owner_registration())
+    await writer.started[0].wait()
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    authority = entry.terminal_authority
+    assert authority is not None
+
+    closing.cancel("first-close-cancel")
+    writer.releases[0].set()
+    await writer.started[1].wait()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+
+    assert cancelled.value.args == ("first-close-cancel",)
+    assert len(writer.attempts) == 2
+    operations = [
+        command.payload["operation"]  # type: ignore[union-attr]
+        for command in writer.attempts
+    ]
+    assert operations[0].operation_id == operations[1].operation_id
+    assert operations[0].occurred_at == operations[1].occurred_at
+    assert operations[0].payload == operations[1].payload
+    assert operations[0].payload.retention_until == authority._entry.claimed_at + timedelta(days=7)  # noqa: SLF001
+    assert registry.internal_failure_code == "terminal_persistence_failed"
+    assert await registry.snapshot("control-a") is not None
+    assert await registry.live_call_count() == 1
+    assert [commit["state"] for commit in writer.commits] == ["active"]
+    assert control.hangups == []
+    close_task = getattr(registry, "_session_close_task", None)
+    assert close_task is not None
+    assert authority._completion_owner is close_task  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_closes_share_one_successful_fixed_work_barrier() -> None:
+    writer = _SequencedCloseWriter([None], blocked_attempts=frozenset({0}))
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    first = asyncio.create_task(registry.close_session_owner_registration())
+    await writer.started[0].wait()
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    authority = entry.terminal_authority
+    assert authority is not None
+    notice_lock = _AcquireNoticeLock()
+    registry._lock = notice_lock  # type: ignore[assignment]  # noqa: SLF001
+    second = asyncio.create_task(registry.close_session_owner_registration())
+    await notice_lock.entered.wait()
+    second_waited = not second.done()
+
+    writer.releases[0].set()
+    assert await asyncio.gather(first, second) == [None, None]
+
+    assert second_waited
+    close_task = getattr(registry, "_session_close_task", None)
+    assert close_task is not None
+    assert close_task.done()
+    assert authority._completion_owner is close_task  # noqa: SLF001
+    assert len(writer.attempts) == 1
+    assert [commit["state"] for commit in writer.commits] == ["active", "terminal"]
+    assert len(control.hangups) == 1
+    assert await registry.snapshot("control-a") is None
+    assert not any(
+        task is not asyncio.current_task()
+        and task.get_name() == "voice-session-owner-close"
+        and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_joiner_is_local_and_core_effects_remain_once() -> None:
+    writer = _SequencedCloseWriter([None], blocked_attempts=frozenset({0}))
+    control = _BlockingHangupControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    first = asyncio.create_task(registry.close_session_owner_registration())
+    await writer.started[0].wait()
+    notice_lock = _AcquireNoticeLock()
+    registry._lock = notice_lock  # type: ignore[assignment]  # noqa: SLF001
+    second = asyncio.create_task(registry.close_session_owner_registration())
+    await notice_lock.entered.wait()
+
+    second.cancel("joiner-first-cancel")
+    writer.releases[0].set()
+    await control.hangup_started.wait()
+    second.cancel("joiner-second-cancel")
+    control.hangup_release.set()
+    await first
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await second
+
+    assert cancelled.value.args == ("joiner-first-cancel",)
+    assert len(writer.attempts) == 1
+    assert [commit["state"] for commit in writer.commits] == ["active", "terminal"]
+    assert len(control.hangups) == 1
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_shared_close_failure_is_retained_without_sequential_restart() -> None:
+    writer = _SequencedCloseWriter(
+        [RuntimeError("close-persistence-secret")],
+        blocked_attempts=frozenset({0}),
+    )
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    first = asyncio.create_task(registry.close_session_owner_registration())
+    await writer.started[0].wait()
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    authority = entry.terminal_authority
+    assert authority is not None
+    token = authority.completion_token
+    closed_at = authority._closed_at  # noqa: SLF001
+    notice_lock = _AcquireNoticeLock()
+    registry._lock = notice_lock  # type: ignore[assignment]  # noqa: SLF001
+    second = asyncio.create_task(registry.close_session_owner_registration())
+    await notice_lock.entered.wait()
+    writer.releases[0].set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert all(isinstance(result, RuntimeError) for result in results)
+    assert all(str(result) == "terminal_persistence_failed" for result in results)
+    assert len(writer.attempts) == 1
+    with pytest.raises(RuntimeError, match="^terminal_persistence_failed$"):
+        await registry.close_session_owner_registration()
+    assert len(writer.attempts) == 1
+    retained = registry._by_control["control-a"].terminal_authority  # noqa: SLF001
+    assert retained is authority
+    assert retained.completion_token == token
+    assert retained._closed_at == closed_at  # noqa: SLF001
+    close_task = getattr(registry, "_session_close_task", None)
+    assert close_task is not None
+    assert authority._completion_owner is close_task  # noqa: SLF001
+    assert await registry.live_call_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_pending_two_closes_share_unique_provider_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    event = _event("call.hangup", "provider-pending-two-closes")
+    resolution = await registry.resolve_webhook(event)
+    assert resolution.reservation is not None
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    waiters = _TwoWaiterEvent()
+    entry.terminal_settled_event = waiters
+    settlement_entered = asyncio.Event()
+    settlement_release = asyncio.Event()
+    settle = registry._settle_reservation  # noqa: SLF001
+
+    async def block_settlement(*args: object) -> None:
+        settlement_entered.set()
+        await settlement_release.wait()
+        await settle(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry, "_settle_reservation", block_settlement)
+    provider = asyncio.create_task(
+        registry.reconcile_after_commit(
+            event,
+            resolution,
+            WebhookCommitResult("first", "applied"),
+        )
+    )
+    await settlement_entered.wait()
+    provider.cancel("provider-finalizer-cancel")
+    first_close = asyncio.create_task(registry.close_session_owner_registration())
+    second_close = asyncio.create_task(registry.close_session_owner_registration())
+    await waiters.first_waiter.wait()
+
+    settlement_release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await provider
+    await asyncio.gather(first_close, second_close)
+
+    assert cancelled.value.args == ("provider-finalizer-cancel",)
+    assert await registry.snapshot("control-a") is None
+    assert await registry.live_call_count() == 0
+    assert writer.control_commits == []
+    assert [commit["state"] for commit in writer.commits] == ["active"]
+    assert control.hangups == []
+    close_task = getattr(registry, "_session_close_task", None)
+    assert close_task is not None
+    assert close_task.done()
+    assert not any(
+        task is not asyncio.current_task()
+        and task.get_name()
+        in {"voice-provider-terminal-settlement", "voice-session-owner-close"}
+        and not task.done()
+        for task in asyncio.all_tasks()
+    )
 
 
 @pytest.mark.asyncio

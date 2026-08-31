@@ -375,9 +375,22 @@ class ProcessSessionFactory:
         authority = await self._registry.prepare_required_recording_drain(call_id)
         if authority is None:
             return
-        if not await self._persist_unconsumed_terminal(authority):
+        persisted, cancellation = await self._persist_unconsumed_terminal(authority)
+        if not persisted:
+            if cancellation is not None:
+                raise cancellation
             return
-        await self._registry.complete_reserved_terminal(authority)
+        try:
+            await self._registry.complete_reserved_terminal(authority)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+        if cancellation is not None:
+            raise cancellation
 
     async def _live(
         self,
@@ -618,7 +631,7 @@ class ProcessSessionFactory:
     async def _persist_unconsumed_terminal(
         self,
         authority: TerminalAuthority,
-    ) -> bool:
+    ) -> tuple[bool, asyncio.CancelledError | None]:
         entry = authority._entry  # noqa: SLF001
         started_at = entry.claimed_at or entry.created_at
         operation = VoiceOperationV1(
@@ -641,19 +654,22 @@ class ProcessSessionFactory:
                 + self._registry._retention_delta,  # type: ignore[attr-defined]  # noqa: SLF001
             ),
         )
+        cancellation: asyncio.CancelledError | None = None
         while True:
             try:
                 await self._writer.commit_control(
                     PersistenceCommand("outbox", {"operation": operation}, None)
                 )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
                 continue
             except BaseException:
                 self._registry._note_terminal_failure(
                     "terminal_persistence_failed"
                 )
-                return False
-            return True
+                return False, cancellation
+            return True, cancellation
 
 
 __all__ = ["ProcessSessionFactory", "ProcessTaskRegistrar"]
