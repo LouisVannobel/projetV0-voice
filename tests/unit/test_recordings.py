@@ -1010,7 +1010,7 @@ class CleanupApi:
 
 
 @pytest.mark.asyncio
-async def test_recording_off_cleanup_skips_stop_but_always_hangs_up_with_capsule() -> None:
+async def test_recording_off_cleanup_owns_neither_stop_nor_terminal_hangup() -> None:
     writer = StubWriter()
     api = CleanupApi()
     subject = boundary(api, writer)  # type: ignore[arg-type]
@@ -1021,21 +1021,14 @@ async def test_recording_off_cleanup_skips_stop_but_always_hangs_up_with_capsule
         reason="recording_off",
     )
 
-    assert api.events == ["hangup"]
+    assert api.events == []
     assert api.stop_calls == []
+    assert api.hangup_calls == []
     assert writer.commands == []
-    correlation = build_recording_correlation(
-        identity(), retention_days=30, required=False
-    )
-    assert api.hangup_calls[0][:2] == (
-        CALL_CONTROL_ID,
-        derive_recording_action_id(correlation.recording_id, "hangup"),
-    )
-    assert decode_recording_correlation(api.hangup_calls[0][2]) == correlation  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_may_active_cleanup_stops_then_hangs_up_without_fabricating_state() -> None:
+async def test_may_active_cleanup_stops_without_owning_terminal_hangup() -> None:
     writer = StubWriter()
     api = CleanupApi()
     subject = boundary(api, writer)  # type: ignore[arg-type]
@@ -1046,7 +1039,7 @@ async def test_may_active_cleanup_stops_then_hangs_up_without_fabricating_state(
         reason="normal_shutdown",
     )
 
-    assert api.events == ["stop", "hangup"]
+    assert api.events == ["stop"]
     correlation = build_recording_correlation(
         identity(), retention_days=30, required=False
     )
@@ -1056,15 +1049,13 @@ async def test_may_active_cleanup_stops_then_hangs_up_without_fabricating_state(
     assert api.stop_calls[0][2] == derive_recording_action_id(
         correlation.recording_id, "recording-stop"
     )
-    assert api.hangup_calls[0][1] == derive_recording_action_id(
-        correlation.recording_id, "hangup"
-    )
+    assert api.hangup_calls == []
     assert writer.commands == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["rejected", "exception", "cancellation"])
-async def test_stop_fault_never_suppresses_hangup_and_preserves_first_cancellation(
+async def test_stop_fault_preserves_first_cancellation_without_terminal_hangup(
     fault: str,
 ) -> None:
     cancellation = asyncio.CancelledError("stop-cancelled")
@@ -1092,45 +1083,21 @@ async def test_stop_fault_never_suppresses_hangup_and_preserves_first_cancellati
                 identity(), recording_may_be_active=True, reason="shutdown"
             )
         assert "RAW-STOP-SENTINEL" not in repr(raised.value)
-    assert api.events == ["stop", "hangup"]
+    assert api.events == ["stop"]
+    assert api.hangup_calls == []
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_during_hangup_waits_for_owned_attempt_then_propagates() -> None:
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def blocked_hangup() -> CallControlResult:
-        entered.set()
-        await release.wait()
-        return CallControlResult("accepted")
-
-    api = CleanupApi(hangup_result=blocked_hangup)
+async def test_recording_cleanup_never_creates_an_owned_hangup_task() -> None:
+    api = CleanupApi(hangup_result=AssertionError("hangup-owned-elsewhere"))
     subject = boundary(api, StubWriter())  # type: ignore[arg-type]
-    pending = asyncio.create_task(
-        subject.cleanup(
-            identity(),
-            recording_may_be_active=False,
-            reason="caller_cancelled",
-        )
+    await subject.cleanup(
+        identity(),
+        recording_may_be_active=False,
+        reason="caller_cancelled",
     )
-    await entered.wait()
-    owned_hangups = [
-        task
-        for task in asyncio.all_tasks()
-        if task.get_name() == "voice-recording-hangup"
-    ]
-    assert len(owned_hangups) == 1
-    assert owned_hangups[0].done() is False
-    pending.cancel("caller-cancelled")
-    await asyncio.sleep(0)
-
-    assert pending.done() is False
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await pending
-    assert owned_hangups[0].done() is True
-    assert api.events == ["hangup"]
+    assert api.events == []
+    assert api.hangup_calls == []
     assert not any(
         task is not asyncio.current_task() and "hangup" in task.get_name()
         for task in asyncio.all_tasks()

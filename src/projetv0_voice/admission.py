@@ -20,6 +20,7 @@ from pydantic import SecretStr
 
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.persistence.writer import (
     QualificationRunConsumed,
     WebhookCommitResult,
@@ -166,6 +167,7 @@ class _SessionLifecycleOwner(Protocol):
     _phase: str
     _session: object | None
     _task: asyncio.Task[None] | None
+    _terminal_capability: _TerminalCapability | None
 
     def request_drain(self, cause: str) -> None: ...
 
@@ -232,10 +234,19 @@ class _CallEntry:
     session_phase: SessionPhase = "active_unconsumed"
     lifecycle_owner: object | None = field(default=None, repr=False)
     lifecycle_owner_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    terminal_capability: _TerminalCapability | None = field(default=None, repr=False)
     terminal_state: Literal[
         "open", "external_pending", "reserved", "completing", "removed"
     ] = "open"
     terminal_authority: TerminalAuthority | None = field(default=None, repr=False)
+    terminal_completion_owner: asyncio.Task[object] | None = field(
+        default=None,
+        repr=False,
+    )
+    terminal_completion_event: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        repr=False,
+    )
     terminal_pending_count: int = 0
     terminal_settled_event: asyncio.Event = field(
         default_factory=asyncio.Event,
@@ -536,6 +547,47 @@ class CallConstructionGrant:
 
     def __repr__(self) -> str:
         return "CallConstructionGrant()"
+
+
+class _TerminalCapability:
+    """One-shot exact authority transfer from lifecycle owner to cleanup child."""
+
+    __slots__ = ("_cleanup_task", "_grant", "_owner", "_owner_task")
+
+    def __init__(
+        self,
+        *,
+        grant: CallConstructionGrant,
+        owner: object,
+        owner_task: asyncio.Task[None],
+    ) -> None:
+        self._grant = grant
+        self._owner = owner
+        self._owner_task = owner_task
+        self._cleanup_task: asyncio.Task[None] | None = None
+
+    def __repr__(self) -> str:
+        return "TerminalCapability()"
+
+    def transfer_to_cleanup(self, cleanup_task: asyncio.Task[None]) -> None:
+        if (
+            asyncio.current_task() is not self._owner_task
+            or not isinstance(cleanup_task, asyncio.Task)
+            or cleanup_task.done()
+            or cleanup_task.cancelling() != 0
+        ):
+            raise RuntimeError("terminal_capability_transfer_failed") from None
+        if self._cleanup_task is None:
+            self._cleanup_task = cleanup_task
+            return
+        if self._cleanup_task is not cleanup_task:
+            raise RuntimeError("terminal_capability_transfer_failed") from None
+
+    def permits_current_task(self) -> bool:
+        current = asyncio.current_task()
+        if self._cleanup_task is not None:
+            return current is self._cleanup_task
+        return current is self._owner_task
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1306,12 +1358,16 @@ class CallRegistry:
                         _closed_at=closed_at,
                     )
                     entry.terminal_authority = authority
+                    entry.terminal_completion_owner = cast(
+                        asyncio.Task[object], completion_owner
+                    )
                     entry.terminal_state = "reserved"
                     entry.terminal_event = "call.hangup"
                     entry.lease_state = "terminal"
                     entry.session_phase = "terminal"
                     entry.raw_token = None
                     entry.drain_intent = True
+                    entry.terminal_settled_event.set()
                     current_task = asyncio.current_task()
                     action_owners: list[asyncio.Task[object]] = []
                     from projetv0_voice.telnyx.webhooks import WebhookDisposition
@@ -2078,8 +2134,119 @@ class CallRegistry:
         return claim
 
     async def close_session_owner_registration(self) -> None:
+        authorities: list[TerminalAuthority] = []
+        owners: list[_SessionLifecycleOwner] = []
         async with self._lock:
             self._session_owner_registration_open = False
+            pending_events = tuple(
+                dict.fromkeys(
+                    entry.terminal_settled_event
+                    for entry in self._by_control.values()
+                    if entry.terminal_authority is None
+                    and entry.terminal_state == "external_pending"
+                    and entry.terminal_pending_count > 0
+                )
+            )
+        for pending_event in pending_events:
+            while not pending_event.is_set():
+                try:
+                    await asyncio.shield(pending_event.wait())
+                except asyncio.CancelledError:
+                    continue
+        async with self._lock:
+            self._session_owner_registration_open = False
+            completion_owner = asyncio.current_task()
+            if completion_owner is None:
+                raise RuntimeError("terminal_owner_unavailable") from None
+            for entry in tuple(self._by_control.values()):
+                if (
+                    entry.terminal_event is not None
+                    or entry.terminal_authority is not None
+                    or entry.session_phase in {"terminal", "removed"}
+                ):
+                    continue
+                if entry.session_phase == "active_unconsumed":
+                    authority = TerminalAuthority(
+                        status="closed",
+                        reason="process_draining",
+                        metric_class="drained",
+                        cleanup_hangup=True,
+                        persist_call=True,
+                        persist_lease=True,
+                        completion_token=self._uuid_factory(),
+                        _entry=entry,
+                        _generation=entry.generation,
+                        _completion_owner=cast(
+                            asyncio.Task[object], completion_owner
+                        ),
+                        _closed_at=self._require_aware(self._utcnow()),
+                    )
+                    entry.terminal_authority = authority
+                    entry.terminal_completion_owner = cast(
+                        asyncio.Task[object], completion_owner
+                    )
+                    entry.terminal_state = "reserved"
+                    entry.terminal_event = "process_draining"
+                    entry.lease_state = "terminal"
+                    entry.session_phase = "terminal"
+                    entry.raw_token = None
+                    entry.drain_intent = True
+                    entry.terminal_settled_event.set()
+                    authorities.append(authority)
+                    continue
+                if (
+                    entry.lifecycle_owner is not None
+                    and self._valid_session_owner(entry.lifecycle_owner)
+                ):
+                    owners.append(
+                        cast(_SessionLifecycleOwner, entry.lifecycle_owner)
+                    )
+        unique_owners = tuple(dict.fromkeys(owners))
+        for owner in unique_owners:
+            owner.request_drain("process_draining")
+        for owner in unique_owners:
+            await self._wait_lifecycle_owner(owner)
+        for authority in authorities:
+            await self._persist_authority_call(authority)
+            await self.complete_reserved_terminal(authority)
+
+    async def _persist_authority_call(self, authority: TerminalAuthority) -> None:
+        entry = authority._entry
+        started_at = entry.claimed_at or entry.created_at
+        operation = VoiceOperationV1(
+            schema_version=1,
+            operation_id=authority.completion_token,
+            deployment_id=self._deployment_id,
+            call_id=entry.call_id,
+            occurred_at=authority._closed_at,
+            kind="call.upsert",
+            payload=CallUpsertPayloadV1(
+                telnyx_call_control_id=entry.call_control_id,
+                telnyx_call_leg_id=entry.call_leg_id,
+                telnyx_call_session_id=entry.call_session_id,
+                status=authority.status,
+                disclosure_state="failed",
+                started_at=started_at,
+                ended_at=authority._closed_at,
+                end_reason=authority.reason,
+                retention_until=started_at + self._retention_delta,
+            ),
+        )
+        commit_control = getattr(self._writer, "commit_control", None)
+        if not callable(commit_control):
+            self._note_terminal_failure("terminal_persistence_failed")
+            raise RuntimeError("terminal_persistence_failed") from None
+        while True:
+            try:
+                await commit_control(
+                    PersistenceCommand("outbox", {"operation": operation}, None)
+                )
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                self._note_terminal_failure("terminal_persistence_failed")
+                raise RuntimeError("terminal_persistence_failed") from None
+            return
 
     @staticmethod
     def _valid_session_owner(owner: object) -> bool:
@@ -2140,6 +2307,13 @@ class CallRegistry:
             entry.construction_grant = grant
             entry.lifecycle_owner = owner
             entry.lifecycle_owner_task = owner_task
+            capability = _TerminalCapability(
+                grant=grant,
+                owner=owner,
+                owner_task=owner_task,
+            )
+            entry.terminal_capability = capability
+            cast(_SessionLifecycleOwner, owner)._terminal_capability = capability
             entry.session_phase = "constructing"
             return grant
 
@@ -2222,14 +2396,12 @@ class CallRegistry:
     async def reserve_or_read_terminal(
         self,
         grant: CallConstructionGrant,
-        owner: object,
-        owner_task: asyncio.Task[None],
+        capability: _TerminalCapability,
         proposed: TerminalProposal,
     ) -> TerminalAuthority:
         if (
             not isinstance(grant, CallConstructionGrant)
-            or not self._valid_session_owner(owner)
-            or not isinstance(owner_task, asyncio.Task)
+            or not isinstance(capability, _TerminalCapability)
             or not isinstance(proposed, TerminalProposal)
         ):
             raise RuntimeError("terminal_authority_unavailable") from None
@@ -2242,9 +2414,11 @@ class CallRegistry:
                     or entry.generation != grant.generation.generation
                     or entry.claim is not grant.lease_claim
                     or entry.construction_grant is not grant
-                    or entry.lifecycle_owner is not owner
-                    or entry.lifecycle_owner_task is not owner_task
-                    or asyncio.current_task() is not owner_task
+                    or entry.terminal_capability is not capability
+                    or capability._grant is not grant
+                    or capability._owner is not entry.lifecycle_owner
+                    or capability._owner_task is not entry.lifecycle_owner_task
+                    or not capability.permits_current_task()
                     or entry.session_phase
                     not in {"constructing", "preactivated", "running", "terminal"}
                 ):
@@ -2276,6 +2450,9 @@ class CallRegistry:
                         _closed_at=self._require_aware(self._utcnow()),
                     )
                     entry.terminal_authority = authority
+                    entry.terminal_completion_owner = cast(
+                        asyncio.Task[object], completion_owner
+                    )
                     entry.terminal_state = "reserved"
                     entry.terminal_event = proposed.reason
                     entry.lease_state = "terminal"
@@ -2294,19 +2471,46 @@ class CallRegistry:
     async def complete_reserved_terminal(self, authority: object) -> bool:
         if not isinstance(authority, TerminalAuthority):
             return False
-        async with self._lock:
-            entry = self._by_control.get(authority._entry.call_control_id)
-            if (
-                entry is not authority._entry
-                or entry.generation != authority._generation
-                or entry.terminal_authority is not authority
-                or entry.terminal_state not in {"reserved", "completing"}
-            ):
-                return False
-            if asyncio.current_task() is not authority._completion_owner:
-                return False
-            entry.terminal_state = "completing"
         cancellation: asyncio.CancelledError | None = None
+        entry: _CallEntry
+        while True:
+            try:
+                async with self._lock:
+                    entry = self._by_control.get(  # type: ignore[assignment]
+                        authority._entry.call_control_id
+                    )
+                    if (
+                        entry is not authority._entry
+                        or entry.generation != authority._generation
+                        or entry.terminal_authority is not authority
+                        or entry.terminal_state not in {"reserved", "completing"}
+                    ):
+                        return False
+                    current_task = asyncio.current_task()
+                    if current_task is None:
+                        return False
+                    completion_owner = entry.terminal_completion_owner
+                    if current_task is not completion_owner:
+                        provider_takeover = (
+                            not authority.persist_call
+                            and not authority.persist_lease
+                            and not authority.cleanup_hangup
+                            and (
+                                completion_owner is None
+                                or completion_owner.done()
+                                or completion_owner.cancelling() != 0
+                            )
+                        )
+                        if not provider_takeover:
+                            return False
+                        entry.terminal_completion_owner = cast(
+                            asyncio.Task[object], current_task
+                        )
+                    entry.terminal_state = "completing"
+                break
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
         if authority.persist_lease:
             while True:
                 try:
@@ -2332,10 +2536,15 @@ class CallRegistry:
         if authority.cleanup_hangup:
             while True:
                 try:
-                    await self._call_control.hangup(
+                    result = await self._call_control.hangup(
                         entry.call_control_id,
                         command_id=entry.hangup_command_id,
                     )
+                    if (
+                        not isinstance(result, CallControlResult)
+                        or result.outcome != "accepted"
+                    ):
+                        self._note_terminal_failure("terminal_hangup_failed")
                 except asyncio.CancelledError as error:
                     if cancellation is None:
                         cancellation = error
@@ -2346,25 +2555,32 @@ class CallRegistry:
         abort_target_clearers: tuple[
             tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...
         ] = ()
-        async with self._lock:
-            current = self._by_control.get(entry.call_control_id)
-            if (
-                current is not entry
-                or current.generation != authority._generation
-                or current.terminal_authority is not authority
-            ):
-                return False
-            if not current.capacity_released:
-                current.capacity_released = True
-                self._permits_used -= 1
-            current.resources_released = True
-            current.session_phase = "removed"
-            current.terminal_state = "removed"
-            current.terminal_settled_event.set()
-            abort_target_clearers = tuple(current.abort_target_clearers)
-            current.abort_target_clearers.clear()
-            self._by_control.pop(current.call_control_id, None)
-            self._by_call_id.pop(current.call_id, None)
+        while True:
+            try:
+                async with self._lock:
+                    current = self._by_control.get(entry.call_control_id)
+                    if (
+                        current is not entry
+                        or current.generation != authority._generation
+                        or current.terminal_authority is not authority
+                    ):
+                        return False
+                    if not current.capacity_released:
+                        current.capacity_released = True
+                        self._permits_used -= 1
+                    current.resources_released = True
+                    current.session_phase = "removed"
+                    current.terminal_state = "removed"
+                    current.terminal_settled_event.set()
+                    current.terminal_completion_event.set()
+                    abort_target_clearers = tuple(current.abort_target_clearers)
+                    current.abort_target_clearers.clear()
+                    self._by_control.pop(current.call_control_id, None)
+                    self._by_call_id.pop(current.call_id, None)
+                break
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
         for abort_target, clearer in abort_target_clearers:
             with contextlib.suppress(BaseException):
                 clearer(abort_target)
@@ -2380,47 +2596,65 @@ class CallRegistry:
             return None
         owner: object | None = None
         session: object | None = None
-        async with self._lock:
-            entry = self._by_call_id.get(call_id)
-            if (
-                entry is None
-                or entry.terminal_authority is not None
-                or entry.terminal_event is not None
-                or entry.session_phase in {"terminal", "removed"}
-            ):
-                return None
-            if entry.session_phase == "active_unconsumed":
-                completion_owner = asyncio.current_task()
-                if completion_owner is None:
-                    raise RuntimeError("terminal_owner_unavailable") from None
-                authority = TerminalAuthority(
-                    status="failed",
-                    reason="recording_required_error",
-                    metric_class="failed",
-                    cleanup_hangup=False,
-                    persist_call=True,
-                    persist_lease=True,
-                    completion_token=self._uuid_factory(),
-                    _entry=entry,
-                    _generation=entry.generation,
-                    _completion_owner=cast(
+        while True:
+            pending_event: asyncio.Event | None = None
+            async with self._lock:
+                entry = self._by_call_id.get(call_id)
+                if (
+                    entry is None
+                    or entry.terminal_authority is not None
+                    or entry.terminal_event is not None
+                    or entry.session_phase in {"terminal", "removed"}
+                ):
+                    return None
+                if (
+                    entry.session_phase == "active_unconsumed"
+                    and entry.terminal_state == "external_pending"
+                    and entry.terminal_pending_count > 0
+                ):
+                    pending_event = entry.terminal_settled_event
+                elif entry.session_phase == "active_unconsumed":
+                    completion_owner = asyncio.current_task()
+                    if completion_owner is None:
+                        raise RuntimeError("terminal_owner_unavailable") from None
+                    authority = TerminalAuthority(
+                        status="failed",
+                        reason="recording_required_error",
+                        metric_class="failed",
+                        cleanup_hangup=False,
+                        persist_call=True,
+                        persist_lease=True,
+                        completion_token=self._uuid_factory(),
+                        _entry=entry,
+                        _generation=entry.generation,
+                        _completion_owner=cast(
+                            asyncio.Task[object], completion_owner
+                        ),
+                        _closed_at=self._require_aware(self._utcnow()),
+                    )
+                    entry.terminal_authority = authority
+                    entry.terminal_completion_owner = cast(
                         asyncio.Task[object], completion_owner
-                    ),
-                    _closed_at=self._require_aware(self._utcnow()),
-                )
-                entry.terminal_authority = authority
-                entry.terminal_state = "reserved"
-                entry.terminal_event = "recording_required_error"
-                entry.lease_state = "terminal"
-                entry.session_phase = "terminal"
-                entry.raw_token = None
-                entry.drain_intent = True
-                entry.terminal_settled_event.set()
-                return authority
-            if entry.session_phase in {"constructing", "preactivated"}:
-                owner = entry.lifecycle_owner
-            elif entry.session_phase == "running":
-                session = entry.session
+                    )
+                    entry.terminal_state = "reserved"
+                    entry.terminal_event = "recording_required_error"
+                    entry.lease_state = "terminal"
+                    entry.session_phase = "terminal"
+                    entry.raw_token = None
+                    entry.drain_intent = True
+                    entry.terminal_settled_event.set()
+                    return authority
+                elif entry.session_phase in {"constructing", "preactivated"}:
+                    owner = entry.lifecycle_owner
+                elif entry.session_phase == "running":
+                    session = entry.session
+            if pending_event is None:
+                break
+            while not pending_event.is_set():
+                try:
+                    await asyncio.shield(pending_event.wait())
+                except asyncio.CancelledError:
+                    continue
         if owner is not None and self._valid_session_owner(owner):
             lifecycle_owner = cast(_SessionLifecycleOwner, owner)
             lifecycle_owner.request_drain("recording_required_error")
@@ -2457,6 +2691,7 @@ class CallRegistry:
     async def _finish_provider_terminal(self, call_control_id: str) -> None:
         authority: TerminalAuthority | None = None
         owner: object | None = None
+        cancellation: asyncio.CancelledError | None = None
         async with self._lock:
             entry = self._by_control.get(call_control_id)
             if entry is None:
@@ -2469,8 +2704,21 @@ class CallRegistry:
             lifecycle_owner = cast(_SessionLifecycleOwner, owner)
             lifecycle_owner.request_drain("telnyx_hangup")
             if asyncio.current_task() is not lifecycle_owner._task:
-                await self._wait_lifecycle_owner(lifecycle_owner)
-        await self.complete_reserved_terminal(authority)
+                try:
+                    await self._wait_lifecycle_owner(lifecycle_owner)
+                except asyncio.CancelledError as error:
+                    cancellation = error
+        completed = await self.complete_reserved_terminal(authority)
+        if not completed:
+            completion_event = authority._entry.terminal_completion_event
+            while not completion_event.is_set():
+                try:
+                    await asyncio.shield(completion_event.wait())
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+        if cancellation is not None:
+            raise cancellation
 
     def _schedule_abort_exact(self, entry: _CallEntry, generation: UUID) -> bool:
         return self._schedule_abort_target(

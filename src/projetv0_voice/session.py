@@ -406,6 +406,8 @@ class RegistryTerminalizer(Protocol):
 
     def note_failure(self, code: str) -> None: ...
 
+    def transfer_to_cleanup(self, cleanup_task: asyncio.Task[None]) -> None: ...
+
 
 class SessionWriter(ControlWriter, TurnWriter, Protocol):
     fatal_event: asyncio.Event
@@ -579,7 +581,6 @@ class CallSession:
         if self._run_started:
             raise CallSessionError("call_session_already_run")
         self._run_started = True
-        self._verify_handshake(handshake)
 
         first_failure = FirstFailure(shared_failure_event=self._writer.fatal_event)
         native_fatal = _NativeFatalObservation()
@@ -612,6 +613,7 @@ class CallSession:
         cancellation: asyncio.CancelledError | None = None
 
         try:
+            self._verify_handshake(handshake)
             handshake.audio_admission.bind(controller.is_active)
             self._register_transport_handlers(
                 transport=cast(_TransportEvents, handshake.transport),
@@ -677,6 +679,12 @@ class CallSession:
         except asyncio.CancelledError as error:
             cancellation = error
             reason = "external_cancel"
+        except CallSessionError as error:
+            reason = (
+                error.args[0]
+                if error.args and error.args[0] == "call_identity_mismatch"
+                else "call_failed"
+            )
         except Exception:
             reason = first_failure.code or "call_failed"
             first_failure.signal(reason)
@@ -713,15 +721,7 @@ class CallSession:
         """End the active per-call runner through its public cancellation surface."""
 
         if reason is not None:
-            if type(reason) is not str or reason not in {
-                "recording_required_error",
-                "process_draining",
-                "external_cancel",
-                "token_deadline",
-                "session_construction_failed",
-            }:
-                raise ValueError("call_drain_reason_invalid") from None
-            self._terminal_outcome.request_reason(reason)
+            self._latch_drain_reason(reason)
 
         runner: WorkerRunner | None = None
         async with self._drain_lock:
@@ -731,6 +731,18 @@ class CallSession:
                 runner = self._active_runner
         if runner is not None:
             await runner.cancel(reason="drain")
+
+    def _latch_drain_reason(self, reason: str) -> None:
+        if type(reason) is not str or reason not in {
+            "recording_required_error",
+            "process_draining",
+            "external_cancel",
+            "token_deadline",
+            "session_construction_failed",
+            "telnyx_hangup",
+        }:
+            raise ValueError("call_drain_reason_invalid") from None
+        self._terminal_outcome.request_reason(reason)
 
     async def aclose_unstarted(self) -> None:
         """Close transferred resources and terminalize before `run` starts."""
@@ -836,7 +848,16 @@ class CallSession:
         first_failure: FirstFailure,
     ) -> asyncio.CancelledError | None:
         caller_task = asyncio.current_task()
-        cleanup_task = asyncio.create_task(cleanup, name="call-cleanup")
+        cleanup_gate = asyncio.Event()
+
+        async def run_cleanup() -> None:
+            await cleanup_gate.wait()
+            await cleanup
+
+        cleanup_task = asyncio.create_task(run_cleanup(), name="call-cleanup")
+        if self._registry_terminalizer is not None:
+            self._registry_terminalizer.transfer_to_cleanup(cleanup_task)
+        cleanup_gate.set()
         while not cleanup_task.done():
             try:
                 await asyncio.shield(cleanup_task)
@@ -1044,21 +1065,15 @@ class CallSession:
             )
             self._metric_lease.finish(authority.metric_class)
             if authority.persist_call and not self._writer.fatal_event.is_set():
-                await self._attempt(
-                    lambda: self._commit_terminal_call(
-                        status=frozen.status,
-                        reason=frozen.reason,
-                        disclosure_completed=disclosure_completed,
-                        operation_id=authority.completion_token,
-                        ended_at=authority._closed_at,  # noqa: SLF001
-                    ),
-                    first_failure,
-                    "persistence_failed",
+                persisted = await self._commit_authoritative_terminal_call(
+                    status=frozen.status,
+                    reason=frozen.reason,
+                    disclosure_completed=disclosure_completed,
+                    operation_id=authority.completion_token,
+                    ended_at=authority._closed_at,  # noqa: SLF001
                 )
-                if first_failure.code == "persistence_failed":
-                    self._registry_terminalizer.note_failure(
-                        "terminal_persistence_failed"
-                    )
+                if not persisted:
+                    return
             await self._registry_terminalizer.complete(authority)
             return
         frozen = terminal_outcome.freeze()
@@ -1148,6 +1163,34 @@ class CallSession:
         await self._writer.commit_control(
             PersistenceCommand("outbox", {"operation": operation}, None)
         )
+
+    async def _commit_authoritative_terminal_call(
+        self,
+        *,
+        status: Literal["closed", "failed"],
+        reason: str,
+        disclosure_completed: bool,
+        operation_id: UUID,
+        ended_at: datetime,
+    ) -> bool:
+        while True:
+            try:
+                await self._commit_terminal_call(
+                    status=status,
+                    reason=reason,
+                    disclosure_completed=disclosure_completed,
+                    operation_id=operation_id,
+                    ended_at=ended_at,
+                )
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                if self._registry_terminalizer is not None:
+                    self._registry_terminalizer.note_failure(
+                        "terminal_persistence_failed"
+                    )
+                return False
+            return True
 
     async def _attempt(
         self,

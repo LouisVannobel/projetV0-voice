@@ -15,6 +15,7 @@ from projetv0_voice.admission import (
     CallConstructionGrant,
     TerminalAuthority,
     TerminalProposal,
+    _TerminalCapability,
 )
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
@@ -70,8 +71,7 @@ class _SessionRegistry(Protocol):
     async def reserve_or_read_terminal(
         self,
         grant: CallConstructionGrant,
-        owner: object,
-        owner_task: asyncio.Task[None],
+        capability: _TerminalCapability,
         proposed: TerminalProposal,
     ) -> TerminalAuthority: ...
 
@@ -86,7 +86,7 @@ class _SessionRegistry(Protocol):
 
 
 class _RegistryTerminalizer:
-    __slots__ = ("_grant", "_owner", "_registry")
+    __slots__ = ("_capability", "_grant", "_owner", "_registry")
 
     def __init__(
         self,
@@ -97,6 +97,10 @@ class _RegistryTerminalizer:
         self._registry = registry
         self._grant = grant
         self._owner = owner
+        capability = owner._terminal_capability
+        if capability is None:
+            raise RuntimeError("terminal_capability_unavailable") from None
+        self._capability = capability
 
     async def terminalize(
         self,
@@ -111,15 +115,14 @@ class _RegistryTerminalizer:
         self,
         proposed: TerminalProposal,
     ) -> TerminalAuthority:
-        task = self._owner._task
-        if task is None:
-            raise RuntimeError("terminal_authority_unavailable") from None
         return await self._registry.reserve_or_read_terminal(
             self._grant,
-            self._owner,
-            task,
+            self._capability,
             proposed,
         )
+
+    def transfer_to_cleanup(self, cleanup_task: asyncio.Task[None]) -> None:
+        self._capability.transfer_to_cleanup(cleanup_task)
 
     async def complete(self, authority: TerminalAuthority) -> bool:
         return await self._registry.complete_reserved_terminal(authority)
@@ -168,6 +171,7 @@ class _CallLifecycleOwner:
         "_phase",
         "_session",
         "_task",
+        "_terminal_capability",
     )
 
     def __init__(self, factory: ProcessSessionFactory) -> None:
@@ -180,6 +184,7 @@ class _CallLifecycleOwner:
         self._handshake: AuthenticatedTelnyxHandshake | None = None
         self._metric_lease: _CallMetricLease | None = None
         self._session: object | None = None
+        self._terminal_capability: _TerminalCapability | None = None
         self._drain_cause: str | None = None
 
     def bind_task(self, task: asyncio.Task[None]) -> None:
@@ -201,6 +206,9 @@ class _CallLifecycleOwner:
             return
         if self._drain_cause is None or cause == "recording_required_error":
             self._drain_cause = cause
+        session = self._session
+        if isinstance(session, CallSession):
+            session._latch_drain_reason(cause)  # noqa: SLF001
         task = self._task
         if (
             task is not None
@@ -329,7 +337,7 @@ class ProcessSessionFactory:
                 owner,
                 owner_task,
             )
-        except asyncio.CancelledError:
+        except BaseException:
             await owner.cancel_and_join()
             raise
         if grant is None:

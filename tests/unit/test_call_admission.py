@@ -2330,4 +2330,39 @@ async def test_delayed_retired_abort_cannot_touch_same_key_replacement_generatio
     await registry.join_until_empty()
     assert await registry.snapshot("control-a") is None
     assert await registry.live_call_count() == 0
-    assert not registry._background_owner._tasks  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_delayed_old_task9_call_id_hook_cannot_touch_replacement() -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    registry, _control = _registry(capacity=1)
+    initiated = await registry.resolve_webhook(_initiated("old-initiated"))
+    await registry.reconcile_after_commit(
+        _initiated("old-initiated"),
+        initiated,
+        WebhookCommitResult("first", "applied"),
+    )
+    old = await registry.snapshot("control-a")
+    assert old is not None
+    hangup = await registry.resolve_webhook(_hangup("old-hangup"))
+    await registry.reconcile_after_commit(
+        _hangup("old-hangup"),
+        hangup,
+        WebhookCommitResult("first", "applied"),
+    )
+    replacement_resolution = await registry.resolve_webhook(
+        _initiated("replacement-initiated")
+    )
+    replacement = await registry.snapshot("control-a")
+    assert replacement is not None
+    assert replacement.call_id != old.call_id
+
+    assert await registry.prepare_required_recording_drain(old.call_id) is None
+
+    current = await registry.snapshot("control-a")
+    assert current is not None
+    assert current.call_id == replacement.call_id
+    assert replacement_resolution.reservation is not None
+    replacement_resolution.reservation.abandon_before_submit()
+    await registry.join_until_empty()

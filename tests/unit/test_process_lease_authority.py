@@ -48,16 +48,26 @@ class Writer:
     def __init__(self) -> None:
         self.commits: list[dict[str, object]] = []
         self.active_error: BaseException | None = None
+        self.control_commits: list[object] = []
 
     async def commit_lease(self, **values: object) -> None:
         if values["state"] == "active" and self.active_error is not None:
             raise self.active_error
         self.commits.append(values)
 
+    async def commit_control(self, command: object) -> None:
+        self.control_commits.append(command)
+
 
 class CallControl:
-    def __init__(self, streaming_outcome: str = "accepted") -> None:
+    def __init__(
+        self,
+        streaming_outcome: str = "accepted",
+        *,
+        hangup_outcome: str = "accepted",
+    ) -> None:
         self.streaming_outcome = streaming_outcome
+        self.hangup_outcome = hangup_outcome
         self.hangups: list[tuple[str, UUID]] = []
 
     async def answer(self, *_: object, **__: object) -> CallControlResult:
@@ -71,7 +81,7 @@ class CallControl:
     ) -> CallControlResult:
         del client_state
         self.hangups.append((call_control_id, command_id))
-        return CallControlResult("accepted")
+        return CallControlResult(self.hangup_outcome)  # type: ignore[arg-type]
 
 
 def _registry(
@@ -238,9 +248,11 @@ class _ConstructionOwner:
     def __init__(self) -> None:
         self.causes: list[str] = []
         self.closed = asyncio.Event()
+        self.requested = asyncio.Event()
 
     def request_drain(self, cause: str) -> None:
         self.causes.append(cause)
+        self.requested.set()
 
     async def wait(self) -> None:
         await self.closed.wait()
@@ -254,6 +266,28 @@ class _WaitBarrierEvent(asyncio.Event):
     async def wait(self) -> bool:
         self.wait_entered.set()
         return await super().wait()
+
+
+class _SecondAcquireBarrierLock:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.acquires = 0
+        self.second_entered = asyncio.Event()
+        self.second_release = asyncio.Event()
+
+    async def __aenter__(self) -> _SecondAcquireBarrierLock:
+        self.acquires += 1
+        if self.acquires == 2:
+            self.second_entered.set()
+            await self.second_release.wait()
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
 
 
 async def _blocked_owner_task(release: asyncio.Event) -> None:
@@ -376,6 +410,50 @@ async def test_consume_requires_open_registration_live_deadline_and_retained_tas
 
 
 @pytest.mark.asyncio
+async def test_consume_rejects_retained_task_with_pending_cancellation() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    cancellation_seen = asyncio.Event()
+    owner_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancelling_owner() -> None:
+        try:
+            owner_started.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+
+    owner_task = asyncio.create_task(cancelling_owner())
+    await owner_started.wait()
+    owner_task.cancel("candidate-cancel")
+    await cancellation_seen.wait()
+    owner = _ConstructionOwner()
+    try:
+        assert owner_task.cancelling() > 0
+        assert (
+            await registry.consume_claim_for_construction(
+                claim,
+                "stream-a",
+                owner,
+                owner_task,
+            )
+            is None
+        )
+    finally:
+        release.set()
+        await owner_task
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "commit_result",
     [
@@ -407,8 +485,7 @@ async def test_provider_pending_commit_precedes_freeze_and_owns_external_complet
         assert task is not None
         authority = await registry.reserve_or_read_terminal(
             grant,
-            owner,
-            task,
+            owner._terminal_capability,
             TerminalProposal(
                 status="failed",
                 reason="session_construction_failed",
@@ -473,8 +550,7 @@ async def test_local_terminal_authority_is_first_writer_and_completes_fixed_work
         assert task is not None
         authority = await registry.reserve_or_read_terminal(
             grant,
-            owner,
-            task,
+            owner._terminal_capability,
             TerminalProposal(
                 status="failed",
                 reason="session_construction_failed",
@@ -499,6 +575,397 @@ async def test_local_terminal_authority_is_first_writer_and_completes_fixed_work
     assert [commit["state"] for commit in writer.commits] == ["active", "terminal"]
     assert len(control.hangups) == 1
     assert await registry.complete_reserved_terminal(object()) is False
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_provider_authority_completion_is_takeover_safe_after_promoter_cancellation() -> None:
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    hangup = _event("call.hangup", "hangup-takeover")
+    resolution = await registry.resolve_webhook(hangup)
+    assert resolution.reservation is not None
+    promoted = asyncio.Event()
+    hold = asyncio.Event()
+    authority_box: list[object] = []
+
+    async def promote_then_block() -> None:
+        await resolution.reservation.confirm(
+            WebhookCommitResult("first", "applied")
+        )
+        entry = registry._by_control["control-a"]  # noqa: SLF001
+        assert entry.terminal_authority is not None
+        authority_box.append(entry.terminal_authority)
+        promoted.set()
+        await hold.wait()
+
+    promoter = asyncio.create_task(promote_then_block())
+    await promoted.wait()
+    promoter.cancel("finalizer-cancelled")
+    await asyncio.gather(promoter, return_exceptions=True)
+
+    assert await registry.complete_reserved_terminal(authority_box[0]) is True
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_provider_finalizer_cancellation_waits_owner_then_completes_and_reraises() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    owner_release = asyncio.Event()
+    owner_task = asyncio.create_task(_blocked_owner_task(owner_release))
+    owner._task = owner_task
+    grant = await registry.consume_claim_for_construction(
+        claim, "stream-a", owner, owner_task
+    )
+    assert grant is not None
+    hangup = _event("call.hangup", "hangup-cancelled-finalizer")
+    resolution = await registry.resolve_webhook(hangup)
+    finalizer = asyncio.create_task(
+        registry.reconcile_after_commit(
+            hangup,
+            resolution,
+            WebhookCommitResult("first", "applied"),
+        )
+    )
+    await owner.requested.wait()
+
+    finalizer.cancel("finalizer-cancelled")
+    owner.closed.set()
+    owner_release.set()
+    await owner_task
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await finalizer
+
+    assert cancelled.value.args == ("finalizer-cancelled",)
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_first_provider_commit_wakes_owner_despite_pending_duplicate() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    start_owner = asyncio.Event()
+    authority_ready = asyncio.Event()
+
+    async def owner_flow() -> None:
+        await start_owner.wait()
+        authority = await registry.reserve_or_read_terminal(
+            grant,
+            owner._terminal_capability,
+            TerminalProposal(
+                status="failed",
+                reason="session_construction_failed",
+                metric_class="failed",
+                cleanup_hangup=True,
+            ),
+        )
+        assert authority.reason == "telnyx_hangup"
+        authority_ready.set()
+
+    owner_task = asyncio.create_task(owner_flow())
+    grant = await registry.consume_claim_for_construction(
+        claim, "stream-a", owner, owner_task
+    )
+    assert grant is not None
+    first = await registry.resolve_webhook(_event("call.hangup", "hangup-first"))
+    duplicate = await registry.resolve_duplicate_webhook(
+        _event("call.hangup", "hangup-duplicate")
+    )
+    assert first.reservation is not None
+    assert duplicate.reservation is not None
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    barrier = _WaitBarrierEvent()
+    entry.terminal_settled_event = barrier
+    start_owner.set()
+    await barrier.wait_entered.wait()
+
+    await first.reservation.confirm(WebhookCommitResult("first", "applied"))
+
+    assert barrier.is_set()
+    await authority_ready.wait()
+    await owner_task
+    await duplicate.reservation.confirm(
+        WebhookCommitResult("duplicate", "duplicate")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hangup_outcome",
+    ["rejected", "rate_limited", "retryable_not_sent", "outcome_unknown"],
+)
+async def test_nonaccepted_terminal_hangup_latches_process_failure(
+    hangup_outcome: str,
+) -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
+
+    writer = Writer()
+    registry = _registry(
+        writer,
+        CallControl(hangup_outcome=hangup_outcome),
+        lambda: 100.0,
+    )
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    start = asyncio.Event()
+
+    async def owner_flow() -> None:
+        await start.wait()
+        authority = await registry.reserve_or_read_terminal(
+            grant,
+            owner._terminal_capability,
+            TerminalProposal(
+                status="failed",
+                reason="call_failed",
+                metric_class="failed",
+                cleanup_hangup=True,
+            ),
+        )
+        assert await registry.complete_reserved_terminal(authority)
+
+    owner_task = asyncio.create_task(owner_flow())
+    grant = await registry.consume_claim_for_construction(
+        claim, "stream-a", owner, owner_task
+    )
+    assert grant is not None
+    start.set()
+    await owner_task
+
+    assert registry.internal_failure_code == "terminal_hangup_failed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_removal_retries_lock_after_cancellation_then_reraises() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    reserve = asyncio.Event()
+    complete = asyncio.Event()
+    authority_box: list[object] = []
+
+    async def owner_flow() -> None:
+        await reserve.wait()
+        authority = await registry.reserve_or_read_terminal(
+            grant,
+            owner._terminal_capability,
+            TerminalProposal(
+                status="failed",
+                reason="call_failed",
+                metric_class="failed",
+                cleanup_hangup=False,
+            ),
+        )
+        authority_box.append(authority)
+        complete.set()
+        await completion_start.wait()
+        await registry.complete_reserved_terminal(authority)
+
+    completion_start = asyncio.Event()
+    owner_task = asyncio.create_task(owner_flow())
+    owner._task = owner_task
+    grant = await registry.consume_claim_for_construction(
+        claim, "stream-a", owner, owner_task
+    )
+    assert grant is not None
+    reserve.set()
+    await complete.wait()
+    barrier_lock = _SecondAcquireBarrierLock()
+    registry._lock = barrier_lock  # type: ignore[assignment]  # noqa: SLF001
+    completion_start.set()
+    await barrier_lock.second_entered.wait()
+
+    owner_task.cancel("removal-cancelled")
+    barrier_lock.second_release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await owner_task
+
+    assert cancelled.value.args == ("removal-cancelled",)
+    assert await registry.snapshot("control-a") is None
+    assert authority_box
+
+
+@pytest.mark.asyncio
+async def test_active_unconsumed_required_drain_waits_for_provider_pending_authority() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    hangup = _event("call.hangup", "hangup-pending-required")
+    resolution = await registry.resolve_webhook(hangup)
+    assert resolution.reservation is not None
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    barrier = _WaitBarrierEvent()
+    entry.terminal_settled_event = barrier
+    drain_task = asyncio.create_task(
+        registry.prepare_required_recording_drain(claim.call_id)
+    )
+    wait_entered = asyncio.create_task(barrier.wait_entered.wait())
+
+    done, _pending = await asyncio.wait(
+        (drain_task, wait_entered),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    waited_for_provider = wait_entered in done and drain_task not in done
+    if waited_for_provider:
+        await resolution.reservation.confirm(
+            WebhookCommitResult("first", "applied")
+        )
+        assert await drain_task is None
+    else:
+        resolution.reservation.abandon_before_submit()
+        await resolution.reservation._run_abandonment()
+    wait_entered.cancel()
+    await asyncio.gather(wait_entered, return_exceptions=True)
+
+    assert waited_for_provider
+
+
+@pytest.mark.asyncio
+async def test_owner_self_required_drain_latches_without_cancel_or_self_wait() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    owner = _ConstructionOwner()
+    start = asyncio.Event()
+    grant_box: list[object] = []
+
+    async def owner_flow() -> None:
+        await start.wait()
+        assert await registry.prepare_required_recording_drain(claim.call_id) is None
+        authority = await registry.reserve_or_read_terminal(
+            grant_box[0],
+            owner._terminal_capability,
+            TerminalProposal(
+                status="failed",
+                reason="recording_required_error",
+                metric_class="failed",
+                cleanup_hangup=False,
+            ),
+        )
+        assert await registry.complete_reserved_terminal(authority)
+
+    owner_task = asyncio.create_task(owner_flow())
+    owner._task = owner_task
+    grant = await registry.consume_claim_for_construction(
+        claim,
+        "stream-a",
+        owner,
+        owner_task,
+    )
+    assert grant is not None
+    grant_box.append(grant)
+    start.set()
+    await owner_task
+
+    assert owner.causes == ["recording_required_error"]
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_close_session_registration_terminalizes_unconsumed_as_process_draining() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+
+    await registry.close_session_owner_registration()
+
+    assert await registry.snapshot("control-a") is None
+    assert await registry.live_call_count() == 0
+    assert [commit["state"] for commit in writer.commits] == ["active", "terminal"]
+    assert len(writer.control_commits) == 1
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.status == "closed"
+    assert operation.payload.end_reason == "process_draining"
+    assert len(control.hangups) == 1
+
+
+@pytest.mark.asyncio
+async def test_process_close_waits_for_active_unconsumed_provider_pending_authority() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    assert claim is not None
+    hangup = _event("call.hangup", "hangup-pending-close")
+    resolution = await registry.resolve_webhook(hangup)
+    assert resolution.reservation is not None
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    barrier = _WaitBarrierEvent()
+    entry.terminal_settled_event = barrier
+    closing = asyncio.create_task(registry.close_session_owner_registration())
+    wait_entered = asyncio.create_task(barrier.wait_entered.wait())
+
+    done, _pending = await asyncio.wait(
+        (closing, wait_entered),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    waited_for_provider = wait_entered in done and closing not in done
+    if waited_for_provider:
+        await resolution.reservation.confirm(
+            WebhookCommitResult("first", "applied")
+        )
+        authority = entry.terminal_authority
+        assert authority is not None
+        assert await registry.complete_reserved_terminal(authority)
+        await closing
+    else:
+        resolution.reservation.abandon_before_submit()
+        await resolution.reservation._run_abandonment()
+    wait_entered.cancel()
+    await asyncio.gather(wait_entered, return_exceptions=True)
+
+    assert waited_for_provider
     assert await registry.snapshot("control-a") is None
 
 

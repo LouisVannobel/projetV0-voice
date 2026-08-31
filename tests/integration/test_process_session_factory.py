@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -9,14 +11,25 @@ from uuid import UUID
 import pytest
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.runner.types import TelnyxCallData
+from pydantic import SecretStr
 
 from projetv0_voice.admission import (
     CallConstructionGrant,
     CallGenerationHandle,
+    CallRegistry,
+    ProcessLeaseAuthority,
     ProcessLeaseClaim,
+    _TerminalCapability,
 )
+from projetv0_voice.config import AgentManifestV1
+from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import RuntimeMetrics
+from projetv0_voice.persistence.writer import WebhookCommitResult
+from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
+from projetv0_voice.session_factory import ProcessSessionFactory
+from projetv0_voice.telnyx.call_control import CallControlResult
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
+from projetv0_voice.telnyx.webhooks import VerifiedWebhook
 
 NOW = datetime(2026, 8, 31, 9, tzinfo=UTC)
 CALL_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -67,10 +80,63 @@ def _handshake(claim: ProcessLeaseClaim) -> AuthenticatedTelnyxHandshake:
     )
 
 
+def _mismatched_handshake(
+    claim: ProcessLeaseClaim,
+    events: list[str],
+) -> AuthenticatedTelnyxHandshake:
+    return AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData(
+            stream_id="stream-a",
+            call_id="wrong-control",
+            outbound_encoding="PCMU",
+        ),
+        token_locator_id="telnyx-header-connected-v1",
+        lease_claim=claim,
+        transport=_OfflineTransport(events),  # type: ignore[arg-type]
+        audio_admission=_AudioAdmission(),  # type: ignore[arg-type]
+    )
+
+
+def _exact_real_handshake(
+    claim: ProcessLeaseClaim,
+    events: list[str],
+) -> AuthenticatedTelnyxHandshake:
+    return AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData(
+            stream_id="stream-a",
+            call_id="control-a",
+            outbound_encoding="PCMU",
+        ),
+        token_locator_id="telnyx-header-connected-v1",
+        lease_claim=claim,
+        transport=_OfflineTransport(events),  # type: ignore[arg-type]
+        audio_admission=_AudioAdmission(),  # type: ignore[arg-type]
+    )
+
+
+def _claim_handshake(
+    claim: ProcessLeaseClaim,
+    events: list[str],
+) -> AuthenticatedTelnyxHandshake:
+    suffix = claim.call_control_id.removeprefix("control-")
+    return AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData(
+            stream_id=f"stream-{suffix}",
+            call_id=claim.call_control_id,
+            outbound_encoding="PCMU",
+        ),
+        token_locator_id="telnyx-header-connected-v1",
+        lease_claim=claim,
+        transport=_OfflineTransport(events),  # type: ignore[arg-type]
+        audio_admission=_AudioAdmission(),  # type: ignore[arg-type]
+    )
+
+
 class _Registrar:
     def __init__(self, *, reject: bool = False) -> None:
         self.reject = reject
         self.tasks: list[asyncio.Task[None]] = []
+        self.started = asyncio.Event()
 
     def try_start(
         self,
@@ -83,6 +149,25 @@ class _Registrar:
             return None
         task = asyncio.create_task(coroutine, name=name)
         self.tasks.append(task)
+        self.started.set()
+        return task
+
+
+class _EagerRegistrar(_Registrar):
+    def try_start(
+        self,
+        coroutine: Any,
+        *,
+        name: str,
+    ) -> asyncio.Task[None] | None:
+        task = asyncio.Task(
+            coroutine,
+            loop=asyncio.get_running_loop(),
+            name=name,
+            eager_start=True,
+        )
+        self.tasks.append(task)
+        self.started.set()
         return task
 
 
@@ -94,8 +179,10 @@ class _Registry:
         self.activated = asyncio.Event()
         self.required_drains: list[UUID] = []
         self.activation_error: BaseException | None = None
+        self.consume_error: BaseException | None = None
         self.persist_call = False
         self.terminal_failures: list[str] = []
+        self.preconsume_probe: Any = None
 
     async def consume_claim_for_construction(
         self,
@@ -106,6 +193,15 @@ class _Registry:
     ) -> CallConstructionGrant | None:
         self.consume_calls.append((claim, stream_id, owner, owner_task))
         assert owner_task.done() is False
+        if self.preconsume_probe is not None:
+            self.preconsume_probe()
+        if self.consume_error is not None:
+            raise self.consume_error
+        owner._terminal_capability = _TerminalCapability(  # type: ignore[attr-defined]  # noqa: SLF001
+            grant=self.grant,
+            owner=owner,
+            owner_task=owner_task,
+        )
         return self.grant
 
     async def construction_is_live(
@@ -135,11 +231,10 @@ class _Registry:
     async def reserve_or_read_terminal(
         self,
         grant: CallConstructionGrant,
-        owner: object,
-        owner_task: asyncio.Task[None],
+        capability: _TerminalCapability,
         proposed: object,
     ) -> Any:
-        del grant, owner, owner_task
+        del grant, capability
         return SimpleNamespace(
             status=proposed.status,
             reason=proposed.reason,
@@ -204,6 +299,284 @@ class _Recording:
 
     async def cleanup(self, *_args: object, **_kwargs: object) -> None:
         self.events.append("recording-cleanup")
+
+
+class _OfflineTransport:
+    def __init__(self, events: list[str]) -> None:
+        self._input = _Processor("transport-input", events)
+        self._output = _Processor("transport-output", events)
+
+    def input(self) -> FrameProcessor:
+        return self._input
+
+    def output(self) -> FrameProcessor:
+        return self._output
+
+    def add_event_handler(self, _event_name: str, _handler: object) -> None:
+        return None
+
+
+class _RealWriter:
+    def __init__(
+        self,
+        *,
+        terminal_faults: list[BaseException] | None = None,
+        terminal_started: asyncio.Event | None = None,
+        terminal_release: asyncio.Event | None = None,
+    ) -> None:
+        self.fatal_event = asyncio.Event()
+        self.lease_commits: list[dict[str, object]] = []
+        self.control_commits: list[object] = []
+        self.terminal_faults = list(terminal_faults or [])
+        self.terminal_started = terminal_started
+        self.terminal_release = terminal_release
+
+    async def commit_lease(self, **values: object) -> None:
+        self.lease_commits.append(values)
+
+    async def commit_control(self, command: object) -> None:
+        self.control_commits.append(command)
+        operation = command.payload["operation"]  # type: ignore[union-attr]
+        if (
+            operation.kind == "call.upsert"
+            and operation.payload.status in {"closed", "failed"}
+        ):
+            if self.terminal_started is not None:
+                self.terminal_started.set()
+            if self.terminal_release is not None:
+                await self.terminal_release.wait()
+            if self.terminal_faults:
+                raise self.terminal_faults.pop(0)
+
+    def try_enqueue_turn(self, _operation: object) -> bool:
+        return True
+
+
+class _RealControl:
+    def __init__(self) -> None:
+        self.hangups: list[tuple[str, UUID]] = []
+
+    async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+        return CallControlResult("accepted")
+
+    async def start_streaming(
+        self, *_args: object, **_kwargs: object
+    ) -> CallControlResult:
+        return CallControlResult("accepted")
+
+    async def hangup(
+        self,
+        call_control_id: str,
+        *,
+        command_id: UUID,
+        client_state: SecretStr | None = None,
+    ) -> CallControlResult:
+        del client_state
+        self.hangups.append((call_control_id, command_id))
+        return CallControlResult("accepted")
+
+
+def _webhook(
+    event_type: str,
+    event_id: str,
+    *,
+    call_control_id: str = "control-a",
+    call_leg_id: str = "leg-a",
+    call_session_id: str = "session-a",
+) -> VerifiedWebhook:
+    return VerifiedWebhook(
+        event_id=event_id,
+        event_type=event_type,
+        occurred_at=NOW,
+        call_control_id=call_control_id,
+        call_leg_id=call_leg_id,
+        call_session_id=call_session_id,
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=(event_id.encode() + b"_" * 32)[:32],
+        direction="incoming" if event_type == "call.initiated" else None,
+        call_state="parked" if event_type == "call.initiated" else "answered",
+    )
+
+
+def _real_manifest() -> AgentManifestV1:
+    return AgentManifestV1.model_validate(
+        {
+            "schema_version": 1,
+            "agent_id": "agent-a",
+            "revision": "revision-a",
+            "tenant_id": "tenant-a",
+            "dids": ["+33123456789"],
+            "language": "fr-FR",
+            "prompt_path": "prompt.md",
+            "prompt_revision": "prompt-a",
+            "greeting": "Bonjour.",
+            "conversation_mode": "freeform",
+            "max_concurrent_calls": 1,
+            "direction": "inbound_only",
+            "transport_codec": "PCMU",
+            "transport_sample_rate_hz": 8000,
+            "transcript_retention_days": 7,
+            "recording_mode": "off",
+            "recording_format": "wav",
+            "recording_retention_days": None,
+            "recording_required": False,
+            "recording_play_beep": False,
+        }
+    )
+
+
+def _real_profile() -> QualifiedDeploymentProfileV1:
+    profile = QualifiedDeploymentProfileV1.model_validate_json(
+        Path("tests/fixtures/qualified-deployment-profile-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return profile.model_copy(update={"deployment_id": "deployment-a"})
+
+
+async def _real_claim(
+    writer: _RealWriter,
+    control: _RealControl,
+) -> tuple[CallRegistry, ProcessLeaseClaim]:
+    registry = CallRegistry(
+        writer=writer,
+        call_control=control,
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        deployment_id="deployment-a",
+        capacity=1,
+        lease_ttl_seconds=30,
+        stream_url="wss://voice.invalid/telnyx/stream",
+        retention_days=7,
+        utcnow=lambda: NOW,
+        monotonic=lambda: 100.0,
+        token_factory=lambda _size: "A" * 43,
+        prefix_factory=lambda: 0,
+        uuid_factory=iter(
+            UUID(int=(4 << 76) | (0b10 << 62) | index)
+            for index in range(1, 100)
+        ).__next__,
+    )
+    initiated = _webhook("call.initiated", "initiated-a")
+    resolution = await registry.resolve_webhook(initiated)
+    await registry.reconcile_after_commit(
+        initiated, resolution, WebhookCommitResult("first", "applied")
+    )
+    answered = _webhook("call.answered", "answered-a")
+    resolution = await registry.resolve_webhook(answered)
+    await registry.reconcile_after_commit(
+        answered, resolution, WebhookCommitResult("first", "applied")
+    )
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a",
+        token_digest=bytes.fromhex(
+            "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+        ),
+    )
+    assert claim is not None
+    return registry, claim
+
+
+async def _real_claims(
+    writer: _RealWriter,
+    control: _RealControl,
+    count: int,
+) -> tuple[CallRegistry, list[ProcessLeaseClaim]]:
+    registry = CallRegistry(
+        writer=writer,
+        call_control=control,
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        deployment_id="deployment-a",
+        capacity=count,
+        lease_ttl_seconds=30,
+        stream_url="wss://voice.invalid/telnyx/stream",
+        retention_days=7,
+        utcnow=lambda: NOW,
+        monotonic=lambda: 100.0,
+        token_factory=lambda _size: "A" * 43,
+        prefix_factory=lambda: 1,
+        uuid_factory=iter(
+            UUID(int=(4 << 76) | (0b10 << 62) | index)
+            for index in range(1, 1000)
+        ).__next__,
+    )
+    authority = ProcessLeaseAuthority(registry)
+    claims: list[ProcessLeaseClaim] = []
+    digest = bytes.fromhex(
+        "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+    )
+    for index in range(count):
+        control_id = f"control-{index}"
+        leg_id = f"leg-{index}"
+        session_id = f"session-{index}"
+        initiated = _webhook(
+            "call.initiated",
+            f"initiated-{index}",
+            call_control_id=control_id,
+            call_leg_id=leg_id,
+            call_session_id=session_id,
+        )
+        resolution = await registry.resolve_webhook(initiated)
+        await registry.reconcile_after_commit(
+            initiated,
+            resolution,
+            WebhookCommitResult("first", "applied"),
+        )
+        answered = _webhook(
+            "call.answered",
+            f"answered-{index}",
+            call_control_id=control_id,
+            call_leg_id=leg_id,
+            call_session_id=session_id,
+        )
+        resolution = await registry.resolve_webhook(answered)
+        await registry.reconcile_after_commit(
+            answered,
+            resolution,
+            WebhookCommitResult("first", "applied"),
+        )
+        claim = await authority.claim_once(
+            call_control_id=control_id,
+            token_digest=digest,
+        )
+        assert claim is not None
+        claims.append(claim)
+    return registry, claims
+
+
+def _real_process_factory(
+    *,
+    registry: CallRegistry,
+    writer: _RealWriter,
+    metrics: RuntimeMetrics,
+    events: list[str],
+    registrar: _Registrar | None = None,
+) -> ProcessSessionFactory:
+    return ProcessSessionFactory(
+        registry=registry,
+        registrar=registrar or _Registrar(),
+        runtime_metrics=metrics,
+        manifest=_real_manifest(),
+        profile=_real_profile(),
+        writer=writer,
+        keyring=CryptoKeyring(
+            {1: b"k" * 32},
+            active_version=1,
+            nonce_factory=lambda size: b"n" * size,
+        ),
+        stt_http_client_factory=lambda: _SttClient(events),
+        stt_factory=lambda _client: _Processor("stt", events),
+        llm_factory=lambda: _Llm(events),
+        tts_factory=lambda: _Processor("tts", events),
+        recording_factory=lambda _identity: _Recording(events),
+        idle_timeout_seconds=30.0,
+    )
 
 
 class _Session:
@@ -301,6 +674,9 @@ async def test_registrar_rejection_closes_candidate_before_claim_or_metric() -> 
     registrar = _Registrar(reject=True)
     metrics = RuntimeMetrics.in_memory(monotonic=lambda: 1.0)
     events: list[str] = []
+    registry.preconsume_probe = lambda: events == [] or pytest.fail(
+        "eager owner crossed closed gate before grant"
+    )
     factory = _factory(
         registry=registry,
         registrar=registrar,
@@ -314,6 +690,58 @@ async def test_registrar_rejection_closes_candidate_before_claim_or_metric() -> 
     assert registry.consume_calls == []
     assert events == []
     assert _metric_points(metrics, "projetv0.voice.calls.active") == []
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_pregrant_exception_cancels_and_joins_registered_candidate() -> None:
+    claim = _claim()
+    registry = _Registry(_grant(claim))
+    registry.consume_error = RuntimeError("consume-secret")
+    registrar = _Registrar()
+    metrics = RuntimeMetrics.in_memory()
+    factory = _factory(
+        registry=registry,
+        registrar=registrar,
+        runtime_metrics=metrics,
+        events=[],
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="consume-secret"):
+            await factory.run(_handshake(claim))
+        assert len(registrar.tasks) == 1
+        assert registrar.tasks[0].done()
+    finally:
+        for task in registrar.tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*registrar.tasks, return_exceptions=True)
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_eager_registrar_reaches_only_closed_owner_gate_before_grant() -> None:
+    claim = _claim()
+    registry = _Registry(_grant(claim))
+    registrar = _EagerRegistrar()
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((1.0, 2.0)).__next__)
+    events: list[str] = []
+    registry.preconsume_probe = lambda: events == [] or pytest.fail(
+        "eager owner crossed closed gate before grant"
+    )
+    factory = _factory(
+        registry=registry,
+        registrar=registrar,
+        runtime_metrics=metrics,
+        events=events,
+    )
+
+    await factory.run(_handshake(claim))
+
+    assert len(registrar.tasks) == 1
+    assert registrar.tasks[0].done()
+    assert events[:2] == ["stt-client", "stt"]
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
@@ -480,4 +908,506 @@ async def test_post_freeze_construction_persistence_fault_latches_process_failur
     total = _metric_points(metrics, "projetv0.voice.calls.total")
     assert len(total) == 1
     assert total[0].attributes["session"] == "failed"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_real_composition_mismatched_handshake_cleans_terminalizes_and_balances_metric(
+) -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((10.0, 11.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+    handshake = _mismatched_handshake(claim, events)
+
+    await factory.run(handshake)
+
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is None
+    assert events.count("recording-cleanup") == 1
+    assert len(writer.control_commits) == 1
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.end_reason == "call_identity_mismatch"
+    assert [commit["state"] for commit in writer.lease_commits] == [
+        "active",
+        "terminal",
+    ]
+    assert len(control.hangups) == 1
+    active = _metric_points(metrics, "projetv0.voice.calls.active")
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert active[0].value == 0
+    assert total[0].attributes["session"] == "failed"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_ten_same_claim_factory_contenders_retain_one_real_winner() -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    registrar = _Registrar()
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((60.0, 61.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+        registrar=registrar,
+    )
+
+    results = await asyncio.gather(
+        *(
+            factory.run(_mismatched_handshake(claim, events))
+            for _index in range(10)
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(result is None for result in results) == 1
+    losers = [result for result in results if isinstance(result, RuntimeError)]
+    assert len(losers) == 9
+    assert all(str(error) == "process_lease_claim_unavailable" for error in losers)
+    assert len(registrar.tasks) == 10
+    assert all(task.done() for task in registrar.tasks)
+    assert len(writer.control_commits) == 1
+    assert await registry.snapshot("control-a") is None
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert len(total) == 1
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_blocked_registry_lock_route_cancellation_joins_candidate_without_metric() -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    registrar = _Registrar()
+    metrics = RuntimeMetrics.in_memory()
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+        registrar=registrar,
+    )
+    await registry._lock.acquire()  # noqa: SLF001
+    running = asyncio.create_task(factory.run(_mismatched_handshake(claim, events)))
+    await registrar.started.wait()
+
+    running.cancel("blocked-consume-cancel")
+    registry._lock.release()  # noqa: SLF001
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await running
+
+    assert cancelled.value.args == ("blocked-consume-cancel",)
+    assert len(registrar.tasks) == 1
+    assert registrar.tasks[0].done()
+    assert _metric_points(metrics, "projetv0.voice.calls.active") == []
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    assert snapshot.lease_state == "active"
+    await registry.close_session_owner_registration()
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_terminal_call_persistence_cancellation_retries_same_authority_work() -> None:
+    cancellation = asyncio.CancelledError("terminal-write-cancel")
+    writer = _RealWriter(terminal_faults=[cancellation])
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((20.0, 21.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+
+    await factory.run(_mismatched_handshake(claim, events))
+
+    assert await registry.snapshot("control-a") is None
+    assert len(writer.control_commits) == 2
+    operations = [
+        command.payload["operation"]  # type: ignore[union-attr]
+        for command in writer.control_commits
+    ]
+    assert operations[0].operation_id == operations[1].operation_id
+    assert operations[0].occurred_at == operations[1].occurred_at
+    assert registry.internal_failure_code is None
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_terminal_call_persistence_failure_latches_even_after_earlier_failure() -> None:
+    writer = _RealWriter(
+        terminal_faults=[RuntimeError("terminal-persistence-secret")]
+    )
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((30.0, 31.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+
+    await factory.run(_mismatched_handshake(claim, events))
+
+    assert await registry.snapshot("control-a") is not None
+    assert len(writer.control_commits) == 1
+    assert registry.internal_failure_code == "terminal_persistence_failed"
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert len(total) == 1
+    assert total[0].attributes["session"] == "failed"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_repeated_route_cancellation_preserves_first_and_waits_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from projetv0_voice.session_factory import _CallLifecycleOwner
+
+    terminal_started = asyncio.Event()
+    terminal_release = asyncio.Event()
+    writer = _RealWriter(
+        terminal_started=terminal_started,
+        terminal_release=terminal_release,
+    )
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((35.0, 36.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+    drain_seen = asyncio.Event()
+    request_drain = _CallLifecycleOwner.request_drain
+
+    def observe_drain(owner: object, cause: str) -> None:
+        request_drain(owner, cause)  # type: ignore[arg-type]
+        drain_seen.set()
+
+    monkeypatch.setattr(_CallLifecycleOwner, "request_drain", observe_drain)
+    running = asyncio.create_task(factory.run(_mismatched_handshake(claim, events)))
+    await terminal_started.wait()
+
+    running.cancel("first-route-cancel")
+    await drain_seen.wait()
+    running.cancel("second-route-cancel")
+    terminal_release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await running
+
+    assert cancelled.value.args == ("first-route-cancel",)
+    assert await registry.snapshot("control-a") is None
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_process_close_cancels_constructing_owner_as_drained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((40.0, 41.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+    construction_entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def block_first_construction_check(*_args: object) -> bool:
+        construction_entered.set()
+        await never.wait()
+        return True
+
+    monkeypatch.setattr(
+        registry,
+        "construction_is_live",
+        block_first_construction_check,
+    )
+    running = asyncio.create_task(factory.run(_handshake(claim)))
+    await construction_entered.wait()
+
+    await registry.close_session_owner_registration()
+    await running
+
+    assert await registry.snapshot("control-a") is None
+    assert len(writer.control_commits) == 1
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.status == "closed"
+    assert operation.payload.end_reason == "process_draining"
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert total[0].attributes["session"] == "drained"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_required_drain_cancels_constructing_owner_without_local_hangup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((45.0, 46.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+    construction_entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def block_first_construction_check(*_args: object) -> bool:
+        construction_entered.set()
+        await never.wait()
+        return True
+
+    monkeypatch.setattr(
+        registry,
+        "construction_is_live",
+        block_first_construction_check,
+    )
+    running = asyncio.create_task(factory.run(_handshake(claim)))
+    await construction_entered.wait()
+
+    await factory.drain_call_by_id(
+        claim.call_id,
+        "recording_required_error",
+    )
+    await running
+
+    assert await registry.snapshot("control-a") is None
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.status == "failed"
+    assert operation.payload.end_reason == "recording_required_error"
+    assert control.hangups == []
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert total[0].attributes["session"] == "failed"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_process_close_drains_real_running_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((50.0, 51.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+    activated = asyncio.Event()
+    activate_session = registry.activate_session
+
+    async def observe_activation(*args: object) -> bool:
+        result = await activate_session(*args)  # type: ignore[arg-type]
+        if result:
+            activated.set()
+        return result
+
+    monkeypatch.setattr(registry, "activate_session", observe_activation)
+    running = asyncio.create_task(
+        factory.run(_exact_real_handshake(claim, events))
+    )
+    await activated.wait()
+
+    await registry.close_session_owner_registration()
+    await running
+
+    assert await registry.snapshot("control-a") is None
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.status == "closed"
+    assert operation.payload.end_reason == "process_draining"
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert total[0].attributes["session"] == "drained"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_required_drain_real_running_session_leaves_hangup_to_task9(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory(monotonic=iter((55.0, 56.0)).__next__)
+    events: list[str] = []
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=events,
+    )
+    activated = asyncio.Event()
+    activate_session = registry.activate_session
+
+    async def observe_activation(*args: object) -> bool:
+        result = await activate_session(*args)  # type: ignore[arg-type]
+        if result:
+            activated.set()
+        return result
+
+    monkeypatch.setattr(registry, "activate_session", observe_activation)
+    running = asyncio.create_task(
+        factory.run(_exact_real_handshake(claim, events))
+    )
+    await activated.wait()
+
+    await factory.drain_call_by_id(
+        claim.call_id,
+        "recording_required_error",
+    )
+    await running
+
+    assert await registry.snapshot("control-a") is None
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.status == "failed"
+    assert operation.payload.end_reason == "recording_required_error"
+    assert control.hangups == []
+    total = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert total[0].attributes["session"] == "failed"
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_ten_real_calls_own_distinct_resources_runtimes_and_four_observers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_module = import_module("projetv0_voice.session")
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claims = await _real_claims(writer, control, 10)
+    samples = iter(float(index) for index in range(100, 120))
+    metrics = RuntimeMetrics.in_memory(monotonic=samples.__next__)
+    events: list[str] = []
+    stt_clients: list[_SttClient] = []
+    stt_services: list[_Processor] = []
+    llm_services: list[_Llm] = []
+    tts_services: list[_Processor] = []
+    recordings: list[_Recording] = []
+    sessions: list[object] = []
+    runtimes: list[object] = []
+    runtimes_ready = asyncio.Event()
+    build_runtime = session_module.build_runtime
+
+    def observe_runtime(**values: object) -> object:
+        runtime = build_runtime(**values)
+        runtimes.append(runtime)
+        if len(runtimes) == 10:
+            runtimes_ready.set()
+        return runtime
+
+    monkeypatch.setattr(session_module, "build_runtime", observe_runtime)
+
+    def stt_client_factory() -> _SttClient:
+        client = _SttClient(events)
+        stt_clients.append(client)
+        return client
+
+    def stt_factory(_client: _SttClient) -> _Processor:
+        service = _Processor("stt", events)
+        stt_services.append(service)
+        return service
+
+    def llm_factory() -> _Llm:
+        service = _Llm(events)
+        llm_services.append(service)
+        return service
+
+    def tts_factory() -> _Processor:
+        service = _Processor("tts", events)
+        tts_services.append(service)
+        return service
+
+    def recording_factory(_identity: object) -> _Recording:
+        recording = _Recording(events)
+        recordings.append(recording)
+        return recording
+
+    def session_factory(**values: object) -> object:
+        session = session_module.CallSession(**values)
+        sessions.append(session)
+        return session
+
+    factory = ProcessSessionFactory(
+        registry=registry,
+        registrar=_Registrar(),
+        runtime_metrics=metrics,
+        manifest=_real_manifest(),
+        profile=_real_profile(),
+        writer=writer,
+        keyring=CryptoKeyring(
+            {1: b"k" * 32},
+            active_version=1,
+            nonce_factory=lambda size: b"n" * size,
+        ),
+        stt_http_client_factory=stt_client_factory,
+        stt_factory=stt_factory,
+        llm_factory=llm_factory,
+        tts_factory=tts_factory,
+        recording_factory=recording_factory,
+        session_factory=session_factory,  # type: ignore[arg-type]
+        idle_timeout_seconds=30.0,
+    )
+    running = [
+        asyncio.create_task(factory.run(_claim_handshake(claim, events)))
+        for claim in claims
+    ]
+    await runtimes_ready.wait()
+
+    await registry.close_session_owner_registration()
+    await asyncio.gather(*running)
+
+    collections = (
+        stt_clients,
+        stt_services,
+        llm_services,
+        tts_services,
+        recordings,
+        sessions,
+        runtimes,
+    )
+    assert all(len(collection) == 10 for collection in collections)
+    assert all(len({id(item) for item in collection}) == 10 for collection in collections)
+    assert len({id(runtime.pipeline) for runtime in runtimes}) == 10
+    assert len({id(runtime.worker) for runtime in runtimes}) == 10
+    assert len({id(runtime.runner) for runtime in runtimes}) == 10
+    inventories = [runtime.worker._observer._observers for runtime in runtimes]  # noqa: SLF001
+    assert all(len(inventory) == 4 for inventory in inventories)
+    assert len({id(observer) for inventory in inventories for observer in inventory}) == 40
+    assert len(writer.control_commits) == 10
+    assert len(control.hangups) == 10
+    assert await registry.live_call_count() == 0
+    totals = _metric_points(metrics, "projetv0.voice.calls.total")
+    assert sum(point.value for point in totals) == 10
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001

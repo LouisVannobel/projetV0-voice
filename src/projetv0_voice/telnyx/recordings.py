@@ -713,23 +713,6 @@ class TelnyxRecordingBoundary(RecordingBoundary):
             if isinstance(stop_result, CallControlResult):
                 failed = failed or stop_result.outcome != "accepted"
 
-        hangup_result, cancellation, hangup_failed = await _join_owned_action(
-            self._telnyx.hangup(
-                correlation.call_control_id,
-                command_id=derive_recording_action_id(
-                    correlation.recording_id, "hangup"
-                ),
-                client_state=client_state,
-            ),
-            name="voice-recording-hangup",
-        )
-        if first_cancellation is None and cancellation is not None:
-            first_cancellation = cancellation
-        failed = failed or hangup_failed or not isinstance(
-            hangup_result, CallControlResult
-        )
-        if isinstance(hangup_result, CallControlResult):
-            failed = failed or hangup_result.outcome != "accepted"
         if first_cancellation is not None:
             raise first_cancellation
         if failed:
