@@ -2218,7 +2218,10 @@ class CallRegistry:
 
     async def _close_session_owner_registration_core(self) -> None:
         authorities: list[TerminalAuthority] = []
-        owners: list[_SessionLifecycleOwner] = []
+        provider_authorities: list[
+            tuple[TerminalAuthority, _CallEntry, UUID, asyncio.Event]
+        ] = []
+        owners: list[tuple[_SessionLifecycleOwner, str]] = []
         cancellation: asyncio.CancelledError | None = None
         failure: BaseException | None = None
         async with self._lock:
@@ -2248,9 +2251,43 @@ class CallRegistry:
                     if completion_owner is None:
                         raise RuntimeError("terminal_owner_unavailable") from None
                     for entry in tuple(self._by_control.values()):
+                        authority = entry.terminal_authority
+                        if (
+                            authority is not None
+                            and entry.terminal_event == "call.hangup"
+                            and entry.terminal_state in {"reserved", "completing"}
+                            and authority._entry is entry
+                            and authority._generation == entry.generation
+                            and not authority.persist_call
+                            and not authority.persist_lease
+                            and not authority.cleanup_hangup
+                        ):
+                            provider_authorities.append(
+                                (
+                                    authority,
+                                    entry,
+                                    entry.generation,
+                                    entry.terminal_completion_event,
+                                )
+                            )
+                            if (
+                                entry.lifecycle_owner is not None
+                                and self._valid_session_owner(entry.lifecycle_owner)
+                            ):
+                                entry.drain_intent = True
+                                owners.append(
+                                    (
+                                        cast(
+                                            _SessionLifecycleOwner,
+                                            entry.lifecycle_owner,
+                                        ),
+                                        "telnyx_hangup",
+                                    )
+                                )
+                            continue
                         if (
                             entry.terminal_event is not None
-                            or entry.terminal_authority is not None
+                            or authority is not None
                             or entry.session_phase in {"terminal", "removed"}
                         ):
                             continue
@@ -2289,16 +2326,22 @@ class CallRegistry:
                         ):
                             entry.drain_intent = True
                             owners.append(
-                                cast(_SessionLifecycleOwner, entry.lifecycle_owner)
+                                (
+                                    cast(
+                                        _SessionLifecycleOwner,
+                                        entry.lifecycle_owner,
+                                    ),
+                                    "process_draining",
+                                )
                             )
                 break
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error
         unique_owners = tuple(dict.fromkeys(owners))
-        for owner in unique_owners:
-            owner.request_drain("process_draining")
-        for owner in unique_owners:
+        for owner, cause in unique_owners:
+            owner.request_drain(cause)
+        for owner, _cause in unique_owners:
             try:
                 await self._wait_lifecycle_owner(owner)
             except asyncio.CancelledError as error:
@@ -2308,6 +2351,28 @@ class CallRegistry:
                 self._internal_failure_code = "lifecycle_drain_failed"
                 if failure is None:
                     failure = error
+        for authority, entry, generation, completion_event in provider_authorities:
+            if authority._entry is not entry or authority._generation != generation:
+                if failure is None:
+                    failure = RuntimeError("terminal_authority_unavailable")
+                continue
+            completed = False
+            try:
+                completed = await self.complete_reserved_terminal(authority)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                continue
+            if not completed:
+                while not completion_event.is_set():
+                    try:
+                        await asyncio.shield(completion_event.wait())
+                    except asyncio.CancelledError as error:
+                        if cancellation is None:
+                            cancellation = error
         for authority in authorities:
             try:
                 persistence_cancellation = await self._persist_authority_call(

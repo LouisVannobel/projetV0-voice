@@ -1303,13 +1303,29 @@ async def test_provider_pending_two_closes_share_unique_provider_winner(
     settlement_entered = asyncio.Event()
     settlement_release = asyncio.Event()
     settle = registry._settle_reservation  # noqa: SLF001
+    complete = registry.complete_reserved_terminal
+    provider_completion_entered = asyncio.Event()
+    close_completion_entered = asyncio.Event()
+    completion_release = asyncio.Event()
+    completion_authorities: list[object] = []
 
     async def block_settlement(*args: object) -> None:
         settlement_entered.set()
         await settlement_release.wait()
         await settle(*args)  # type: ignore[arg-type]
 
+    async def block_completion(authority: object) -> bool:
+        completion_authorities.append(authority)
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "voice-session-owner-close":
+            close_completion_entered.set()
+        else:
+            provider_completion_entered.set()
+        await completion_release.wait()
+        return await complete(authority)
+
     monkeypatch.setattr(registry, "_settle_reservation", block_settlement)
+    monkeypatch.setattr(registry, "complete_reserved_terminal", block_completion)
     provider = asyncio.create_task(
         registry.reconcile_after_commit(
             event,
@@ -1321,21 +1337,65 @@ async def test_provider_pending_two_closes_share_unique_provider_winner(
     provider.cancel("provider-finalizer-cancel")
     first_close = asyncio.create_task(registry.close_session_owner_registration())
     second_close = asyncio.create_task(registry.close_session_owner_registration())
+    close_returned = asyncio.Event()
+
+    def note_close_returned(_task: asyncio.Task[None]) -> None:
+        close_returned.set()
+
+    first_close.add_done_callback(note_close_returned)
+    second_close.add_done_callback(note_close_returned)
     await waiters.first_waiter.wait()
+    close_task = getattr(registry, "_session_close_task", None)
+    assert close_task is not None
+    second_close.cancel("r8-close-caller-cancel")
 
     settlement_release.set()
+    await provider_completion_entered.wait()
+    close_wait = asyncio.create_task(close_completion_entered.wait())
+    close_return = asyncio.create_task(close_returned.wait())
+    done, _pending = await asyncio.wait(
+        (close_wait, close_return),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    close_joined_provider = close_wait in done and close_return not in done
+    for waiter in (close_wait, close_return):
+        if not waiter.done():
+            waiter.cancel()
+    await asyncio.gather(close_wait, close_return, return_exceptions=True)
+
+    provider_authority = entry.terminal_authority
+    assert close_joined_provider
+    assert provider_authority is not None
+    assert provider_authority.persist_call is False
+    assert provider_authority.persist_lease is False
+    assert provider_authority.cleanup_hangup is False
+    assert provider_authority._completion_owner is not close_task  # noqa: SLF001
+    completion_token = provider_authority.completion_token
+    closed_at = provider_authority._closed_at  # noqa: SLF001
+    assert entry.terminal_event == "call.hangup"
+    assert entry.terminal_state == "reserved"
+    assert await registry.live_call_count() == 1
+    assert not first_close.done()
+    assert not second_close.done()
+
+    completion_release.set()
     with pytest.raises(asyncio.CancelledError) as cancelled:
         await provider
-    await asyncio.gather(first_close, second_close)
+    await first_close
+    with pytest.raises(asyncio.CancelledError) as close_cancelled:
+        await second_close
 
     assert cancelled.value.args == ("provider-finalizer-cancel",)
+    assert close_cancelled.value.args == ("r8-close-caller-cancel",)
+    assert len(completion_authorities) == 2
+    assert all(authority is provider_authority for authority in completion_authorities)
+    assert provider_authority.completion_token == completion_token
+    assert provider_authority._closed_at == closed_at  # noqa: SLF001
     assert await registry.snapshot("control-a") is None
     assert await registry.live_call_count() == 0
     assert writer.control_commits == []
     assert [commit["state"] for commit in writer.commits] == ["active"]
     assert control.hangups == []
-    close_task = getattr(registry, "_session_close_task", None)
-    assert close_task is not None
     assert close_task.done()
     assert not any(
         task is not asyncio.current_task()
