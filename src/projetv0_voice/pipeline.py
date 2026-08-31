@@ -7,7 +7,7 @@ import inspect
 import math
 from collections.abc import Coroutine, Sequence
 from contextvars import Context
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from typing import Any, Protocol, cast
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -389,8 +389,31 @@ class PipelineServices(Protocol):
     tts: FrameProcessor
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _RuntimeMetricsObserverBinding:
+    runtime_metrics: RuntimeMetrics
+    stt: FrameProcessor
+    llm: FrameProcessor
+    tts: FrameProcessor
+
+
 class RuntimeMetricsObserver(BaseObserver):
     """Forward only identity-bound native service TTFB measurements."""
+
+    __binding: _RuntimeMetricsObserverBinding
+    __slots__ = ("__binding",)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in (
+            "_binding",
+            "_runtime_metrics",
+            "_stt",
+            "_llm",
+            "_tts",
+            "_RuntimeMetricsObserver__binding",
+        ):
+            raise FrozenInstanceError(f"cannot assign to field '{name}'")
+        super().__setattr__(name, value)
 
     def __init__(
         self,
@@ -407,10 +430,36 @@ class RuntimeMetricsObserver(BaseObserver):
         ):
             raise ValueError("runtime_metrics_observer_invalid") from None
         super().__init__()
-        self._runtime_metrics = runtime_metrics
-        self._stt = stt
-        self._llm = llm
-        self._tts = tts
+        object.__setattr__(
+            self,
+            "_RuntimeMetricsObserver__binding",
+            _RuntimeMetricsObserverBinding(
+                runtime_metrics=runtime_metrics,
+                stt=stt,
+                llm=llm,
+                tts=tts,
+            ),
+        )
+
+    @property
+    def _binding(self) -> _RuntimeMetricsObserverBinding:
+        return self.__binding
+
+    @property
+    def _runtime_metrics(self) -> RuntimeMetrics:
+        return self.__binding.runtime_metrics
+
+    @property
+    def _stt(self) -> FrameProcessor:
+        return self.__binding.stt
+
+    @property
+    def _llm(self) -> FrameProcessor:
+        return self.__binding.llm
+
+    @property
+    def _tts(self) -> FrameProcessor:
+        return self.__binding.tts
 
     async def on_push_frame(self, data: FramePushed) -> None:
         if data.direction is not FrameDirection.DOWNSTREAM or type(data.frame) is not MetricsFrame:
@@ -444,10 +493,16 @@ class RuntimeMetricsObserver(BaseObserver):
 class _CallObserverState:
     _value: int = 0
 
-    def _transition(self, *, allowed: tuple[int, ...], target: int) -> bool:
-        if self._value not in allowed:
+    def _mark_session_bound(self) -> bool:
+        if self._value != 0:
             return False
-        object.__setattr__(self, "_value", target)
+        object.__setattr__(self, "_value", 1)
+        return True
+
+    def _mark_consumed(self) -> bool:
+        if self._value not in (0, 1):
+            return False
+        object.__setattr__(self, "_value", 2)
         return True
 
 
@@ -536,17 +591,11 @@ class _CallObservers:
             or self.metrics._tts is not services.tts
         ):
             raise ValueError("call_observers_binding_invalid") from None
-        if not self._state._transition(
-            allowed=(self._NEW,),
-            target=self._SESSION_BOUND,
-        ):
+        if not self._state._mark_session_bound():
             raise ValueError("call_observers_reused") from None
 
     def _consume(self) -> list[BaseObserver]:
-        if not self._state._transition(
-            allowed=(self._NEW, self._SESSION_BOUND),
-            target=self._CONSUMED,
-        ):
+        if not self._state._mark_consumed():
             raise ValueError("call_observers_reused") from None
         return [self.latency, self.metrics]
 

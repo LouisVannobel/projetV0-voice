@@ -1016,6 +1016,78 @@ async def test_closed_observer_lifecycle_rejects_normal_reset(phase: str) -> Non
 
 
 @pytest.mark.asyncio
+async def test_consumed_holder_cannot_be_reset_and_reused_through_state_helper() -> None:
+    holder, owner, _services = _holder_in_phase("consumed")
+    transition = getattr(holder._state, "_transition", None)  # type: ignore[attr-defined]  # noqa: SLF001
+    if transition is not None:
+        transition(
+            allowed=(holder._CONSUMED,),  # type: ignore[attr-defined]  # noqa: SLF001
+            target=holder._NEW,  # type: ignore[attr-defined]  # noqa: SLF001
+        )
+    failure = pipeline_module.FirstFailure()
+
+    with pytest.raises(ValueError, match="^call_observers_reused$"):
+        pipeline_module.build_runtime(
+            pipeline=pipeline_module.ObservedPipeline(
+                [_SetupProbe()],
+                first_failure=failure,
+            ),
+            first_failure=failure,
+            greeting="Disclosure.",
+            mark_name="mark",
+            idle_timeout_seconds=60.0,
+            observers=holder,
+        )
+
+    assert transition is None
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "_runtime_metrics",
+        "_stt",
+        "_llm",
+        "_tts",
+        "_binding",
+        "_RuntimeMetricsObserver__binding",
+    ],
+)
+async def test_runtime_metrics_observer_rejects_post_bind_substitution(
+    attribute: str,
+) -> None:
+    holder, owner, services = _holder_in_phase("session_bound")
+    observer = holder.metrics  # type: ignore[attr-defined]
+    replacement_owner = RuntimeMetrics.in_memory()
+    replacement_service = FrameProcessor(name="replacement")
+    replacement: object = (
+        replacement_owner if attribute == "_runtime_metrics" else replacement_service
+    )
+    if attribute in {"_binding", "_RuntimeMetricsObserver__binding"}:
+        replacement = object()
+
+    observer._SEALED_BINDING_ATTRIBUTES = ()  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(FrozenInstanceError):
+        setattr(observer, attribute, replacement)
+
+    assert observer._runtime_metrics is owner  # noqa: SLF001
+    assert observer._stt is services.stt  # noqa: SLF001
+    assert observer._llm is services.llm  # noqa: SLF001
+    assert observer._tts is services.tts  # noqa: SLF001
+    binding = getattr(observer, "_binding", None)
+    if binding is not None:
+        with pytest.raises(FrozenInstanceError):
+            binding.stt = replacement_service
+    lifecycle_marker = object()
+    observer._task_manager = lifecycle_marker  # type: ignore[assignment]  # noqa: SLF001
+    assert observer._task_manager is lifecycle_marker  # noqa: SLF001
+    await replacement_owner.aclose()
+    await owner.aclose()
+
+
+@pytest.mark.asyncio
 async def test_build_runtime_rejects_reused_holder() -> None:
     owner = RuntimeMetrics.in_memory()
     holder, _ = _call_observers(
