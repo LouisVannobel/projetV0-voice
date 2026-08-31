@@ -651,6 +651,64 @@ async def test_provider_finalizer_cancellation_waits_owner_then_completes_and_re
 
 
 @pytest.mark.asyncio
+async def test_duplicate_provider_finalizer_joins_fixed_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = Writer()
+    registry = _registry(writer, CallControl(), lambda: 100.0)
+    await _durable_waiting_wss(registry)
+    event = _event("call.hangup", "hangup-join")
+    first = await registry.resolve_webhook(event)
+    duplicate = await registry.resolve_duplicate_webhook(event)
+    assert first.reservation is not None
+    assert duplicate.reservation is not None
+    first_entered = asyncio.Event()
+    first_release = asyncio.Event()
+    second_entered = asyncio.Event()
+    calls = 0
+    complete = registry.complete_reserved_terminal
+
+    async def block_first_completion(authority: object) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            await first_release.wait()
+        else:
+            second_entered.set()
+        return await complete(authority)
+
+    monkeypatch.setattr(
+        registry,
+        "complete_reserved_terminal",
+        block_first_completion,
+    )
+    first_finalizer = asyncio.create_task(
+        registry.reconcile_after_commit(
+            event,
+            first,
+            WebhookCommitResult("first", "applied"),
+        )
+    )
+    await first_entered.wait()
+    duplicate_finalizer = asyncio.create_task(
+        registry.reconcile_after_commit(
+            event,
+            duplicate,
+            WebhookCommitResult("duplicate", "duplicate"),
+        )
+    )
+    await second_entered.wait()
+
+    assert duplicate_finalizer.done() is False
+    first_release.set()
+    dispositions = await asyncio.gather(first_finalizer, duplicate_finalizer)
+
+    assert [item.status_code for item in dispositions] == [200, 200]
+    assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
 async def test_first_provider_commit_wakes_owner_despite_pending_duplicate() -> None:
     from projetv0_voice.admission import ProcessLeaseAuthority, TerminalProposal
 
