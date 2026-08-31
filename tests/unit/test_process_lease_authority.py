@@ -700,11 +700,14 @@ async def test_duplicate_provider_finalizer_joins_fixed_completion(
     )
     await second_entered.wait()
 
-    assert duplicate_finalizer.done() is False
+    assert duplicate_finalizer.done()
+    duplicate_disposition = await duplicate_finalizer
+    assert duplicate_disposition.status_code == 200
+    assert await registry.snapshot("control-a") is None
     first_release.set()
-    dispositions = await asyncio.gather(first_finalizer, duplicate_finalizer)
+    first_disposition = await first_finalizer
 
-    assert [item.status_code for item in dispositions] == [200, 200]
+    assert first_disposition.status_code == 200
     assert await registry.snapshot("control-a") is None
 
 
@@ -1025,6 +1028,80 @@ async def test_process_close_waits_for_active_unconsumed_provider_pending_author
 
     assert waited_for_provider
     assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_process_close_finishes_all_reserved_work_then_reraises() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0, capacity=2)
+    await _durable_waiting_wss_for(
+        registry,
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        event_prefix="first",
+    )
+    await _durable_waiting_wss_for(
+        registry,
+        call_control_id="control-b",
+        call_leg_id="leg-b",
+        call_session_id="session-b",
+        event_prefix="second",
+    )
+    authority = ProcessLeaseAuthority(registry)
+    first_claim = await authority.claim_once(
+        call_control_id="control-a", token_digest=DIGEST
+    )
+    second_claim = await authority.claim_once(
+        call_control_id="control-b", token_digest=DIGEST
+    )
+    assert first_claim is not None
+    assert second_claim is not None
+    owner = _ConstructionOwner()
+    owner_release = asyncio.Event()
+    owner_task = asyncio.create_task(_blocked_owner_task(owner_release))
+    owner._task = owner_task
+    grant = await registry.consume_claim_for_construction(
+        first_claim,
+        "stream-a",
+        owner,
+        owner_task,
+    )
+    assert grant is not None
+    closing = asyncio.create_task(registry.close_session_owner_registration())
+    await owner.requested.wait()
+    late_provider = await registry.resolve_webhook(
+        _event(
+            "call.hangup",
+            "late-provider-after-close",
+            call_control_id="control-a",
+            call_leg_id="leg-a",
+            call_session_id="session-a",
+        )
+    )
+    provider_race_blocked = late_provider.reservation is None
+
+    closing.cancel("process-close-cancel")
+    owner.closed.set()
+    owner_release.set()
+    await owner_task
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+    if late_provider.reservation is not None:
+        late_provider.reservation.abandon_before_submit()
+        await late_provider.reservation._run_abandonment()
+
+    assert cancelled.value.args == ("process-close-cancel",)
+    assert provider_race_blocked
+    assert await registry.snapshot("control-b") is None
+    assert len(writer.control_commits) == 1
+    operation = writer.control_commits[0].payload["operation"]  # type: ignore[union-attr]
+    assert operation.payload.end_reason == "process_draining"
+    assert [commit["state"] for commit in writer.commits].count("terminal") == 1
+    assert len(control.hangups) == 1
 
 
 @pytest.mark.asyncio

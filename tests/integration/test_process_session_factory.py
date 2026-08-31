@@ -1076,6 +1076,40 @@ async def test_terminal_call_persistence_failure_latches_even_after_earlier_fail
 
 
 @pytest.mark.asyncio
+async def test_unconsumed_task9_writer_failure_retains_authority_and_capacity() -> None:
+    writer = _RealWriter(
+        terminal_faults=[RuntimeError("task9-terminal-persistence-secret")]
+    )
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    metrics = RuntimeMetrics.in_memory()
+    factory = _real_process_factory(
+        registry=registry,
+        writer=writer,
+        metrics=metrics,
+        events=[],
+    )
+
+    await factory.drain_call_by_id(
+        claim.call_id,
+        "recording_required_error",
+    )
+
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    assert snapshot.lease_state == "terminal"
+    entry = registry._by_control["control-a"]  # noqa: SLF001
+    assert entry.terminal_state == "reserved"
+    assert entry.terminal_authority is not None
+    assert entry.terminal_authority.reason == "recording_required_error"
+    assert await registry.live_call_count() == 1
+    assert registry.internal_failure_code == "terminal_persistence_failed"
+    assert [commit["state"] for commit in writer.lease_commits] == ["active"]
+    assert control.hangups == []
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_repeated_route_cancellation_preserves_first_and_waits_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

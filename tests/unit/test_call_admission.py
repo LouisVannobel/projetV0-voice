@@ -2366,3 +2366,71 @@ async def test_delayed_old_task9_call_id_hook_cannot_touch_replacement() -> None
     assert replacement_resolution.reservation is not None
     replacement_resolution.reservation.abandon_before_submit()
     await registry.join_until_empty()
+
+
+@pytest.mark.asyncio
+async def test_provider_commit_cancellation_during_action_join_finishes_fixed_authority() -> None:
+    from projetv0_voice.persistence.writer import WebhookCommitResult
+
+    class CancellationResistantStreaming(CallControl):
+        def __init__(self) -> None:
+            super().__init__()
+            self.streaming_entered = asyncio.Event()
+            self.streaming_cancelled = asyncio.Event()
+            self.streaming_release = asyncio.Event()
+
+        async def start_streaming(
+            self,
+            call_control_id: str,
+            request: object,
+            *,
+            command_id: UUID,
+        ) -> CallControlResult:
+            self.streams.append((call_control_id, command_id))
+            self.stream_tokens.append(
+                request.stream_auth_token.get_secret_value()  # type: ignore[attr-defined]
+            )
+            self.streaming_entered.set()
+            while not self.streaming_release.is_set():
+                try:
+                    await self.streaming_release.wait()
+                except asyncio.CancelledError:
+                    self.streaming_cancelled.set()
+            return CallControlResult("accepted")
+
+    control = CancellationResistantStreaming()
+    registry, _ = _registry(capacity=1, control=control)
+    initiated = await registry.resolve_webhook(_initiated())
+    await registry.reconcile_after_commit(
+        _initiated(), initiated, WebhookCommitResult("first", "applied")
+    )
+    answered = await registry.resolve_webhook(_answered())
+    streaming = asyncio.create_task(
+        registry.reconcile_after_commit(
+            _answered(),
+            answered,
+            WebhookCommitResult("first", "applied"),
+        )
+    )
+    await control.streaming_entered.wait()
+    hangup_event = _hangup("provider-terminal-cancel")
+    hangup = await registry.resolve_webhook(hangup_event)
+    finalizer = asyncio.create_task(
+        registry.reconcile_after_commit(
+            hangup_event,
+            hangup,
+            WebhookCommitResult("first", "applied"),
+        )
+    )
+    await control.streaming_cancelled.wait()
+
+    finalizer.cancel("post-commit-finalizer-cancel")
+    control.streaming_release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await finalizer
+    await asyncio.gather(streaming, return_exceptions=True)
+
+    assert cancelled.value.args == ("post-commit-finalizer-cancel",)
+    assert await registry.snapshot("control-a") is None
+    assert await registry.live_call_count() == 0
+    assert control.streaming_cancelled.is_set()

@@ -375,7 +375,8 @@ class ProcessSessionFactory:
         authority = await self._registry.prepare_required_recording_drain(call_id)
         if authority is None:
             return
-        await self._persist_unconsumed_terminal(authority)
+        if not await self._persist_unconsumed_terminal(authority):
+            return
         await self._registry.complete_reserved_terminal(authority)
 
     async def _live(
@@ -617,7 +618,7 @@ class ProcessSessionFactory:
     async def _persist_unconsumed_terminal(
         self,
         authority: TerminalAuthority,
-    ) -> None:
+    ) -> bool:
         entry = authority._entry  # noqa: SLF001
         started_at = entry.claimed_at or entry.created_at
         operation = VoiceOperationV1(
@@ -651,7 +652,8 @@ class ProcessSessionFactory:
                 self._registry._note_terminal_failure(
                     "terminal_persistence_failed"
                 )
-            return
+                return False
+            return True
 
 
 __all__ = ["ProcessSessionFactory", "ProcessTaskRegistrar"]
