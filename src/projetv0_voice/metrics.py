@@ -386,6 +386,12 @@ class RuntimeMetrics:
     def failure_code(self) -> str | None:
         return self._failure_code
 
+    @property
+    def publication(self) -> RuntimePublication:
+        """Expose the exact typed holder shared with lifecycle and health."""
+
+        return self._publication
+
     def record_admission_rejection(self, reason: object) -> None:
         if not _closed(reason, _REJECTION_REASONS):
             self._latch_failure()

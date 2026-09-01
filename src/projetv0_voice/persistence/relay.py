@@ -136,6 +136,12 @@ class OutboxRelay:
         self._callback_started = False
         self._drain_started = False
 
+    @property
+    def claim_lease_seconds(self) -> int:
+        """Expose the exact ambiguity holdoff owned by lifecycle supervision."""
+
+        return self._claim_lease_seconds
+
     async def run_once(self, *, batch_size: int = 100) -> RelayResult:
         if type(batch_size) is not int or not 1 <= batch_size <= 100:
             raise ValueError("batch_size is outside the supported range")

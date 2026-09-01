@@ -7,6 +7,7 @@ import contextlib
 import errno
 import hashlib
 import inspect
+import math
 import re
 import sqlite3
 import time
@@ -161,6 +162,40 @@ class RelayClaimResult:
 class CleanupResult:
     receipts: int
     leases: int
+
+
+@dataclass(frozen=True, slots=True)
+class WriterRuntimeObservation:
+    """One owner-sampled immutable writer/outbox/storage observation."""
+
+    writer_queue_depth: int
+    writer_queue_oldest_age: float
+    writer_quick_check: bool
+    outbox_depth: int
+    outbox_oldest_age: float
+    outbox_bytes: int
+    storage_bytes: int
+
+    def __post_init__(self) -> None:
+        integers = (
+            self.writer_queue_depth,
+            self.outbox_depth,
+            self.outbox_bytes,
+            self.storage_bytes,
+        )
+        ages = (self.writer_queue_oldest_age, self.outbox_oldest_age)
+        if (
+            any(type(value) is not int or value < 0 for value in integers)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                or value < 0
+                for value in ages
+            )
+            or type(self.writer_quick_check) is not bool
+        ):
+            raise ValueError("writer_runtime_observation_invalid") from None
 
 
 WebhookReceiptKind = Literal["first", "duplicate"]
@@ -545,6 +580,35 @@ class PersistenceWriter:
             )
         )
 
+    async def terminalize_stale_lease(
+        self,
+        stale: StaleLease,
+        *,
+        closed_at: datetime,
+        operation: VoiceOperationV1,
+    ) -> None:
+        """Atomically terminalize one accepted stale cleanup and its call snapshot."""
+
+        if (
+            not isinstance(stale, StaleLease)
+            or not isinstance(operation, VoiceOperationV1)
+            or operation.kind != "call.upsert"
+            or operation.call_id != stale.call_id
+        ):
+            raise ValueError("stale_terminal_invalid") from None
+        await self.commit_control(
+            PersistenceCommand(
+                "lease",
+                {
+                    "action": "stale_terminal",
+                    "stale": stale,
+                    "closed_at": closed_at,
+                    "operation": operation,
+                },
+                None,
+            )
+        )
+
     async def read_relay_batch(
         self, *, batch_size: int, now: datetime, lease_seconds: int
     ) -> tuple[OutboxItem, ...]:
@@ -590,6 +654,26 @@ class PersistenceWriter:
         except asyncio.CancelledError:
             result.add_done_callback(self._consume_relay_result_exception)
             raise
+        except BaseException:
+            if result.done() and not result.cancelled():
+                result.exception()
+            raise
+        return await result
+
+    async def runtime_observation(self) -> WriterRuntimeObservation:
+        """Read one typed aggregate through the sole writer owner/connection."""
+
+        result: asyncio.Future[WriterRuntimeObservation] = (
+            asyncio.get_running_loop().create_future()
+        )
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "relay_batch",
+                    {"action": "runtime_observation", "result": result},
+                    None,
+                )
+            )
         except BaseException:
             if result.done() and not result.cancelled():
                 result.exception()
@@ -949,13 +1033,19 @@ class PersistenceWriter:
         self._check_storage_limit()
 
     def _check_storage_limit(self) -> None:
+        total = self._measure_storage_bytes()
+        if total > self.max_storage_bytes:
+            raise FatalPersistenceError("storage_limit_exceeded")
+
+    def _measure_storage_bytes(self) -> int:
         journal_path = Path(f"{self._database_path}-journal")
         try:
             total = self._file_size(self._database_path) + self._file_size(journal_path)
         except OSError as error:
             raise error
-        if total > self.max_storage_bytes:
-            raise FatalPersistenceError("storage_limit_exceeded")
+        if type(total) is not int or total < 0:
+            raise FatalPersistenceError("storage_measurement_invalid")
+        return total
 
     async def _call_failpoint(self, name: str) -> None:
         if self._failpoint is None:
@@ -996,6 +1086,36 @@ class PersistenceWriter:
                 await connection.rollback()
             raise
         return False, command_result
+
+    async def _apply_stale_terminal(self, payload: Mapping[str, object]) -> None:
+        stale = payload.get("stale")
+        closed_at = payload.get("closed_at")
+        operation = payload.get("operation")
+        if (
+            not isinstance(stale, StaleLease)
+            or not isinstance(closed_at, datetime)
+            or closed_at.tzinfo is None
+            or closed_at.utcoffset() is None
+            or not isinstance(operation, VoiceOperationV1)
+            or operation.kind != "call.upsert"
+            or operation.call_id != stale.call_id
+        ):
+            raise CommandSerializationError("stale_terminal_invalid")
+        await self._apply_lease(
+            {
+                "action": "upsert",
+                "call_control_id": stale.call_control_id,
+                "call_id": stale.call_id,
+                "tenant_id": stale.tenant_id,
+                "agent_id": stale.agent_id,
+                "state": "terminal",
+                "token_hash": stale.token_hash,
+                "created_at": stale.created_at,
+                "expires_at": stale.expires_at,
+                "closed_at": closed_at,
+            }
+        )
+        await self._insert_outbox(operation)
 
     async def _classify_webhook_receipt(
         self, payload: Mapping[str, object]
@@ -1304,6 +1424,9 @@ class PersistenceWriter:
         await self._insert_outbox(operation)
 
     async def _apply_lease(self, payload: Mapping[str, object]) -> None:
+        if payload.get("action") == "stale_terminal":
+            await self._apply_stale_terminal(payload)
+            return
         if payload.get("action") != "upsert":
             raise CommandSerializationError("invalid_lease_command")
         connection = self._require_owner_connection()
@@ -1518,6 +1641,72 @@ class PersistenceWriter:
                 return
             if not result.done():
                 result.set_result(oldest)
+        elif action == "runtime_observation":
+            result = payload.get("result")
+            if not isinstance(result, asyncio.Future):
+                raise CommandSerializationError("invalid_runtime_observation_command")
+            monotonic_now = self._monotonic()
+            utc_now = self._utcnow()
+            if (
+                isinstance(monotonic_now, bool)
+                or not isinstance(monotonic_now, int | float)
+                or not math.isfinite(float(monotonic_now))
+                or not isinstance(utc_now, datetime)
+                or utc_now.tzinfo is None
+                or utc_now.utcoffset() is None
+            ):
+                raise FatalPersistenceError("runtime_observation_clock_invalid")
+            waiting = tuple(
+                command
+                for command in self._pending_commands
+                if command.kind != "shutdown"
+            )
+            oldest_queue_age = (
+                0.0
+                if not waiting
+                else max(0.0, float(monotonic_now) - waiting[0].enqueued_at)
+            )
+            cursor = await connection.execute(
+                """
+                SELECT COUNT(*), MIN(created_at),
+                       COALESCE(SUM(length(nonce) + length(ciphertext)), 0)
+                FROM outbox
+                """
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if (
+                row is None
+                or len(row) != 3
+                or type(row[0]) is not int
+                or row[0] < 0
+                or type(row[2]) is not int
+                or row[2] < 0
+                or row[1] is not None
+                and not isinstance(row[1], str)
+            ):
+                raise FatalPersistenceError("runtime_observation_invalid")
+            oldest_outbox_age = (
+                0.0
+                if row[1] is None
+                else max(
+                    0.0,
+                    (
+                        utc_now.astimezone(UTC) - _parse_datetime(row[1])
+                    ).total_seconds(),
+                )
+            )
+            observation = WriterRuntimeObservation(
+                writer_queue_depth=len(waiting),
+                writer_queue_oldest_age=oldest_queue_age,
+                writer_quick_check=self._last_quick_check,
+                outbox_depth=row[0],
+                outbox_oldest_age=oldest_outbox_age,
+                outbox_bytes=row[2],
+                storage_bytes=self._measure_storage_bytes(),
+            )
+            if not result.done():
+                result.set_result(observation)
         elif action == "ack":
             queue_id = self._required_positive_int(payload, "queue_id")
             expected_claim = self._required_positive_int(payload, "expected_claim_attempt")

@@ -93,6 +93,8 @@ def _registry(
     capacity: int = 1,
     token_factory: Any = None,
     prefix_factory: Any = lambda: 0,
+    candidate_run_id: UUID | None = None,
+    qualification_observer: Any = None,
 ) -> Any:
     from projetv0_voice.admission import CallRegistry
 
@@ -112,6 +114,8 @@ def _registry(
     kwargs: dict[str, object] = {}
     if background_task_factory is not None:
         kwargs["background_task_factory"] = background_task_factory
+    if qualification_observer is not None:
+        kwargs["qualification_observer"] = qualification_observer
     selected_token_factory = (
         (lambda _: "A" * 43) if token_factory is None else token_factory
     )
@@ -130,6 +134,7 @@ def _registry(
         token_factory=selected_token_factory,
         prefix_factory=prefix_factory,
         uuid_factory=lambda: next(ids),
+        candidate_run_id=candidate_run_id,
         **kwargs,
     )
 
@@ -242,6 +247,70 @@ async def _durable_waiting_wss_for(
     await registry.reconcile_after_commit(
         answered, resolution, WebhookCommitResult("first", "applied")
     )
+
+
+@pytest.mark.asyncio
+async def test_begin_drain_closes_new_admission_action_and_ordinary_claims() -> None:
+    from projetv0_voice.admission import (
+        CallAdmissionRejected,
+        ProcessLeaseAuthority,
+    )
+
+    writer = Writer()
+    control = CallControl()
+    registry = _registry(writer, control, lambda: 100.0)
+    initiated = _event("call.initiated", "event-before-drain")
+    resolution = await registry.resolve_webhook(initiated)
+
+    await registry.begin_drain()
+
+    with pytest.raises(CallAdmissionRejected, match="^call_draining$") as captured:
+        await registry.resolve_webhook(
+            _event("call.initiated", "event-after-drain", call_control_id="other")
+        )
+    assert captured.value.status_code == 503
+    disposition = await registry.reconcile_after_commit(
+        initiated,
+        resolution,
+        WebhookCommitResult("first", "applied"),
+    )
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a",
+        token_digest=snapshot.token_digest,
+    )
+
+    assert disposition.status_code == 503
+    assert claim is None
+    assert await registry.qualification_state_valid() is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_consumption_closes_readiness_but_keeps_accepted_claim() -> None:
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    writer = Writer()
+    transitions: list[str] = []
+    registry = _registry(
+        writer,
+        CallControl(),
+        lambda: 100.0,
+        candidate_run_id=UUID("99999999-9999-4999-8999-999999999999"),
+        qualification_observer=transitions.append,
+    )
+
+    await _durable_waiting_wss(registry)
+    snapshot = await registry.snapshot("control-a")
+    assert snapshot is not None
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a",
+        token_digest=snapshot.token_digest,
+    )
+
+    assert await registry.qualification_state() == "consumed"
+    assert claim is not None
+    assert transitions == ["consumed"]
 
 
 class _ConstructionOwner:

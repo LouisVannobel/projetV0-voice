@@ -38,6 +38,7 @@ from projetv0_voice.runtime_config import (
     capture_runtime_environment,
     parse_runtime_settings,
 )
+from projetv0_voice.telnyx.call_control import CallControlResult, StreamingStartV1
 
 ENDPOINT = "https://collector.invalid/tenant/v1/metrics"
 PREFIX = "projetv0.voice."
@@ -114,6 +115,92 @@ EXPECTED_INSTRUMENTS = {
     "runtime.event_loop_lag": ("_Histogram", "s"),
     "ready": ("_ObservableGauge", "1"),
 }
+
+
+def test_task_10c_l_declares_exact_eleven_non_ingress_metric_owners() -> None:
+    from projetv0_voice.lifecycle import NON_INGRESS_METRIC_OWNERS
+
+    assert NON_INGRESS_METRIC_OWNERS == {
+        "actions.total": "call_control",
+        "relay.runs": "relay_supervisor",
+        "writer.queue_depth": "writer_snapshot",
+        "writer.queue_oldest_age": "writer_snapshot",
+        "writer.quick_check": "writer_snapshot",
+        "outbox.depth": "writer_snapshot",
+        "outbox.oldest_age": "writer_snapshot",
+        "outbox.bytes": "writer_snapshot",
+        "recordings.total": "recording_transitions",
+        "runtime.event_loop_lag": "lag_supervisor",
+        "ready": "runtime_publication",
+    }
+
+
+def test_typed_ingress_observation_finishes_exactly_once() -> None:
+    from projetv0_voice.lifecycle import IngressMetricObservation, IngressMetricOutcome
+
+    metrics = metrics_module.RuntimeMetrics.in_memory()
+    observation = IngressMetricObservation(metrics)
+    outcome = IngressMetricOutcome(
+        webhook_class="initiated",
+        receipt="none",
+        disposition="unavailable",
+        admission_rejection="capacity",
+    )
+
+    observation.finish(outcome)
+    observation.finish(outcome)
+
+    values = _metric_map(metrics)
+    webhook = _points(values[PREFIX + "webhooks.total"])
+    assert webhook[
+        (
+            ("disposition", "unavailable"),
+            ("receipt", "none"),
+            ("webhook_class", "initiated"),
+        )
+    ].value == 1
+    rejection = _points(values[PREFIX + "admission.rejections"])
+    assert rejection[(("reason", "capacity"),)].value == 1
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_measured_call_control_counts_one_final_semantic_result() -> None:
+    from projetv0_voice.lifecycle import _MeasuredCallControl
+
+    class Control:
+        async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def start_streaming(
+            self, *_args: object, **_kwargs: object
+        ) -> CallControlResult:
+            return CallControlResult("retryable_not_sent")
+
+        async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            raise RuntimeError("provider-secret")
+
+    metrics = metrics_module.RuntimeMetrics.in_memory()
+    measured = _MeasuredCallControl(Control(), metrics)
+    request = StreamingStartV1(
+        stream_url="wss://voice.invalid/telnyx/media",
+        stream_auth_token="A" * 43,
+    )
+
+    assert (await measured.answer("control", command_id=object())).outcome == "accepted"
+    assert (
+        await measured.start_streaming("control", request, command_id=object())
+    ).outcome == "retryable_not_sent"
+    with pytest.raises(RuntimeError, match="provider-secret"):
+        await measured.hangup("control", command_id=object())
+
+    points = _points(_metric_map(metrics)[PREFIX + "actions.total"])
+    assert points[(("action", "answer"), ("outcome", "accepted"))].value == 1
+    assert points[
+        (("action", "streaming_start"), ("outcome", "retryable_not_sent"))
+    ].value == 1
+    assert points[(("action", "hangup"), ("outcome", "internal_error"))].value == 1
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 def _reader(owner: metrics_module.RuntimeMetrics) -> InMemoryMetricReader:

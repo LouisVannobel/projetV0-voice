@@ -39,6 +39,7 @@ from projetv0_voice.persistence.postgres_sink import (
     PurgeOutcome,
     RecordingPurgeLease,
 )
+from projetv0_voice.persistence.writer import WebhookCommitResult
 from projetv0_voice.session import (
     CallIdentity,
     ControlWriter,
@@ -842,6 +843,32 @@ def resolve_recording_webhook(
         raise
     except Exception:
         raise RecordingWebhookError("recording_webhook_invalid") from None
+
+
+def recording_metric_transition(
+    event: VerifiedWebhook,
+    effect: WebhookDurableEffect | None,
+    result: WebhookCommitResult,
+) -> Literal["saved", "error"] | None:
+    """Map only a first/applied local recording COMMIT to its one metric point."""
+
+    if (
+        not isinstance(event, VerifiedWebhook)
+        or event.event_type not in {"call.recording.saved", "call.recording.error"}
+        or not isinstance(effect, WebhookDurableEffect)
+        or effect.operation is None
+        or effect.operation.kind != "recording.upsert"
+        or not isinstance(effect.operation.payload, RecordingUpsertPayloadV1)
+        or not isinstance(result, WebhookCommitResult)
+        or (result.receipt, result.effect) != ("first", "applied")
+    ):
+        return None
+    status = effect.operation.payload.status
+    if event.event_type == "call.recording.saved" and status == "saved":
+        return "saved"
+    if event.event_type == "call.recording.error" and status == "failed":
+        return "error"
+    return None
 
 
 async def _await_with_deadline(

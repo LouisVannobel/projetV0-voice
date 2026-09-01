@@ -76,6 +76,7 @@ class CallAdmissionRejected(RuntimeError):
             "placeholder_capacity_reached",
             "qualification_run_consumed",
             "qualification_window_expired",
+            "call_draining",
         }
     )
     _EVENT_CODES = frozenset({"call_event_invalid", "call_identity_conflict"})
@@ -846,6 +847,10 @@ class CallRegistry:
         candidate_run_id: UUID | None = None,
         candidate_consumed: bool = False,
         admission_expires_at: datetime | None = None,
+        qualification_observer: Callable[
+            [Literal["valid", "consumed", "expired"]], None
+        ]
+        | None = None,
         background_task_factory: BackgroundTaskFactory = _default_background_task_factory,
     ) -> None:
         if (
@@ -867,6 +872,8 @@ class CallRegistry:
             or candidate_consumed
             and candidate_run_id is None
             or not callable(background_task_factory)
+            or qualification_observer is not None
+            and not callable(qualification_observer)
             or not callable(prefix_factory)
             or admission_expires_at is not None
             and (
@@ -900,6 +907,7 @@ class CallRegistry:
             if admission_expires_at is None
             else admission_expires_at.astimezone(UTC)
         )
+        self._qualification_observer = qualification_observer
         self._lock = asyncio.Lock()
         self._by_control: dict[str, _CallEntry] = {}
         self._by_call_id: dict[UUID, _CallEntry] = {}
@@ -909,6 +917,8 @@ class CallRegistry:
         self._session_owner_registration_open = True
         self._session_close_task: asyncio.Task[None] | None = None
         self._internal_failure_code: str | None = None
+        self._internal_failure_event = asyncio.Event()
+        self._draining = False
 
     def __repr__(self) -> str:
         return "CallRegistry()"
@@ -921,13 +931,21 @@ class CallRegistry:
     def internal_failure_code(self) -> str | None:
         return self._internal_failure_code
 
+    @property
+    def internal_failure_event(self) -> asyncio.Event:
+        return self._internal_failure_event
+
+    def _set_internal_failure(self, code: str) -> None:
+        self._internal_failure_code = code
+        self._internal_failure_event.set()
+
     def _note_terminal_failure(self, code: str) -> None:
         if code in {
             "terminal_persistence_failed",
             "terminal_hangup_failed",
             "terminal_removal_failed",
         }:
-            self._internal_failure_code = code
+            self._set_internal_failure(code)
 
     def _qualification_expired(self) -> bool:
         if self._admission_expires_at is None:
@@ -1057,6 +1075,10 @@ class CallRegistry:
     async def resolve_webhook(self, event: VerifiedWebhook) -> ResolvedWebhook:
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
 
+        if event.event_type in {"call.initiated", "call.answered", "call.hangup"}:
+            async with self._lock:
+                if self._draining:
+                    raise CallAdmissionRejected("call_draining")
         if event.event_type == "call.answered":
             return await self._resolve_answered(event)
         if event.event_type == "call.hangup":
@@ -1129,6 +1151,9 @@ class CallRegistry:
 
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
 
+        async with self._lock:
+            if self._draining:
+                raise CallAdmissionRejected("call_draining")
         if event.call_control_id is None or event.event_type not in {
             "call.initiated",
             "call.answered",
@@ -1295,7 +1320,7 @@ class CallRegistry:
             reservation._run_abandonment(), name="voice-reservation-owner"
         ):
             return reservation
-        self._internal_failure_code = "background_task_registration_failed"
+        self._set_internal_failure("background_task_registration_failed")
         await self._settle_failed_call_registration(reservation)
         raise CallAdmissionRejected("owner_registration_failed")
 
@@ -1319,7 +1344,7 @@ class CallRegistry:
             reservation._run_abandonment(), name="voice-placeholder-owner"
         ):
             return reservation
-        self._internal_failure_code = "background_task_registration_failed"
+        self._set_internal_failure("background_task_registration_failed")
         await self._settle_failed_placeholder_registration(reservation)
         raise CallAdmissionRejected("owner_registration_failed")
 
@@ -1350,6 +1375,7 @@ class CallRegistry:
         result: WebhookCommitValue | None,
     ) -> None:
         terminal_action_owners: tuple[asyncio.Task[object], ...] = ()
+        qualification_consumed = False
         async with self._lock:
             if reservation._registry_applied:
                 return
@@ -1432,10 +1458,12 @@ class CallRegistry:
             ) == ("first", "applied"):
                 entry.durable = True
                 entry.lease_state = "pending"
-                if self._candidate_run_id is not None:
+                if self._candidate_run_id is not None and not self._candidate_consumed:
                     self._candidate_consumed = True
-            elif isinstance(result, QualificationRunConsumed):
+                    qualification_consumed = True
+            elif isinstance(result, QualificationRunConsumed) and not self._candidate_consumed:
                 self._candidate_consumed = True
+                qualification_consumed = True
             if entry.precommit_refcount == 0 and not entry.durable:
                 entry.raw_token = None
                 if not entry.capacity_released:
@@ -1444,6 +1472,9 @@ class CallRegistry:
                 self._by_control.pop(entry.call_control_id, None)
                 self._by_call_id.pop(entry.call_id, None)
             reservation._registry_applied = True
+        if qualification_consumed and self._qualification_observer is not None:
+            with contextlib.suppress(Exception):
+                self._qualification_observer("consumed")
         for owner_task in terminal_action_owners:
             owner_task.cancel()
         if terminal_action_owners:
@@ -1705,6 +1736,8 @@ class CallRegistry:
         generation: UUID | None = None
         deadline_work: _TerminalWork | None = None
         async with self._lock:
+            if self._draining:
+                return WebhookDisposition(503)
             if self._qualification_expired():
                 return WebhookDisposition(503)
             entry = self._by_control.get(call_control_id)
@@ -1852,7 +1885,7 @@ class CallRegistry:
                     name="voice-action-deadline-cleanup",
                 )
                 if cleanup is None:
-                    self._internal_failure_code = "background_task_registration_failed"
+                    self._set_internal_failure("background_task_registration_failed")
                     while True:
                         try:
                             await self._run_terminal_cleanup(
@@ -1862,7 +1895,7 @@ class CallRegistry:
                             break
                         except asyncio.CancelledError:
                             continue
-                    self._internal_failure_code = "background_task_registration_failed"
+                    self._set_internal_failure("background_task_registration_failed")
                 else:
                     while not cleanup.done():
                         try:
@@ -1935,11 +1968,11 @@ class CallRegistry:
                 if lifecycle_owner._task is not asyncio.current_task():
                     lifecycle_waits.append(lifecycle_owner.wait())
             except BaseException:
-                self._internal_failure_code = "lifecycle_drain_failed"
+                self._set_internal_failure("lifecycle_drain_failed")
         if lifecycle_waits:
             results = await asyncio.gather(*lifecycle_waits, return_exceptions=True)
             if any(isinstance(result, BaseException) for result in results):
-                self._internal_failure_code = "lifecycle_drain_failed"
+                self._set_internal_failure("lifecycle_drain_failed")
         if work.lifecycle_owners:
             return
         entry = work.entry
@@ -1961,9 +1994,9 @@ class CallRegistry:
                 except asyncio.CancelledError:
                     if retry_cancelled_io:
                         continue
-                    self._internal_failure_code = "terminal_persistence_failed"
+                    self._set_internal_failure("terminal_persistence_failed")
                 except BaseException:
-                    self._internal_failure_code = "terminal_persistence_failed"
+                    self._set_internal_failure("terminal_persistence_failed")
                 break
         if work.cleanup_hangup:
             while True:
@@ -2108,6 +2141,7 @@ class CallRegistry:
             digest_matches = hmac.compare_digest(expected_digest, token_digest)
             if (
                 entry is None
+                or self._draining
                 or self._qualification_expired()
                 or entry.terminal_event is not None
                 or not entry.durable
@@ -2173,6 +2207,29 @@ class CallRegistry:
 
             completion.set_result(WebhookDisposition(200))
         return claim
+
+    async def begin_drain(self) -> None:
+        """Close new admissions, action ownership, and ordinary WSS claims."""
+
+        async with self._lock:
+            self._draining = True
+
+    async def qualification_state_valid(self) -> bool:
+        """Return the owner-locked candidate/override readiness predicate."""
+
+        return await self.qualification_state() == "valid"
+
+    async def qualification_state(
+        self,
+    ) -> Literal["valid", "consumed", "expired"]:
+        """Distinguish candidate consumption from expiry for WSS eligibility."""
+
+        async with self._lock:
+            if self._candidate_consumed:
+                return "consumed"
+            if self._qualification_expired():
+                return "expired"
+            return "valid"
 
     async def close_session_owner_registration(self) -> None:
         cancellation: asyncio.CancelledError | None = None
@@ -2348,7 +2405,7 @@ class CallRegistry:
                 if cancellation is None:
                     cancellation = error
             except BaseException as error:
-                self._internal_failure_code = "lifecycle_drain_failed"
+                self._set_internal_failure("lifecycle_drain_failed")
                 if failure is None:
                     failure = error
         for authority, entry, generation, completion_event in provider_authorities:
@@ -2749,7 +2806,7 @@ class CallRegistry:
                         cancellation = error
                     continue
                 except BaseException:
-                    self._internal_failure_code = "terminal_hangup_failed"
+                    self._set_internal_failure("terminal_hangup_failed")
                 break
         abort_target_clearers: tuple[
             tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...
@@ -2954,7 +3011,7 @@ class CallRegistry:
         coroutine = self._abort_target(target)
         scheduled = self._background_owner.spawn(coroutine, name=name)
         if not scheduled:
-            self._internal_failure_code = "background_task_registration_failed"
+            self._set_internal_failure("background_task_registration_failed")
         return scheduled
 
     async def _abort_target(self, target: _AbortTarget) -> None:

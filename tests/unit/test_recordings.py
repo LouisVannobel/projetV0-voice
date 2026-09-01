@@ -22,6 +22,7 @@ from projetv0_voice.persistence.postgres_sink import (
     OperationSinkTransientError,
     RecordingPurgeLease,
 )
+from projetv0_voice.persistence.writer import WebhookCommitResult
 from projetv0_voice.session import CallIdentity, RecordingStartState
 from projetv0_voice.telnyx.call_control import (
     CallControlResult,
@@ -47,6 +48,7 @@ from projetv0_voice.telnyx.recordings import (
     derive_recording_id,
     encode_recording_correlation,
     purge_recordings_once,
+    recording_metric_transition,
     resolve_recording_webhook,
 )
 from projetv0_voice.telnyx.webhooks import (
@@ -117,6 +119,47 @@ def test_recording_identity_action_and_capsule_golden_vectors_are_frozen() -> No
         "InYiOjF9"
     )
     assert decode_recording_correlation(encoded) == correlation
+
+
+@pytest.mark.parametrize(
+    ("event_type", "status", "expected"),
+    [
+        ("call.recording.saved", "saved", "saved"),
+        ("call.recording.error", "failed", "error"),
+    ],
+)
+def test_recording_metric_transition_requires_first_applied_local_commit(
+    event_type: str,
+    status: str,
+    expected: str,
+) -> None:
+    event = recording_event(
+        event_type,
+        provider_recording_id=(
+            "recording_Ab-12" if event_type == "call.recording.saved" else None
+        ),
+    )
+    effect = resolve_recording_webhook(event)
+    assert effect is not None
+    assert effect.operation is not None
+    assert effect.operation.payload.status == status
+
+    assert (
+        recording_metric_transition(
+            event,
+            effect,
+            WebhookCommitResult("first", "applied"),
+        )
+        == expected
+    )
+    assert (
+        recording_metric_transition(
+            event,
+            effect,
+            WebhookCommitResult("duplicate", "duplicate"),
+        )
+        is None
+    )
 
 
 def test_identity_excludes_mutable_call_runtime_values_and_actions_are_distinct() -> None:
