@@ -567,6 +567,12 @@ from projetv0_voice.runtime_config import (
     parse_runtime_settings,
     read_runtime_secret,
 )
+import projetv0_voice.observability_bootstrap as preloaded_observability_bootstrap
+import pydantic as preloaded_pydantic
+preloaded_modules = [
+    preloaded_observability_bootstrap.__name__,
+    preloaded_pydantic.__name__,
+]
 os.setgroups([])
 os.setgid(10001)
 os.setuid(10001)
@@ -577,10 +583,38 @@ identity = {
     "egid": os.getegid(),
     "groups": os.getgroups(),
 }
+expected_identity = {
+    "uid": 10001,
+    "gid": 10001,
+    "euid": 10001,
+    "egid": 10001,
+    "groups": [],
+}
+post_drop_calls = []
+def call_after_identity_drop(name, operation, argument):
+    current_identity = {
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "euid": os.geteuid(),
+        "egid": os.getegid(),
+        "groups": os.getgroups(),
+    }
+    post_drop_calls.append({"name": name, "identity": current_identity})
+    if current_identity != expected_identity:
+        raise RuntimeError("runtime_secret_test_identity_invalid")
+    return operation(argument)
 try:
     capture = capture_runtime_environment(json.loads(sys.argv[2]))
-    settings = parse_runtime_settings(capture)
-    value = read_runtime_secret(Path(sys.argv[1]))
+    settings = call_after_identity_drop(
+        "parse_runtime_settings",
+        parse_runtime_settings,
+        capture,
+    )
+    value = call_after_identity_drop(
+        "read_runtime_secret",
+        read_runtime_secret,
+        Path(sys.argv[1]),
+    )
 except BaseException as error:
     print(json.dumps({
         "kind": "error",
@@ -589,6 +623,8 @@ except BaseException as error:
         "context": error.__context__ is None,
         "identity": identity,
         "settings": locals().get("settings").deployment_id if "settings" in locals() else None,
+        "preloaded_modules": preloaded_modules,
+        "post_drop_calls": post_drop_calls,
     }))
 else:
     print(json.dumps({
@@ -596,6 +632,8 @@ else:
         "value": value.get_secret_value(),
         "identity": identity,
         "settings": settings.deployment_id,
+        "preloaded_modules": preloaded_modules,
+        "post_drop_calls": post_drop_calls,
     }))
 """
     environment = dict(os.environ)
@@ -636,6 +674,32 @@ else:
         "egid": 10001,
         "groups": [],
     }
+    assert payload.pop("preloaded_modules") == [
+        "projetv0_voice.observability_bootstrap",
+        "pydantic",
+    ]
+    assert payload.pop("post_drop_calls") == [
+        {
+            "name": "parse_runtime_settings",
+            "identity": {
+                "uid": 10001,
+                "gid": 10001,
+                "euid": 10001,
+                "egid": 10001,
+                "groups": [],
+            },
+        },
+        {
+            "name": "read_runtime_secret",
+            "identity": {
+                "uid": 10001,
+                "gid": 10001,
+                "euid": 10001,
+                "egid": 10001,
+                "groups": [],
+            },
+        },
+    ]
     assert payload.pop("settings") == "voice-agent-a"
     return payload
 
