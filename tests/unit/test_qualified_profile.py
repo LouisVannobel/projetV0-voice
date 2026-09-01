@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +15,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError
 
+from projetv0_voice import qualified_profile as qualified_profile_module
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.qualified_profile import (
     InferenceProfileV1,
@@ -957,6 +960,126 @@ def test_override_loader_reads_from_open_fd_not_path(
         now=now,
     )
     assert loaded.benchmark_max_calls == 20
+
+
+def test_public_profile_open_adds_nonblocking_and_close_on_exec_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    path = write_json(
+        tmp_path / "override.json",
+        {
+            "schema_version": 1,
+            "run_id": str(RUN_ID),
+            "deployment_id": "voice-agent-a",
+            "qualified_profile_sha256": HEX_B,
+            "benchmark_max_calls": 20,
+            "created_at": (now - timedelta(seconds=1)).isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    close_on_exec = 1 << 27
+    nonblocking = 1 << 28
+    real_open = os.open
+    seen: list[int] = []
+    monkeypatch.setattr(qualified_profile_module.os, "O_CLOEXEC", close_on_exec, raising=False)
+    monkeypatch.setattr(qualified_profile_module.os, "O_NONBLOCK", nonblocking, raising=False)
+
+    def recording_open(
+        open_path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        seen.append(flags)
+        return real_open(open_path, flags & ~(close_on_exec | nonblocking), mode)
+
+    monkeypatch.setattr(qualified_profile_module.os, "open", recording_open)
+
+    loaded = load_qualification_override(
+        path,
+        qualification_mode=True,
+        expected_run_id=RUN_ID,
+        **override_bindings(now),
+        ownership_check=lambda _: True,
+        now=now,
+    )
+
+    assert loaded.benchmark_max_calls == 20
+    assert len(seen) == 1
+    assert seen[0] & close_on_exec
+    assert seen[0] & nonblocking
+
+
+def _run_public_profile_subprocess(path: Path) -> dict[str, object]:
+    code = """
+import json
+import os
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID
+sys.path.insert(0, os.environ["PYTHONPATH"])
+from projetv0_voice.qualified_profile import load_qualification_override
+now = datetime(2026, 8, 25, tzinfo=UTC)
+try:
+    load_qualification_override(
+        Path(sys.argv[1]),
+        qualification_mode=True,
+        expected_run_id=UUID("11111111-1111-4111-8111-111111111111"),
+        expected_deployment_id="voice-agent-a",
+        expected_qualified_profile_sha256="b" * 64,
+        strict_qualified_at=now - timedelta(days=1),
+        ownership_check=lambda _: True,
+        now=now,
+    )
+except BaseException as error:
+    print(json.dumps({"kind": "error", "message": str(error)}))
+else:
+    print(json.dumps({"kind": "value"}))
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(REPOSITORY_ROOT / "src")
+    try:
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-I", "-c", code, str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        return {"kind": "timeout"}
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux kernel descriptor contract")
+@pytest.mark.parametrize("kind", ["fifo", "socket", "directory", "symlink"])
+def test_linux_kernel_public_profile_nonregular_and_symlink_fail_before_deadline(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    path = tmp_path / "profile.json"
+    socket_owner: socket.socket | None = None
+    if kind == "fifo":
+        os.mkfifo(path, 0o440)
+    elif kind == "socket":
+        socket_owner = socket.socket(socket.AF_UNIX)
+        socket_owner.bind(str(path))
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        target = write_json(tmp_path / "target.json", {})
+        path.symlink_to(target)
+    try:
+        result = _run_public_profile_subprocess(path)
+    finally:
+        if socket_owner is not None:
+            socket_owner.close()
+
+    assert result["kind"] == "error"
 
 
 def test_override_loader_rejects_reparse_ancestor_and_oversized_file(tmp_path: Path) -> None:

@@ -137,6 +137,7 @@ def test_guard_returns_opaque_frozen_token_for_valid_endpoint(endpoint: str) -> 
     assert type(token) is observability_bootstrap.ObservabilityBootstrapToken
     assert repr(token) == "ObservabilityBootstrapToken()"
     assert str(token) == "ObservabilityBootstrapToken()"
+    assert not hasattr(token, "endpoint")
     with pytest.raises((AttributeError, TypeError)):
         token.endpoint = endpoint  # type: ignore[misc]
 

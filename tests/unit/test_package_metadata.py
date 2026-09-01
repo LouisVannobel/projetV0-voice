@@ -6,6 +6,8 @@ import tomllib
 from importlib.metadata import version
 from pathlib import Path
 
+import yaml
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_RUNTIME_DEPENDENCIES = [
     "aiosqlite==0.22.1",
@@ -101,3 +103,47 @@ def test_production_source_does_not_use_the_development_runner() -> None:
     )
 
     assert "pipecat.runner.run" not in production_source
+
+
+def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> None:
+    workflow_path = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+    assert workflow_path.is_file()
+    workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    assert workflow["name"] == "Voice runtime CI"
+    assert workflow["on"] == {
+        "push": {"branches": ["main", "z/**"]},
+        "pull_request": "",
+    }
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["jobs"]) == {"shared-repository-ci", "python-linux"}
+    assert workflow["jobs"]["shared-repository-ci"] == {
+        "uses": (
+            "LouisVannobel/projetV0-pipelines/.github/workflows/"
+            "reusable-repository-ci.yml@399df8dcb93a28734269ad11b63e847896684487"
+        )
+    }
+    linux = workflow["jobs"]["python-linux"]
+    assert linux["runs-on"] == "ubuntu-24.04"
+    assert linux["steps"] == [
+        {
+            "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "with": {"persist-credentials": "false"},
+        },
+        {
+            "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+            "with": {"version": "0.12.4", "python-version": "3.13.15"},
+        },
+        {"run": "uv sync --all-groups --frozen"},
+        {"run": "uv run pytest -q"},
+        {
+            "name": "Run privileged Linux descriptor cases",
+            "run": (
+                'sudo env "PATH=$PATH" uv run pytest tests/unit/test_runtime_config.py '
+                'tests/unit/test_qualified_profile.py -q -k '
+                '"linux_kernel or fifo or socket or grows"'
+            ),
+        },
+        {"run": "uv run ruff check ."},
+        {"run": "uv run mypy --strict src"},
+    ]

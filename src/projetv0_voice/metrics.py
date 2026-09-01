@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import math
-import os
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, replace
+from threading import Lock
 from typing import Any
 
 import requests
@@ -22,8 +23,8 @@ from opentelemetry.sdk.resources import Resource
 
 from projetv0_voice.observability_bootstrap import (
     ObservabilityBootstrapToken,
+    _token_matches_endpoint,
     _valid_endpoint,
-    _validate_observability_mapping,
 )
 
 _PREFIX = "projetv0.voice."
@@ -97,6 +98,109 @@ def _nonnegative_integer(value: object) -> int | None:
     return value if type(value) is int and 0 <= value <= _MAX_OTLP_INT else None
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimePublishedSnapshot:
+    """One complete immutable process observation publication."""
+
+    generation: int
+    ready: bool
+    draining: bool
+    writer_queue_depth: int
+    writer_queue_oldest_age: float
+    writer_quick_check: bool
+    outbox_depth: int
+    outbox_oldest_age: float
+    outbox_bytes: int
+    storage_bytes: int
+    startup_profile_and_stale_recovery_complete: bool
+    admission_open: bool
+    qualification_state_valid: bool
+    writer_owner_alive_and_ready: bool
+    no_writer_fatal_or_degradation: bool
+    relay_supervisor_alive: bool
+    no_permanent_relay_or_sink_degradation: bool
+
+    def __post_init__(self) -> None:
+        integer_values = (
+            self.generation,
+            self.writer_queue_depth,
+            self.outbox_depth,
+            self.outbox_bytes,
+            self.storage_bytes,
+        )
+        number_values = (
+            self.writer_queue_oldest_age,
+            self.outbox_oldest_age,
+        )
+        boolean_values = (
+            self.ready,
+            self.draining,
+            self.writer_quick_check,
+            self.startup_profile_and_stale_recovery_complete,
+            self.admission_open,
+            self.qualification_state_valid,
+            self.writer_owner_alive_and_ready,
+            self.no_writer_fatal_or_degradation,
+            self.relay_supervisor_alive,
+            self.no_permanent_relay_or_sink_degradation,
+        )
+        if (
+            any(_nonnegative_integer(value) is None for value in integer_values)
+            or any(_nonnegative_number(value) is None for value in number_values)
+            or any(type(value) is not bool for value in boolean_values)
+        ):
+            raise RuntimeError("runtime_snapshot_invalid") from None
+
+
+class RuntimePublication:
+    """Protect exactly one reference to the latest immutable publication."""
+
+    __slots__ = ("_lock", "_snapshot")
+
+    def __init__(self, snapshot: RuntimePublishedSnapshot) -> None:
+        if type(snapshot) is not RuntimePublishedSnapshot:
+            raise RuntimeError("runtime_publication_invalid") from None
+        self._lock = Lock()
+        self._snapshot = snapshot
+
+    def __repr__(self) -> str:
+        return "RuntimePublication()"
+
+    def publish(self, snapshot: RuntimePublishedSnapshot) -> None:
+        if type(snapshot) is not RuntimePublishedSnapshot:
+            raise RuntimeError("runtime_publication_invalid") from None
+        with self._lock:
+            if snapshot.generation <= self._snapshot.generation:
+                raise RuntimeError("runtime_publication_invalid") from None
+            self._snapshot = snapshot
+
+    def snapshot(self) -> RuntimePublishedSnapshot:
+        with self._lock:
+            return self._snapshot
+
+
+def _initial_runtime_snapshot() -> RuntimePublishedSnapshot:
+    return RuntimePublishedSnapshot(
+        generation=0,
+        ready=False,
+        draining=False,
+        writer_queue_depth=0,
+        writer_queue_oldest_age=0.0,
+        writer_quick_check=False,
+        outbox_depth=0,
+        outbox_oldest_age=0.0,
+        outbox_bytes=0,
+        storage_bytes=0,
+        startup_profile_and_stale_recovery_complete=False,
+        admission_open=False,
+        qualification_state_valid=False,
+        writer_owner_alive_and_ready=False,
+        no_writer_fatal_or_degradation=False,
+        relay_supervisor_alive=False,
+        no_permanent_relay_or_sink_degradation=False,
+    )
+
+
 class _CallMetricLease:
     """Single-finish owner for one call's active, total, and duration metrics."""
 
@@ -126,20 +230,14 @@ class RuntimeMetrics:
         provider: Any,
         metric_reader: Any,
         monotonic: Callable[[], object] = time.monotonic,
+        publication: RuntimePublication | None = None,
     ) -> None:
         self._provider = provider
         self._metric_reader = metric_reader
         self._failure_code: str | None = None
         self._shutdown_task: asyncio.Task[None] | None = None
         self._monotonic = monotonic
-
-        self._writer_queue_depth_value = 0
-        self._writer_queue_oldest_age_value = 0.0
-        self._writer_quick_check_value = 0
-        self._outbox_depth_value = 0
-        self._outbox_oldest_age_value = 0.0
-        self._outbox_bytes_value = 0
-        self._ready_value = 0
+        self._publication = publication or RuntimePublication(_initial_runtime_snapshot())
 
         self._meter = provider.get_meter("projetv0.voice", None)
         self._calls_active = self._meter.create_up_down_counter(
@@ -232,6 +330,7 @@ class RuntimeMetrics:
         cls,
         *,
         monotonic: Callable[[], object] = time.monotonic,
+        publication: RuntimePublication | None = None,
     ) -> RuntimeMetrics:
         """Create an independent local owner without an export thread."""
 
@@ -242,16 +341,24 @@ class RuntimeMetrics:
             exemplar_filter=AlwaysOffExemplarFilter(),
             shutdown_on_exit=False,
         )
-        return cls(provider=provider, metric_reader=reader, monotonic=monotonic)
+        return cls(
+            provider=provider,
+            metric_reader=reader,
+            monotonic=monotonic,
+            publication=publication,
+        )
 
     @classmethod
-    def production(cls, token: ObservabilityBootstrapToken) -> RuntimeMetrics:
+    def production(
+        cls,
+        token: ObservabilityBootstrapToken,
+        *,
+        endpoint: str,
+    ) -> RuntimeMetrics:
         """Create the fixed local OTLP/HTTP owner after bootstrap validation."""
 
         if type(token) is not ObservabilityBootstrapToken:
             raise ValueError("observability_bootstrap_token_invalid") from None
-        _validate_observability_mapping(os.environ)
-        endpoint = os.environ["VOICE_OTLP_HTTP_ENDPOINT"]
         return _build_production(token, endpoint=endpoint)
 
     @classmethod
@@ -261,11 +368,13 @@ class RuntimeMetrics:
         metric_reader: Any,
         *,
         monotonic: Callable[[], object] = time.monotonic,
+        publication: RuntimePublication | None = None,
     ) -> RuntimeMetrics:
         return cls(
             provider=provider,
             metric_reader=metric_reader,
             monotonic=monotonic,
+            publication=publication,
         )
 
     @property
@@ -401,9 +510,16 @@ class RuntimeMetrics:
         if depth_value is None or age_value is None or type(quick_check) is not bool:
             self._latch_failure()
             return
-        self._writer_queue_depth_value = depth_value
-        self._writer_queue_oldest_age_value = age_value
-        self._writer_quick_check_value = int(quick_check)
+        current = self._publication.snapshot()
+        self._publication.publish(
+            replace(
+                current,
+                generation=current.generation + 1,
+                writer_queue_depth=depth_value,
+                writer_queue_oldest_age=age_value,
+                writer_quick_check=quick_check,
+            )
+        )
 
     def update_outbox_state(
         self,
@@ -418,15 +534,29 @@ class RuntimeMetrics:
         if depth_value is None or age_value is None or bytes_value is None:
             self._latch_failure()
             return
-        self._outbox_depth_value = depth_value
-        self._outbox_oldest_age_value = age_value
-        self._outbox_bytes_value = bytes_value
+        current = self._publication.snapshot()
+        self._publication.publish(
+            replace(
+                current,
+                generation=current.generation + 1,
+                outbox_depth=depth_value,
+                outbox_oldest_age=age_value,
+                outbox_bytes=bytes_value,
+            )
+        )
 
     def update_ready(self, ready: object) -> None:
         if type(ready) is not bool:
             self._latch_failure()
             return
-        self._ready_value = int(ready)
+        current = self._publication.snapshot()
+        self._publication.publish(
+            replace(
+                current,
+                generation=current.generation + 1,
+                ready=ready,
+            )
+        )
 
     async def aclose(self) -> None:
         """Run provider shutdown exactly once while shielding shared completion."""
@@ -493,31 +623,31 @@ class RuntimeMetrics:
     def _observe_writer_queue_depth(
         self, _options: CallbackOptions
     ) -> Iterable[Observation]:
-        return (Observation(self._writer_queue_depth_value),)
+        return (Observation(self._publication.snapshot().writer_queue_depth),)
 
     def _observe_writer_queue_oldest_age(
         self, _options: CallbackOptions
     ) -> Iterable[Observation]:
-        return (Observation(self._writer_queue_oldest_age_value),)
+        return (Observation(self._publication.snapshot().writer_queue_oldest_age),)
 
     def _observe_writer_quick_check(
         self, _options: CallbackOptions
     ) -> Iterable[Observation]:
-        return (Observation(self._writer_quick_check_value),)
+        return (Observation(int(self._publication.snapshot().writer_quick_check)),)
 
     def _observe_outbox_depth(self, _options: CallbackOptions) -> Iterable[Observation]:
-        return (Observation(self._outbox_depth_value),)
+        return (Observation(self._publication.snapshot().outbox_depth),)
 
     def _observe_outbox_oldest_age(
         self, _options: CallbackOptions
     ) -> Iterable[Observation]:
-        return (Observation(self._outbox_oldest_age_value),)
+        return (Observation(self._publication.snapshot().outbox_oldest_age),)
 
     def _observe_outbox_bytes(self, _options: CallbackOptions) -> Iterable[Observation]:
-        return (Observation(self._outbox_bytes_value),)
+        return (Observation(self._publication.snapshot().outbox_bytes),)
 
     def _observe_ready(self, _options: CallbackOptions) -> Iterable[Observation]:
-        return (Observation(self._ready_value),)
+        return (Observation(int(self._publication.snapshot().ready)),)
 
 
 def _build_production(
@@ -533,6 +663,8 @@ def _build_production(
         raise ValueError("observability_bootstrap_token_invalid") from None
     if not _valid_endpoint(endpoint):
         raise RuntimeError("observability_endpoint_invalid") from None
+    if not _token_matches_endpoint(token, endpoint):
+        raise RuntimeError("observability_endpoint_mismatch") from None
 
     session = session_factory()
     session.trust_env = False
@@ -558,4 +690,4 @@ def _build_production(
     return RuntimeMetrics(provider=provider, metric_reader=reader)
 
 
-__all__ = ["RuntimeMetrics"]
+__all__ = ["RuntimeMetrics", "RuntimePublication", "RuntimePublishedSnapshot"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -729,6 +730,114 @@ class _FakeProvider:
         self.shutdown_calls.append(timeout_millis)
 
 
+def _published_snapshot(
+    generation: int,
+    *,
+    base: int,
+    ready: bool,
+) -> metrics_module.RuntimePublishedSnapshot:
+    return metrics_module.RuntimePublishedSnapshot(
+        generation=generation,
+        ready=ready,
+        draining=False,
+        writer_queue_depth=base,
+        writer_queue_oldest_age=float(base) + 0.1,
+        writer_quick_check=ready,
+        outbox_depth=base + 1,
+        outbox_oldest_age=float(base) + 0.2,
+        outbox_bytes=base + 2,
+        storage_bytes=base + 3,
+        startup_profile_and_stale_recovery_complete=ready,
+        admission_open=ready,
+        qualification_state_valid=ready,
+        writer_owner_alive_and_ready=ready,
+        no_writer_fatal_or_degradation=ready,
+        relay_supervisor_alive=ready,
+        no_permanent_relay_or_sink_degradation=ready,
+    )
+
+
+def _observable_callback_values(owner: metrics_module.RuntimeMetrics) -> tuple[object, ...]:
+    callbacks = (
+        owner._observe_writer_queue_depth,  # noqa: SLF001
+        owner._observe_writer_queue_oldest_age,  # noqa: SLF001
+        owner._observe_writer_quick_check,  # noqa: SLF001
+        owner._observe_outbox_depth,  # noqa: SLF001
+        owner._observe_outbox_oldest_age,  # noqa: SLF001
+        owner._observe_outbox_bytes,  # noqa: SLF001
+        owner._observe_ready,  # noqa: SLF001
+    )
+    return tuple(next(iter(callback(None))).value for callback in callbacks)  # type: ignore[arg-type]
+
+
+def test_runtime_publication_is_frozen_and_rejects_nonmonotone_generation() -> None:
+    old = _published_snapshot(7, base=10, ready=False)
+    publication = metrics_module.RuntimePublication(old)
+
+    assert publication.snapshot() is old
+    assert repr(publication) == "RuntimePublication()"
+    with pytest.raises((AttributeError, TypeError)):
+        old.ready = True
+    for generation in (6, 7):
+        with pytest.raises(RuntimeError, match="^runtime_publication_invalid$") as caught:
+            publication.publish(_published_snapshot(generation, base=20, ready=True))
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+    assert publication.snapshot() is old
+
+
+def test_observable_callbacks_see_only_complete_old_or_new_publication() -> None:
+    old = _published_snapshot(1, base=10, ready=False)
+    publication = metrics_module.RuntimePublication(old)
+    owner = metrics_module.RuntimeMetrics._from_provider(  # noqa: SLF001
+        _FakeProvider(),
+        metric_reader=None,
+        publication=publication,
+    )
+    first_candidate_scalar = threading.Event()
+    finish_candidate = threading.Event()
+    candidate: dict[str, object] = {
+        "generation": 2,
+        "ready": True,
+        "draining": False,
+        "writer_queue_depth": 20,
+    }
+
+    def build_then_publish() -> None:
+        first_candidate_scalar.set()
+        assert finish_candidate.wait(timeout=5)
+        candidate.update(
+            {
+                "writer_queue_oldest_age": 20.1,
+                "writer_quick_check": True,
+                "outbox_depth": 21,
+                "outbox_oldest_age": 20.2,
+                "outbox_bytes": 22,
+                "storage_bytes": 23,
+                "startup_profile_and_stale_recovery_complete": True,
+                "admission_open": True,
+                "qualification_state_valid": True,
+                "writer_owner_alive_and_ready": True,
+                "no_writer_fatal_or_degradation": True,
+                "relay_supervisor_alive": True,
+                "no_permanent_relay_or_sink_degradation": True,
+            }
+        )
+        publication.publish(metrics_module.RuntimePublishedSnapshot(**candidate))
+
+    publisher = threading.Thread(target=build_then_publish, name="snapshot-publisher")
+    publisher.start()
+    assert first_candidate_scalar.wait(timeout=5)
+    before = _observable_callback_values(owner)
+    finish_candidate.set()
+    publisher.join(timeout=5)
+    assert publisher.is_alive() is False
+    after = _observable_callback_values(owner)
+
+    assert before == (10, 10.1, 0, 11, 10.2, 12, 0)
+    assert after == (20, 20.1, 1, 21, 20.2, 22, 1)
+
+
 @pytest.mark.asyncio
 async def test_production_builder_passes_exact_http_reader_provider_values() -> None:
     calls: dict[str, Any] = {}
@@ -797,6 +906,47 @@ async def test_production_builder_passes_exact_http_reader_provider_values() -> 
 
     await owner.aclose()
     assert provider.shutdown_calls == [10000.0]
+
+
+def test_production_uses_explicit_settings_endpoint_after_environment_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    selected: list[object] = []
+
+    def build(
+        received_token: ObservabilityBootstrapToken,
+        *,
+        endpoint: object,
+    ) -> object:
+        assert received_token is token
+        selected.append(endpoint)
+        return object()
+
+    monkeypatch.setattr(metrics_module, "_build_production", build)
+    monkeypatch.setitem(
+        os.environ,
+        "VOICE_OTLP_HTTP_ENDPOINT",
+        "https://mutated.invalid/v1/metrics",
+    )
+
+    owner = metrics_module.RuntimeMetrics.production(token, endpoint=ENDPOINT)
+
+    assert owner is not None
+    assert selected == [ENDPOINT]
+
+
+def test_production_rejects_token_and_settings_endpoint_mismatch() -> None:
+    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+
+    with pytest.raises(RuntimeError, match="^observability_endpoint_mismatch$") as caught:
+        metrics_module._build_production(  # noqa: SLF001
+            token,
+            endpoint="https://other.invalid/v1/metrics",
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 class _LocalExporter(MetricExporter):

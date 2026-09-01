@@ -310,7 +310,13 @@ def _read_profile_atomic[ModelT: BaseModel](
     except FileNotFoundError as error:
         raise ValueError("profile artifact file does not exist") from error
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as error:

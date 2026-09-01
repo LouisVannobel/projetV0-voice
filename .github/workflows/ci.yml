@@ -1,0 +1,30 @@
+name: Voice runtime CI
+
+on:
+  push:
+    branches: [main, "z/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shared-repository-ci:
+    uses: LouisVannobel/projetV0-pipelines/.github/workflows/reusable-repository-ci.yml@399df8dcb93a28734269ad11b63e847896684487
+
+  python-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.4"
+          python-version: "3.13.15"
+      - run: uv sync --all-groups --frozen
+      - run: uv run pytest -q
+      - name: Run privileged Linux descriptor cases
+        run: sudo env "PATH=$PATH" uv run pytest tests/unit/test_runtime_config.py tests/unit/test_qualified_profile.py -q -k "linux_kernel or fifo or socket or grows"
+      - run: uv run ruff check .
+      - run: uv run mypy --strict src
