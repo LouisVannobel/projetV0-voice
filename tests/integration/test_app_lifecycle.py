@@ -1648,3 +1648,152 @@ async def test_public_shutdown_maps_private_fixed_supervisor_failure() -> None:
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     assert sentinel not in repr(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_parent_startup_cancellation_cancels_phase_once_and_preserves_first(
+    tmp_path: Path,
+) -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    entered = asyncio.Event()
+    release_phase = asyncio.Event()
+    child_saw_cancel = asyncio.Event()
+    sink_close_entered = asyncio.Event()
+    allow_sink_close = asyncio.Event()
+    child_cancel_count = 0
+    hard_exit_calls: list[int] = []
+
+    class Sink:
+        async def open(self) -> None:
+            nonlocal child_cancel_count
+            entered.set()
+            try:
+                await release_phase.wait()
+            except asyncio.CancelledError:
+                child_cancel_count += 1
+                child_saw_cancel.set()
+                raise
+
+        async def close(self) -> None:
+            sink_close_entered.set()
+            await allow_sink_close.wait()
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append(code)
+        raise AssertionError("recoverable parent cancellation must not hard exit")
+
+    writer = PersistenceWriter(
+        tmp_path / "voice.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        sink=Sink(),
+        metrics=RuntimeMetrics.in_memory(),
+        startup_phase_timeout_seconds=5.0,
+        shutdown_timeout_seconds=30.0,
+        hard_exit=hard_exit,
+    )
+    startup = asyncio.create_task(supervisor.startup())
+    await entered.wait()
+
+    startup.cancel("first-parent-cancel")
+    cancel_waiter = asyncio.create_task(child_saw_cancel.wait())
+    cancel_seen, _pending = await asyncio.wait(
+        (cancel_waiter,), timeout=0.2
+    )
+    child_was_cancelled = bool(cancel_seen)
+    if not child_was_cancelled:
+        cancel_waiter.cancel()
+        await asyncio.gather(cancel_waiter, return_exceptions=True)
+        release_phase.set()
+    await sink_close_entered.wait()
+    startup.cancel("second-parent-cancel")
+    allow_sink_close.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await startup
+
+    assert str(captured.value) == "first-parent-cancel"
+    assert child_was_cancelled
+    assert child_cancel_count == 1
+    assert hard_exit_calls == []
+    assert supervisor.readiness_snapshot().ready is False
+    assert supervisor.readiness_snapshot().admission_open is False
+    assert supervisor._startup_phase_tasks == set()  # noqa: SLF001
+    assert supervisor._writer_task is not None  # noqa: SLF001
+    assert supervisor._writer_task.done()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_parent_cancel_swallowing_phase_hard_exits_only_at_cleanup_deadline(
+    tmp_path: Path,
+) -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    entered = asyncio.Event()
+    child_saw_cancel = asyncio.Event()
+    release = asyncio.Event()
+    child_cancel_count = 0
+    hard_exit_calls: list[int] = []
+
+    class Sink:
+        async def open(self) -> None:
+            nonlocal child_cancel_count
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_cancel_count += 1
+                child_saw_cancel.set()
+                await release.wait()
+
+        async def close(self) -> None:
+            return None
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append(code)
+        raise HardExitSentinel
+
+    writer = PersistenceWriter(
+        tmp_path / "voice.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    metrics = RuntimeMetrics.in_memory()
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        sink=Sink(),
+        metrics=metrics,
+        startup_phase_timeout_seconds=5.0,
+        shutdown_timeout_seconds=0.05,
+        hard_exit=hard_exit,
+    )
+    startup = asyncio.create_task(supervisor.startup())
+    await entered.wait()
+    startup.cancel("parent-cancel")
+
+    with pytest.raises(HardExitSentinel):
+        await startup
+    assert child_saw_cancel.is_set()
+    assert child_cancel_count == 1
+    assert hard_exit_calls == [72]
+
+    release.set()
+    await asyncio.gather(
+        *tuple(supervisor._startup_phase_tasks),  # noqa: SLF001
+        return_exceptions=True,
+    )
+    await writer.drain(timeout_seconds=1.0)
+    assert supervisor._writer_task is not None  # noqa: SLF001
+    await supervisor._writer_task  # noqa: SLF001
+    await metrics.aclose()

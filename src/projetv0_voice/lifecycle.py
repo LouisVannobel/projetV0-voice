@@ -702,6 +702,7 @@ class RuntimeSupervisor:
         self._hard_exit = hard_exit
         self._writer_task: asyncio.Task[None] | None = None
         self._startup_phase_tasks: set[asyncio.Task[Any]] = set()
+        self._startup_phase_cancel_requested: set[asyncio.Task[Any]] = set()
         self._startup_cleanup_task: asyncio.Task[None] | None = None
         self._startup_phase_timed_out = False
         self._fixed_tasks: dict[str, asyncio.Task[None]] = {}
@@ -787,7 +788,8 @@ class RuntimeSupervisor:
                 else "runtime_startup_failed"
             )
         if cancellation is not None:
-            await self._finish_startup_unwind()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._finish_startup_unwind()
             raise cancellation
         if failure_code is not None:
             if self._startup_phase_timed_out:
@@ -825,6 +827,7 @@ class RuntimeSupervisor:
 
         def finished(done: asyncio.Task[ResultT]) -> None:
             self._startup_phase_tasks.discard(done)
+            self._startup_phase_cancel_requested.discard(done)
             if not done.cancelled():
                 with contextlib.suppress(BaseException):
                     done.exception()
@@ -834,7 +837,18 @@ class RuntimeSupervisor:
         timeout_seconds = self._startup_phase_timeouts.get(
             code, self._startup_phase_timeout_seconds
         )
-        done, _pending = await asyncio.wait((task,), timeout=timeout_seconds)
+        parent_cancellation: asyncio.CancelledError | None = None
+        done: set[asyncio.Task[ResultT]] = set()
+        try:
+            completed, _pending = await asyncio.wait(
+                (task,), timeout=timeout_seconds
+            )
+            done.update(completed)
+        except asyncio.CancelledError as error:
+            parent_cancellation = error
+        if parent_cancellation is not None:
+            self._cancel_startup_phase_once(task)
+            raise parent_cancellation
         if task not in done:
             self._startup_phase_timed_out = True
             self._startup_complete = False
@@ -844,7 +858,7 @@ class RuntimeSupervisor:
             self.fixed_supervisors.close_registration()
             if self._unauthenticated_gate is not None:
                 self._unauthenticated_gate.close()
-            task.cancel()
+            self._cancel_startup_phase_once(task)
             raise RuntimeError(code) from None
         phase_failed = False
         result: ResultT | None = None
@@ -857,6 +871,12 @@ class RuntimeSupervisor:
         if phase_failed:
             raise RuntimeError(code) from None
         return cast(ResultT, result)
+
+    def _cancel_startup_phase_once(self, task: asyncio.Task[Any]) -> None:
+        if task.done() or task in self._startup_phase_cancel_requested:
+            return
+        self._startup_phase_cancel_requested.add(task)
+        task.cancel()
 
     @property
     def call_control_facade(self) -> _CallControl:
