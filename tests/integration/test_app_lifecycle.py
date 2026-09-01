@@ -976,6 +976,7 @@ async def test_shutdown_deadline_bounds_each_dependency_close(
 @pytest.mark.asyncio
 async def test_production_composition_builds_ordered_graph_with_one_measured_control(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import base64
     import hashlib
@@ -1142,17 +1143,17 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         return secrets[str(path)]
 
     def build_metrics(
+        _cls: type[RuntimeMetrics],
         token: object,
+        *,
         endpoint: str,
-        publication: object,
     ) -> RuntimeMetrics:
-        from projetv0_voice.metrics import RuntimePublication
-
         assert token is settings.observability_token()
         assert endpoint == settings.otlp_http_endpoint
-        assert isinstance(publication, RuntimePublication)
         order.append("metrics")
-        return RuntimeMetrics.in_memory(publication=publication)
+        return RuntimeMetrics.in_memory()
+
+    monkeypatch.setattr(RuntimeMetrics, "production", classmethod(build_metrics))
 
     factories = RuntimeProductionFactories(
         validate_artifacts=lambda received: order.append(
@@ -1174,7 +1175,6 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
             order.append("keyring")
             or CryptoKeyring({1: KEY}, active_version=1)
         ),
-        metrics_factory=build_metrics,  # type: ignore[arg-type]
         sink_factory=lambda _dsn: order.append("sink") or Sink(),
         call_control_factory=lambda _key: order.append("call-control") or Control(),
         inference_factory=lambda _key, _profile: (
@@ -1222,6 +1222,28 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
     await graph.supervisor.aclose()
 
+    from projetv0_voice.persistence.postgres_sink import OperationSinkTransientError
+
+    sentinel = "PRIVATE-SINK-SENTINEL"
+
+    def fail_sink(_dsn: SecretStr) -> object:
+        raise OperationSinkTransientError(sentinel)
+
+    failing_factories = replace(factories, sink_factory=fail_sink)  # type: ignore[arg-type]
+    with pytest.raises(
+        RuntimeError, match="^runtime_production_composition_failed$"
+    ) as captured:
+        await build_production_runtime(
+            settings,
+            factories=failing_factories,
+            utcnow=lambda: NOW,
+            monotonic=lambda: 10.0,
+            startup_phase_timeout_seconds=2.0,
+        )
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sentinel not in repr(captured.value)
+
 
 @pytest.mark.asyncio
 async def test_startup_phase_timeout_is_independent_and_unwinds_blocked_sink(
@@ -1231,12 +1253,18 @@ async def test_startup_phase_timeout_is_independent_and_unwinds_blocked_sink(
 
     open_entered = asyncio.Event()
     never_open = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_after_cancel = asyncio.Event()
     sink_closed = asyncio.Event()
 
     class Sink:
         async def open(self) -> None:
             open_entered.set()
-            await never_open.wait()
+            try:
+                await never_open.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_after_cancel.wait()
 
         async def close(self) -> None:
             sink_closed.set()
@@ -1255,9 +1283,19 @@ async def test_startup_phase_timeout_is_independent_and_unwinds_blocked_sink(
         shutdown_timeout_seconds=30.0,
     )
 
+    startup = asyncio.create_task(supervisor.startup())
+    await open_entered.wait()
+    done, _pending = await asyncio.wait((startup,), timeout=0.2)
+    returned_at_phase_deadline = startup in done
+    assert cancellation_seen.is_set()
+    release_after_cancel.set()
     with pytest.raises(RuntimeError, match="^runtime_startup_failed$"):
-        await supervisor.startup()
+        await startup
+    cleanup = supervisor._startup_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    await asyncio.wait_for(asyncio.shield(cleanup), timeout=2.0)
 
+    assert returned_at_phase_deadline
     assert open_entered.is_set()
     assert sink_closed.is_set()
     assert supervisor._writer_task is not None  # noqa: SLF001
@@ -1266,10 +1304,16 @@ async def test_startup_phase_timeout_is_independent_and_unwinds_blocked_sink(
 
 @pytest.mark.asyncio
 async def test_pre_supervisor_composition_unwind_uses_one_deadline() -> None:
+    from typing import NoReturn
+
     from projetv0_voice.lifecycle import _close_failed_composition
+
+    class HardExitSentinel(BaseException):
+        pass
 
     never = asyncio.Event()
     entered: list[str] = []
+    hard_exit_calls: list[int] = []
 
     async def block(name: str) -> None:
         entered.append(name)
@@ -1290,15 +1334,317 @@ async def test_pre_supervisor_composition_unwind_uses_one_deadline() -> None:
         async def aclose(self) -> None:
             await block("metrics")
 
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append(code)
+        raise HardExitSentinel
+
     loop = asyncio.get_running_loop()
     started = loop.time()
-    await _close_failed_composition(
-        Control(),  # type: ignore[arg-type]
-        Sink(),  # type: ignore[arg-type]
-        Metrics(),  # type: ignore[arg-type]
-        timeout_seconds=0.05,
-    )
+    with pytest.raises(HardExitSentinel):
+        await _close_failed_composition(
+            Control(),  # type: ignore[arg-type]
+            Sink(),  # type: ignore[arg-type]
+            Metrics(),  # type: ignore[arg-type]
+            timeout_seconds=0.05,
+            hard_exit=hard_exit,
+        )
     elapsed = loop.time() - started
 
     assert elapsed < 0.1
     assert entered == ["call_control"]
+    assert hard_exit_calls == [72]
+    live_closes = tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("voice-composition-close-")
+    )
+    await asyncio.gather(*live_closes, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_startup_cleanup_hard_exits_when_phase_child_remains_live(
+    tmp_path: Path,
+) -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    hard_exit_calls: list[int] = []
+
+    class Sink:
+        async def open(self) -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        async def close(self) -> None:
+            return None
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append(code)
+        raise HardExitSentinel
+
+    writer = PersistenceWriter(
+        tmp_path / "voice.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    metrics = RuntimeMetrics.in_memory()
+    sink = Sink()
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        sink=sink,
+        metrics=metrics,
+        startup_phase_timeout_seconds=1.0,
+        startup_phase_timeouts={"operation_sink_open_failed": 0.01},
+        shutdown_timeout_seconds=0.05,
+        hard_exit=hard_exit,
+    )
+
+    with pytest.raises(RuntimeError, match="^runtime_startup_failed$"):
+        await supervisor.startup()
+    assert entered.is_set()
+    cleanup = supervisor._startup_cleanup_task  # noqa: SLF001
+    assert cleanup is not None
+    with pytest.raises(HardExitSentinel):
+        await cleanup
+    assert hard_exit_calls == [72]
+    assert supervisor.readiness_snapshot().ready is False
+    assert supervisor.readiness_snapshot().admission_open is False
+
+    release.set()
+    await asyncio.gather(
+        *tuple(supervisor._startup_phase_tasks),  # noqa: SLF001
+        return_exceptions=True,
+    )
+    await writer.drain(timeout_seconds=1.0)
+    assert supervisor._writer_task is not None  # noqa: SLF001
+    await supervisor._writer_task  # noqa: SLF001
+    await sink.close()
+    await metrics.aclose()
+
+
+@pytest.mark.asyncio
+async def test_composition_cleanup_hard_exits_instead_of_abandoning_live_close() -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import _close_failed_composition
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    hard_exit_calls: list[int] = []
+
+    class Control:
+        async def aclose(self) -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append(code)
+        raise HardExitSentinel
+
+    with pytest.raises(HardExitSentinel):
+        await _close_failed_composition(
+            Control(),  # type: ignore[arg-type]
+            None,
+            None,
+            timeout_seconds=0.01,
+            hard_exit=hard_exit,
+        )
+    assert entered.is_set()
+    assert hard_exit_calls == [72]
+
+    release.set()
+    live_closes = tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("voice-composition-close-")
+    )
+    await asyncio.gather(*live_closes, return_exceptions=True)
+
+
+def test_composition_cleanup_production_hard_exit_is_nonreturning_subprocess() -> None:
+    import subprocess
+    import sys
+
+    script = r"""
+import asyncio
+from projetv0_voice.lifecycle import _close_failed_composition
+
+class Control:
+    async def aclose(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()
+
+asyncio.run(_close_failed_composition(Control(), None, None, timeout_seconds=0.01))
+print("POST-HARD-EXIT-MARKER")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 72
+    assert "POST-HARD-EXIT-MARKER" not in result.stdout
+    assert "POST-HARD-EXIT-MARKER" not in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_composition_cleanup_cancellation_cannot_abandon_live_close() -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import _close_failed_composition
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    hard_exit_calls: list[int] = []
+
+    class Control:
+        async def aclose(self) -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append(code)
+        raise HardExitSentinel
+
+    cleanup = asyncio.create_task(
+        _close_failed_composition(
+            Control(),  # type: ignore[arg-type]
+            None,
+            None,
+            timeout_seconds=0.05,
+            hard_exit=hard_exit,
+        )
+    )
+    await entered.wait()
+    cleanup.cancel()
+    with pytest.raises(HardExitSentinel):
+        await cleanup
+    assert hard_exit_calls == [72]
+
+    release.set()
+    live_closes = tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("voice-composition-close-")
+    )
+    await asyncio.gather(*live_closes, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_public_startup_failure_clears_private_sink_exception_context(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.persistence.postgres_sink import OperationSinkTransientError
+
+    sentinel = "PRIVATE-SINK-SENTINEL"
+
+    class Sink:
+        async def open(self) -> None:
+            raise OperationSinkTransientError(sentinel)
+
+        async def close(self) -> None:
+            return None
+
+    writer = PersistenceWriter(
+        tmp_path / "voice.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        sink=Sink(),
+        metrics=RuntimeMetrics.in_memory(),
+        startup_phase_timeout_seconds=2.0,
+        shutdown_timeout_seconds=30.0,
+    )
+
+    with pytest.raises(RuntimeError, match="^runtime_startup_failed$") as captured:
+        await supervisor.startup()
+
+    output = capsys.readouterr()
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sentinel not in str(captured.value)
+    assert sentinel not in repr(captured.value)
+    assert sentinel not in output.out
+    assert sentinel not in output.err
+    assert sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_public_shutdown_failure_clears_private_sink_exception_context() -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.persistence.postgres_sink import OperationSinkTransientError
+
+    sentinel = "PRIVATE-SINK-SENTINEL"
+
+    class Sink:
+        async def open(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            raise OperationSinkTransientError(sentinel)
+
+    supervisor = RuntimeSupervisor(sink=Sink(), shutdown_timeout_seconds=1.0)
+
+    with pytest.raises(RuntimeError, match="^runtime_shutdown_failed$") as captured:
+        await supervisor.aclose()
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sentinel not in repr(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_public_shutdown_maps_private_fixed_supervisor_failure() -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    sentinel = "PRIVATE-FIXED-SENTINEL"
+    supervisor = RuntimeSupervisor(shutdown_timeout_seconds=1.0)
+
+    async def fail() -> None:
+        raise RuntimeError(sentinel)
+
+    task = supervisor.fixed_supervisors.try_start(
+        fail(), name="voice-purge-supervisor"
+    )
+    assert task is not None
+    supervisor._fixed_tasks["purge"] = task  # noqa: SLF001
+    supervisor.fixed_supervisors.close_registration()
+    await asyncio.gather(task, return_exceptions=True)
+
+    with pytest.raises(RuntimeError, match="^owned_task_failed$") as captured:
+        await supervisor.aclose()
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sentinel not in repr(captured.value)
