@@ -932,6 +932,12 @@ class CallRegistry:
         return self._internal_failure_code
 
     @property
+    def call_control_identity(self) -> object:
+        """Expose the process facade identity for composition verification."""
+
+        return self._call_control
+
+    @property
     def internal_failure_event(self) -> asyncio.Event:
         return self._internal_failure_event
 

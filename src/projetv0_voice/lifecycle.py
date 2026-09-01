@@ -5,23 +5,35 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import math
 import threading
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
+from pipecat.processors.frame_processor import FrameProcessor
 from pydantic import SecretStr
 
+from projetv0_voice.admission import (
+    CallRegistry,
+    ProcessLeaseAuthority,
+    SynchronousUnauthenticatedGate,
+    select_call_capacity,
+)
+from projetv0_voice.config import AgentManifestV1
+from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import (
     RuntimeMetrics,
     RuntimePublication,
     RuntimePublishedSnapshot,
 )
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.observability_bootstrap import ObservabilityBootstrapToken
 from projetv0_voice.persistence.relay import OutboxRelay
 from projetv0_voice.persistence.writer import (
     PersistenceWriter,
@@ -31,14 +43,35 @@ from projetv0_voice.persistence.writer import (
     WebhookCommitValue,
     WriterRuntimeObservation,
 )
+from projetv0_voice.qualified_profile import (
+    QualificationCandidateProfileV1,
+    QualificationOverrideV1,
+    QualifiedDeploymentProfileV1,
+    RuntimeDeploymentProfileV1,
+    canonical_inference_profile_sha256,
+    canonical_qualified_profile_sha256,
+)
+from projetv0_voice.runtime_config import RuntimeSettingsV1
+from projetv0_voice.session import (
+    CallIdentity,
+    PublicSttHttpClient,
+    RecordingBoundary,
+)
+from projetv0_voice.session_factory import ProcessSessionFactory
 from projetv0_voice.telnyx.call_control import CallControlResult, StreamingStartV1
+from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshakeService
 from projetv0_voice.telnyx.recordings import (
     PurgeBatchResult,
     RecordingPurgeError,
+    TelnyxRecordingBoundary,
+    after_recording_webhook_commit,
+    purge_recordings_once,
     recording_metric_transition,
 )
 from projetv0_voice.telnyx.webhooks import (
     ResolvedWebhook,
+    TelnyxWebhookProcessor,
+    TelnyxWebhookVerifier,
     VerifiedWebhook,
     WebhookDisposition,
     WebhookDurableEffect,
@@ -214,6 +247,83 @@ class _CloseableGate(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeProfileSelection:
+    """One validated runtime profile plus an optional qualification override."""
+
+    profile: RuntimeDeploymentProfileV1
+    override: QualificationOverrideV1 | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.profile,
+            QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1,
+        ) or self.override is not None and not isinstance(
+            self.override, QualificationOverrideV1
+        ):
+            raise ValueError("runtime_profile_selection_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeInferenceFactories:
+    """Typed external inference constructors retained by the session factory."""
+
+    stt_http_client_factory: Callable[[], PublicSttHttpClient]
+    stt_factory: Callable[[PublicSttHttpClient], FrameProcessor]
+    llm_factory: Callable[[], FrameProcessor]
+    tts_factory: Callable[[], FrameProcessor]
+
+    def __post_init__(self) -> None:
+        if not all(
+            callable(value)
+            for value in (
+                self.stt_http_client_factory,
+                self.stt_factory,
+                self.llm_factory,
+                self.tts_factory,
+            )
+        ):
+            raise ValueError("runtime_inference_factories_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeProductionFactories:
+    """Typed filesystem and external-client seams used by production composition."""
+
+    validate_artifacts: Callable[[RuntimeSettingsV1], None]
+    load_manifest: Callable[[RuntimeSettingsV1], AgentManifestV1]
+    load_profile: Callable[
+        [RuntimeSettingsV1, AgentManifestV1, datetime], RuntimeProfileSelection
+    ]
+    read_secret: Callable[[PurePosixPath], SecretStr]
+    load_keyring: Callable[[RuntimeSettingsV1], CryptoKeyring]
+    metrics_factory: Callable[
+        [ObservabilityBootstrapToken, str, RuntimePublication], RuntimeMetrics
+    ]
+    sink_factory: Callable[[SecretStr], _RuntimeSink]
+    call_control_factory: Callable[[SecretStr], _ProcessCallControl]
+    inference_factory: Callable[
+        [SecretStr, RuntimeDeploymentProfileV1], RuntimeInferenceFactories
+    ]
+
+    def __post_init__(self) -> None:
+        if not all(
+            callable(value)
+            for value in (
+                self.validate_artifacts,
+                self.load_manifest,
+                self.load_profile,
+                self.read_secret,
+                self.load_keyring,
+                self.metrics_factory,
+                self.sink_factory,
+                self.call_control_factory,
+                self.inference_factory,
+            )
+        ):
+            raise ValueError("runtime_production_factories_invalid") from None
+
+
 class _MeasuredCallControl:
     """Single semantic metric owner around the process Call Control facade."""
 
@@ -281,6 +391,35 @@ class _MeasuredCallControl:
             raise RuntimeError("call_control_result_invalid") from None
         self._metrics.record_action(action, result.outcome)
         return result
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RuntimeProductionGraph:
+    """Fully composed Task 10C-L graph consumed later by the FastAPI app."""
+
+    settings: RuntimeSettingsV1
+    manifest: AgentManifestV1
+    profile: RuntimeDeploymentProfileV1
+    override: QualificationOverrideV1 | None
+    keyring: CryptoKeyring
+    supervisor: RuntimeSupervisor
+    metrics: RuntimeMetrics
+    writer: PersistenceWriter
+    sink: _RuntimeSink
+    relay: OutboxRelay
+    raw_call_control: _ProcessCallControl
+    measured_call_control: _CallControl
+    registry: CallRegistry
+    lease_authority: ProcessLeaseAuthority
+    unauthenticated_gate: SynchronousUnauthenticatedGate
+    handshake: AuthenticatedTelnyxHandshakeService
+    session_factory: ProcessSessionFactory
+    webhook_processor: TelnyxWebhookProcessor
+    recording_factory: Callable[[CallIdentity], RecordingBoundary]
+    recording_call_control_identity: object
+
+    def __repr__(self) -> str:
+        return "RuntimeProductionGraph()"
 
 
 def publish_runtime_readiness(
@@ -422,8 +561,6 @@ class _OwnedTaskSet:
     ) -> asyncio.Task[None]:
         task = self.try_start(coroutine, name=name)
         if task is None:
-            with self._lock:
-                self._terminal_failure = True
             raise RuntimeError("owned_task_registration_failed") from None
         return task
 
@@ -493,6 +630,8 @@ class RuntimeSupervisor:
         retention_days: int = 7,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         loop_interval_seconds: float = 0.25,
+        startup_phase_timeout_seconds: float = 5.0,
+        startup_phase_timeouts: Mapping[str, float] | None = None,
         shutdown_timeout_seconds: float = 30.0,
     ) -> None:
         self.webhook_finalizers = _OwnedTaskSet()
@@ -509,8 +648,31 @@ class RuntimeSupervisor:
             or not isinstance(shutdown_timeout_seconds, int | float)
             or not math.isfinite(float(shutdown_timeout_seconds))
             or shutdown_timeout_seconds <= 0
+            or isinstance(startup_phase_timeout_seconds, bool)
+            or not isinstance(startup_phase_timeout_seconds, int | float)
+            or not math.isfinite(float(startup_phase_timeout_seconds))
+            or startup_phase_timeout_seconds <= 0
             or not isinstance(deployment_id, str)
             or not deployment_id
+        ):
+            raise ValueError("runtime_supervisor_config_invalid") from None
+        selected_phase_timeouts = dict(startup_phase_timeouts or {})
+        if any(
+            key
+            not in {
+                "writer_startup_failed",
+                "writer_quick_check_failed",
+                "qualification_status_failed",
+                "operation_sink_open_failed",
+                "stale_recovery_failed",
+                "runtime_publication_failed",
+                "runtime_begin_drain_failed",
+            }
+            or isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or value <= 0
+            for key, value in selected_phase_timeouts.items()
         ):
             raise ValueError("runtime_supervisor_config_invalid") from None
         self._writer = writer
@@ -535,6 +697,8 @@ class RuntimeSupervisor:
         self._retention_days = retention_days
         self._utcnow = utcnow
         self._loop_interval_seconds = float(loop_interval_seconds)
+        self._startup_phase_timeout_seconds = float(startup_phase_timeout_seconds)
+        self._startup_phase_timeouts = MappingProxyType(selected_phase_timeouts)
         self._shutdown_timeout_seconds = float(shutdown_timeout_seconds)
         self._writer_task: asyncio.Task[None] | None = None
         self._fixed_tasks: dict[str, asyncio.Task[None]] = {}
@@ -557,6 +721,8 @@ class RuntimeSupervisor:
             storage_bytes=0,
         )
         self._close_task: asyncio.Task[None] | None = None
+        self._deadline_tasks: set[asyncio.Future[object]] = set()
+        self._shutdown_failure_code: str | None = None
         self._closed = False
 
     async def startup(self) -> None:
@@ -567,32 +733,40 @@ class RuntimeSupervisor:
             self._writer_task = asyncio.create_task(
                 self._writer.run(), name="voice-persistence-writer"
             )
-            async with asyncio.timeout(self._shutdown_timeout_seconds):
-                if not await self._writer.wait_ready():
-                    raise RuntimeError("writer_startup_failed")
-                if not await self._writer.quick_check():
-                    raise RuntimeError("writer_quick_check_failed")
-                if (
-                    self._candidate_run_id is not None
-                    and await self._writer.qualification_run_consumed(
-                        self._candidate_run_id
-                    )
-                ):
-                    raise RuntimeError("qualification_run_consumed")
-                self._qualification_valid = True
-                if self._sink is not None:
-                    await self._sink.open()
-                await self._recover_stale_leases()
-                self._register_fixed_supervisors()
-                self.fixed_supervisors.close_registration()
-                self._startup_complete = True
-                self._admission_open = True
-                self._last_writer_observation = await self._writer.runtime_observation()
-                self._publish_current()
-                if self._writer_health_breached():
-                    await self.begin_drain()
+            if not await self._startup_await(
+                self._writer.wait_ready(), code="writer_startup_failed"
+            ):
+                raise RuntimeError("writer_startup_failed")
+            if not await self._startup_await(
+                self._writer.quick_check(), code="writer_quick_check_failed"
+            ):
+                raise RuntimeError("writer_quick_check_failed")
+            if self._candidate_run_id is not None and await self._startup_await(
+                self._writer.qualification_run_consumed(self._candidate_run_id),
+                code="qualification_status_failed",
+            ):
+                raise RuntimeError("qualification_run_consumed")
+            self._qualification_valid = True
+            if self._sink is not None:
+                await self._startup_await(
+                    self._sink.open(), code="operation_sink_open_failed"
+                )
+            await self._recover_stale_leases()
+            self._register_fixed_supervisors()
+            self.fixed_supervisors.close_registration()
+            self._startup_complete = True
+            self._admission_open = True
+            self._last_writer_observation = await self._startup_await(
+                self._writer.runtime_observation(),
+                code="runtime_publication_failed",
+            )
+            self._publish_current()
+            if self._writer_health_breached():
+                await self._startup_await(
+                    self.begin_drain(), code="runtime_begin_drain_failed"
+                )
         except asyncio.CancelledError:
-            await self._unwind_startup()
+            await self._finish_startup_unwind()
             raise
         except BaseException as error:
             code = (
@@ -603,10 +777,28 @@ class RuntimeSupervisor:
                     "qualification_run_consumed",
                     "writer_startup_failed",
                     "writer_quick_check_failed",
+                    "owned_task_registration_failed",
                 }
                 else "runtime_startup_failed"
             )
-            await self._unwind_startup()
+            await self._finish_startup_unwind()
+            raise RuntimeError(code) from None
+
+    async def _startup_await[ResultT](
+        self,
+        awaitable: Awaitable[ResultT],
+        *,
+        code: str,
+    ) -> ResultT:
+        try:
+            timeout_seconds = self._startup_phase_timeouts.get(
+                code, self._startup_phase_timeout_seconds
+            )
+            async with asyncio.timeout(timeout_seconds):
+                return await awaitable
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
             raise RuntimeError(code) from None
 
     @property
@@ -836,10 +1028,12 @@ class RuntimeSupervisor:
         if self._closed:
             return
         deadline = asyncio.get_running_loop().time() + self._shutdown_timeout_seconds
-        await self.begin_drain()
+        await self._await_shutdown_deadline(self.begin_drain(), deadline)
         await self.webhook_finalizers.join_until_empty(deadline)
         if self._registry is not None:
-            await self._registry.close_session_owner_registration()
+            await self._await_shutdown_deadline(
+                self._registry.close_session_owner_registration(), deadline
+            )
         self.call_lifecycle_owners.close_registration()
         await self.call_lifecycle_owners.join_until_empty(deadline)
 
@@ -847,7 +1041,9 @@ class RuntimeSupervisor:
         await self._join_state_supervisors(deadline)
         if self._registry is not None:
             self._registry.close_registration()
-            await self._registry.join_until_empty()
+            await self._await_shutdown_deadline(
+                self._registry.join_until_empty(), deadline
+            )
 
         self._relay_stop.set()
         await self._join_task("relay", deadline)
@@ -857,54 +1053,142 @@ class RuntimeSupervisor:
 
     async def _unwind_startup(self) -> None:
         deadline = asyncio.get_running_loop().time() + self._shutdown_timeout_seconds
-        await self.begin_drain()
-        await self.webhook_finalizers.join_until_empty(deadline)
+        await self._await_shutdown_deadline(self.begin_drain(), deadline)
+        await self._join_empty_owner_for_unwind(
+            self.webhook_finalizers, deadline
+        )
         if self._registry is not None:
-            await self._registry.close_session_owner_registration()
+            await self._await_shutdown_deadline(
+                self._registry.close_session_owner_registration(), deadline
+            )
         self.call_lifecycle_owners.close_registration()
-        await self.call_lifecycle_owners.join_until_empty(deadline)
+        await self._join_empty_owner_for_unwind(
+            self.call_lifecycle_owners, deadline
+        )
 
         self._state_stop.set()
         await self._join_state_supervisors(deadline)
         if self._registry is not None:
             self._registry.close_registration()
-            await self._registry.join_until_empty()
+            await self._await_shutdown_deadline(
+                self._registry.join_until_empty(), deadline
+            )
 
         self._relay_stop.set()
         await self._join_task("relay", deadline)
-        await self.fixed_supervisors.join_until_empty(deadline)
+        await self._join_empty_owner_for_unwind(self.fixed_supervisors, deadline)
         await self._unwind_startup_dependencies(deadline)
         self._closed = True
+
+    async def _finish_startup_unwind(self) -> None:
+        task = asyncio.create_task(
+            self._unwind_startup(), name="voice-startup-unwind"
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+            except BaseException:
+                break
+        await task
+        if cancellation is not None:
+            raise cancellation
+
+    @staticmethod
+    async def _join_empty_owner_for_unwind(
+        owner: _OwnedTaskSet,
+        deadline: float,
+    ) -> None:
+        try:
+            await owner.join_until_empty(deadline)
+        except RuntimeError as error:
+            if str(error) != "owned_task_failed":
+                raise
 
     async def _close_dependencies(self, deadline: float) -> None:
         await self._close_writer(deadline)
         if self._call_control is not None:
-            with contextlib.suppress(Exception):
-                await self._call_control.aclose()
+            await self._await_shutdown_deadline(
+                self._call_control.aclose(), deadline
+            )
         if self._sink is not None:
-            with contextlib.suppress(Exception):
-                await self._sink.close()
+            await self._await_shutdown_deadline(self._sink.close(), deadline)
         if self._metrics is not None:
-            with contextlib.suppress(Exception):
-                await self._metrics.aclose()
+            await self._await_shutdown_deadline(self._metrics.aclose(), deadline)
 
     async def _unwind_startup_dependencies(self, deadline: float) -> None:
+        deadline_failure: RuntimeError | None = None
         if self._call_control is not None:
-            with contextlib.suppress(Exception):
-                await self._call_control.aclose()
+            try:
+                await self._await_shutdown_deadline(
+                    self._call_control.aclose(), deadline
+                )
+            except RuntimeError as error:
+                if str(error) == "runtime_shutdown_deadline_exceeded":
+                    deadline_failure = error
         if self._sink is not None:
-            with contextlib.suppress(Exception):
-                await self._sink.close()
-        await self._close_writer(deadline)
+            try:
+                await self._await_shutdown_deadline(self._sink.close(), deadline)
+            except RuntimeError as error:
+                if str(error) == "runtime_shutdown_deadline_exceeded":
+                    deadline_failure = error
+        try:
+            await self._close_writer(deadline)
+        except RuntimeError as error:
+            if str(error) == "runtime_shutdown_deadline_exceeded":
+                deadline_failure = error
         if self._metrics is not None:
-            with contextlib.suppress(Exception):
-                await self._metrics.aclose()
+            try:
+                await self._await_shutdown_deadline(self._metrics.aclose(), deadline)
+            except RuntimeError as error:
+                if str(error) == "runtime_shutdown_deadline_exceeded":
+                    deadline_failure = error
+        if deadline_failure is not None:
+            raise deadline_failure
+
+    async def _await_shutdown_deadline[ResultT](
+        self,
+        awaitable: Coroutine[Any, Any, ResultT],
+        deadline: float,
+    ) -> ResultT:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            awaitable.close()
+            self._shutdown_failure_code = "runtime_shutdown_deadline_exceeded"
+            raise RuntimeError("runtime_shutdown_deadline_exceeded") from None
+        task = asyncio.create_task(awaitable)
+        retained = cast(asyncio.Future[object], task)
+        self._deadline_tasks.add(retained)
+
+        def finished(done: asyncio.Task[ResultT]) -> None:
+            self._deadline_tasks.discard(cast(asyncio.Future[object], done))
+            if not done.cancelled():
+                with contextlib.suppress(BaseException):
+                    done.exception()
+
+        task.add_done_callback(finished)
+        done, _pending = await asyncio.wait((task,), timeout=remaining)
+        if task not in done:
+            task.cancel()
+            self._shutdown_failure_code = "runtime_shutdown_deadline_exceeded"
+            raise RuntimeError("runtime_shutdown_deadline_exceeded") from None
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            self._shutdown_failure_code = "runtime_shutdown_failed"
+            raise RuntimeError("runtime_shutdown_failed") from None
 
     async def _close_writer(self, deadline: float) -> None:
         if self._writer is not None and self._writer_task is not None:
             remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-            with contextlib.suppress(Exception):
-                await self._writer.drain(timeout_seconds=remaining)
+            if not self._writer_task.done() and not self._writer.fatal_event.is_set():
+                with contextlib.suppress(Exception):
+                    await self._writer.drain(timeout_seconds=remaining)
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0 and not self._writer_task.done():
                 raise RuntimeError("runtime_shutdown_deadline_exceeded") from None
@@ -926,14 +1210,20 @@ class RuntimeSupervisor:
             command_id = _stale_cleanup_id(stale.call_id)
             try:
                 result = (
-                    await measured.hangup(
-                        stale.call_control_id,
-                        command_id=command_id,
+                    await self._startup_await(
+                        measured.hangup(
+                            stale.call_control_id,
+                            command_id=command_id,
+                        ),
+                        code="stale_recovery_failed",
                     )
                     if measured is not None
-                    else await self._call_control.hangup(  # type: ignore[union-attr]
-                        stale.call_control_id,
-                        command_id=command_id,
+                    else await self._startup_await(
+                        self._call_control.hangup(  # type: ignore[union-attr]
+                            stale.call_control_id,
+                            command_id=command_id,
+                        ),
+                        code="stale_recovery_failed",
                     )
                 )
             except asyncio.CancelledError:
@@ -943,30 +1233,35 @@ class RuntimeSupervisor:
             if result.outcome != "accepted":
                 raise RuntimeError("stale_recovery_failed") from None
             ended_at = _aware_utc(self._utcnow())
-            await self._writer.terminalize_stale_lease(
-                stale,
-                closed_at=ended_at,
-                operation=_stale_terminal_operation(
+            await self._startup_await(
+                self._writer.terminalize_stale_lease(
                     stale,
-                    deployment_id=self._deployment_id,
-                    ended_at=ended_at,
-                    retention_days=self._retention_days,
+                    closed_at=ended_at,
+                    operation=_stale_terminal_operation(
+                        stale,
+                        deployment_id=self._deployment_id,
+                        ended_at=ended_at,
+                        retention_days=self._retention_days,
+                    ),
                 ),
+                code="stale_recovery_failed",
             )
 
     def _register_fixed_supervisors(self) -> None:
-        inventory = (
-            ("relay", self._relay_loop()),
-            ("purge", self._purge_loop()),
-            ("reaper", self._reaper_loop()),
-            ("qualification-expiry", self._qualification_expiry_loop()),
-            ("writer-fatal", self._writer_fatal_loop()),
-            ("readiness", self._readiness_loop()),
-            ("event-loop-lag", self._event_loop_lag_loop()),
+        inventory: tuple[
+            tuple[str, Callable[[], Coroutine[Any, Any, None]]], ...
+        ] = (
+            ("relay", self._relay_loop),
+            ("purge", self._purge_loop),
+            ("reaper", self._reaper_loop),
+            ("qualification-expiry", self._qualification_expiry_loop),
+            ("writer-fatal", self._writer_fatal_loop),
+            ("readiness", self._readiness_loop),
+            ("event-loop-lag", self._event_loop_lag_loop),
         )
-        for name, coroutine in inventory:
+        for name, create_coroutine in inventory:
             task = self.fixed_supervisors.spawn_required(
-                coroutine, name=f"voice-{name}-supervisor"
+                create_coroutine(), name=f"voice-{name}-supervisor"
             )
             self._fixed_tasks[name] = task
 
@@ -1174,6 +1469,384 @@ class RuntimeSupervisor:
             raise RuntimeError("runtime_shutdown_deadline_exceeded") from None
 
 
+async def build_production_runtime(
+    settings: RuntimeSettingsV1,
+    *,
+    factories: RuntimeProductionFactories,
+    utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
+    monotonic: Callable[[], float] = lambda: asyncio.get_running_loop().time(),
+    startup_phase_timeout_seconds: float = 5.0,
+    startup_phase_timeouts: Mapping[str, float] | None = None,
+    shutdown_timeout_seconds: float | None = None,
+) -> RuntimeProductionGraph:
+    """Validate and compose the complete non-ASGI production runtime graph."""
+
+    if (
+        type(settings) is not RuntimeSettingsV1
+        or type(factories) is not RuntimeProductionFactories
+        or not callable(utcnow)
+        or not callable(monotonic)
+        or isinstance(startup_phase_timeout_seconds, bool)
+        or not isinstance(startup_phase_timeout_seconds, int | float)
+        or not math.isfinite(float(startup_phase_timeout_seconds))
+        or startup_phase_timeout_seconds <= 0
+    ):
+        raise ValueError("runtime_production_composition_invalid") from None
+    selected_shutdown_timeout = (
+        float(settings.shutdown_grace_seconds)
+        if shutdown_timeout_seconds is None
+        else shutdown_timeout_seconds
+    )
+    if (
+        isinstance(selected_shutdown_timeout, bool)
+        or not isinstance(selected_shutdown_timeout, int | float)
+        or not math.isfinite(float(selected_shutdown_timeout))
+        or selected_shutdown_timeout <= 0
+    ):
+        raise ValueError("runtime_production_composition_invalid") from None
+
+    metrics: RuntimeMetrics | None = None
+    sink: _RuntimeSink | None = None
+    raw_call_control: _ProcessCallControl | None = None
+    try:
+        factories.validate_artifacts(settings)
+        manifest = factories.load_manifest(settings)
+        now = _aware_utc(utcnow())
+        selection = factories.load_profile(settings, manifest, now)
+        if not isinstance(manifest, AgentManifestV1) or not isinstance(
+            selection, RuntimeProfileSelection
+        ):
+            raise RuntimeError("runtime_artifacts_invalid")
+        _validate_profile_selection(settings, manifest, selection, now=now)
+
+        telnyx_api_key = factories.read_secret(settings.telnyx_api_key_file)
+        webhook_public_key = factories.read_secret(
+            settings.telnyx_webhook_public_key_file
+        )
+        openrouter_api_key = factories.read_secret(settings.openrouter_api_key_file)
+        postgres_dsn = factories.read_secret(settings.postgres_dsn_file)
+        if not all(
+            isinstance(value, SecretStr)
+            and bool(value.get_secret_value())
+            for value in (
+                telnyx_api_key,
+                webhook_public_key,
+                openrouter_api_key,
+                postgres_dsn,
+            )
+        ):
+            raise RuntimeError("runtime_secret_invalid")
+        api_key_sha256 = hashlib.sha256(
+            telnyx_api_key.get_secret_value().encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(
+            selection.profile.telnyx_api_key_sha256, api_key_sha256
+        ):
+            raise RuntimeError("runtime_profile_api_key_mismatch")
+
+        keyring = factories.load_keyring(settings)
+        if not isinstance(keyring, CryptoKeyring):
+            raise RuntimeError("runtime_keyring_invalid")
+        publication = _new_publication()
+        token = settings.observability_token()
+        metrics = factories.metrics_factory(
+            token,
+            settings.otlp_http_endpoint,
+            publication,
+        )
+        if (
+            not isinstance(metrics, RuntimeMetrics)
+            or metrics.publication is not publication
+        ):
+            raise RuntimeError("runtime_metrics_composition_invalid")
+        writer = PersistenceWriter(Path(str(settings.sqlite_path)), keyring)
+        sink = factories.sink_factory(postgres_dsn)
+
+        supervisor_ref: RuntimeSupervisor | None = None
+
+        async def begin_drain() -> None:
+            if supervisor_ref is None:
+                raise RuntimeError("runtime_supervisor_unavailable") from None
+            await supervisor_ref.begin_drain()
+
+        relay = OutboxRelay(
+            writer,
+            cast(Any, sink),
+            on_degraded=begin_drain,
+            drain=begin_drain,
+        )
+        raw_call_control = factories.call_control_factory(telnyx_api_key)
+        inference = factories.inference_factory(
+            openrouter_api_key, selection.profile
+        )
+        if not isinstance(inference, RuntimeInferenceFactories):
+            raise RuntimeError("runtime_inference_composition_invalid")
+        supervisor = RuntimeSupervisor(
+            writer=writer,
+            call_control=raw_call_control,
+            metrics=metrics,
+            candidate_run_id=settings.qualification_run_id,
+            deployment_id=settings.deployment_id,
+            retention_days=manifest.transcript_retention_days,
+            utcnow=utcnow,
+            loop_interval_seconds=0.25,
+            startup_phase_timeout_seconds=float(startup_phase_timeout_seconds),
+            startup_phase_timeouts=startup_phase_timeouts,
+            shutdown_timeout_seconds=float(selected_shutdown_timeout),
+        )
+        supervisor_ref = supervisor
+        measured_call_control = supervisor.call_control_facade
+        capacity = select_call_capacity(
+            profile=selection.profile,
+            manifest=manifest,
+            deployment_max_calls=settings.deployment_max_calls,
+            override=selection.override,
+        )
+        admission_expires_at = (
+            selection.profile.expires_at
+            if isinstance(selection.profile, QualificationCandidateProfileV1)
+            else None
+            if selection.override is None
+            else selection.override.expires_at
+        )
+        registry = CallRegistry(
+            writer=writer,
+            call_control=cast(Any, measured_call_control),
+            tenant_id=manifest.tenant_id,
+            agent_id=manifest.agent_id,
+            deployment_id=settings.deployment_id,
+            capacity=capacity,
+            lease_ttl_seconds=selection.profile.call_lease_ttl_seconds,
+            stream_url=settings.telnyx_media_wss_url,
+            retention_days=manifest.transcript_retention_days,
+            utcnow=utcnow,
+            monotonic=monotonic,
+            candidate_run_id=settings.qualification_run_id,
+            admission_expires_at=admission_expires_at,
+            qualification_observer=supervisor.observe_qualification_state,
+        )
+        lease_authority = ProcessLeaseAuthority(registry)
+        gate = SynchronousUnauthenticatedGate(capacity)
+        handshake = AuthenticatedTelnyxHandshakeService(
+            profile=selection.profile,
+            lease_authority=lease_authority,
+            unauthenticated_gate=gate,
+            timeout_seconds=settings.handshake_timeout_seconds,
+        )
+        recording_retention_days = (
+            manifest.recording_retention_days
+            or manifest.transcript_retention_days
+        )
+
+        def recording_factory(identity: CallIdentity) -> RecordingBoundary:
+            del identity
+            return TelnyxRecordingBoundary(
+                telnyx=cast(Any, measured_call_control),
+                writer=writer,
+                retention_days=recording_retention_days,
+                required=manifest.recording_required,
+                play_beep=manifest.recording_play_beep,
+                utcnow=utcnow,
+            )
+
+        session_factory = ProcessSessionFactory(
+            registry=cast(Any, registry),
+            registrar=supervisor.call_lifecycle_owners,
+            runtime_metrics=metrics,
+            manifest=manifest,
+            profile=selection.profile,
+            writer=writer,
+            keyring=keyring,
+            stt_http_client_factory=inference.stt_http_client_factory,
+            stt_factory=inference.stt_factory,
+            llm_factory=inference.llm_factory,
+            tts_factory=inference.tts_factory,
+            recording_factory=recording_factory,
+            recording_call_control_identity=measured_call_control,
+            idle_timeout_seconds=settings.call_idle_timeout_seconds,
+            cleanup_phase_timeout_seconds=(
+                settings.call_cleanup_phase_timeout_seconds
+            ),
+        )
+        verifier = TelnyxWebhookVerifier(
+            public_key=webhook_public_key.get_secret_value(),
+            call_control_required_types=(
+                "call.initiated",
+                "call.answered",
+                "call.hangup",
+                "call.recording.saved",
+                "call.recording.error",
+            ),
+        )
+        webhook_processor = TelnyxWebhookProcessor(
+            verifier=verifier,
+            resolver=registry.resolve_webhook,
+            duplicate_resolver=registry.resolve_duplicate_webhook,
+            finalizer_owner=supervisor,
+        )
+
+        async def recording_after_commit(
+            event: VerifiedWebhook,
+            effect: WebhookDurableEffect | None,
+        ) -> WebhookDisposition | None:
+            return await after_recording_webhook_commit(
+                event,
+                effect,
+                telnyx=cast(Any, measured_call_control),
+                writer=writer,
+                local_drain=session_factory.drain_call_by_id,
+                monotonic=monotonic,
+                timeout_seconds=settings.call_cleanup_phase_timeout_seconds,
+            )
+
+        async def purge_once() -> PurgeBatchResult:
+            return await purge_recordings_once(
+                worker_id="voice-recording-purge",
+                lease_seconds=30,
+                batch_size=100,
+                telnyx=cast(Any, measured_call_control),
+                sink=cast(Any, sink),
+                utcnow=utcnow,
+            )
+
+        supervisor.bind_runtime_graph(
+            relay=relay,
+            registry=registry,
+            sink=sink,
+            unauthenticated_gate=gate,
+            purge_once=purge_once,
+            recording_after_commit=recording_after_commit,
+        )
+        return RuntimeProductionGraph(
+            settings=settings,
+            manifest=manifest,
+            profile=selection.profile,
+            override=selection.override,
+            keyring=keyring,
+            supervisor=supervisor,
+            metrics=metrics,
+            writer=writer,
+            sink=sink,
+            relay=relay,
+            raw_call_control=raw_call_control,
+            measured_call_control=measured_call_control,
+            registry=registry,
+            lease_authority=lease_authority,
+            unauthenticated_gate=gate,
+            handshake=handshake,
+            session_factory=session_factory,
+            webhook_processor=webhook_processor,
+            recording_factory=recording_factory,
+            recording_call_control_identity=measured_call_control,
+        )
+    except asyncio.CancelledError:
+        await _close_failed_composition(
+            raw_call_control,
+            sink,
+            metrics,
+            timeout_seconds=float(startup_phase_timeout_seconds),
+        )
+        raise
+    except BaseException:
+        await _close_failed_composition(
+            raw_call_control,
+            sink,
+            metrics,
+            timeout_seconds=float(startup_phase_timeout_seconds),
+        )
+        raise RuntimeError("runtime_production_composition_failed") from None
+
+
+def _validate_profile_selection(
+    settings: RuntimeSettingsV1,
+    manifest: AgentManifestV1,
+    selection: RuntimeProfileSelection,
+    *,
+    now: datetime,
+) -> None:
+    profile = selection.profile
+    expected = (
+        profile.deployment_id == settings.deployment_id
+        and profile.runtime_contract_sha256 == settings.runtime_contract_sha256
+        and profile.image_digest == settings.image_digest
+        and profile.agent_bundle_sha256 == settings.agent_bundle_sha256
+        and profile.inference_profile_sha256
+        == settings.inference_profile_sha256
+        and profile.inference_profile_sha256
+        == canonical_inference_profile_sha256(profile.inference)
+    )
+    if not expected:
+        raise RuntimeError("runtime_profile_binding_invalid")
+    if settings.runtime_mode == "strict":
+        valid_mode = (
+            isinstance(profile, QualifiedDeploymentProfileV1)
+            and selection.override is None
+            and profile.telnyx_data_locality == "EU"
+        )
+    elif settings.runtime_mode == "qualification_candidate":
+        valid_mode = (
+            isinstance(profile, QualificationCandidateProfileV1)
+            and selection.override is None
+            and settings.qualification_run_id == profile.run_id
+            and settings.benchmark_did_sha256 == profile.benchmark_did_hash
+            and now < profile.expires_at
+            and manifest.recording_mode == "off"
+        )
+    else:
+        override = selection.override
+        valid_mode = (
+            isinstance(profile, QualifiedDeploymentProfileV1)
+            and isinstance(override, QualificationOverrideV1)
+            and settings.qualification_run_id == override.run_id
+            and override.deployment_id == settings.deployment_id
+            and override.qualified_profile_sha256
+            == canonical_qualified_profile_sha256(profile)
+            and profile.qualified_at <= override.created_at < now < override.expires_at
+            and profile.telnyx_data_locality == "EU"
+        )
+    if not valid_mode:
+        raise RuntimeError("runtime_profile_mode_invalid")
+
+
+async def _close_failed_composition(
+    call_control: _ProcessCallControl | None,
+    sink: _RuntimeSink | None,
+    metrics: RuntimeMetrics | None,
+    *,
+    timeout_seconds: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    for close in (
+        None if call_control is None else call_control.aclose,
+        None if sink is None else sink.close,
+        None if metrics is None else metrics.aclose,
+    ):
+        if close is None:
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            operation = close()
+            task = asyncio.create_task(operation)
+        except BaseException:
+            continue
+        done, _pending = await asyncio.wait((task,), timeout=remaining)
+        if task not in done:
+            task.cancel()
+
+            def consume(completed: asyncio.Task[None]) -> None:
+                if not completed.cancelled():
+                    with contextlib.suppress(BaseException):
+                        completed.exception()
+
+            task.add_done_callback(consume)
+            break
+        with contextlib.suppress(BaseException):
+            task.result()
+
+
 def _new_publication() -> RuntimePublication:
     return RuntimePublication(
         RuntimePublishedSnapshot(
@@ -1251,4 +1924,12 @@ async def _wait_or_stop(stop: asyncio.Event, delay_seconds: float) -> bool:
     return True
 
 
-__all__ = ["RuntimeSupervisor", "publish_runtime_readiness"]
+__all__ = [
+    "RuntimeInferenceFactories",
+    "RuntimeProductionFactories",
+    "RuntimeProductionGraph",
+    "RuntimeProfileSelection",
+    "RuntimeSupervisor",
+    "build_production_runtime",
+    "publish_runtime_readiness",
+]

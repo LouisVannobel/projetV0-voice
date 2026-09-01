@@ -297,6 +297,7 @@ class ProcessSessionFactory:
         llm_factory: Callable[[], FrameProcessor],
         tts_factory: Callable[[], FrameProcessor],
         recording_factory: Callable[[CallIdentity], RecordingBoundary],
+        recording_call_control_identity: object | None = None,
         idle_timeout_seconds: float,
         session_factory: Callable[..., CallSession] = CallSession,
         cleanup_phase_timeout_seconds: float = 5.0,
@@ -313,9 +314,16 @@ class ProcessSessionFactory:
         self._llm_factory = llm_factory
         self._tts_factory = tts_factory
         self._recording_factory = recording_factory
+        self._recording_call_control_identity = recording_call_control_identity
         self._session_factory = session_factory
         self._idle_timeout_seconds = idle_timeout_seconds
         self._cleanup_phase_timeout_seconds = cleanup_phase_timeout_seconds
+
+    @property
+    def recording_call_control_identity(self) -> object | None:
+        """Expose the recording facade identity fixed by process composition."""
+
+        return self._recording_call_control_identity
 
     async def run(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         owner = _CallLifecycleOwner(self)

@@ -412,9 +412,10 @@ async def test_startup_accepted_before_terminal_commit_rolls_back_and_reopens(
         metrics=RuntimeMetrics.in_memory(),
         utcnow=lambda: NOW,
         loop_interval_seconds=0.05,
+        shutdown_timeout_seconds=5.0,
     )
 
-    with pytest.raises(RuntimeError, match="^runtime_startup_failed$"):
+    with pytest.raises(RuntimeError, match="^stale_recovery_failed$"):
         await supervisor.startup()
     with sqlite3.connect(database) as connection:
         state = connection.execute(
@@ -683,7 +684,8 @@ async def test_shutdown_does_not_close_dependencies_while_real_writer_is_stuck(
         metrics=metrics,
         utcnow=lambda: NOW,
         loop_interval_seconds=1.0,
-        shutdown_timeout_seconds=0.05,
+        startup_phase_timeout_seconds=2.0,
+        shutdown_timeout_seconds=0.01,
     )
     await supervisor.startup()
     blocking = True
@@ -867,3 +869,436 @@ async def test_startup_unwind_joins_retained_registry_background_before_dependen
     with pytest.raises(RuntimeError, match="^runtime_startup_failed$"):
         await startup
     assert control_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_preclosed_fixed_inventory_is_all_or_clean(
+    tmp_path: Path,
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    class BrokenControl:
+        async def aclose(self) -> None:
+            raise RuntimeError("external-close-failed")
+
+    writer = PersistenceWriter(
+        tmp_path / "voice.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    metrics = RuntimeMetrics.in_memory()
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        call_control=BrokenControl(),  # type: ignore[arg-type]
+        metrics=metrics,
+        utcnow=lambda: NOW,
+        loop_interval_seconds=0.05,
+    )
+    supervisor.fixed_supervisors.close_registration()
+
+    with pytest.raises(RuntimeError, match="^owned_task_registration_failed$"):
+        await supervisor.startup()
+
+    assert supervisor._writer_task is not None  # noqa: SLF001
+    assert supervisor._writer_task.done()  # noqa: SLF001
+    assert not [
+        warning
+        for warning in recwarn
+        if "was never awaited" in str(warning.message)
+    ]
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_name().startswith("voice-")
+        and not task.done()
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_dependency", ["call_control", "sink", "metrics"])
+async def test_shutdown_deadline_bounds_each_dependency_close(
+    blocked_dependency: str,
+) -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closed: list[str] = []
+
+    async def close(name: str) -> None:
+        if blocked_dependency == name:
+            entered.set()
+            await release.wait()
+        closed.append(name)
+
+    class Control:
+        async def aclose(self) -> None:
+            await close("call_control")
+
+    class Sink:
+        async def open(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            await close("sink")
+
+    metrics = RuntimeMetrics.in_memory()
+    original_metrics_close = metrics.aclose
+
+    async def close_metrics() -> None:
+        await close("metrics")
+
+    metrics.aclose = close_metrics  # type: ignore[method-assign]
+    supervisor = RuntimeSupervisor(
+        call_control=Control(),  # type: ignore[arg-type]
+        sink=Sink(),
+        metrics=metrics,
+        shutdown_timeout_seconds=0.05,
+    )
+
+    with pytest.raises(RuntimeError, match="^runtime_shutdown_deadline_exceeded$"):
+        await asyncio.wait_for(supervisor.aclose(), timeout=0.5)
+    assert entered.is_set()
+    if blocked_dependency == "call_control":
+        assert closed == []
+    elif blocked_dependency == "sink":
+        assert closed == ["call_control"]
+    else:
+        assert closed == ["call_control", "sink"]
+
+    release.set()
+    metrics.aclose = original_metrics_close  # type: ignore[method-assign]
+    await original_metrics_close()
+
+
+@pytest.mark.asyncio
+async def test_production_composition_builds_ordered_graph_with_one_measured_control(
+    tmp_path: Path,
+) -> None:
+    import base64
+    import hashlib
+
+    from nacl.signing import SigningKey
+    from pydantic import SecretStr
+
+    from projetv0_voice.config import AgentManifestV1
+    from projetv0_voice.lifecycle import (
+        RuntimeInferenceFactories,
+        RuntimeProductionFactories,
+        RuntimeProfileSelection,
+        build_production_runtime,
+    )
+    from projetv0_voice.qualified_profile import (
+        InferenceProfileV1,
+        QualifiedDeploymentProfileV1,
+        canonical_inference_profile_sha256,
+    )
+    from projetv0_voice.runtime_config import (
+        capture_runtime_environment,
+        parse_runtime_settings,
+    )
+    from projetv0_voice.telnyx.handshake import (
+        AuthenticatedTelnyxHandshakeService,
+    )
+    from projetv0_voice.telnyx.webhooks import TelnyxWebhookProcessor
+
+    api_key = "telnyx-api-key-value"
+    public_key = base64.b64encode(
+        bytes(SigningKey.generate().verify_key)
+    ).decode("ascii")
+    inference = InferenceProfileV1.model_validate(
+        {
+            "schema_version": 1,
+            "stt_model": "test/stt",
+            "llm_model": "test/llm",
+            "tts_model": "test/tts",
+            "tts_voice": "fr-test",
+            "tts_pcm_sample_rate": 24000,
+            "tts_pcm_channels": 1,
+            "llm_provider_policy": {"allow_fallbacks": True, "sort": "latency"},
+            "tts_provider_options": {},
+        }
+    )
+    inference_hash = canonical_inference_profile_sha256(inference)
+    settings = parse_runtime_settings(
+        capture_runtime_environment(
+            {
+                "VOICE_RUNTIME_MODE": "strict",
+                "VOICE_DEPLOYMENT_ID": "voice-agent-a",
+                "VOICE_RUNTIME_CONTRACT_PATH": "/srv/projetv0/runtime-contract.json",
+                "VOICE_AGENT_BUNDLE_PATH": "/srv/projetv0/agent-bundle",
+                "VOICE_QUALIFIED_PROFILE_PATH": "/srv/projetv0/qualified.json",
+                "VOICE_KEYRING_PATH": "/srv/projetv0/keyring.json",
+                "VOICE_SQLITE_PATH": "/var/lib/projetv0/voice.sqlite3",
+                "VOICE_RUNTIME_CONTRACT_SHA256": "a" * 64,
+                "VOICE_IMAGE_DIGEST": (
+                    f"ghcr.io/louisvannobel/projetv0-voice@sha256:{'d' * 64}"
+                ),
+                "VOICE_AGENT_BUNDLE_SHA256": "b" * 64,
+                "VOICE_INFERENCE_PROFILE_SHA256": inference_hash,
+                "VOICE_DEPLOYMENT_MAX_CALLS": "10",
+                "VOICE_HANDSHAKE_TIMEOUT_SECONDS": "5",
+                "VOICE_CALL_IDLE_TIMEOUT_SECONDS": "300",
+                "VOICE_CALL_CLEANUP_PHASE_TIMEOUT_SECONDS": "10",
+                "VOICE_PRE_DRAIN_GRACE_SECONDS": "15",
+                "VOICE_UVICORN_GRACE_SECONDS": "20",
+                "VOICE_SHUTDOWN_GRACE_SECONDS": "30",
+                "VOICE_TELNYX_API_KEY_FILE": "/run/secrets/telnyx-api-key",
+                "VOICE_TELNYX_WEBHOOK_PUBLIC_KEY_FILE": "/run/secrets/telnyx-webhook-key",
+                "VOICE_OPENROUTER_API_KEY_FILE": "/run/secrets/openrouter-api-key",
+                "VOICE_POSTGRES_DSN_FILE": "/run/secrets/postgres-dsn",
+                "VOICE_TELNYX_MEDIA_WSS_URL": "wss://voice.invalid/telnyx/media",
+                "VOICE_OTLP_HTTP_ENDPOINT": "https://collector.invalid/v1/metrics",
+                "VOICE_BIND_HOST": "127.0.0.1",
+                "VOICE_BIND_PORT": "8080",
+            }
+        ),
+        geteuid=lambda: 10001,
+        getegid=lambda: 10001,
+    )
+    manifest = AgentManifestV1.model_validate(
+        {
+            "schema_version": 1,
+            "tenant_id": "tenant-a",
+            "agent_id": "agent-a",
+            "revision": "r1",
+            "dids": ["+33123456789"],
+            "language": "fr",
+            "prompt_path": tmp_path / "prompt.md",
+            "prompt_revision": "p1",
+            "greeting": "Bonjour",
+            "conversation_mode": "freeform",
+            "max_concurrent_calls": 10,
+            "direction": "inbound_only",
+            "transport_codec": "PCMU",
+            "transport_sample_rate_hz": 8000,
+            "transcript_retention_days": 7,
+            "recording_mode": "telnyx_dual",
+            "recording_format": "wav",
+            "recording_retention_days": 30,
+            "recording_required": False,
+            "recording_play_beep": False,
+        }
+    )
+    profile = QualifiedDeploymentProfileV1(
+        schema_version=1,
+        deployment_id=settings.deployment_id,
+        runtime_contract_sha256=settings.runtime_contract_sha256,
+        image_digest=settings.image_digest,
+        agent_bundle_sha256=settings.agent_bundle_sha256,
+        inference_profile_sha256=settings.inference_profile_sha256,
+        inference=inference,
+        token_locator_id="telnyx-header-connected-v1",
+        telnyx_api_key_sha256=hashlib.sha256(api_key.encode()).hexdigest(),
+        telnyx_data_locality="EU",
+        telnyx_handshake_fixture_sha256="c" * 64,
+        disclosure_mark_timeout_ms=5000,
+        call_lease_ttl_seconds=30,
+        qualified_at=NOW - timedelta(days=1),
+    )
+    order: list[str] = []
+
+    class Sink:
+        async def open(self) -> None:
+            order.append("sink-open")
+
+        async def close(self) -> None:
+            order.append("sink-close")
+
+        async def ingest(self, _operation: object) -> None:
+            return None
+
+        async def lease_recording_purges(
+            self, _worker_id: str, _lease_seconds: int, _batch_size: int
+        ) -> tuple[()]:
+            return ()
+
+    class Control:
+        async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def start_streaming(
+            self, *_args: object, **_kwargs: object
+        ) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def aclose(self) -> None:
+            order.append("call-control-close")
+
+    secrets = {
+        str(settings.telnyx_api_key_file): SecretStr(api_key),
+        str(settings.telnyx_webhook_public_key_file): SecretStr(public_key),
+        str(settings.openrouter_api_key_file): SecretStr("openrouter-key"),
+        str(settings.postgres_dsn_file): SecretStr("postgres-dsn"),
+    }
+
+    def read_secret(path: object) -> SecretStr:
+        order.append(f"secret:{path}")
+        return secrets[str(path)]
+
+    def build_metrics(
+        token: object,
+        endpoint: str,
+        publication: object,
+    ) -> RuntimeMetrics:
+        from projetv0_voice.metrics import RuntimePublication
+
+        assert token is settings.observability_token()
+        assert endpoint == settings.otlp_http_endpoint
+        assert isinstance(publication, RuntimePublication)
+        order.append("metrics")
+        return RuntimeMetrics.in_memory(publication=publication)
+
+    factories = RuntimeProductionFactories(
+        validate_artifacts=lambda received: order.append(
+            "artifacts" if received is settings else "wrong-settings"
+        ),
+        load_manifest=lambda received: (
+            order.append("manifest") or manifest
+            if received is settings
+            else manifest
+        ),
+        load_profile=lambda received, selected_manifest, _now: (
+            order.append("profile")
+            or RuntimeProfileSelection(profile=profile, override=None)
+            if received is settings and selected_manifest is manifest
+            else RuntimeProfileSelection(profile=profile, override=None)
+        ),
+        read_secret=read_secret,
+        load_keyring=lambda received: (
+            order.append("keyring")
+            or CryptoKeyring({1: KEY}, active_version=1)
+        ),
+        metrics_factory=build_metrics,  # type: ignore[arg-type]
+        sink_factory=lambda _dsn: order.append("sink") or Sink(),
+        call_control_factory=lambda _key: order.append("call-control") or Control(),
+        inference_factory=lambda _key, _profile: (
+            order.append("inference")
+            or RuntimeInferenceFactories(
+                stt_http_client_factory=lambda: object(),  # type: ignore[arg-type]
+                stt_factory=lambda _client: object(),  # type: ignore[arg-type]
+                llm_factory=lambda: object(),  # type: ignore[arg-type]
+                tts_factory=lambda: object(),  # type: ignore[arg-type]
+            )
+        ),
+    )
+
+    graph = await build_production_runtime(
+        settings,
+        factories=factories,
+        utcnow=lambda: NOW,
+        monotonic=lambda: 10.0,
+        startup_phase_timeout_seconds=2.0,
+    )
+
+    assert order[:12] == [
+        "artifacts",
+        "manifest",
+        "profile",
+        f"secret:{settings.telnyx_api_key_file}",
+        f"secret:{settings.telnyx_webhook_public_key_file}",
+        f"secret:{settings.openrouter_api_key_file}",
+        f"secret:{settings.postgres_dsn_file}",
+        "keyring",
+        "metrics",
+        "sink",
+        "call-control",
+        "inference",
+    ]
+    assert graph.raw_call_control is not graph.measured_call_control
+    assert graph.supervisor.call_control_facade is graph.measured_call_control
+    assert graph.registry.call_control_identity is graph.measured_call_control
+    assert (
+        graph.session_factory.recording_call_control_identity
+        is graph.measured_call_control
+    )
+    assert graph.recording_call_control_identity is graph.measured_call_control
+    assert isinstance(graph.handshake, AuthenticatedTelnyxHandshakeService)
+    assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
+    await graph.supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_startup_phase_timeout_is_independent_and_unwinds_blocked_sink(
+    tmp_path: Path,
+) -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    open_entered = asyncio.Event()
+    never_open = asyncio.Event()
+    sink_closed = asyncio.Event()
+
+    class Sink:
+        async def open(self) -> None:
+            open_entered.set()
+            await never_open.wait()
+
+        async def close(self) -> None:
+            sink_closed.set()
+
+    writer = PersistenceWriter(
+        tmp_path / "voice.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        sink=Sink(),
+        metrics=RuntimeMetrics.in_memory(),
+        startup_phase_timeout_seconds=2.0,
+        startup_phase_timeouts={"operation_sink_open_failed": 0.05},
+        shutdown_timeout_seconds=30.0,
+    )
+
+    with pytest.raises(RuntimeError, match="^runtime_startup_failed$"):
+        await supervisor.startup()
+
+    assert open_entered.is_set()
+    assert sink_closed.is_set()
+    assert supervisor._writer_task is not None  # noqa: SLF001
+    assert supervisor._writer_task.done()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_pre_supervisor_composition_unwind_uses_one_deadline() -> None:
+    from projetv0_voice.lifecycle import _close_failed_composition
+
+    never = asyncio.Event()
+    entered: list[str] = []
+
+    async def block(name: str) -> None:
+        entered.append(name)
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            return
+
+    class Control:
+        async def aclose(self) -> None:
+            await block("call_control")
+
+    class Sink:
+        async def close(self) -> None:
+            await block("sink")
+
+    class Metrics:
+        async def aclose(self) -> None:
+            await block("metrics")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await _close_failed_composition(
+        Control(),  # type: ignore[arg-type]
+        Sink(),  # type: ignore[arg-type]
+        Metrics(),  # type: ignore[arg-type]
+        timeout_seconds=0.05,
+    )
+    elapsed = loop.time() - started
+
+    assert elapsed < 0.1
+    assert entered == ["call_control"]
