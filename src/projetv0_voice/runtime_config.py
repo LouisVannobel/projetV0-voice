@@ -15,6 +15,8 @@ from uuid import UUID
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
+    from projetv0_voice.observability_bootstrap import ObservabilityBootstrapToken
+
 type RuntimeMode = Literal[
     "strict",
     "qualification_candidate",
@@ -101,7 +103,6 @@ class _PlatformUnsupported(Exception):
 class RuntimeEnvironmentCapture:
     """Private immutable snapshot populated only after the key-only scan."""
 
-    _identity: object = field(repr=False, compare=False)
     _values: tuple[object, ...]
 
     def __repr__(self) -> str:
@@ -115,7 +116,6 @@ class RuntimeEnvironmentCapture:
 class RuntimeSettingsV1:
     """Sole immutable authority for every Task 10C runtime setting."""
 
-    _capture_identity: object = field(repr=False, compare=False)
     runtime_mode: RuntimeMode
     deployment_id: str
     runtime_contract_path: PurePosixPath
@@ -146,9 +146,21 @@ class RuntimeSettingsV1:
     otlp_http_endpoint: str
     bind_host: str
     bind_port: int
+    _observability_token: ObservabilityBootstrapToken | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __repr__(self) -> str:
         return "RuntimeSettingsV1()"
+
+    def observability_token(self) -> ObservabilityBootstrapToken:
+        token = self._observability_token
+        if token is None:
+            raise RuntimeError("observability_token_unavailable") from None
+        return token
 
 
 def capture_runtime_environment(
@@ -183,7 +195,7 @@ def capture_runtime_environment(
             captured.append(_MISSING)
         except BaseException:
             raise RuntimeError("runtime_environment_capture_failed") from None
-    return RuntimeEnvironmentCapture(object(), tuple(captured))
+    return RuntimeEnvironmentCapture(tuple(captured))
 
 
 def _required_string(capture: RuntimeEnvironmentCapture, name: str) -> str:
@@ -433,8 +445,7 @@ def parse_runtime_settings(
         bind_host = _required_string(capture, "VOICE_BIND_HOST")
         if any(char in bind_host for char in "/\\:[]") and bind_host != "::":
             raise _SettingsInvalid
-        return RuntimeSettingsV1(
-            _capture_identity=capture._identity,  # noqa: SLF001
+        settings = RuntimeSettingsV1(
             runtime_mode=mode,
             deployment_id=_required_string(capture, "VOICE_DEPLOYMENT_ID"),
             runtime_contract_path=_required_path(capture, "VOICE_RUNTIME_CONTRACT_PATH"),
@@ -510,6 +521,13 @@ def parse_runtime_settings(
                 maximum=65535,
             ),
         )
+        from projetv0_voice.observability_bootstrap import (
+            _issue_parser_observability_token,
+        )
+
+        token = _issue_parser_observability_token(settings.otlp_http_endpoint)
+        object.__setattr__(settings, "_observability_token", token)
+        return settings
     except _SettingsInvalid:
         pass
     raise RuntimeError("runtime_settings_invalid") from None

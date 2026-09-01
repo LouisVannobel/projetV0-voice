@@ -8,7 +8,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path, PurePosixPath
 from types import ModuleType
 from uuid import uuid4
@@ -362,7 +362,7 @@ def test_exact_scalar_contract_rejects_coercion_and_out_of_range_values(
     assert caught.value.__context__ is None
 
 
-def test_token_is_issued_only_for_the_identical_captured_settings_endpoint() -> None:
+def test_full_parse_attaches_one_opaque_production_token_to_settings() -> None:
     runtime_config = _runtime_config()
     bootstrap = importlib.import_module("projetv0_voice.observability_bootstrap")
     capture = runtime_config.capture_runtime_environment(valid_environment())
@@ -372,38 +372,42 @@ def test_token_is_issued_only_for_the_identical_captured_settings_endpoint() -> 
         getegid=lambda: 10001,
     )
 
-    token = bootstrap.issue_observability_token(capture, settings)
+    token = settings.observability_token()
 
     assert repr(token) == "ObservabilityBootstrapToken()"
-    changed_settings = replace(
-        settings,
-        otlp_http_endpoint="https://other.invalid/v1/metrics",
-    )
-    with pytest.raises(RuntimeError, match="^observability_endpoint_mismatch$") as caught:
-        bootstrap.issue_observability_token(capture, changed_settings)
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    assert not hasattr(bootstrap, "issue_observability_token")
 
 
-def test_token_issuer_requires_the_exact_settings_from_the_same_capture() -> None:
+def test_direct_and_replaced_settings_have_no_production_token_or_provenance_field() -> None:
     runtime_config = _runtime_config()
-    bootstrap = importlib.import_module("projetv0_voice.observability_bootstrap")
-    first_capture = runtime_config.capture_runtime_environment(valid_environment())
-    second_capture = runtime_config.capture_runtime_environment(valid_environment())
-    second_settings = runtime_config.parse_runtime_settings(
-        second_capture,
+    capture = runtime_config.capture_runtime_environment(valid_environment())
+    settings = runtime_config.parse_runtime_settings(
+        capture,
         geteuid=lambda: 10001,
         getegid=lambda: 10001,
     )
+    token = settings.observability_token()
+    direct_values = {
+        model_field.name: getattr(settings, model_field.name)
+        for model_field in fields(settings)
+        if model_field.init
+    }
+    direct = runtime_config.RuntimeSettingsV1(**direct_values)
+    replaced = replace(settings)
 
-    with pytest.raises(RuntimeError, match="^observability_settings_mismatch$") as caught:
-        bootstrap.issue_observability_token(first_capture, second_settings)
+    for value in (direct, replaced):
+        with pytest.raises(RuntimeError, match="^observability_token_unavailable$") as caught:
+            value.observability_token()
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
 
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    with pytest.raises(TypeError):
+        replace(settings, _capture_identity=object())
+    with pytest.raises(TypeError, match="init=False"):
+        replace(settings, _observability_token=token)
 
 
-def test_endpoint_only_capture_cannot_issue_production_evidence() -> None:
+def test_endpoint_only_capture_cannot_create_settings_or_access_an_issuer() -> None:
     runtime_config = _runtime_config()
     bootstrap = importlib.import_module("projetv0_voice.observability_bootstrap")
     capture = runtime_config.capture_runtime_environment(
@@ -416,8 +420,7 @@ def test_endpoint_only_capture_cannot_issue_production_evidence() -> None:
             geteuid=lambda: 10001,
             getegid=lambda: 10001,
         )
-    with pytest.raises(RuntimeError, match="^observability_settings_invalid$"):
-        bootstrap.issue_observability_token(capture, object())
+    assert not hasattr(bootstrap, "issue_observability_token")
 
 
 def _run_isolated(code: str, extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:

@@ -293,7 +293,7 @@ def test_dependency_logging_requires_exact_token() -> None:
     class _TokenSubclass(observability_bootstrap.ObservabilityBootstrapToken):
         pass
 
-    for value in (object(), _TokenSubclass()):
+    for value in (object(), object.__new__(_TokenSubclass)):
         with pytest.raises(ValueError, match="^observability_bootstrap_token_invalid$"):
             dependency_logging.configure_dependency_logging(value)  # type: ignore[arg-type]
 

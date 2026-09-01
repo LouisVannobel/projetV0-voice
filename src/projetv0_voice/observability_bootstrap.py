@@ -8,12 +8,9 @@ from dataclasses import dataclass, field
 from hmac import compare_digest
 from typing import Any, TypeGuard
 
-from projetv0_voice.runtime_config import (
-    RuntimeEnvironmentCapture,
-    RuntimeSettingsV1,
-    _valid_otlp_http_endpoint,
-)
+from projetv0_voice.runtime_config import _valid_otlp_http_endpoint
 
+_TOKEN_CONSTRUCTOR_SENTINEL = object()
 _PRODUCTION_TOKEN_ISSUER = object()
 
 
@@ -23,12 +20,18 @@ class ObservabilityBootstrapToken:
 
     _issuer: object | None = field(default=None, repr=False, compare=False)
     _endpoint: str | None = field(default=None, repr=False, compare=False)
-    _capture_identity: object | None = field(default=None, repr=False, compare=False)
 
-    def __init__(self) -> None:
-        object.__setattr__(self, "_issuer", None)
-        object.__setattr__(self, "_endpoint", None)
-        object.__setattr__(self, "_capture_identity", None)
+    def __init__(
+        self,
+        sentinel: object,
+        *,
+        endpoint: str,
+        issuer: object | None = None,
+    ) -> None:
+        if sentinel is not _TOKEN_CONSTRUCTOR_SENTINEL:
+            raise TypeError("observability_token_constructor_private")
+        object.__setattr__(self, "_issuer", issuer)
+        object.__setattr__(self, "_endpoint", endpoint)
 
     def __repr__(self) -> str:
         return "ObservabilityBootstrapToken()"
@@ -38,13 +41,12 @@ def _new_token(
     *,
     endpoint: str,
     issuer: object | None = None,
-    capture_identity: object | None = None,
 ) -> ObservabilityBootstrapToken:
-    token = ObservabilityBootstrapToken()
-    object.__setattr__(token, "_issuer", issuer)
-    object.__setattr__(token, "_endpoint", endpoint)
-    object.__setattr__(token, "_capture_identity", capture_identity)
-    return token
+    return ObservabilityBootstrapToken(
+        _TOKEN_CONSTRUCTOR_SENTINEL,
+        endpoint=endpoint,
+        issuer=issuer,
+    )
 
 
 _FORBIDDEN_EXACT = frozenset(
@@ -81,30 +83,14 @@ def _validate_observability_mapping(
     return _new_token(endpoint=endpoint)
 
 
-def issue_observability_token(
-    capture: RuntimeEnvironmentCapture,
-    settings: RuntimeSettingsV1,
-) -> ObservabilityBootstrapToken:
-    """Issue production evidence only for settings parsed from this capture."""
+def _issue_parser_observability_token(endpoint: str) -> ObservabilityBootstrapToken:
+    """Issue production evidence for the fully validated parser result."""
 
-    if type(capture) is not RuntimeEnvironmentCapture:
-        raise RuntimeError("runtime_capture_invalid") from None
-    if type(settings) is not RuntimeSettingsV1:
-        raise RuntimeError("observability_settings_invalid") from None
-    if settings._capture_identity is not capture._identity:  # noqa: SLF001
-        raise RuntimeError("observability_settings_mismatch") from None
-    captured_endpoint = capture._value("VOICE_OTLP_HTTP_ENDPOINT")  # noqa: SLF001
-    endpoint = settings.otlp_http_endpoint
-    if (
-        type(captured_endpoint) is not str
-        or not _valid_endpoint(endpoint)
-        or not compare_digest(captured_endpoint, endpoint)
-    ):
-        raise RuntimeError("observability_endpoint_mismatch") from None
+    if not _valid_endpoint(endpoint):
+        raise RuntimeError("observability_endpoint_invalid") from None
     return _new_token(
         endpoint=endpoint,
         issuer=_PRODUCTION_TOKEN_ISSUER,
-        capture_identity=capture._identity,  # noqa: SLF001
     )
 
 
@@ -114,7 +100,6 @@ def _is_production_token(
     return (
         type(token) is ObservabilityBootstrapToken
         and token._issuer is _PRODUCTION_TOKEN_ISSUER  # noqa: SLF001
-        and token._capture_identity is not None  # noqa: SLF001
         and type(token._endpoint) is str  # noqa: SLF001
     )
 
@@ -135,6 +120,5 @@ def validate_observability_environment() -> ObservabilityBootstrapToken:
 
 __all__ = [
     "ObservabilityBootstrapToken",
-    "issue_observability_token",
     "validate_observability_environment",
 ]

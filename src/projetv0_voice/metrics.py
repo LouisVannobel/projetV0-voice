@@ -360,6 +360,10 @@ class RuntimeMetrics:
 
         if not _is_production_token(token):
             raise ValueError("observability_bootstrap_token_invalid") from None
+        if not _valid_endpoint(endpoint):
+            raise RuntimeError("observability_endpoint_invalid") from None
+        if not _token_matches_endpoint(token, endpoint):
+            raise RuntimeError("observability_endpoint_mismatch") from None
         return _build_production(token, endpoint=endpoint)
 
     @classmethod

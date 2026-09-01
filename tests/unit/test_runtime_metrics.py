@@ -32,9 +32,9 @@ from projetv0_voice import metrics as metrics_module
 from projetv0_voice.observability_bootstrap import (
     ObservabilityBootstrapToken,
     _validate_observability_mapping,
-    issue_observability_token,
 )
 from projetv0_voice.runtime_config import (
+    RuntimeSettingsV1,
     capture_runtime_environment,
     parse_runtime_settings,
 )
@@ -43,7 +43,10 @@ ENDPOINT = "https://collector.invalid/tenant/v1/metrics"
 PREFIX = "projetv0.voice."
 
 
-def _production_token() -> ObservabilityBootstrapToken:
+def _production_settings(
+    *,
+    endpoint: str = ENDPOINT,
+) -> RuntimeSettingsV1:
     capture = capture_runtime_environment(
         {
             "VOICE_RUNTIME_MODE": "strict",
@@ -71,7 +74,7 @@ def _production_token() -> ObservabilityBootstrapToken:
             "VOICE_OPENROUTER_API_KEY_FILE": "/run/secrets/openrouter-api-key",
             "VOICE_POSTGRES_DSN_FILE": "/run/secrets/postgres-dsn",
             "VOICE_TELNYX_MEDIA_WSS_URL": "wss://voice.invalid/telnyx/media",
-            "VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT,
+            "VOICE_OTLP_HTTP_ENDPOINT": endpoint,
             "VOICE_BIND_HOST": "127.0.0.1",
             "VOICE_BIND_PORT": "8080",
         }
@@ -81,7 +84,11 @@ def _production_token() -> ObservabilityBootstrapToken:
         geteuid=lambda: 10001,
         getegid=lambda: 10001,
     )
-    return issue_observability_token(capture, settings)
+    return settings
+
+
+def _production_token() -> ObservabilityBootstrapToken:
+    return _production_settings().observability_token()
 
 
 EXPECTED_INSTRUMENTS = {
@@ -982,29 +989,45 @@ def test_production_uses_explicit_settings_endpoint_after_environment_mutation(
     assert selected == [ENDPOINT]
 
 
-def test_production_rejects_token_and_settings_endpoint_mismatch() -> None:
-    token = _production_token()
+def test_production_rejects_token_and_settings_endpoint_mismatch_before_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _production_settings()
+    second = _production_settings(endpoint="https://other.invalid/v1/metrics")
+    monkeypatch.setattr(
+        metrics_module,
+        "_build_production",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cross-settings mismatch reached production construction",
+            pytrace=False,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="^observability_endpoint_mismatch$") as caught:
-        metrics_module._build_production(  # noqa: SLF001
-            token,
-            endpoint="https://other.invalid/v1/metrics",
+        metrics_module.RuntimeMetrics.production(
+            first.observability_token(),
+            endpoint=second.otlp_http_endpoint,
         )
 
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    monkeypatch.undo()
+    with pytest.raises(RuntimeError, match="^observability_endpoint_mismatch$"):
+        metrics_module._build_production(  # noqa: SLF001
+            first.observability_token(),
+            endpoint=second.otlp_http_endpoint,
+        )
 
 
 def test_direct_and_guard_only_tokens_cannot_authorize_production_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(TypeError):
+        ObservabilityBootstrapToken()
+    with pytest.raises(TypeError):
         ObservabilityBootstrapToken(ENDPOINT)  # type: ignore[call-arg]
 
-    tokens = (
-        ObservabilityBootstrapToken(),
-        _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT}),
-    )
+    tokens = (_validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT}),)
     monkeypatch.setattr(
         metrics_module,
         "_build_production",
@@ -1291,7 +1314,7 @@ def test_production_rejects_non_exact_token_without_importing_endpoint_value() -
     class _TokenSubclass(ObservabilityBootstrapToken):
         pass
 
-    for value in (object(), _TokenSubclass()):
+    for value in (object(), object.__new__(_TokenSubclass)):
         with pytest.raises(ValueError, match="^observability_bootstrap_token_invalid$"):
             metrics_module._build_production(  # type: ignore[arg-type]  # noqa: SLF001
                 value,
