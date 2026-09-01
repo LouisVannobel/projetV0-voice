@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -204,7 +206,8 @@ import os
 import sys
 sys.path.insert(0, os.environ["PYTHONPATH"])
 third_party = (
-    "loguru", "opentelemetry", "requests", "pipecat", "openai", "httpx", "telnyx"
+    "loguru", "onnxruntime", "opentelemetry", "requests", "pipecat", "openai",
+    "httpx", "telnyx"
 )
 import projetv0_voice.observability_bootstrap as bootstrap
 phase_guard = [name for name in third_party if name in sys.modules]
@@ -237,11 +240,20 @@ print(json.dumps([
     assert json.loads(result.stdout) == [
         [],
         [],
-        ["loguru"],
-        ["loguru", "opentelemetry", "requests"],
-        ["loguru", "opentelemetry", "requests", "pipecat", "openai", "httpx"],
+        ["loguru", "onnxruntime"],
+        ["loguru", "onnxruntime", "opentelemetry", "requests"],
         [
             "loguru",
+            "onnxruntime",
+            "opentelemetry",
+            "requests",
+            "pipecat",
+            "openai",
+            "httpx",
+        ],
+        [
+            "loguru",
+            "onnxruntime",
             "opentelemetry",
             "requests",
             "pipecat",
@@ -314,8 +326,34 @@ def test_dependency_logging_is_idempotent_and_closes_exact_logger_set() -> None:
         {"VOICE_OTLP_HTTP_ENDPOINT": VALID_ENDPOINT}
     )
 
-    dependency_logging.configure_dependency_logging(token)
-    dependency_logging.configure_dependency_logging(token)
+    imported: list[str] = []
+    severity: list[int] = []
+
+    class _FakeOnnxRuntime:
+        set_default_logger_severity = staticmethod(severity.append)
+
+    real_import = importlib.import_module
+    active_threads = 1
+
+    def controlled_import(name: str) -> object:
+        if name == "onnxruntime":
+            imported.append(name)
+            return _FakeOnnxRuntime()
+        return real_import(name)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(importlib, "import_module", controlled_import)
+    monkeypatch.setattr(threading, "active_count", lambda: active_threads)
+    try:
+        dependency_logging.configure_dependency_logging(token)
+        active_threads = 2
+        dependency_logging.configure_dependency_logging(token)
+    finally:
+        monkeypatch.undo()
+
+    assert imported == ["onnxruntime"]
+    assert severity == [4]
 
     for name in names:
         configured = logging.getLogger(name)
@@ -333,6 +371,19 @@ def test_dependency_logging_disables_only_pipecat_loguru_namespace(
     fake_logger = type("_FakeLogger", (), {"disable": disabled.append})()
     fake_loguru = type("_FakeLoguru", (), {"logger": fake_logger})()
     monkeypatch.setitem(sys.modules, "loguru", fake_loguru)
+    fake_onnx = type(
+        "_FakeOnnxRuntime",
+        (),
+        {"set_default_logger_severity": lambda _self, _severity: None},
+    )()
+    real_import = importlib.import_module
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(threading, "active_count", lambda: 1)
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: fake_onnx if name == "onnxruntime" else real_import(name),
+    )
     token = observability_bootstrap._validate_observability_mapping(  # noqa: SLF001
         {"VOICE_OTLP_HTTP_ENDPOINT": VALID_ENDPOINT}
     )
@@ -340,3 +391,148 @@ def test_dependency_logging_disables_only_pipecat_loguru_namespace(
     dependency_logging.configure_dependency_logging(token)
 
     assert disabled == ["pipecat"]
+
+
+def _guard_token() -> observability_bootstrap.ObservabilityBootstrapToken:
+    return observability_bootstrap._validate_observability_mapping(  # noqa: SLF001
+        {"VOICE_OTLP_HTTP_ENDPOINT": VALID_ENDPOINT}
+    )
+
+
+def test_dependency_logging_suppresses_only_controlled_native_fd2_import_window(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    native_sentinel = b"onnx-native-import-sentinel"
+    stdout_sentinel = b"fd1-remains-visible-sentinel"
+    restored_sentinel = b"fd2-restored-sentinel"
+    imported: list[str] = []
+    severity: list[int] = []
+
+    class _FakeOnnxRuntime:
+        set_default_logger_severity = staticmethod(severity.append)
+
+    real_import = importlib.import_module
+
+    def controlled_import(name: str) -> object:
+        if name == "onnxruntime":
+            imported.append(name)
+            os.write(1, stdout_sentinel)
+            os.write(2, native_sentinel)
+            return _FakeOnnxRuntime()
+        return real_import(name)
+
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(threading, "active_count", lambda: 1)
+    monkeypatch.setattr(importlib, "import_module", controlled_import)
+
+    dependency_logging.configure_dependency_logging(_guard_token())
+    os.write(2, restored_sentinel)
+    captured = capfd.readouterr()
+
+    assert imported == ["onnxruntime"]
+    assert severity == [4]
+    assert stdout_sentinel.decode() in captured.out
+    assert native_sentinel.decode() not in captured.err
+    assert restored_sentinel.decode() in captured.err
+
+
+@pytest.mark.parametrize("failure_phase", ["import", "severity"])
+def test_dependency_logging_restores_fd2_and_closes_descriptors_on_native_failure(
+    failure_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    native_sentinel = b"native-failure-secret-sentinel"
+    restored_sentinel = b"fd2-restored-after-failure"
+    real_import = importlib.import_module
+    real_dup = os.dup
+    real_open = os.open
+    real_dup2 = os.dup2
+    real_close = os.close
+    created: list[int] = []
+    closed: list[int] = []
+
+    class _FakeOnnxRuntime:
+        def set_default_logger_severity(self, severity: int) -> None:
+            assert severity == 4
+            if failure_phase == "severity":
+                raise RuntimeError("severity-secret-sentinel")
+
+    def controlled_import(name: str) -> object:
+        if name != "onnxruntime":
+            return real_import(name)
+        os.write(2, native_sentinel)
+        if failure_phase == "import":
+            raise RuntimeError("import-secret-sentinel")
+        return _FakeOnnxRuntime()
+
+    def recording_dup(descriptor: int) -> int:
+        duplicated = real_dup(descriptor)
+        created.append(duplicated)
+        return duplicated
+
+    def recording_open(path: str, flags: int, mode: int = 0o777) -> int:
+        opened = real_open(path, flags, mode)
+        if path == os.devnull:
+            created.append(opened)
+        return opened
+
+    def recording_dup2(
+        source: int,
+        destination: int,
+        inheritable: bool = True,
+    ) -> int:
+        return real_dup2(source, destination, inheritable=inheritable)
+
+    def recording_close(descriptor: int) -> None:
+        if descriptor in created:
+            closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(threading, "active_count", lambda: 1)
+    monkeypatch.setattr(importlib, "import_module", controlled_import)
+    monkeypatch.setattr(os, "dup", recording_dup)
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "dup2", recording_dup2)
+    monkeypatch.setattr(os, "close", recording_close)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^dependency_logging_configuration_failed$",
+    ) as caught:
+        dependency_logging.configure_dependency_logging(_guard_token())
+    os.write(2, restored_sentinel)
+    captured = capfd.readouterr()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert dependency_logging._configured is False  # noqa: SLF001
+    assert native_sentinel.decode() not in captured.err
+    assert "secret-sentinel" not in captured.err
+    assert restored_sentinel.decode() in captured.err
+    assert len(created) == 2
+    assert sorted(closed) == sorted(created)
+    assert len(set(closed)) == 2
+
+
+def test_dependency_logging_rejects_native_boundary_after_threads_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imports: list[str] = []
+    real_import = importlib.import_module
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(threading, "active_count", lambda: 2)
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: imports.append(name) or real_import(name),
+    )
+
+    with pytest.raises(RuntimeError, match="^dependency_logging_phase_invalid$") as caught:
+        dependency_logging.configure_dependency_logging(_guard_token())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert imports == []
