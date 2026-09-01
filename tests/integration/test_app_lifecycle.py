@@ -1362,6 +1362,232 @@ async def test_pre_supervisor_composition_unwind_uses_one_deadline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_composition_cleanup_creation_rejection_waits_for_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import _close_failed_composition
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    loop = asyncio.get_running_loop()
+    original_create_task = asyncio.create_task
+    now = [100.0]
+    timeout_seconds = 5.0
+    deadline = now[0] + timeout_seconds
+    entered: list[str] = []
+    rejected: list[Coroutine[Any, Any, None]] = []
+    hard_exit_calls: list[tuple[int, float]] = []
+    clock_advanced = asyncio.Event()
+
+    class Control:
+        async def aclose(self) -> None:
+            entered.append("call-control")
+
+    class Sink:
+        async def close(self) -> None:
+            entered.append("sink")
+
+    class Metrics:
+        async def aclose(self) -> None:
+            entered.append("metrics")
+
+    def rejecting_create_task(
+        coroutine: Coroutine[Any, Any, None],
+        *,
+        name: str | None = None,
+        context: Any = None,
+    ) -> asyncio.Task[None]:
+        if name is not None and name.startswith("voice-composition-close-"):
+            rejected.append(coroutine)
+            raise RuntimeError("task creation rejected")
+        return original_create_task(coroutine, name=name, context=context)
+
+    def advance_to_deadline() -> None:
+        now[0] = deadline
+        clock_advanced.set()
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append((code, loop.time()))
+        raise HardExitSentinel
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr(asyncio, "create_task", rejecting_create_task)
+    loop.call_soon(advance_to_deadline)
+
+    with pytest.raises(HardExitSentinel):
+        await _close_failed_composition(
+            Control(),  # type: ignore[arg-type]
+            Sink(),  # type: ignore[arg-type]
+            Metrics(),  # type: ignore[arg-type]
+            timeout_seconds=timeout_seconds,
+            hard_exit=hard_exit,
+        )
+
+    assert clock_advanced.is_set()
+    assert hard_exit_calls == [(72, deadline)]
+    assert entered == []
+    assert len(rejected) == 1
+    assert inspect.getcoroutinestate(rejected[0]) == inspect.CORO_CLOSED
+    assert not any(
+        task.get_name().startswith("voice-composition-close-")
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_composition_cleanup_creation_rejection_absorbs_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import _close_failed_composition
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    loop = asyncio.get_running_loop()
+    original_create_task = asyncio.create_task
+    now = [200.0]
+    timeout_seconds = 5.0
+    deadline = now[0] + timeout_seconds
+    creation_rejected = asyncio.Event()
+    entered: list[str] = []
+    hard_exit_calls: list[tuple[int, float]] = []
+
+    class Control:
+        async def aclose(self) -> None:
+            entered.append("call-control")
+
+    class Sink:
+        async def close(self) -> None:
+            entered.append("sink")
+
+    class Metrics:
+        async def aclose(self) -> None:
+            entered.append("metrics")
+
+    def rejecting_create_task(
+        coroutine: Coroutine[Any, Any, None],
+        *,
+        name: str | None = None,
+        context: Any = None,
+    ) -> asyncio.Task[None]:
+        if name is not None and name.startswith("voice-composition-close-"):
+            creation_rejected.set()
+            raise RuntimeError("task creation rejected")
+        return original_create_task(coroutine, name=name, context=context)
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append((code, loop.time()))
+        raise HardExitSentinel
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr(asyncio, "create_task", rejecting_create_task)
+    cleanup = asyncio.create_task(
+        _close_failed_composition(
+            Control(),  # type: ignore[arg-type]
+            Sink(),  # type: ignore[arg-type]
+            Metrics(),  # type: ignore[arg-type]
+            timeout_seconds=timeout_seconds,
+            hard_exit=hard_exit,
+        )
+    )
+    await creation_rejected.wait()
+
+    for index, clock_value in enumerate((201.0, 202.0, 204.0), start=1):
+        now[0] = clock_value
+        cleanup.cancel(f"cancel-{index}")
+        next_turn: asyncio.Future[None] = loop.create_future()
+        loop.call_soon(next_turn.set_result, None)
+        await next_turn
+        assert not cleanup.done()
+        assert hard_exit_calls == []
+
+    loop.call_soon(now.__setitem__, 0, deadline)
+    with pytest.raises(HardExitSentinel):
+        await cleanup
+
+    assert hard_exit_calls == [(72, deadline)]
+    assert entered == []
+
+
+@pytest.mark.asyncio
+async def test_composition_cleanup_eager_create_then_raise_keeps_gate_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import NoReturn
+
+    from projetv0_voice.lifecycle import _close_failed_composition
+
+    class HardExitSentinel(BaseException):
+        pass
+
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    original_create_task = asyncio.create_task
+    now = [300.0]
+    timeout_seconds = 5.0
+    deadline = now[0] + timeout_seconds
+    retained: list[asyncio.Task[None]] = []
+    entered: list[str] = []
+    hard_exit_calls: list[tuple[int, float]] = []
+
+    class Control:
+        async def aclose(self) -> None:
+            entered.append("call-control")
+
+    class Sink:
+        async def close(self) -> None:
+            entered.append("sink")
+
+    class Metrics:
+        async def aclose(self) -> None:
+            entered.append("metrics")
+
+    def create_then_raise(
+        coroutine: Coroutine[Any, Any, None],
+        *,
+        name: str | None = None,
+        context: Any = None,
+    ) -> asyncio.Task[None]:
+        task = original_create_task(coroutine, name=name, context=context)
+        if name is not None and name.startswith("voice-composition-close-"):
+            retained.append(task)
+            raise RuntimeError("task factory raised after eager creation")
+        return task
+
+    def hard_exit(code: int) -> NoReturn:
+        hard_exit_calls.append((code, loop.time()))
+        raise HardExitSentinel
+
+    loop.set_task_factory(asyncio.eager_task_factory)
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr(asyncio, "create_task", create_then_raise)
+    loop.call_soon(now.__setitem__, 0, deadline)
+    try:
+        with pytest.raises(HardExitSentinel):
+            await _close_failed_composition(
+                Control(),  # type: ignore[arg-type]
+                Sink(),  # type: ignore[arg-type]
+                Metrics(),  # type: ignore[arg-type]
+                timeout_seconds=timeout_seconds,
+                hard_exit=hard_exit,
+            )
+    finally:
+        loop.set_task_factory(previous_factory)
+
+    assert hard_exit_calls == [(72, deadline)]
+    assert entered == []
+    assert len(retained) == 1
+    for task in retained:
+        task.cancel()
+    await asyncio.gather(*retained, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_startup_cleanup_hard_exits_when_phase_child_remains_live(
     tmp_path: Path,
 ) -> None:

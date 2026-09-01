@@ -1990,8 +1990,16 @@ async def _close_failed_composition(
         except BaseException:
             create_failed = True
         if create_failed:
-            runner.close()
-            _hard_exit_now(hard_exit)
+            with contextlib.suppress(BaseException):
+                runner.close()
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    _hard_exit_now(hard_exit)
+                try:
+                    await asyncio.sleep(remaining)
+                except asyncio.CancelledError:
+                    continue
         retained.add(task)
 
         def consume(completed: asyncio.Task[None]) -> None:
