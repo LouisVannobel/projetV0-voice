@@ -139,7 +139,8 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
         {
             "name": "Run privileged Linux descriptor cases",
             "run": (
-                'sudo env "PATH=$PATH" uv run pytest tests/unit/test_runtime_config.py '
+                'sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 '
+                'uv run pytest tests/unit/test_runtime_config.py '
                 'tests/unit/test_qualified_profile.py -q -k '
                 '"linux_kernel or fifo or socket or grows"'
             ),

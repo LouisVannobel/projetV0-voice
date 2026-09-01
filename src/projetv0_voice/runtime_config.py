@@ -6,7 +6,7 @@ import os
 import re
 import stat
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
@@ -85,6 +85,10 @@ class _SettingsInvalid(Exception):
     pass
 
 
+class _EnvironmentForbidden(Exception):
+    pass
+
+
 class _SecretInvalid(Exception):
     pass
 
@@ -97,6 +101,7 @@ class _PlatformUnsupported(Exception):
 class RuntimeEnvironmentCapture:
     """Private immutable snapshot populated only after the key-only scan."""
 
+    _identity: object = field(repr=False, compare=False)
     _values: tuple[object, ...]
 
     def __repr__(self) -> str:
@@ -110,6 +115,7 @@ class RuntimeEnvironmentCapture:
 class RuntimeSettingsV1:
     """Sole immutable authority for every Task 10C runtime setting."""
 
+    _capture_identity: object = field(repr=False, compare=False)
     runtime_mode: RuntimeMode
     deployment_id: str
     runtime_contract_path: PurePosixPath
@@ -150,6 +156,8 @@ def capture_runtime_environment(
 ) -> RuntimeEnvironmentCapture:
     """Scan names first, then fetch each allowed value exactly once."""
 
+    forbidden = False
+    scan_failed = False
     try:
         for key in mapping:
             if (
@@ -157,10 +165,14 @@ def capture_runtime_environment(
                 or key in _FORBIDDEN_EXACT
                 or key.startswith(("OTEL_", "LOGURU_"))
             ):
-                raise RuntimeError("runtime_environment_forbidden") from None
-    except RuntimeError:
-        raise
+                raise _EnvironmentForbidden
+    except _EnvironmentForbidden:
+        forbidden = True
     except BaseException:
+        scan_failed = True
+    if forbidden:
+        raise RuntimeError("runtime_environment_forbidden") from None
+    if scan_failed:
         raise RuntimeError("runtime_environment_scan_failed") from None
 
     captured: list[object] = []
@@ -171,7 +183,7 @@ def capture_runtime_environment(
             captured.append(_MISSING)
         except BaseException:
             raise RuntimeError("runtime_environment_capture_failed") from None
-    return RuntimeEnvironmentCapture(tuple(captured))
+    return RuntimeEnvironmentCapture(object(), tuple(captured))
 
 
 def _required_string(capture: RuntimeEnvironmentCapture, name: str) -> str:
@@ -247,7 +259,10 @@ def _integer(
     maximum: int,
 ) -> int:
     value = _required_string(capture, name)
-    if _DECIMAL_INTEGER.fullmatch(value) is None:
+    if (
+        _DECIMAL_INTEGER.fullmatch(value) is None
+        or len(value) > len(str(maximum))
+    ):
         raise _SettingsInvalid
     parsed = int(value)
     if not minimum <= parsed <= maximum:
@@ -336,7 +351,6 @@ def _validate_mode(
             and qualification_override_path is None
             and qualification_run_id is not None
             and benchmark_did_sha256 is not None
-            and deployment_max_calls == 1
         )
     else:
         valid = (
@@ -420,6 +434,7 @@ def parse_runtime_settings(
         if any(char in bind_host for char in "/\\:[]") and bind_host != "::":
             raise _SettingsInvalid
         return RuntimeSettingsV1(
+            _capture_identity=capture._identity,  # noqa: SLF001
             runtime_mode=mode,
             deployment_id=_required_string(capture, "VOICE_DEPLOYMENT_ID"),
             runtime_contract_path=_required_path(capture, "VOICE_RUNTIME_CONTRACT_PATH"),

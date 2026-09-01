@@ -6,22 +6,45 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hmac import compare_digest
-from typing import Any
+from typing import Any, TypeGuard
 
 from projetv0_voice.runtime_config import (
     RuntimeEnvironmentCapture,
+    RuntimeSettingsV1,
     _valid_otlp_http_endpoint,
 )
 
+_PRODUCTION_TOKEN_ISSUER = object()
 
-@dataclass(frozen=True, slots=True, repr=False)
+
+@dataclass(frozen=True, slots=True, repr=False, init=False)
 class ObservabilityBootstrapToken:
     """Opaque evidence that the real process environment passed the guard."""
 
+    _issuer: object | None = field(default=None, repr=False, compare=False)
     _endpoint: str | None = field(default=None, repr=False, compare=False)
+    _capture_identity: object | None = field(default=None, repr=False, compare=False)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_issuer", None)
+        object.__setattr__(self, "_endpoint", None)
+        object.__setattr__(self, "_capture_identity", None)
 
     def __repr__(self) -> str:
         return "ObservabilityBootstrapToken()"
+
+
+def _new_token(
+    *,
+    endpoint: str,
+    issuer: object | None = None,
+    capture_identity: object | None = None,
+) -> ObservabilityBootstrapToken:
+    token = ObservabilityBootstrapToken()
+    object.__setattr__(token, "_issuer", issuer)
+    object.__setattr__(token, "_endpoint", endpoint)
+    object.__setattr__(token, "_capture_identity", capture_identity)
+    return token
 
 
 _FORBIDDEN_EXACT = frozenset(
@@ -55,35 +78,53 @@ def _validate_observability_mapping(
     if not _valid_endpoint(endpoint):
         raise RuntimeError("observability_endpoint_invalid") from None
     assert type(endpoint) is str
-    return ObservabilityBootstrapToken(endpoint)
+    return _new_token(endpoint=endpoint)
 
 
 def issue_observability_token(
     capture: RuntimeEnvironmentCapture,
-    endpoint: str,
+    settings: RuntimeSettingsV1,
 ) -> ObservabilityBootstrapToken:
-    """Issue opaque evidence only for the parsed endpoint from this capture."""
+    """Issue production evidence only for settings parsed from this capture."""
 
     if type(capture) is not RuntimeEnvironmentCapture:
         raise RuntimeError("runtime_capture_invalid") from None
+    if type(settings) is not RuntimeSettingsV1:
+        raise RuntimeError("observability_settings_invalid") from None
+    if settings._capture_identity is not capture._identity:  # noqa: SLF001
+        raise RuntimeError("observability_settings_mismatch") from None
     captured_endpoint = capture._value("VOICE_OTLP_HTTP_ENDPOINT")  # noqa: SLF001
+    endpoint = settings.otlp_http_endpoint
     if (
-        type(endpoint) is not str
-        or type(captured_endpoint) is not str
+        type(captured_endpoint) is not str
         or not _valid_endpoint(endpoint)
         or not compare_digest(captured_endpoint, endpoint)
     ):
         raise RuntimeError("observability_endpoint_mismatch") from None
-    return ObservabilityBootstrapToken(endpoint)
+    return _new_token(
+        endpoint=endpoint,
+        issuer=_PRODUCTION_TOKEN_ISSUER,
+        capture_identity=capture._identity,  # noqa: SLF001
+    )
+
+
+def _is_production_token(
+    token: object,
+) -> TypeGuard[ObservabilityBootstrapToken]:
+    return (
+        type(token) is ObservabilityBootstrapToken
+        and token._issuer is _PRODUCTION_TOKEN_ISSUER  # noqa: SLF001
+        and token._capture_identity is not None  # noqa: SLF001
+        and type(token._endpoint) is str  # noqa: SLF001
+    )
 
 
 def _token_matches_endpoint(token: object, endpoint: object) -> bool:
-    return (
-        type(token) is ObservabilityBootstrapToken
-        and type(endpoint) is str
-        and token._endpoint is not None  # noqa: SLF001
-        and compare_digest(token._endpoint, endpoint)  # noqa: SLF001
-    )
+    if not _is_production_token(token) or type(endpoint) is not str:
+        return False
+    token_endpoint = token._endpoint  # noqa: SLF001
+    assert type(token_endpoint) is str
+    return compare_digest(token_endpoint, endpoint)
 
 
 def validate_observability_environment() -> ObservabilityBootstrapToken:

@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import ModuleType
 from uuid import uuid4
@@ -133,6 +134,17 @@ class _CountingMapping(Mapping[object, object]):
         return len(self.keys)
 
 
+class _FailingIteratorMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        raise AssertionError(f"value read for {type(key).__name__}")
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("mapping-iterator-secret-sentinel")
+
+    def __len__(self) -> int:
+        return 1
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -169,6 +181,18 @@ def test_capture_reads_every_allowed_value_exactly_once_and_no_unknown_value() -
     assert repr(capture) == "RuntimeEnvironmentCapture()"
     with pytest.raises((AttributeError, TypeError)):
         capture.values = ()
+
+
+def test_hostile_mapping_iterator_failure_is_collapsed_without_text_or_chain() -> None:
+    runtime_config = _runtime_config()
+
+    with pytest.raises(RuntimeError, match="^runtime_environment_scan_failed$") as caught:
+        runtime_config.capture_runtime_environment(_FailingIteratorMapping())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "mapping-iterator-secret-sentinel" not in str(caught.value)
+    assert "mapping-iterator-secret-sentinel" not in repr(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -219,6 +243,23 @@ def test_parse_uses_injected_identity_on_windows_safe_path() -> None:
 
     assert calls == ["uid", "gid"]
     assert settings.deployment_id == "voice-agent-a"
+
+
+@pytest.mark.parametrize("host_cap", [1, 10, (1 << 31) - 1])
+def test_candidate_mode_accepts_every_positive_runtime_host_cap(host_cap: int) -> None:
+    runtime_config = _runtime_config()
+    environment = valid_environment("qualification_candidate")
+    environment["VOICE_DEPLOYMENT_MAX_CALLS"] = str(host_cap)
+    capture = runtime_config.capture_runtime_environment(environment)
+
+    settings = runtime_config.parse_runtime_settings(
+        capture,
+        geteuid=lambda: 10001,
+        getegid=lambda: 10001,
+    )
+
+    assert settings.runtime_mode == "qualification_candidate"
+    assert settings.deployment_max_calls == host_cap
 
 
 def test_parse_reports_one_unsupported_platform_error_when_posix_identity_is_missing(
@@ -296,6 +337,7 @@ def test_mode_inapplicable_values_are_rejected_not_ignored(
         ("VOICE_UVICORN_GRACE_SECONDS", "+1"),
         ("VOICE_SHUTDOWN_GRACE_SECONDS", " 30"),
         ("VOICE_BIND_PORT", "65536"),
+        ("VOICE_BIND_PORT", "9" * 5000),
         ("VOICE_RUNTIME_CONTRACT_SHA256", "A" * 64),
         ("VOICE_TELNYX_MEDIA_WSS_URL", "https://voice.invalid/telnyx/media"),
         ("VOICE_OTLP_HTTP_ENDPOINT", "https://user@collector.invalid/v1/metrics"),
@@ -310,12 +352,14 @@ def test_exact_scalar_contract_rejects_coercion_and_out_of_range_values(
     environment[name] = invalid
     capture = runtime_config.capture_runtime_environment(environment)
 
-    with pytest.raises(RuntimeError, match="^runtime_settings_invalid$"):
+    with pytest.raises(RuntimeError, match="^runtime_settings_invalid$") as caught:
         runtime_config.parse_runtime_settings(
             capture,
             geteuid=lambda: 10001,
             getegid=lambda: 10001,
         )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_token_is_issued_only_for_the_identical_captured_settings_endpoint() -> None:
@@ -328,16 +372,52 @@ def test_token_is_issued_only_for_the_identical_captured_settings_endpoint() -> 
         getegid=lambda: 10001,
     )
 
-    token = bootstrap.issue_observability_token(capture, settings.otlp_http_endpoint)
+    token = bootstrap.issue_observability_token(capture, settings)
 
     assert repr(token) == "ObservabilityBootstrapToken()"
+    changed_settings = replace(
+        settings,
+        otlp_http_endpoint="https://other.invalid/v1/metrics",
+    )
     with pytest.raises(RuntimeError, match="^observability_endpoint_mismatch$") as caught:
-        bootstrap.issue_observability_token(
-            capture,
-            "https://other.invalid/v1/metrics",
-        )
+        bootstrap.issue_observability_token(capture, changed_settings)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_token_issuer_requires_the_exact_settings_from_the_same_capture() -> None:
+    runtime_config = _runtime_config()
+    bootstrap = importlib.import_module("projetv0_voice.observability_bootstrap")
+    first_capture = runtime_config.capture_runtime_environment(valid_environment())
+    second_capture = runtime_config.capture_runtime_environment(valid_environment())
+    second_settings = runtime_config.parse_runtime_settings(
+        second_capture,
+        geteuid=lambda: 10001,
+        getegid=lambda: 10001,
+    )
+
+    with pytest.raises(RuntimeError, match="^observability_settings_mismatch$") as caught:
+        bootstrap.issue_observability_token(first_capture, second_settings)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_endpoint_only_capture_cannot_issue_production_evidence() -> None:
+    runtime_config = _runtime_config()
+    bootstrap = importlib.import_module("projetv0_voice.observability_bootstrap")
+    capture = runtime_config.capture_runtime_environment(
+        {"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT}
+    )
+
+    with pytest.raises(RuntimeError, match="^runtime_settings_invalid$"):
+        runtime_config.parse_runtime_settings(
+            capture,
+            geteuid=lambda: 10001,
+            getegid=lambda: 10001,
+        )
+    with pytest.raises(RuntimeError, match="^observability_settings_invalid$"):
+        bootstrap.issue_observability_token(capture, object())
 
 
 def _run_isolated(code: str, extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -419,6 +499,8 @@ def _require_privileged_linux() -> None:
     if os.name == "nt":
         pytest.skip("Linux kernel descriptor contract")
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        if os.environ.get("PROJETV0_PRIVILEGED_FILES_GATE") == "1":
+            pytest.fail("privileged Linux FILES gate did not run as root", pytrace=False)
         pytest.skip("privileged Linux fixture ownership is required")
 
 
@@ -426,6 +508,24 @@ def _secret_fixture_path() -> Path:
     _require_privileged_linux()
     trusted = Path("/run/secrets")
     trusted.mkdir(mode=0o755, parents=True, exist_ok=True)
+    run_stat = trusted.parent.stat()
+    trusted_stat = trusted.stat()
+    run_permission = (
+        (run_stat.st_mode >> 6) & 0o7
+        if run_stat.st_uid == 10001
+        else (run_stat.st_mode >> 3) & 0o7
+        if run_stat.st_gid == 10001
+        else run_stat.st_mode & 0o7
+    )
+    trusted_permission = (
+        (trusted_stat.st_mode >> 6) & 0o7
+        if trusted_stat.st_uid == 10001
+        else (trusted_stat.st_mode >> 3) & 0o7
+        if trusted_stat.st_gid == 10001
+        else trusted_stat.st_mode & 0o7
+    )
+    assert run_permission & 0o1
+    assert trusted_permission & 0o5 == 0o5
     return trusted / f"projetv0-test-{uuid4().hex}"
 
 
@@ -459,8 +559,24 @@ import os
 import sys
 from pathlib import Path
 sys.path.insert(0, os.environ["PYTHONPATH"])
-from projetv0_voice.runtime_config import read_runtime_secret
+from projetv0_voice.runtime_config import (
+    capture_runtime_environment,
+    parse_runtime_settings,
+    read_runtime_secret,
+)
+os.setgroups([])
+os.setgid(10001)
+os.setuid(10001)
+identity = {
+    "uid": os.getuid(),
+    "gid": os.getgid(),
+    "euid": os.geteuid(),
+    "egid": os.getegid(),
+    "groups": os.getgroups(),
+}
 try:
+    capture = capture_runtime_environment(json.loads(sys.argv[2]))
+    settings = parse_runtime_settings(capture)
     value = read_runtime_secret(Path(sys.argv[1]))
 except BaseException as error:
     print(json.dumps({
@@ -468,15 +584,37 @@ except BaseException as error:
         "error": str(error),
         "cause": error.__cause__ is None,
         "context": error.__context__ is None,
+        "identity": identity,
+        "settings": locals().get("settings").deployment_id if "settings" in locals() else None,
     }))
 else:
-    print(json.dumps({"kind": "value", "value": value.get_secret_value()}))
+    print(json.dumps({
+        "kind": "value",
+        "value": value.get_secret_value(),
+        "identity": identity,
+        "settings": settings.deployment_id,
+    }))
 """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    runtime_environment = valid_environment()
+    for name in (
+        "VOICE_TELNYX_API_KEY_FILE",
+        "VOICE_TELNYX_WEBHOOK_PUBLIC_KEY_FILE",
+        "VOICE_OPENROUTER_API_KEY_FILE",
+        "VOICE_POSTGRES_DSN_FILE",
+    ):
+        runtime_environment[name] = path.as_posix()
     try:
         result = subprocess.run(  # noqa: S603
-            [sys.executable, "-I", "-c", code, str(path)],
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                code,
+                str(path),
+                json.dumps(runtime_environment),
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -487,7 +625,36 @@ else:
         return {"kind": "timeout"}
     if result.returncode != 0:
         return {"kind": "process_error", "stderr": result.stderr}
-    return json.loads(result.stdout)
+    payload = json.loads(result.stdout)
+    assert payload.pop("identity") == {
+        "uid": 10001,
+        "gid": 10001,
+        "euid": 10001,
+        "egid": 10001,
+        "groups": [],
+    }
+    assert payload.pop("settings") == "voice-agent-a"
+    return payload
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux kernel descriptor contract")
+def test_linux_kernel_privileged_gate_preconditions_are_enforced() -> None:
+    path = _secret_fixture_path()
+
+    assert os.geteuid() == 0
+    assert path.parent == Path("/run/secrets")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux kernel descriptor contract")
+def test_linux_kernel_runtime_secret_dropped_identity_reads_compliant_file() -> None:
+    path = _secret_fixture_path()
+    _write_secret(path, b"secret-value")
+    try:
+        result = _read_secret_subprocess(path)
+    finally:
+        _remove_secret_fixture(path)
+
+    assert result == {"kind": "value", "value": "secret-value"}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Linux kernel descriptor contract")

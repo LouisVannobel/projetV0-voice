@@ -32,10 +32,56 @@ from projetv0_voice import metrics as metrics_module
 from projetv0_voice.observability_bootstrap import (
     ObservabilityBootstrapToken,
     _validate_observability_mapping,
+    issue_observability_token,
+)
+from projetv0_voice.runtime_config import (
+    capture_runtime_environment,
+    parse_runtime_settings,
 )
 
 ENDPOINT = "https://collector.invalid/tenant/v1/metrics"
 PREFIX = "projetv0.voice."
+
+
+def _production_token() -> ObservabilityBootstrapToken:
+    capture = capture_runtime_environment(
+        {
+            "VOICE_RUNTIME_MODE": "strict",
+            "VOICE_DEPLOYMENT_ID": "voice-agent-a",
+            "VOICE_RUNTIME_CONTRACT_PATH": "/srv/projetv0/runtime-contract.json",
+            "VOICE_AGENT_BUNDLE_PATH": "/srv/projetv0/agent-bundle",
+            "VOICE_QUALIFIED_PROFILE_PATH": "/srv/projetv0/qualified.json",
+            "VOICE_KEYRING_PATH": "/srv/projetv0/keyring.json",
+            "VOICE_SQLITE_PATH": "/var/lib/projetv0/voice.sqlite3",
+            "VOICE_RUNTIME_CONTRACT_SHA256": "a" * 64,
+            "VOICE_IMAGE_DIGEST": (
+                f"ghcr.io/louisvannobel/projetv0-voice@sha256:{'d' * 64}"
+            ),
+            "VOICE_AGENT_BUNDLE_SHA256": "b" * 64,
+            "VOICE_INFERENCE_PROFILE_SHA256": "c" * 64,
+            "VOICE_DEPLOYMENT_MAX_CALLS": "10",
+            "VOICE_HANDSHAKE_TIMEOUT_SECONDS": "5",
+            "VOICE_CALL_IDLE_TIMEOUT_SECONDS": "300",
+            "VOICE_CALL_CLEANUP_PHASE_TIMEOUT_SECONDS": "10",
+            "VOICE_PRE_DRAIN_GRACE_SECONDS": "15",
+            "VOICE_UVICORN_GRACE_SECONDS": "20",
+            "VOICE_SHUTDOWN_GRACE_SECONDS": "30",
+            "VOICE_TELNYX_API_KEY_FILE": "/run/secrets/telnyx-api-key",
+            "VOICE_TELNYX_WEBHOOK_PUBLIC_KEY_FILE": "/run/secrets/telnyx-webhook-key",
+            "VOICE_OPENROUTER_API_KEY_FILE": "/run/secrets/openrouter-api-key",
+            "VOICE_POSTGRES_DSN_FILE": "/run/secrets/postgres-dsn",
+            "VOICE_TELNYX_MEDIA_WSS_URL": "wss://voice.invalid/telnyx/media",
+            "VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT,
+            "VOICE_BIND_HOST": "127.0.0.1",
+            "VOICE_BIND_PORT": "8080",
+        }
+    )
+    settings = parse_runtime_settings(
+        capture,
+        geteuid=lambda: 10001,
+        getegid=lambda: 10001,
+    )
+    return issue_observability_token(capture, settings)
 
 
 EXPECTED_INSTRUMENTS = {
@@ -857,7 +903,7 @@ async def test_production_builder_passes_exact_http_reader_provider_values() -> 
         calls["provider"] = provider
         return provider
 
-    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    token = _production_token()
     owner = metrics_module._build_production(  # noqa: SLF001
         token,
         endpoint=ENDPOINT,
@@ -911,7 +957,7 @@ async def test_production_builder_passes_exact_http_reader_provider_values() -> 
 def test_production_uses_explicit_settings_endpoint_after_environment_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    token = _production_token()
     selected: list[object] = []
 
     def build(
@@ -937,7 +983,7 @@ def test_production_uses_explicit_settings_endpoint_after_environment_mutation(
 
 
 def test_production_rejects_token_and_settings_endpoint_mismatch() -> None:
-    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    token = _production_token()
 
     with pytest.raises(RuntimeError, match="^observability_endpoint_mismatch$") as caught:
         metrics_module._build_production(  # noqa: SLF001
@@ -947,6 +993,49 @@ def test_production_rejects_token_and_settings_endpoint_mismatch() -> None:
 
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_direct_and_guard_only_tokens_cannot_authorize_production_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(TypeError):
+        ObservabilityBootstrapToken(ENDPOINT)  # type: ignore[call-arg]
+
+    tokens = (
+        ObservabilityBootstrapToken(),
+        _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT}),
+    )
+    monkeypatch.setattr(
+        metrics_module,
+        "_build_production",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid token reached production construction",
+            pytrace=False,
+        ),
+    )
+    for token in tokens:
+        with pytest.raises(
+            ValueError,
+            match="^observability_bootstrap_token_invalid$",
+        ):
+            metrics_module.RuntimeMetrics.production(token, endpoint=ENDPOINT)
+
+    monkeypatch.undo()
+    for token in tokens:
+        with pytest.raises(
+            ValueError,
+            match="^observability_bootstrap_token_invalid$",
+        ) as caught:
+            metrics_module._build_production(  # noqa: SLF001
+                token,
+                endpoint=ENDPOINT,
+                exporter_factory=lambda **_kwargs: object(),
+                reader_factory=lambda *_args, **_kwargs: object(),
+                provider_factory=_FakeProvider,
+                session_factory=requests.Session,
+            )
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
 
 
 class _LocalExporter(MetricExporter):
@@ -981,7 +1070,7 @@ class _LocalExporter(MetricExporter):
 async def test_production_reader_has_real_thread_and_async_export_failure_is_silent(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    token = _production_token()
     dependency_logging.configure_dependency_logging(token)
     exporter = _LocalExporter(fail=True)
     before = {thread.ident for thread in threading.enumerate()}
@@ -1048,7 +1137,7 @@ async def test_real_failure_boundary_never_reflects_one_privacy_sentinel(
             self._provider.shutdown(timeout_millis=timeout_millis)
             raise RuntimeError(sentinel)
 
-    token = _validate_observability_mapping({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
+    token = _production_token()
     dependency_logging.configure_dependency_logging(token)
     exporter = _SentinelExporter()
     owner = metrics_module._build_production(  # noqa: SLF001

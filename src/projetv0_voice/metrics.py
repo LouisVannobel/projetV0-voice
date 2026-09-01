@@ -23,6 +23,7 @@ from opentelemetry.sdk.resources import Resource
 
 from projetv0_voice.observability_bootstrap import (
     ObservabilityBootstrapToken,
+    _is_production_token,
     _token_matches_endpoint,
     _valid_endpoint,
 )
@@ -357,7 +358,7 @@ class RuntimeMetrics:
     ) -> RuntimeMetrics:
         """Create the fixed local OTLP/HTTP owner after bootstrap validation."""
 
-        if type(token) is not ObservabilityBootstrapToken:
+        if not _is_production_token(token):
             raise ValueError("observability_bootstrap_token_invalid") from None
         return _build_production(token, endpoint=endpoint)
 
@@ -659,7 +660,7 @@ def _build_production(
     provider_factory: Callable[..., Any] = MeterProvider,
     session_factory: Callable[[], requests.Session] = requests.Session,
 ) -> RuntimeMetrics:
-    if type(token) is not ObservabilityBootstrapToken:
+    if not _is_production_token(token):
         raise ValueError("observability_bootstrap_token_invalid") from None
     if not _valid_endpoint(endpoint):
         raise RuntimeError("observability_endpoint_invalid") from None
