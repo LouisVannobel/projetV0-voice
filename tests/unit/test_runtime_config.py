@@ -560,6 +560,7 @@ def _read_secret_subprocess(path: Path) -> dict[str, object]:
 import json
 import os
 import sys
+from importlib.abc import MetaPathFinder
 from pathlib import Path
 sys.path.insert(0, os.environ["PYTHONPATH"])
 from projetv0_voice.runtime_config import (
@@ -568,11 +569,17 @@ from projetv0_voice.runtime_config import (
     read_runtime_secret,
 )
 import projetv0_voice.observability_bootstrap as preloaded_observability_bootstrap
-import pydantic as preloaded_pydantic
+import pydantic.types as preloaded_pydantic_types
+from pydantic import SecretStr as PreloadedSecretStr
 preloaded_modules = [
     preloaded_observability_bootstrap.__name__,
-    preloaded_pydantic.__name__,
+    preloaded_pydantic_types.__name__,
 ]
+preloaded_secret_type = {
+    "name": PreloadedSecretStr.__name__,
+    "module": PreloadedSecretStr.__module__,
+    "materialized": PreloadedSecretStr is preloaded_pydantic_types.SecretStr,
+}
 os.setgroups([])
 os.setgid(10001)
 os.setuid(10001)
@@ -590,6 +597,17 @@ expected_identity = {
     "egid": 10001,
     "groups": [],
 }
+blocked_post_drop_imports = []
+class PostDropImportGuard(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {
+            "projetv0_voice.observability_bootstrap",
+            "pydantic.types",
+        }:
+            blocked_post_drop_imports.append(fullname)
+            raise ModuleNotFoundError("post_drop_filesystem_import_forbidden")
+        return None
+sys.meta_path.insert(0, PostDropImportGuard())
 post_drop_calls = []
 def call_after_identity_drop(name, operation, argument):
     current_identity = {
@@ -624,6 +642,8 @@ except BaseException as error:
         "identity": identity,
         "settings": locals().get("settings").deployment_id if "settings" in locals() else None,
         "preloaded_modules": preloaded_modules,
+        "preloaded_secret_type": preloaded_secret_type,
+        "blocked_post_drop_imports": blocked_post_drop_imports,
         "post_drop_calls": post_drop_calls,
     }))
 else:
@@ -633,6 +653,8 @@ else:
         "identity": identity,
         "settings": settings.deployment_id,
         "preloaded_modules": preloaded_modules,
+        "preloaded_secret_type": preloaded_secret_type,
+        "blocked_post_drop_imports": blocked_post_drop_imports,
         "post_drop_calls": post_drop_calls,
     }))
 """
@@ -676,8 +698,14 @@ else:
     }
     assert payload.pop("preloaded_modules") == [
         "projetv0_voice.observability_bootstrap",
-        "pydantic",
+        "pydantic.types",
     ]
+    assert payload.pop("preloaded_secret_type") == {
+        "name": "SecretStr",
+        "module": "pydantic.types",
+        "materialized": True,
+    }
+    assert payload.pop("blocked_post_drop_imports") == []
     assert payload.pop("post_drop_calls") == [
         {
             "name": "parse_runtime_settings",
