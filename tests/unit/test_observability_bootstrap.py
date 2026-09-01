@@ -348,6 +348,8 @@ def test_dependency_logging_is_idempotent_and_closes_exact_logger_set() -> None:
     try:
         dependency_logging.configure_dependency_logging(token)
         active_threads = 2
+        monkeypatch.setattr(dependency_logging, "os", object())
+        monkeypatch.setattr(dependency_logging, "importlib", object())
         dependency_logging.configure_dependency_logging(token)
     finally:
         monkeypatch.undo()
@@ -413,6 +415,7 @@ def test_dependency_logging_suppresses_only_controlled_native_fd2_import_window(
         set_default_logger_severity = staticmethod(severity.append)
 
     real_import = importlib.import_module
+    original_inheritable = os.get_inheritable(2)
 
     def controlled_import(name: str) -> object:
         if name == "onnxruntime":
@@ -435,6 +438,7 @@ def test_dependency_logging_suppresses_only_controlled_native_fd2_import_window(
     assert stdout_sentinel.decode() in captured.out
     assert native_sentinel.decode() not in captured.err
     assert restored_sentinel.decode() in captured.err
+    assert os.get_inheritable(2) is original_inheritable
 
 
 @pytest.mark.parametrize("failure_phase", ["import", "severity"])
@@ -536,3 +540,346 @@ def test_dependency_logging_rejects_native_boundary_after_threads_start(
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert imports == []
+
+
+@pytest.mark.parametrize("phase", ["active_threads", "non_main_thread"])
+def test_dependency_logging_rejects_invalid_phase_before_any_fd_operation(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations: list[str] = []
+
+    def forbidden(name: str) -> object:
+        operations.append(name)
+        raise AssertionError(name)
+
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(
+        threading,
+        "active_count",
+        lambda: 2 if phase == "active_threads" else 1,
+    )
+    if phase == "non_main_thread":
+        monkeypatch.setattr(threading, "current_thread", object)
+    class _ForbiddenOS:
+        get_inheritable = staticmethod(lambda _fd: forbidden("get_inheritable"))
+        dup = staticmethod(lambda _fd: forbidden("dup"))
+        open = staticmethod(lambda *_args: forbidden("open"))
+        dup2 = staticmethod(lambda *_args, **_kwargs: forbidden("dup2"))
+        close = staticmethod(lambda _fd: forbidden("close"))
+
+    monkeypatch.setattr(importlib, "import_module", forbidden)
+    monkeypatch.setattr(dependency_logging, "os", _ForbiddenOS())
+
+    with pytest.raises(RuntimeError, match="^dependency_logging_phase_invalid$") as caught:
+        dependency_logging.configure_dependency_logging(_guard_token())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert operations == []
+
+
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["initial_flush", "get_inheritable", "cleanup_flush"],
+)
+def test_dependency_logging_preflight_or_flush_failure_is_soft_only_with_proved_cleanup(
+    failure_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_dup = os.dup
+    real_open = os.open
+    real_dup2 = os.dup2
+    real_close = os.close
+    real_get_inheritable = os.get_inheritable
+    calls = {"dup": 0, "open": 0, "dup2": 0, "close": 0, "flush": 0}
+
+    class _FakeOnnxRuntime:
+        @staticmethod
+        def set_default_logger_severity(severity: int) -> None:
+            assert severity == 4
+
+    def controlled_flush() -> bool:
+        calls["flush"] += 1
+        return not (
+            failure_phase == "initial_flush"
+            and calls["flush"] == 1
+            or failure_phase == "cleanup_flush"
+            and calls["flush"] == 2
+        )
+
+    def recording_dup(fd: int) -> int:
+        calls["dup"] += 1
+        return real_dup(fd)
+
+    def recording_open(path: str, flags: int, mode: int = 0o777) -> int:
+        calls["open"] += 1
+        return real_open(path, flags, mode)
+
+    def recording_dup2(
+        source: int,
+        destination: int,
+        inheritable: bool = True,
+    ) -> int:
+        calls["dup2"] += 1
+        return real_dup2(source, destination, inheritable=inheritable)
+
+    def recording_close(fd: int) -> None:
+        calls["close"] += 1
+        real_close(fd)
+
+    def controlled_get_inheritable(fd: int) -> bool:
+        if failure_phase == "get_inheritable":
+            raise KeyboardInterrupt("get-inheritable-secret-sentinel")
+        return real_get_inheritable(fd)
+
+    class _ControlledOS:
+        O_WRONLY = os.O_WRONLY
+        devnull = os.devnull
+        get_inheritable = staticmethod(controlled_get_inheritable)
+        dup = staticmethod(recording_dup)
+        open = staticmethod(recording_open)
+        dup2 = staticmethod(recording_dup2)
+        close = staticmethod(recording_close)
+
+    monkeypatch.setattr(dependency_logging, "_configured", False, raising=False)
+    monkeypatch.setattr(threading, "active_count", lambda: 1)
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
+    monkeypatch.setattr(dependency_logging, "_flush_stderr", controlled_flush)
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: _FakeOnnxRuntime()
+        if name == "onnxruntime"
+        else importlib.import_module(name),
+    )
+    monkeypatch.setattr(dependency_logging, "os", _ControlledOS())
+
+    with pytest.raises(
+        RuntimeError,
+        match="^dependency_logging_configuration_failed$",
+    ) as caught:
+        dependency_logging.configure_dependency_logging(_guard_token())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    if failure_phase in ("initial_flush", "get_inheritable"):
+        assert calls == {"dup": 0, "open": 0, "dup2": 0, "close": 0, "flush": 1}
+    else:
+        assert calls == {"dup": 1, "open": 1, "dup2": 2, "close": 2, "flush": 2}
+
+
+_NATIVE_FATAL_FAULT_PROBE = r"""
+import importlib
+import json
+import os
+import sys
+import threading
+
+sys.path.insert(0, os.environ["PYTHONPATH"])
+from projetv0_voice import dependency_logging, observability_bootstrap
+
+fault = os.environ["PROJETV0_NATIVE_FAULT"]
+real_hard_exit = os.environ["PROJETV0_REAL_HARD_EXIT"] == "1"
+returning_hard_exit = os.environ.get("PROJETV0_RETURNING_HARD_EXIT") == "1"
+token = observability_bootstrap._validate_observability_mapping({
+    "VOICE_OTLP_HTTP_ENDPOINT": "https://collector.invalid/tenant/v1/metrics"
+})
+real_dup = os.dup
+real_open = os.open
+real_dup2 = os.dup2
+real_close = os.close
+real_flush_stderr = dependency_logging._flush_stderr
+calls = {
+    "dup": 0,
+    "open": 0,
+    "dup2": [],
+    "close": [],
+    "flush": 0,
+    "exit": [],
+}
+original_inheritable = os.get_inheritable(2)
+
+class FakeOnnxRuntime:
+    @staticmethod
+    def set_default_logger_severity(severity):
+        if severity != 4:
+            raise AssertionError(severity)
+
+def controlled_import(name):
+    if name != "onnxruntime":
+        raise AssertionError(name)
+    return FakeOnnxRuntime()
+
+def recording_flush_stderr():
+    calls["flush"] += 1
+    return real_flush_stderr()
+
+def faulting_dup(fd):
+    calls["dup"] += 1
+    result = real_dup(fd)
+    if fault == "dup":
+        raise KeyboardInterrupt("dup-effect-real")
+    return result
+
+def faulting_open(path, flags, mode=0o777):
+    calls["open"] += 1
+    result = real_open(path, flags, mode)
+    if fault == "open":
+        raise KeyboardInterrupt("open-effect-real")
+    return result
+
+def faulting_dup2(source, destination, inheritable=True):
+    calls["dup2"].append([source, destination, inheritable])
+    call_number = len(calls["dup2"])
+    if fault == "restore_fail" and call_number == 2:
+        raise OSError("restore-failed-before-effect")
+    result = real_dup2(source, destination, inheritable=inheritable)
+    if fault == "redirect" and call_number == 1:
+        raise KeyboardInterrupt("redirect-effect-real")
+    if fault == "restore" and call_number == 2:
+        raise KeyboardInterrupt("restore-effect-real")
+    return result
+
+def faulting_close(fd):
+    calls["close"].append(fd)
+    call_number = len(calls["close"])
+    if fault == "close_devnull_fail" and call_number == 1:
+        raise OSError("close-devnull-failed-before-effect")
+    if fault == "close_saved_fail" and call_number == 2:
+        raise OSError("close-saved-failed-before-effect")
+    real_close(fd)
+    if fault == "close_devnull" and call_number == 1:
+        raise KeyboardInterrupt("close-devnull-effect-real")
+    if fault == "close_saved" and call_number == 2:
+        raise KeyboardInterrupt("close-saved-effect-real")
+
+class TerminalExit(BaseException):
+    pass
+
+def nonreturning_hard_exit(code):
+    calls["exit"].append(code)
+    raise TerminalExit()
+
+def invalid_returning_hard_exit(code):
+    calls["exit"].append(code)
+
+dependency_logging._configured = False
+dependency_logging._flush_stderr = recording_flush_stderr
+dependency_logging.importlib.import_module = controlled_import
+dependency_logging.threading.active_count = lambda: 1
+dependency_logging.threading.current_thread = threading.main_thread
+dependency_logging.os.dup = faulting_dup
+dependency_logging.os.open = faulting_open
+dependency_logging.os.dup2 = faulting_dup2
+dependency_logging.os.close = faulting_close
+if returning_hard_exit:
+    dependency_logging._hard_exit = invalid_returning_hard_exit
+elif not real_hard_exit:
+    dependency_logging._hard_exit = nonreturning_hard_exit
+
+terminal = False
+public_error = None
+try:
+    dependency_logging.configure_dependency_logging(token)
+except TerminalExit:
+    terminal = True
+except RuntimeError as error:
+    public_error = str(error)
+
+if real_hard_exit or returning_hard_exit:
+    os.write(1, b"POST-CALL-MARKER")
+else:
+    print(json.dumps({
+        "terminal": terminal,
+        "public_error": public_error,
+        "calls": calls,
+        "configured": dependency_logging._configured,
+        "original_inheritable": original_inheritable,
+        "final_inheritable": os.get_inheritable(2),
+    }))
+"""
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_dup2", "expected_close_count", "expected_flush_count"),
+    [
+        ("dup", 0, 0, 1),
+        ("open", 0, 1, 1),
+        ("redirect", 2, 2, 1),
+        ("restore_fail", 2, 2, 2),
+        ("restore", 2, 2, 2),
+        ("close_devnull_fail", 2, 2, 2),
+        ("close_devnull", 2, 2, 2),
+        ("close_saved_fail", 2, 2, 2),
+        ("close_saved", 2, 2, 2),
+    ],
+)
+def test_dependency_logging_native_uncertain_effect_uses_nonreturning_fatal_seam(
+    fault: str,
+    expected_dup2: int,
+    expected_close_count: int,
+    expected_flush_count: int,
+) -> None:
+    result = _run_isolated(
+        _NATIVE_FATAL_FAULT_PROBE,
+        {"PROJETV0_NATIVE_FAULT": fault, "PROJETV0_REAL_HARD_EXIT": "0"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["terminal"] is True
+    assert payload["public_error"] is None
+    assert payload["calls"]["exit"] == [71]
+    assert payload["calls"]["dup"] == 1
+    assert payload["calls"]["open"] == (0 if fault == "dup" else 1)
+    assert len(payload["calls"]["dup2"]) == expected_dup2
+    assert len(payload["calls"]["close"]) == expected_close_count
+    assert payload["calls"]["flush"] == expected_flush_count
+    assert len(payload["calls"]["close"]) == len(set(payload["calls"]["close"]))
+    assert all(
+        call[2] is payload["original_inheritable"]
+        for call in payload["calls"]["dup2"]
+    )
+    assert payload["final_inheritable"] is payload["original_inheritable"]
+    assert payload["configured"] is False
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "dup",
+        "open",
+        "redirect",
+        "restore_fail",
+        "restore",
+        "close_devnull_fail",
+        "close_devnull",
+        "close_saved_fail",
+        "close_saved",
+    ],
+)
+def test_dependency_logging_native_uncertain_effect_hard_exits_real_process(
+    fault: str,
+) -> None:
+    result = _run_isolated(
+        _NATIVE_FATAL_FAULT_PROBE,
+        {"PROJETV0_NATIVE_FAULT": fault, "PROJETV0_REAL_HARD_EXIT": "1"},
+    )
+
+    assert result.returncode == 71
+    assert "POST-CALL-MARKER" not in result.stdout
+
+
+def test_dependency_logging_rejects_a_returning_hard_exit_double() -> None:
+    result = _run_isolated(
+        _NATIVE_FATAL_FAULT_PROBE,
+        {
+            "PROJETV0_NATIVE_FAULT": "dup",
+            "PROJETV0_REAL_HARD_EXIT": "0",
+            "PROJETV0_RETURNING_HARD_EXIT": "1",
+        },
+    )
+
+    assert result.returncode == 71
+    assert "POST-CALL-MARKER" not in result.stdout
