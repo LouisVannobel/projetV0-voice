@@ -7,7 +7,7 @@ import socket
 import stat
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields, replace
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -145,6 +145,25 @@ class _FailingIteratorMapping(Mapping[str, object]):
         return 1
 
 
+class _HostileBoundaryFailure(BaseException):
+    pass
+
+
+class _FailingAllowedValueMapping(Mapping[str, object]):
+    def __init__(self, failure_type: type[BaseException], sentinel: str) -> None:
+        self.failure_type = failure_type
+        self.sentinel = sentinel
+
+    def __getitem__(self, key: str) -> object:
+        raise self.failure_type(self.sentinel)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(ALLOWED_NAMES)
+
+    def __len__(self) -> int:
+        return len(ALLOWED_NAMES)
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -193,6 +212,29 @@ def test_hostile_mapping_iterator_failure_is_collapsed_without_text_or_chain() -
     assert caught.value.__context__ is None
     assert "mapping-iterator-secret-sentinel" not in str(caught.value)
     assert "mapping-iterator-secret-sentinel" not in repr(caught.value)
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, _HostileBoundaryFailure])
+def test_hostile_allowed_value_failure_is_collapsed_without_disclosure(
+    failure_type: type[BaseException],
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_config = _runtime_config()
+    sentinel = "allowed-value-secret-sentinel"
+    mapping = _FailingAllowedValueMapping(failure_type, sentinel)
+
+    with pytest.raises(RuntimeError, match="^runtime_environment_capture_failed$") as caught:
+        runtime_config.capture_runtime_environment(mapping)
+
+    captured = capsys.readouterr()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert sentinel not in str(caught.value)
+    assert sentinel not in repr(caught.value)
+    assert sentinel not in caplog.text
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -291,6 +333,39 @@ def test_parse_rejects_every_non_runtime_effective_identity(uid: int, gid: int) 
 
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, _HostileBoundaryFailure])
+@pytest.mark.parametrize("failing_identity", ["geteuid", "getegid"])
+def test_hostile_identity_failure_is_collapsed_without_disclosure(
+    failure_type: type[BaseException],
+    failing_identity: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_config = _runtime_config()
+    capture = runtime_config.capture_runtime_environment(valid_environment())
+    sentinel = f"{failing_identity}-secret-sentinel"
+
+    def hostile_identity() -> int:
+        raise failure_type(sentinel)
+
+    identity_functions: dict[str, Callable[[], int]] = {
+        "geteuid": hostile_identity if failing_identity == "geteuid" else lambda: 10001,
+        "getegid": hostile_identity if failing_identity == "getegid" else lambda: 10001,
+    }
+
+    with pytest.raises(RuntimeError, match="^runtime_identity_invalid$") as caught:
+        runtime_config.parse_runtime_settings(capture, **identity_functions)
+
+    captured = capsys.readouterr()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert sentinel not in str(caught.value)
+    assert sentinel not in repr(caught.value)
+    assert sentinel not in caplog.text
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
 
 
 @pytest.mark.parametrize(

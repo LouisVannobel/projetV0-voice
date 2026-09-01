@@ -189,12 +189,17 @@ def capture_runtime_environment(
 
     captured: list[object] = []
     for name in _ALLOWED_ENVIRONMENT_NAMES:
+        capture_failed = False
+        value: object = _MISSING
         try:
-            captured.append(mapping[name])
+            value = mapping[name]
         except KeyError:
-            captured.append(_MISSING)
+            pass
         except BaseException:
+            capture_failed = True
+        if capture_failed:
             raise RuntimeError("runtime_environment_capture_failed") from None
+        captured.append(value)
     return RuntimeEnvironmentCapture(tuple(captured))
 
 
@@ -391,10 +396,15 @@ def parse_runtime_settings(
     gid_function = getegid if getegid is not None else getattr(os, "getegid", None)
     if uid_function is None or gid_function is None:
         raise RuntimeError("runtime_platform_unsupported") from None
+    identity_failed = False
+    uid: object = _MISSING
+    gid: object = _MISSING
     try:
         uid = uid_function()
         gid = gid_function()
     except BaseException:
+        identity_failed = True
+    if identity_failed:
         raise RuntimeError("runtime_identity_invalid") from None
     if type(uid) is not int or type(gid) is not int or (uid, gid) != (10001, 10001):
         raise RuntimeError("runtime_identity_invalid") from None
