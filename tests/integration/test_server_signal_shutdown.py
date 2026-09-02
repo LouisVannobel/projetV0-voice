@@ -153,13 +153,15 @@ def _signal_process_script(mode: str) -> str:
         class ObservableSupervisor(RuntimeSupervisor):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self.begin_drain_calls = 0
+                self.raw_begin_drain_calls = 0
+                self.effective_drain_transitions = 0
 
             async def begin_drain(self):
-                self.begin_drain_calls += 1
-                first = not self._draining
+                self.raw_begin_drain_calls += 1
+                was_draining = self._draining
                 await super().begin_drain()
-                if first:
+                if not was_draining and self._draining:
+                    self.effective_drain_transitions += 1
                     print("DRAIN", flush=True)
 
         async def seed_stale(path, keyring):
@@ -283,7 +285,8 @@ def _signal_process_script(mode: str) -> str:
                 "SUMMARY:"
                 + ":".join(
                     (
-                        str(supervisor.begin_drain_calls),
+                        str(supervisor.raw_begin_drain_calls),
+                        str(supervisor.effective_drain_transitions),
                         str(int(supervisor._draining)),
                         str(int(server.force_exit)),
                         str(int(coordinator.urgent)),
@@ -3023,8 +3026,16 @@ async def test_signal_proc_repeated_signal_permutations_preserve_lifespan(
     assert process.returncode == 0
     assert stderr == b""
     summary = next(line for line in lines if line.startswith("SUMMARY:"))
-    _label, calls, draining, forced, urgent, shutdown = summary.split(":")
-    assert (calls, draining, forced, shutdown) == ("1", "1", "0", "1")
+    _label, raw_calls, transitions, draining, forced, urgent, shutdown = summary.split(
+        ":"
+    )
+    assert (raw_calls, transitions, draining, forced, shutdown) == (
+        "2",
+        "1",
+        "1",
+        "0",
+        "1",
+    )
     assert urgent == str(int(len(signals) > 1 and signals[1] == signal.SIGINT))
 
 
