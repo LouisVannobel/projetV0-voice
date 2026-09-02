@@ -21,6 +21,17 @@ RUNTIME_BYTES = b"runtime\n"
 RUNTIME_SHA256 = "b45fd73aa413c685440da5ae5c63c69398b339f9cf7a73f4d4324ac8577dc3d1"
 BUNDLE_GOLDEN_SHA256 = "ff95531825d43b758ac6cf8110966a8b8e95ef13140f5f0f56d1d47f1b07b684"
 EMPTY_BUNDLE_SHA256 = "1d82e411b7a8587b2e105d924b9031d4fca7dfed9373c64cc5ebad71cdfa7c08"
+MANIFEST_BYTES = (
+    b'{"schema_version":1,"tenant_id":"t","agent_id":"a","revision":"r",'
+    b'"dids":["+331"],"language":"fr","prompt_path":"prompt.md",'
+    b'"prompt_revision":"p","greeting":"Bonjour","conversation_mode":"freeform",'
+    b'"max_concurrent_calls":1,"direction":"inbound_only","transport_codec":"PCMU",'
+    b'"transport_sample_rate_hz":8000,"transcript_retention_days":7,'
+    b'"recording_mode":"off","recording_format":"wav",'
+    b'"recording_retention_days":null,"recording_required":false,'
+    b'"recording_play_beep":false}'
+)
+UTF8_BUNDLE_GOLDEN = "12cb8fc96a5fd5a9105538aeede00dfcd2335090a759106982807f04e36163ca"
 PRIVILEGED_FILES = (
     os.name == "posix"
     and os.environ.get("PROJETV0_PRIVILEGED_FILES_GATE") == "1"
@@ -225,8 +236,15 @@ def test_rejected_ancestor_open_closes_every_acquired_descriptor_once(
 
     monkeypatch.setattr(wiring, "_linux_flags", lambda *, directory: 0)
     monkeypatch.setattr(wiring.os, "open", open_path)
-    monkeypatch.setattr(wiring.os, "fstat", lambda _descriptor: object())
+    directory = os.stat_result((0o40700, 1, 0, 0, 0, 0, 0, 0, 0, 0))
+    child = os.stat_result((0o40700, 2, 0, 0, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(wiring.os, "fstat", lambda _descriptor: directory)
     monkeypatch.setattr(wiring, "_safe_mode", lambda _value, *, directory: True)
+    monkeypatch.setattr(
+        wiring,
+        "_snapshot_directory",
+        lambda _descriptor: {"trusted": wiring._directory_stat(child)},
+    )
     monkeypatch.setattr(wiring.os, "close", closed.append)
 
     with pytest.raises(OSError, match="synthetic open failure"):
@@ -264,6 +282,93 @@ def test_bundle_entry_stat_must_match_snapshot_before_descent(
 
     with pytest.raises(wiring._WiringInvalid):
         wiring._walk_bundle(1, parts=(), entries=[], total=[0])
+
+
+def test_opened_child_directory_must_match_snapshotted_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stat
+
+    import projetv0_voice.production_wiring as wiring
+
+    parent = os.stat_result((stat.S_IFDIR | 0o755, 10, 1, 1, 0, 0, 0, 0, 0, 0))
+    entry = os.stat_result((stat.S_IFDIR | 0o755, 20, 1, 1, 0, 0, 0, 0, 0, 0))
+    opened = os.stat_result((stat.S_IFDIR | 0o755, 21, 1, 1, 0, 0, 0, 0, 0, 0))
+    snapshots = {
+        1: {"child": wiring._directory_stat(entry)},
+        2: {},
+    }
+    fake_os = SimpleNamespace(
+        fstat=lambda descriptor: parent if descriptor == 1 else opened,
+        stat=lambda _name, *, dir_fd, follow_symlinks: entry,
+        open=lambda _name, _flags, *, dir_fd: 2,
+        close=lambda _descriptor: None,
+    )
+    monkeypatch.setattr(wiring, "os", fake_os)
+    monkeypatch.setattr(wiring, "_safe_mode", lambda _value, *, directory: True)
+    monkeypatch.setattr(
+        wiring, "_snapshot_directory", lambda descriptor: snapshots[descriptor]
+    )
+    monkeypatch.setattr(wiring, "_linux_flags", lambda *, directory: 0)
+
+    with pytest.raises(wiring._WiringInvalid):
+        wiring._walk_bundle(1, parts=(), entries=[], total=[0])
+
+
+def test_bundle_count_and_cumulative_content_bounds_are_closed() -> None:
+    from projetv0_voice.production_wiring import _bundle_digest
+
+    digest = b"d" * 32
+    accepted_count = tuple(
+        (f"f{index:03d}".encode(), 0, digest) for index in range(512)
+    )
+    assert len(_bundle_digest(accepted_count)) == 64
+    with pytest.raises(ValueError, match="^bundle_entry_invalid$"):
+        _bundle_digest((*accepted_count, (b"overflow", 0, digest)))
+
+    assert len(_bundle_digest(((b"max", 16_777_216, digest),))) == 64
+    with pytest.raises(ValueError, match="^bundle_entry_invalid$"):
+        _bundle_digest(((b"overflow", 16_777_217, digest),))
+
+
+def test_relative_path_exact_component_depth_and_byte_bounds() -> None:
+    from projetv0_voice.production_wiring import _relative_bytes, _WiringInvalid
+
+    assert len(_relative_bytes(tuple("x" * 255 for _ in range(16)))) == 4_095
+    with pytest.raises(_WiringInvalid):
+        _relative_bytes(tuple("x" for _ in range(17)))
+    with pytest.raises(_WiringInvalid):
+        _relative_bytes(("x" * 256,))
+    with pytest.raises(_WiringInvalid):
+        _relative_bytes((*tuple("x" * 255 for _ in range(15)), "y" * 256))
+
+
+def test_ancestor_authority_rejects_reverse_name_or_stat_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    stable = os.stat_result((0, 2, 1, 1, 0, 0, 0, 0, 0, 0))
+    authority_type = wiring._AncestorAuthority
+    verify = wiring._verify_ancestor_authorities
+    authority = authority_type(
+        descriptor=10,
+        directory_stat=wiring._directory_stat(stable),
+        entries={"child": (1, 3, 4, 5, 6, 7, 0, 0)},
+    )
+    monkeypatch.setattr(
+        wiring,
+        "_snapshot_directory",
+        lambda _descriptor: {"mutated": (1, 3, 4, 5, 6, 7, 0, 0)},
+    )
+    monkeypatch.setattr(
+        wiring.os,
+        "fstat",
+        lambda _descriptor: stable,
+    )
+
+    with pytest.raises(wiring._WiringInvalid):
+        verify((authority,))
 
 
 def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
@@ -465,3 +570,246 @@ def test_linux_runtime_grows_after_same_fd_read_is_rejected(
         with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
             wiring.build_production_factories(settings).validate_artifacts(settings)
         assert mutated is True
+
+
+def _walk_real_bundle(path: Path) -> tuple[list[tuple[bytes, int, bytes]], int]:
+    import projetv0_voice.production_wiring as wiring
+
+    descriptor = os.open(path, wiring._linux_flags(directory=True))
+    entries: list[tuple[bytes, int, bytes]] = []
+    total = [0]
+    try:
+        wiring._walk_bundle(descriptor, parts=(), entries=entries, total=total)
+    finally:
+        os.close(descriptor)
+    return entries, total[0]
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+@pytest.mark.parametrize("count,accepted", [(512, True), (513, False)])
+def test_linux_kernel_bundle_file_count_bound(count: int, accepted: bool) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        bundle = Path(raw) / "bundle"
+        bundle.mkdir()
+        for index in range(count):
+            (bundle / f"f{index:03d}").write_bytes(b"")
+        if accepted:
+            entries, total = _walk_real_bundle(bundle)
+            assert (len(entries), total) == (512, 0)
+        else:
+            with pytest.raises(wiring._WiringInvalid):
+                _walk_real_bundle(bundle)
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+@pytest.mark.parametrize("components,accepted", [(16, True), (17, False)])
+def test_linux_kernel_bundle_component_depth_bound(
+    components: int,
+    accepted: bool,
+) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        bundle = Path(raw) / "bundle"
+        bundle.mkdir()
+        parent = bundle
+        for index in range(components - 1):
+            parent /= f"d{index}"
+            parent.mkdir()
+        (parent / "leaf").write_bytes(b"")
+        if accepted:
+            entries, _total = _walk_real_bundle(bundle)
+            assert len(entries) == 1
+        else:
+            with pytest.raises(wiring._WiringInvalid):
+                _walk_real_bundle(bundle)
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+@pytest.mark.parametrize(
+    "size,accepted",
+    [(16_777_216, True), (16_777_217, False)],
+)
+def test_linux_kernel_bundle_cumulative_content_bound(
+    size: int,
+    accepted: bool,
+) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        bundle = Path(raw) / "bundle"
+        bundle.mkdir()
+        (bundle / "leaf").write_bytes(b"x" * size)
+        if accepted:
+            entries, total = _walk_real_bundle(bundle)
+            assert (len(entries), total) == (1, 16_777_216)
+        else:
+            with pytest.raises(wiring._WiringInvalid):
+                _walk_real_bundle(bundle)
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_linux_kernel_runtime_contract_non_regular_leaf_is_rejected(kind: str) -> None:
+    from projetv0_voice.production_wiring import build_production_factories
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        trusted = Path(raw)
+        target = trusted / "target"
+        target.write_bytes(RUNTIME_BYTES)
+        runtime = trusted / "runtime.json"
+        if kind == "symlink":
+            runtime.symlink_to(target)
+        else:
+            runtime.mkdir()
+        bundle = trusted / "bundle"
+        bundle.mkdir()
+        settings = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256=RUNTIME_SHA256,
+            bundle_sha256=EMPTY_BUNDLE_SHA256,
+        )
+        with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
+            build_production_factories(settings).validate_artifacts(settings)
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+@pytest.mark.parametrize("mutation", ["mode", "owner"])
+def test_linux_kernel_runtime_contract_permissions_and_ownership(
+    mutation: str,
+) -> None:
+    from projetv0_voice.production_wiring import build_production_factories
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        trusted = Path(raw)
+        runtime = trusted / "runtime.json"
+        runtime.write_bytes(RUNTIME_BYTES)
+        if mutation == "mode":
+            runtime.chmod(0o666)
+        else:
+            os.chown(runtime, 1000, 0)
+        bundle = trusted / "bundle"
+        bundle.mkdir()
+        settings = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256=RUNTIME_SHA256,
+            bundle_sha256=EMPTY_BUNDLE_SHA256,
+        )
+        with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
+            build_production_factories(settings).validate_artifacts(settings)
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+def test_linux_kernel_ancestor_mutation_after_descent_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        trusted = Path(raw)
+        runtime = trusted / "runtime.json"
+        runtime.write_bytes(RUNTIME_BYTES)
+        bundle = trusted / "bundle"
+        bundle.mkdir()
+        settings = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256=RUNTIME_SHA256,
+            bundle_sha256=EMPTY_BUNDLE_SHA256,
+        )
+        original_read = wiring.os.read
+        mutated = False
+
+        def read_and_mutate(descriptor: int, count: int) -> bytes:
+            nonlocal mutated
+            chunk = original_read(descriptor, count)
+            if chunk and not mutated:
+                mutated = True
+                (trusted / "new-entry").write_bytes(b"mutation")
+            return chunk
+
+        monkeypatch.setattr(wiring.os, "read", read_and_mutate)
+        with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
+            wiring.build_production_factories(settings).validate_artifacts(settings)
+        assert mutated is True
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+def test_linux_kernel_raw_utf8_order_and_real_manifest_load_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        trusted = Path(raw)
+        runtime = trusted / "runtime.json"
+        runtime.write_bytes(RUNTIME_BYTES)
+        bundle = trusted / "bundle"
+        bundle.mkdir()
+        for name, content in {
+            ".dot": b"d",
+            "manifest.yaml": MANIFEST_BYTES,
+            "prompt.md": b"prompt",
+            "z.txt": b"z",
+            "é.txt": b"e",
+        }.items():
+            (bundle / name).write_bytes(content)
+        settings = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256=RUNTIME_SHA256,
+            bundle_sha256=UTF8_BUNDLE_GOLDEN,
+        )
+        real_load = wiring.load_agent_manifest
+        calls = 0
+
+        def counted_load(*args: object, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            return real_load(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(wiring, "load_agent_manifest", counted_load)
+        factories = wiring.build_production_factories(settings)
+        factories.validate_artifacts(settings)
+        first = factories.load_manifest(settings)
+        second = factories.load_manifest(settings)
+
+        assert first is second
+        assert first.language == "fr"
+        assert calls == 1
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+def test_linux_kernel_success_and_failure_close_every_descriptor() -> None:
+    from projetv0_voice.production_wiring import build_production_factories
+
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
+        trusted = Path(raw)
+        runtime = trusted / "runtime.json"
+        runtime.write_bytes(RUNTIME_BYTES)
+        bundle = trusted / "bundle"
+        bundle.mkdir()
+        settings = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256=RUNTIME_SHA256,
+            bundle_sha256=EMPTY_BUNDLE_SHA256,
+        )
+        before = len(os.listdir("/proc/self/fd"))
+        build_production_factories(settings).validate_artifacts(settings)
+        after_success = len(os.listdir("/proc/self/fd"))
+        invalid = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256="0" * 64,
+            bundle_sha256=EMPTY_BUNDLE_SHA256,
+        )
+        with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
+            build_production_factories(invalid).validate_artifacts(invalid)
+        after_failure = len(os.listdir("/proc/self/fd"))
+
+        assert (after_success, after_failure) == (before, before)

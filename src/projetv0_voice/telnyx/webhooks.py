@@ -835,12 +835,11 @@ class TelnyxWebhookProcessor:
                 except CallAdmissionRejected as error:
                     return _observed(
                         event,
-                        "none",
+                        "duplicate",
                         error.status_code,
-                        _observed_rejection(error),
                     )
                 except Exception:
-                    return _observed(event, "none", 500)
+                    return _observed(event, "duplicate", 500)
         elif classification == "missing":
             receipt = "first"
             try:
@@ -859,9 +858,14 @@ class TelnyxWebhookProcessor:
         else:
             return _observed(event, "none", 500)
         if not isinstance(resolution, ResolvedWebhook):
-            return _observed(event, "none", 500)
+            terminal_receipt: ObservedWebhookReceipt = (
+                "duplicate" if receipt == "duplicate" else "none"
+            )
+            return _observed(event, terminal_receipt, 500)
         handle = self.start_webhook_finalization(event, resolution)
         if handle is None:
+            if receipt == "duplicate":
+                return _observed(event, "duplicate", 503)
             return _observed(event, "none", 503, "persistence")
         try:
             disposition = await asyncio.shield(handle.wait())

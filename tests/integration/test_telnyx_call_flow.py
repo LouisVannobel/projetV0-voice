@@ -1212,3 +1212,82 @@ def test_public_observed_result_rejects_values_outside_closed_domains() -> None:
             receipt="first",
             metric_disposition="ok",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        ("resolver-reject", 503),
+        ("resolver-error", 500),
+        ("resolver-invalid", 500),
+        ("finalizer-transfer", 503),
+        ("finalizer-wait", 500),
+    ],
+)
+async def test_terminal_duplicate_never_becomes_new_admission_rejection(
+    failure: str,
+    expected_status: int,
+) -> None:
+    from projetv0_voice.admission import CallAdmissionRejected
+    from projetv0_voice.telnyx.webhooks import ResolvedWebhook, VerifiedWebhook
+
+    event = VerifiedWebhook(
+        event_id="duplicate-event",
+        event_type="call.initiated",
+        occurred_at=datetime(2026, 8, 29, 10, tzinfo=UTC),
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"n" * 32,
+        legacy_v1_semantic_fingerprint_sha256=b"l" * 32,
+        direction="incoming",
+        call_state="parked",
+    )
+
+    class Verifier:
+        def verify(self, **_: object) -> VerifiedWebhook:
+            return event
+
+    class Handle:
+        async def wait(self) -> WebhookDisposition:
+            if failure == "finalizer-wait":
+                raise RuntimeError("private-finalizer-wait")
+            return WebhookDisposition(200)
+
+    class Owner:
+        async def classify_webhook_receipt(self, _: VerifiedWebhook) -> str:
+            return "duplicate"
+
+        def start_webhook_finalization(
+            self, _event: VerifiedWebhook, _resolution: ResolvedWebhook
+        ) -> Handle:
+            if failure == "finalizer-transfer":
+                raise RuntimeError("private-finalizer-transfer")
+            return Handle()
+
+    async def duplicate_resolver(_event: VerifiedWebhook) -> object:
+        if failure == "resolver-reject":
+            raise CallAdmissionRejected("call_draining")
+        if failure == "resolver-error":
+            raise RuntimeError("private-resolver")
+        if failure == "resolver-invalid":
+            return object()
+        return ResolvedWebhook(None)
+
+    observed = await TelnyxWebhookProcessor(
+        verifier=Verifier(),  # type: ignore[arg-type]
+        resolver=lambda _: ResolvedWebhook(None),
+        duplicate_resolver=duplicate_resolver,  # type: ignore[arg-type]
+        finalizer_owner=Owner(),  # type: ignore[arg-type]
+    ).process_observed(body=b"{}", headers=[])
+
+    assert observed.disposition == WebhookDisposition(expected_status)
+    assert observed.receipt == "duplicate"
+    assert observed.admission_rejection is None

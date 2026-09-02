@@ -701,6 +701,93 @@ async def test_new_capacity_rejection_emits_one_exact_ingress_metric_outcome() -
     }
 
 
+@pytest.mark.asyncio
+async def test_duplicate_resolver_rejection_emits_one_duplicate_and_zero_admission() -> None:
+    from projetv0_voice.admission import CallAdmissionRejected
+    from projetv0_voice.app import create_app
+    from projetv0_voice.metrics import RuntimeMetrics
+    from projetv0_voice.telnyx.webhooks import (
+        TelnyxWebhookProcessor,
+        VerifiedWebhook,
+    )
+
+    event = VerifiedWebhook(
+        event_id="duplicate-event",
+        event_type="call.initiated",
+        occurred_at=NOW,
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"n" * 32,
+        legacy_v1_semantic_fingerprint_sha256=b"l" * 32,
+        direction="incoming",
+        call_state="parked",
+    )
+
+    class Verifier:
+        def verify(self, **_: object) -> VerifiedWebhook:
+            return event
+
+    class Owner:
+        async def classify_webhook_receipt(self, _: VerifiedWebhook) -> str:
+            return "duplicate"
+
+        def start_webhook_finalization(self, *_: object) -> object:
+            raise AssertionError("duplicate resolver rejection has no finalizer")
+
+    async def reject(_: VerifiedWebhook) -> object:
+        raise CallAdmissionRejected("call_draining")
+
+    metrics = RuntimeMetrics.in_memory()
+    app = create_app(_runtime_settings(), SimpleNamespace())
+    app.state.runtime_graph = SimpleNamespace(
+        webhook_processor=TelnyxWebhookProcessor(
+            verifier=Verifier(),  # type: ignore[arg-type]
+            resolver=lambda _: object(),  # type: ignore[arg-type]
+            duplicate_resolver=reject,  # type: ignore[arg-type]
+            finalizer_owner=Owner(),  # type: ignore[arg-type]
+        ),
+        metrics=metrics,
+    )
+
+    sent = await _raw_http(
+        app,
+        path="/telnyx/events",
+        method="POST",
+        messages=[{"type": "http.request", "body": b"{}", "more_body": False}],
+    )
+    assert next(message for message in sent if message["type"] == "http.response.start")[
+        "status"
+    ] == 503
+
+    collected = metrics._metric_reader.get_metrics_data()  # noqa: SLF001
+    assert collected is not None
+    points = {
+        metric.name: list(metric.data.data_points)
+        for resource in collected.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name
+        in {
+            "projetv0.voice.admission.rejections",
+            "projetv0.voice.webhooks.total",
+        }
+    }
+    assert "projetv0.voice.admission.rejections" not in points
+    assert [point.value for point in points["projetv0.voice.webhooks.total"]] == [1]
+    assert dict(points["projetv0.voice.webhooks.total"][0].attributes) == {
+        "webhook_class": "initiated",
+        "receipt": "duplicate",
+        "disposition": "unavailable",
+    }
+
+
 def test_integrated_runtime_metric_owner_inventory_is_exactly_thirteen() -> None:
     from projetv0_voice.app import INGRESS_METRIC_OWNERS
     from projetv0_voice.lifecycle import NON_INGRESS_METRIC_OWNERS

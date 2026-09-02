@@ -24,12 +24,26 @@ if TYPE_CHECKING:
 type RuntimeBuilder = Callable[[RuntimeSettingsV1], Awaitable[RuntimeProductionGraph]]
 
 _RUNTIME_HARD_EXIT_CODE = 72
-_UVICORN_LOGGERS = (
-    "uvicorn",
+_UVICORN_FLOOR_LOGGERS = (
     "uvicorn.error",
     "uvicorn.access",
     "uvicorn.asgi",
 )
+_UVICORN_LOGGERS = (
+    "uvicorn",
+    *_UVICORN_FLOOR_LOGGERS,
+)
+
+
+def _install_uvicorn_logging_floors() -> None:
+    """Install exact stdlib-only privacy floors before any heavy import."""
+
+    for name in _UVICORN_FLOOR_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.handlers[:] = [logging.NullHandler()]
+        logger.propagate = False
+        logger.disabled = True
+        logger.setLevel(logging.CRITICAL + 1)
 
 
 class FirstSignalDrainCoordinator:
@@ -308,6 +322,7 @@ def main(mapping: Mapping[str, object] = os.environ) -> None:
 
     capture = capture_runtime_environment(mapping)
     settings = parse_runtime_settings(capture)
+    _install_uvicorn_logging_floors()
 
     from projetv0_voice.dependency_logging import configure_dependency_logging
 

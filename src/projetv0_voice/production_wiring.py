@@ -11,6 +11,7 @@ import stat
 import threading
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -61,6 +62,13 @@ type _BundleEntry = tuple[bytes, int, bytes]
 
 class _WiringInvalid(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _AncestorAuthority:
+    descriptor: int
+    directory_stat: tuple[int, ...]
+    entries: dict[str, tuple[int, ...]]
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -194,19 +202,64 @@ def _linux_flags(*, directory: bool) -> int:
     return flags
 
 
-def _open_parent(path: PurePosixPath) -> tuple[list[int], int, str]:
+def _safe_snapshot_entry(value: tuple[int, ...], *, directory: bool) -> bool:
+    mode = value[3]
+    uid = value[6]
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    return (
+        expected_type(mode)
+        and uid == 0
+        and mode & _SPECIAL_BITS == 0
+        and mode & 0o022 == 0
+    )
+
+
+def _capture_ancestor(descriptor: int) -> _AncestorAuthority:
+    observed = os.fstat(descriptor)
+    if not _safe_mode(observed, directory=True):
+        raise _WiringInvalid
+    return _AncestorAuthority(
+        descriptor=descriptor,
+        directory_stat=_directory_stat(observed),
+        entries=_snapshot_directory(descriptor),
+    )
+
+
+def _verify_ancestor_authorities(
+    authorities: Sequence[_AncestorAuthority],
+) -> None:
+    for authority in reversed(authorities):
+        if _directory_stat(os.fstat(authority.descriptor)) != authority.directory_stat:
+            raise _WiringInvalid
+        if _snapshot_directory(authority.descriptor) != authority.entries:
+            raise _WiringInvalid
+
+
+def _open_parent(
+    path: PurePosixPath,
+) -> tuple[
+    list[int],
+    int,
+    str,
+    tuple[_AncestorAuthority, ...],
+    tuple[int, ...],
+]:
     if not path.is_absolute() or path == PurePosixPath("/"):
         raise _WiringInvalid
     components = path.parts[1:]
     if not components or any(part in {"", ".", ".."} for part in components):
         raise _WiringInvalid
     descriptors: list[int] = []
+    authorities: list[_AncestorAuthority] = []
     try:
         current = os.open("/", _linux_flags(directory=True))
         descriptors.append(current)
-        if not _safe_mode(os.fstat(current), directory=True):
-            raise _WiringInvalid
         for component in components[:-1]:
+            authority = _capture_ancestor(current)
+            entry = authority.entries.get(component)
+            if entry is None or not _safe_snapshot_entry(entry, directory=True):
+                raise _WiringInvalid
+            authorities.append(authority)
             child = os.open(
                 component,
                 _linux_flags(directory=True),
@@ -214,9 +267,24 @@ def _open_parent(path: PurePosixPath) -> tuple[list[int], int, str]:
             )
             descriptors.append(child)
             current = child
-            if not _safe_mode(os.fstat(current), directory=True):
+            opened = os.fstat(current)
+            if (
+                not _safe_mode(opened, directory=True)
+                or _directory_stat(opened) != entry
+            ):
                 raise _WiringInvalid
-        return descriptors, current, components[-1]
+        authority = _capture_ancestor(current)
+        leaf_entry = authority.entries.get(components[-1])
+        if leaf_entry is None:
+            raise _WiringInvalid
+        authorities.append(authority)
+        return (
+            descriptors,
+            current,
+            components[-1],
+            tuple(authorities),
+            leaf_entry,
+        )
     except BaseException:
         _close_all(descriptors)
         raise
@@ -249,6 +317,7 @@ def _read_stable_file(
     name: str,
     *,
     maximum: int,
+    expected: tuple[int, ...] | None = None,
 ) -> bytes:
     descriptor = os.open(
         name,
@@ -257,7 +326,12 @@ def _read_stable_file(
     )
     try:
         before = os.fstat(descriptor)
-        if not _safe_mode(before, directory=False) or before.st_size > maximum:
+        if (
+            not _safe_mode(before, directory=False)
+            or before.st_size > maximum
+            or expected is not None
+            and _directory_stat(before) != expected
+        ):
             raise _WiringInvalid
         content = _read_fd(descriptor, maximum)
         after = os.fstat(descriptor)
@@ -271,15 +345,19 @@ def _read_stable_file(
 def _validate_runtime_contract(settings: RuntimeSettingsV1) -> None:
     descriptors: list[int] = []
     try:
-        descriptors, parent, name = _open_parent(settings.runtime_contract_path)
+        descriptors, parent, name, authorities, entry = _open_parent(
+            settings.runtime_contract_path
+        )
         content = _read_stable_file(
             parent,
             name,
             maximum=_MAX_RUNTIME_CONTRACT_BYTES,
+            expected=entry,
         )
         observed = hashlib.sha256(content).hexdigest()
         if not hmac.compare_digest(observed, settings.runtime_contract_sha256):
             raise _WiringInvalid
+        _verify_ancestor_authorities(authorities)
     finally:
         _close_all(descriptors)
 
@@ -346,6 +424,12 @@ def _walk_bundle(
                 dir_fd=descriptor,
             )
             try:
+                opened = os.fstat(child)
+                if (
+                    not _safe_mode(opened, directory=True)
+                    or _directory_stat(opened) != snapshot[name]
+                ):
+                    raise _WiringInvalid
                 _walk_bundle(
                     child,
                     parts=child_parts,
@@ -377,34 +461,71 @@ def _walk_bundle(
 
 
 def _bundle_digest(entries: Sequence[_BundleEntry]) -> str:
+    if len(entries) > _MAX_BUNDLE_FILES:
+        raise ValueError("bundle_entry_invalid") from None
     digest = hashlib.sha256()
     digest.update(_BUNDLE_DOMAIN)
     digest.update(len(entries).to_bytes(4, "big"))
+    previous: bytes | None = None
+    total = 0
     for path, size, file_digest in entries:
         if (
             not isinstance(path, bytes)
-            or not isinstance(size, int)
+            or type(size) is not int
+            or size < 0
             or not isinstance(file_digest, bytes)
             or len(file_digest) != 32
+            or not path
+            or len(path) > _MAX_RELATIVE_PATH_BYTES
+            or previous is not None
+            and path <= previous
         ):
+            raise ValueError("bundle_entry_invalid") from None
+        try:
+            decoded = path.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise ValueError("bundle_entry_invalid") from None
+        components = decoded.split("/")
+        if (
+            len(components) > _MAX_BUNDLE_COMPONENTS
+            or any(component in {"", ".", ".."} for component in components)
+            or any(
+                len(component.encode("utf-8")) > _MAX_COMPONENT_BYTES
+                for component in components
+            )
+        ):
+            raise ValueError("bundle_entry_invalid") from None
+        total += size
+        if total > _MAX_BUNDLE_CONTENT_BYTES:
             raise ValueError("bundle_entry_invalid") from None
         digest.update(len(path).to_bytes(4, "big"))
         digest.update(path)
         digest.update(size.to_bytes(8, "big"))
         digest.update(file_digest)
+        previous = path
     return digest.hexdigest()
 
 
 def _validate_agent_bundle(settings: RuntimeSettingsV1) -> None:
     descriptors: list[int] = []
     try:
-        descriptors, parent, name = _open_parent(settings.agent_bundle_path)
+        descriptors, parent, name, authorities, entry = _open_parent(
+            settings.agent_bundle_path
+        )
+        if not _safe_snapshot_entry(entry, directory=True):
+            raise _WiringInvalid
         root = os.open(
             name,
             _linux_flags(directory=True),
             dir_fd=parent,
         )
         descriptors.append(root)
+        opened = os.fstat(root)
+        if (
+            not _safe_mode(opened, directory=True)
+            or _directory_stat(opened) != entry
+        ):
+            raise _WiringInvalid
         entries: list[_BundleEntry] = []
         _walk_bundle(root, parts=(), entries=entries, total=[0])
         entries.sort(key=lambda item: item[0])
@@ -413,6 +534,7 @@ def _validate_agent_bundle(settings: RuntimeSettingsV1) -> None:
             settings.agent_bundle_sha256,
         ):
             raise _WiringInvalid
+        _verify_ancestor_authorities(authorities)
     finally:
         _close_all(descriptors)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import json
+import logging
 import os
 import subprocess
 import sys
@@ -78,6 +80,60 @@ def test_module_entrypoint_rejects_forbidden_environment_before_heavy_imports() 
     assert "SYNTHETIC-SENTINEL" not in rendered
     assert "Pipecat" not in rendered
     assert "uvicorn" not in rendered.casefold()
+
+
+def test_first_heavy_import_observes_exact_uvicorn_stdlib_floors() -> None:
+    code = r'''
+import builtins
+import json
+import logging
+
+import projetv0_voice.server as server
+
+server.capture_runtime_environment = lambda _mapping: object()
+server.parse_runtime_settings = lambda _capture: object()
+original_import = builtins.__import__
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "projetv0_voice.dependency_logging":
+        observed = {}
+        for logger_name in ("uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+            logger = logging.getLogger(logger_name)
+            observed[logger_name] = {
+                "handlers": [type(handler).__name__ for handler in logger.handlers],
+                "propagate": logger.propagate,
+                "disabled": logger.disabled,
+                "level": logger.level,
+            }
+        print(json.dumps(observed, sort_keys=True))
+        raise SystemExit(0)
+    return original_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = guarded_import
+server.main({})
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "PYTHONNOUSERSITE": "1"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        name: {
+            "handlers": ["NullHandler"],
+            "propagate": False,
+            "disabled": True,
+            "level": logging.CRITICAL + 1,
+        }
+        for name in ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+    }
 
 
 def test_pipecat_is_pinned_to_1_7_0() -> None:
