@@ -798,6 +798,225 @@ async def test_qualification_commit_rejection_emits_one_exact_ingress_metric_out
 
 
 @pytest.mark.asyncio
+async def test_real_candidate_loser_preserves_qualification_ingress_metric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from projetv0_voice.admission import CallRegistry
+    from projetv0_voice.app import create_app
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.metrics import RuntimeMetrics
+    from projetv0_voice.telnyx.call_control import CallControlResult
+    from projetv0_voice.telnyx.webhooks import (
+        TelnyxWebhookProcessor,
+        VerifiedWebhook,
+    )
+
+    class Control:
+        async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def start_streaming(
+            self, *_args: object, **_kwargs: object
+        ) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def aclose(self) -> None:
+            return None
+
+    candidate_run_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    first_commit_entered = asyncio.Event()
+    release_first_commit = asyncio.Event()
+    failpoint_armed = False
+    submissions = 0
+    second_submitted = asyncio.Event()
+
+    async def failpoint(name: str) -> None:
+        if (
+            failpoint_armed
+            and name == "after_mutation_before_commit"
+            and submissions == 1
+            and not first_commit_entered.is_set()
+        ):
+            first_commit_entered.set()
+            await release_first_commit.wait()
+
+    writer = PersistenceWriter(
+        tmp_path / "qualification-concurrent.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+        failpoint=failpoint,
+    )
+    control = Control()
+    registry = CallRegistry(
+        writer=writer,
+        call_control=control,
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        deployment_id="deployment-a",
+        capacity=1,
+        lease_ttl_seconds=30,
+        stream_url="wss://voice.invalid/telnyx/stream",
+        retention_days=7,
+        utcnow=lambda: NOW,
+        monotonic=lambda: 100.0,
+        candidate_run_id=candidate_run_id,
+    )
+    metrics = RuntimeMetrics.in_memory()
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        call_control=control,
+        registry=registry,
+        candidate_run_id=candidate_run_id,
+        metrics=metrics,
+        utcnow=lambda: NOW,
+        loop_interval_seconds=0.05,
+    )
+
+    def event(event_id: str, fingerprint: bytes) -> VerifiedWebhook:
+        return VerifiedWebhook(
+            event_id=event_id,
+            event_type="call.initiated",
+            occurred_at=NOW,
+            call_control_id="qualification-control",
+            call_leg_id="qualification-leg",
+            call_session_id="qualification-session",
+            recording_id=None,
+            stream_id=None,
+            client_state=None,
+            recording_started_at=None,
+            recording_ended_at=None,
+            recording_channels=None,
+            semantic_fingerprint_sha256=fingerprint,
+            direction="incoming",
+            call_state="parked",
+        )
+
+    events = {
+        b"first": event("qualification-first", b"a" * 32),
+        b"second": event("qualification-second", b"b" * 32),
+    }
+
+    class Verifier:
+        def verify(self, *, body: bytes, **_kwargs: object) -> VerifiedWebhook:
+            return events[body]
+
+    await supervisor.startup()
+    first_request: asyncio.Task[list[dict[str, Any]]] | None = None
+    second_request: asyncio.Task[list[dict[str, Any]]] | None = None
+    try:
+        for received in events.values():
+            assert await supervisor.classify_webhook_receipt(received) == "missing"
+
+        async def cached_missing(_event: VerifiedWebhook) -> str:
+            return "missing"
+
+        monkeypatch.setattr(supervisor, "classify_webhook_receipt", cached_missing)
+        original_submit = writer.submit_webhook
+
+        def observe_submit(*args: object, **kwargs: object) -> object:
+            nonlocal submissions
+            ticket = original_submit(*args, **kwargs)
+            submissions += 1
+            if submissions == 2:
+                second_submitted.set()
+            return ticket
+
+        monkeypatch.setattr(writer, "submit_webhook", observe_submit)
+        processor = TelnyxWebhookProcessor(
+            verifier=Verifier(),  # type: ignore[arg-type]
+            resolver=registry.resolve_webhook,
+            duplicate_resolver=registry.resolve_duplicate_webhook,
+            finalizer_owner=supervisor,
+        )
+        app = create_app(_runtime_settings(), SimpleNamespace())
+        app.state.runtime_graph = SimpleNamespace(
+            webhook_processor=processor,
+            metrics=metrics,
+        )
+
+        async def post(body: bytes) -> list[dict[str, Any]]:
+            return await _raw_http(
+                app,
+                path="/telnyx/events",
+                method="POST",
+                messages=[
+                    {"type": "http.request", "body": body, "more_body": False}
+                ],
+            )
+
+        failpoint_armed = True
+        first_request = asyncio.create_task(post(b"first"))
+        await first_commit_entered.wait()
+        second_request = asyncio.create_task(post(b"second"))
+        await second_submitted.wait()
+        release_first_commit.set()
+        first_response, second_response = await asyncio.gather(
+            first_request,
+            second_request,
+        )
+
+        statuses = [
+            next(
+                message["status"]
+                for message in response
+                if message["type"] == "http.response.start"
+            )
+            for response in (first_response, second_response)
+        ]
+        assert sorted(statuses) == [200, 503]
+        assert all(
+            next(
+                message["body"]
+                for message in response
+                if message["type"] == "http.response.body"
+            )
+            == b""
+            for response in (first_response, second_response)
+        )
+
+        collected = metrics._metric_reader.get_metrics_data()  # noqa: SLF001
+        assert collected is not None
+        points = {
+            metric.name: list(metric.data.data_points)
+            for resource in collected.resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+            if metric.name
+            in {
+                "projetv0.voice.admission.rejections",
+                "projetv0.voice.webhooks.total",
+            }
+        }
+        unavailable = [
+            point
+            for point in points["projetv0.voice.webhooks.total"]
+            if dict(point.attributes)
+            == {
+                "webhook_class": "initiated",
+                "receipt": "first",
+                "disposition": "unavailable",
+            }
+        ]
+        assert [point.value for point in unavailable] == [1]
+        reasons = {
+            dict(point.attributes)["reason"]: point.value
+            for point in points["projetv0.voice.admission.rejections"]
+        }
+        assert reasons == {"qualification": 1}
+    finally:
+        release_first_commit.set()
+        if first_request is not None:
+            await asyncio.gather(first_request, return_exceptions=True)
+        if second_request is not None:
+            await asyncio.gather(second_request, return_exceptions=True)
+        await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_resolver_rejection_emits_one_duplicate_and_zero_admission() -> None:
     from projetv0_voice.admission import CallAdmissionRejected
     from projetv0_voice.app import create_app

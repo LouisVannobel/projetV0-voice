@@ -1714,15 +1714,26 @@ async def test_post_submit_settlement_joins_abandonment_before_reraising_cancell
     reservation = resolution.reservation
     assert reservation is not None
 
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_settle = registry._settle_reservation  # noqa: SLF001
+
+    async def observed_settle(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await release.wait()
+        await real_settle(*args, **kwargs)
+
+    registry._settle_reservation = observed_settle  # type: ignore[method-assign]
     await registry._lock.acquire()  # noqa: SLF001
     try:
         settling = asyncio.create_task(reservation.settle_after_submit_failure())
-        await asyncio.sleep(0)
+        await entered.wait()
         assert reservation._abandon_event.is_set()  # noqa: SLF001
         settling.cancel()
-        await asyncio.sleep(0)
+        assert settling.cancelling() > 0
         assert settling.done() is False
     finally:
+        release.set()
         registry._lock.release()  # noqa: SLF001
 
     with pytest.raises(asyncio.CancelledError):

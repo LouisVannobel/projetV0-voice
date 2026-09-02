@@ -1633,7 +1633,7 @@ class CallRegistry:
         elif isinstance(reservation, _PlaceholderReservation):
             await reservation.confirm_fail_closed(result)
         if isinstance(result, QualificationRunConsumed):
-            return WebhookDisposition(503)
+            return WebhookDisposition(503, admission_rejection="qualification")
         if result.effect == "existing_terminal":
             if event.event_type == "call.hangup" and event.call_control_id is not None:
                 await self._finish_provider_terminal_envelope(
