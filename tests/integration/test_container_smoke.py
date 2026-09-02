@@ -136,7 +136,7 @@ def _probe_http(image: str, network: str, url: str) -> tuple[int, bytes]:
     return int(status), base64.b64decode(encoded)
 
 
-def _wait_ready(image: str, network: str) -> tuple[int, bytes]:
+def _wait_ready(image: str, network: str) -> bytes:
     deadline = time.monotonic() + 30.0
     last = "runtime did not answer"
     while time.monotonic() < deadline:
@@ -147,7 +147,7 @@ def _wait_ready(image: str, network: str) -> tuple[int, bytes]:
                 "http://voice-runtime:8080/health/ready",
             )
             if status == 200:
-                return status, body
+                return body
             last = f"status={status} body={body!r}"
         except (subprocess.SubprocessError, ValueError) as error:
             last = str(error)
@@ -174,8 +174,42 @@ def _volume_file_size(image: str, volume: str, path: str) -> int:
         "-c",
         program,
         path,
+        timeout=10,
     )
     return int(_output(result).strip())
+
+
+def _assert_container_running(container: str, label: str) -> None:
+    state = _docker(
+        "inspect",
+        "--format",
+        "{{.State.Running}}",
+        container,
+        check=False,
+        timeout=10,
+    )
+    if state.returncode == 0 and _output(state).strip() == "true":
+        return
+    logs = _docker("logs", container, check=False, timeout=10)
+    raise AssertionError(f"{label} exited before the smoke completed:\n{_output(logs)}")
+
+
+def _wait_for_volume_marker(
+    image: str,
+    volume: str,
+    path: str,
+    container: str,
+    label: str,
+) -> None:
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        marker_size = _volume_file_size(image, volume, path)
+        _assert_container_running(container, label)
+        if marker_size > 0:
+            return
+        time.sleep(0.1)
+    logs = _docker("logs", container, check=False, timeout=10)
+    raise AssertionError(f"{label} did not publish its readiness marker:\n{_output(logs)}")
 
 
 def test_dockerfile_declares_the_pinned_non_root_runtime() -> None:
@@ -336,10 +370,10 @@ def test_container_smoke(tmp_path: Path) -> None:
         profile_bytes = (
             json.dumps(profile, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode("utf-8")
+        agent_root = REPO_ROOT / "agents/agent-a"
         agent_files = {
-            path.name: path.read_bytes()
-            for path in (REPO_ROOT / "agents/agent-a").iterdir()
-            if path.is_file()
+            record["path"]: agent_root.joinpath(*record["path"].split("/")).read_bytes()
+            for record in manifest["files"]
         }
         keyring = json.dumps(
             {
@@ -461,14 +495,17 @@ def test_container_smoke(tmp_path: Path) -> None:
         )
 
         tripwire = (
-            "import socket,threading;from pathlib import Path;"
-            "\ndef listen(port):"
-            "\n s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
-            "s.bind(('0.0.0.0',port));s.listen()"
-            "\n while True:"
-            "\n  c,_=s.accept();Path('/capture/provider-connected').write_text(str(port));c.close()"
-            "\n[threading.Thread(target=listen,args=(p,),daemon=True).start() "
-            "for p in (443,8443)];threading.Event().wait()"
+            "import selectors,socket;from pathlib import Path;"
+            "selector=selectors.DefaultSelector()"
+            "\nfor port in (443,8443):"
+            "\n sock=socket.socket();sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
+            "sock.bind(('0.0.0.0',port));sock.listen();"
+            "selector.register(sock,selectors.EVENT_READ,port)"
+            "\nPath('/capture/provider-tripwire-ready').write_text('ready')"
+            "\nwhile True:"
+            "\n for key,_ in selector.select():"
+            "\n  client,_=key.fileobj.accept();"
+            "Path('/capture/provider-connected').write_text(str(key.data));client.close()"
         )
         _docker(
             "run",
@@ -495,6 +532,13 @@ def test_container_smoke(tmp_path: Path) -> None:
             image,
             "-c",
             tripwire,
+        )
+        _wait_for_volume_marker(
+            image,
+            volumes["capture"],
+            "provider-tripwire-ready",
+            containers["tripwire"],
+            "provider tripwire",
         )
 
         environment = {
@@ -555,9 +599,9 @@ def test_container_smoke(tmp_path: Path) -> None:
         run_arguments.append(image)
         _docker(*run_arguments)
 
-        status, body = _wait_ready(image, network)
+        body = _wait_ready(image, network)
         response_bodies.append(body)
-        assert status == 200 and body == b""
+        assert body == b""
         live_status, live_body = _probe_http(
             image, network, "http://voice-runtime:8080/health/live"
         )
@@ -614,11 +658,14 @@ def test_container_smoke(tmp_path: Path) -> None:
         assert "python\\x00-m\\x00projetv0_voice.server\\x00" in pid_one
 
         observer = (
-            "import time,urllib.error,urllib.request;"
+            "import time,urllib.error,urllib.request;from pathlib import Path;"
             "end=time.monotonic()+5"
             "\nwhile time.monotonic()<end:"
-            "\n try: print(urllib.request.urlopen("
-            "'http://voice-runtime:8080/health/ready',timeout=.2).status,flush=True)"
+            "\n try:"
+            "\n  status=urllib.request.urlopen("
+            "'http://voice-runtime:8080/health/ready',timeout=.2).status;"
+            "print(status,flush=True)"
+            "\n  if status==200: Path('/capture/observer-ready').write_text('200')"
             "\n except urllib.error.HTTPError as e: print(e.code,flush=True)"
             "\n except Exception: print('closed',flush=True);break"
             "\n time.sleep(.05)"
@@ -633,17 +680,24 @@ def test_container_smoke(tmp_path: Path) -> None:
             "--read-only",
             "--tmpfs",
             "/tmp:rw,noexec,nosuid,nodev",
+            "--mount",
+            f"type=volume,src={volumes['capture']},dst=/capture",
             "--entrypoint",
             "python",
             image,
             "-c",
             observer,
         )
-        time.sleep(0.2)
+        _wait_for_volume_marker(
+            image,
+            volumes["capture"],
+            "observer-ready",
+            containers["observer"],
+            "ready observer",
+        )
         _docker("kill", "--signal", "SIGTERM", containers["runtime"])
         exit_code = int(_output(_docker("wait", containers["runtime"], timeout=30)).strip())
         assert exit_code == 0
-        assert exit_code != 72
         _docker("wait", containers["observer"], timeout=10)
         observed = [
             line.strip()
@@ -658,6 +712,7 @@ def test_container_smoke(tmp_path: Path) -> None:
         logs = _output(_docker("logs", containers["runtime"]))
         combined = logs.encode("utf-8", errors="replace") + b"".join(response_bodies)
         assert all(sentinel.encode() not in combined for sentinel in sentinels)
+        _assert_container_running(containers["tripwire"], "provider tripwire")
         assert _volume_file_size(image, volumes["capture"], "provider-connected") == -1
         assert _volume_file_size(image, volumes["capture"], "otlp.bin") > 0
     finally:
