@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -18,7 +19,7 @@ KEYRING_PATH = PurePosixPath("/run/secrets/aead_keyring_v1.json")
 DEFAULT_RUNTIME_PATH = PurePosixPath("/srv/projetv0/runtime-contract.json")
 DEFAULT_BUNDLE_PATH = PurePosixPath("/srv/projetv0/agent-bundle")
 RUNTIME_BYTES = b"runtime\n"
-RUNTIME_SHA256 = "b45fd73aa413c685440da5ae5c63c69398b339f9cf7a73f4d4324ac8577dc3d1"
+RUNTIME_SHA256 = "fae9d8f386d67956867dedef7c89476199a4a25ee9ffe13560a6bfae7ae6c407"
 BUNDLE_GOLDEN_SHA256 = "ff95531825d43b758ac6cf8110966a8b8e95ef13140f5f0f56d1d47f1b07b684"
 EMPTY_BUNDLE_SHA256 = "1d82e411b7a8587b2e105d924b9031d4fca7dfed9373c64cc5ebad71cdfa7c08"
 MANIFEST_BYTES = (
@@ -37,6 +38,10 @@ PRIVILEGED_FILES = (
     and os.environ.get("PROJETV0_PRIVILEGED_FILES_GATE") == "1"
     and getattr(os, "geteuid", lambda: -1)() == 0
 )
+
+
+def test_runtime_fixture_matches_literal_sha256() -> None:
+    assert hashlib.sha256(RUNTIME_BYTES).hexdigest() == RUNTIME_SHA256
 
 
 def _settings(
@@ -508,8 +513,9 @@ def test_linux_kernel_runtime_exact_byte_bound(
 @pytest.mark.parametrize("kind", ["fifo", "socket"])
 def test_linux_fifo_or_socket_bundle_leaf_is_rejected(
     kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from projetv0_voice.production_wiring import build_production_factories
+    import projetv0_voice.production_wiring as wiring
 
     with tempfile.TemporaryDirectory(dir="/root", prefix="voice-wiring-") as raw:
         trusted = Path(raw)
@@ -529,9 +535,22 @@ def test_linux_fifo_or_socket_bundle_leaf_is_rejected(
             agent_bundle_path=PurePosixPath(str(bundle)),
             runtime_sha256=RUNTIME_SHA256,
         )
+        original_walk = wiring._walk_bundle
+        walk_reached = False
+
+        def walk_special_bundle(*args: object, **kwargs: object) -> None:
+            nonlocal walk_reached
+            walk_reached = True
+            original_walk(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(wiring, "_walk_bundle", walk_special_bundle)
         try:
+            wiring._validate_runtime_contract(settings)
+            with pytest.raises(wiring._WiringInvalid):
+                wiring._validate_agent_bundle(settings)
+            assert walk_reached is True
             with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
-                build_production_factories(settings).validate_artifacts(settings)
+                wiring.build_production_factories(settings).validate_artifacts(settings)
         finally:
             if owner is not None:
                 owner.close()
@@ -554,6 +573,7 @@ def test_linux_runtime_grows_after_same_fd_read_is_rejected(
             agent_bundle_path=PurePosixPath(str(bundle)),
             runtime_sha256=RUNTIME_SHA256,
         )
+        wiring._validate_runtime_contract(settings)
         original_read = wiring.os.read
         mutated = False
 
@@ -722,7 +742,9 @@ def test_linux_kernel_ancestor_mutation_after_descent_is_rejected(
             bundle_sha256=EMPTY_BUNDLE_SHA256,
         )
         original_read = wiring.os.read
+        original_verify = wiring._verify_ancestor_authorities
         mutated = False
+        verified = False
 
         def read_and_mutate(descriptor: int, count: int) -> bytes:
             nonlocal mutated
@@ -732,10 +754,23 @@ def test_linux_kernel_ancestor_mutation_after_descent_is_rejected(
                 (trusted / "new-entry").write_bytes(b"mutation")
             return chunk
 
+        def verify_mutated_authority(
+            authorities: tuple[wiring._AncestorAuthority, ...],
+        ) -> None:
+            nonlocal verified
+            verified = True
+            original_verify(authorities)
+
         monkeypatch.setattr(wiring.os, "read", read_and_mutate)
+        monkeypatch.setattr(
+            wiring,
+            "_verify_ancestor_authorities",
+            verify_mutated_authority,
+        )
         with pytest.raises(RuntimeError, match="^runtime_artifacts_invalid$"):
             wiring.build_production_factories(settings).validate_artifacts(settings)
         assert mutated is True
+        assert verified is True
 
 
 @pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
