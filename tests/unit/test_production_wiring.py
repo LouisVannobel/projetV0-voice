@@ -388,11 +388,12 @@ def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
     )
     events: list[tuple[str, object]] = []
 
-    monkeypatch.setattr(
-        wiring,
-        "DefaultAsyncHttpxClient",
-        lambda: events.append(("http", object())) or events[-1][1],
-    )
+    def http_client_factory(**kwargs: object) -> object:
+        client = object()
+        events.append(("http", (client, kwargs)))
+        return client
+
+    monkeypatch.setattr(wiring, "DefaultAsyncHttpxClient", http_client_factory)
     monkeypatch.setattr(
         wiring,
         "build_stt",
@@ -453,6 +454,8 @@ def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
         "control",
     ]
     assert events[2][1][2] == "fr"  # type: ignore[index]
+    assert events[0][1][1] == {"trust_env": False}  # type: ignore[index]
+    assert events[1][1][1] == {"trust_env": False}  # type: ignore[index]
 
 
 @pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")

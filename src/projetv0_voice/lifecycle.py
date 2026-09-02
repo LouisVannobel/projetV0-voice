@@ -986,18 +986,20 @@ class RuntimeSupervisor:
         self,
         event: VerifiedWebhook,
         resolution: ResolvedWebhook,
+        receipt: Literal["first", "duplicate"] = "first",
     ) -> _WebhookFinalizationHandle:
         if (
             self._writer is None
             or not isinstance(event, VerifiedWebhook)
             or not isinstance(resolution, ResolvedWebhook)
+            or receipt not in {"first", "duplicate"}
         ):
             raise RuntimeError("webhook_finalizer_invalid") from None
         completion: asyncio.Future[WebhookDisposition] = (
             asyncio.get_running_loop().create_future()
         )
         task = self.webhook_finalizers.try_start(
-            self._finalize_webhook(event, resolution, completion),
+            self._finalize_webhook(event, resolution, receipt, completion),
             name="voice-webhook-finalizer",
         )
         if task is None:
@@ -1011,6 +1013,7 @@ class RuntimeSupervisor:
         self,
         event: VerifiedWebhook,
         resolution: ResolvedWebhook,
+        receipt: Literal["first", "duplicate"],
         completion: asyncio.Future[WebhookDisposition],
     ) -> None:
         assert self._writer is not None
@@ -1033,9 +1036,13 @@ class RuntimeSupervisor:
                     event.legacy_v1_semantic_fingerprint_sha256
                 ),
                 qualification_run_id=(
-                    None
-                    if self._registry is None
-                    else self._registry.candidate_run_id
+                    self._candidate_run_id
+                    if receipt == "first"
+                    and event.event_type == "call.initiated"
+                    and resolution.effect is not None
+                    and resolution.effect.lease is not None
+                    and resolution.effect.lease.get("state") == "pending"
+                    else None
                 ),
             )
         except BaseException:
@@ -1062,6 +1069,13 @@ class RuntimeSupervisor:
         except asyncio.CancelledError:
             raise
         except BaseException:
+            if resolution.reservation is not None:
+                try:
+                    await resolution.reservation.settle_after_submit_failure()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    pass
             if not completion.done():
                 completion.set_result(WebhookDisposition(503))
             return
@@ -1075,7 +1089,10 @@ class RuntimeSupervisor:
             return
 
         disposition = WebhookDisposition(
-            503 if isinstance(result, QualificationRunConsumed) else 200
+            503 if isinstance(result, QualificationRunConsumed) else 200,
+            admission_rejection=(
+                "qualification" if isinstance(result, QualificationRunConsumed) else None
+            ),
         )
         if self._registry is not None:
             try:
@@ -1117,17 +1134,31 @@ class RuntimeSupervisor:
         if self._closed:
             return
         deadline = asyncio.get_running_loop().time() + self._shutdown_timeout_seconds
+        terminal_owner_failed = False
+
+        async def join_or_remember(awaitable: Awaitable[object]) -> None:
+            nonlocal terminal_owner_failed
+            try:
+                await awaitable
+            except RuntimeError as error:
+                if str(error) != "owned_task_failed":
+                    raise
+                terminal_owner_failed = True
+
         await self._await_shutdown_deadline(self.begin_drain(), deadline)
-        await self.webhook_finalizers.join_until_empty(deadline)
+        await join_or_remember(self.webhook_finalizers.join_until_empty(deadline))
         if self._registry is not None:
             await self._await_shutdown_deadline(
                 self._registry.close_session_owner_registration(), deadline
             )
         self.call_lifecycle_owners.close_registration()
-        await self.call_lifecycle_owners.join_until_empty(deadline)
+        await join_or_remember(
+            self.call_lifecycle_owners.join_until_empty(deadline)
+        )
 
         self._state_stop.set()
-        await self._join_state_supervisors(deadline)
+        if await self._join_state_supervisors(deadline):
+            terminal_owner_failed = True
         if self._registry is not None:
             self._registry.close_registration()
             await self._await_shutdown_deadline(
@@ -1135,10 +1166,12 @@ class RuntimeSupervisor:
             )
 
         self._relay_stop.set()
-        await self._join_task("relay", deadline)
-        await self.fixed_supervisors.join_until_empty(deadline)
+        await join_or_remember(self._join_task("relay", deadline))
+        await join_or_remember(self.fixed_supervisors.join_until_empty(deadline))
         await self._close_dependencies(deadline)
         self._closed = True
+        if terminal_owner_failed:
+            raise RuntimeError("runtime_shutdown_failed") from None
 
     async def _unwind_startup(self) -> None:
         deadline = asyncio.get_running_loop().time() + self._shutdown_timeout_seconds
@@ -1574,7 +1607,8 @@ class RuntimeSupervisor:
             or self._writer.is_degraded
         )
 
-    async def _join_state_supervisors(self, deadline: float) -> None:
+    async def _join_state_supervisors(self, deadline: float) -> bool:
+        terminal_owner_failed = False
         for name in (
             "purge",
             "reaper",
@@ -1583,7 +1617,13 @@ class RuntimeSupervisor:
             "readiness",
             "event-loop-lag",
         ):
-            await self._join_task(name, deadline)
+            try:
+                await self._join_task(name, deadline)
+            except RuntimeError as error:
+                if str(error) != "owned_task_failed":
+                    raise
+                terminal_owner_failed = True
+        return terminal_owner_failed
 
     async def _join_task(self, name: str, deadline: float) -> None:
         task = self._fixed_tasks.get(name)
@@ -1718,11 +1758,16 @@ async def build_production_runtime(
         )
         if not isinstance(inference, RuntimeInferenceFactories):
             raise RuntimeError("runtime_inference_composition_invalid")
+        candidate_run_id = (
+            settings.qualification_run_id
+            if settings.runtime_mode == "qualification_candidate"
+            else None
+        )
         supervisor = RuntimeSupervisor(
             writer=writer,
             call_control=raw_call_control,
             metrics=metrics,
-            candidate_run_id=settings.qualification_run_id,
+            candidate_run_id=candidate_run_id,
             deployment_id=settings.deployment_id,
             retention_days=manifest.transcript_retention_days,
             utcnow=utcnow,
@@ -1759,7 +1804,7 @@ async def build_production_runtime(
             retention_days=manifest.transcript_retention_days,
             utcnow=utcnow,
             monotonic=monotonic,
-            candidate_run_id=settings.qualification_run_id,
+            candidate_run_id=candidate_run_id,
             admission_expires_at=admission_expires_at,
             qualification_observer=supervisor.observe_qualification_state,
         )

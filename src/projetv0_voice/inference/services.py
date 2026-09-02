@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any, cast
 
-from openai import DefaultAsyncHttpxClient
+import httpx
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.services.whisper.base_stt import language_to_whisper_language
@@ -16,6 +18,35 @@ from projetv0_voice.qualified_profile import InferenceProfileV1
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _ISO_639_1 = re.compile(r"^[a-z]{2}$")
+
+
+class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
+    """Pin-aware OpenRouter client factory without ambient HTTP authority."""
+
+    def create_client(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+        default_headers: Mapping[str, str] | None = None,
+        **_kwargs: Any,
+    ) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            organization=organization,
+            project=project,
+            http_client=DefaultAsyncHttpxClient(
+                limits=httpx.Limits(
+                    max_keepalive_connections=100,
+                    max_connections=1000,
+                    keepalive_expiry=None,
+                ),
+                trust_env=False,
+            ),
+            default_headers=default_headers,
+        )
 
 
 def build_stt(
@@ -55,7 +86,7 @@ def build_llm(
 
     dumped = profile.model_dump(mode="json")
     policy = cast(dict[str, Any], dumped["llm_provider_policy"])
-    return OpenRouterLLMService(
+    return _TrustlessOpenRouterLLMService(
         api_key=api_key.get_secret_value(),
         base_url=_OPENROUTER_BASE_URL,
         settings=OpenRouterLLMService.Settings(

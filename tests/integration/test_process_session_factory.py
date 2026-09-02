@@ -1529,6 +1529,9 @@ async def test_ten_real_calls_own_distinct_resources_runtimes_and_four_observers
     assert len(writer.control_commits) == 10
     assert len(control.hangups) == 10
     assert await registry.live_call_count() == 0
+    assert events.count("stt-client-close") == 10
+    assert events.count("llm-client-close") == 10
+    assert events.count("tts-cleanup") == 10
     totals = _metric_points(metrics, "projetv0.voice.calls.total")
     assert sum(point.value for point in totals) == 10
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001

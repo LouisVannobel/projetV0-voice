@@ -560,7 +560,10 @@ async def test_signed_saved_reconciliation_preserves_1024_call_control_end_to_en
             )
 
         def start_webhook_finalization(
-            self, event: VerifiedWebhook, resolution: object
+            self,
+            event: VerifiedWebhook,
+            resolution: object,
+            _receipt: object = "first",
         ) -> Handle:
             async def finalize() -> WebhookDisposition:
                 effect = resolution.effect  # type: ignore[attr-defined]

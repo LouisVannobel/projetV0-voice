@@ -629,7 +629,7 @@ def _inference_factories(
     profile = deployment_profile.inference
 
     def stt_http_client_factory() -> PublicSttHttpClient:
-        return cast(PublicSttHttpClient, DefaultAsyncHttpxClient())
+        return cast(PublicSttHttpClient, DefaultAsyncHttpxClient(trust_env=False))
 
     def stt_factory(client: PublicSttHttpClient) -> Any:
         return build_stt(

@@ -659,7 +659,12 @@ class FakeFinalizerOwner:
             )
         return "missing"
 
-    def start_webhook_finalization(self, event: Any, resolution: Any) -> _FinalizationHandle:
+    def start_webhook_finalization(
+        self,
+        event: Any,
+        resolution: Any,
+        _receipt: str,
+    ) -> _FinalizationHandle:
         task = asyncio.create_task(self._run(event, resolution))
         self.tasks.append(task)
         return _FinalizationHandle(task)
@@ -792,6 +797,129 @@ async def test_processor_awaits_after_commit_and_accepts_only_recording_disposit
 
     assert response == module.WebhookDisposition(503)
     assert order == ["committed", "after_commit"]
+
+
+@pytest.mark.asyncio
+async def test_processor_preserves_the_closed_qualification_rejection_reason() -> None:
+    module = webhooks()
+    event = module.VerifiedWebhook(
+        event_id="qualification-consumed",
+        event_type="call.initiated",
+        occurred_at=NOW,
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"q" * 32,
+        direction="incoming",
+        call_state="parked",
+    )
+
+    class Handle:
+        async def wait(self) -> Any:
+            return module.WebhookDisposition(
+                503,
+                admission_rejection="qualification",
+            )
+
+    class Owner:
+        async def classify_webhook_receipt(self, _event: Any) -> str:
+            return "missing"
+
+        def start_webhook_finalization(self, *_args: object) -> Handle:
+            return Handle()
+
+    class Verifier:
+        def verify(self, **_kwargs: object) -> Any:
+            return event
+
+    processor = module.TelnyxWebhookProcessor(
+        verifier=Verifier(),
+        resolver=lambda _event: module.ResolvedWebhook(None),
+        finalizer_owner=Owner(),
+    )
+
+    observed = await processor.process_observed(body=b"{}", headers=[])
+
+    assert observed.disposition == module.WebhookDisposition(503)
+    assert observed.webhook_class == "initiated"
+    assert observed.receipt == "first"
+    assert observed.metric_disposition == "unavailable"
+    assert observed.admission_rejection == "qualification"
+
+
+def test_webhook_disposition_rejects_dynamic_admission_rejection() -> None:
+    module = webhooks()
+
+    with pytest.raises(ValueError, match="^webhook_disposition_invalid$"):
+        module.WebhookDisposition(503, admission_rejection="PRIVATE-REASON")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("classification", "expected_receipt"),
+    [("missing", "first"), ("duplicate", "duplicate")],
+)
+async def test_processor_transfers_closed_receipt_classification_to_finalizer(
+    classification: str,
+    expected_receipt: str,
+) -> None:
+    module = webhooks()
+    event = module.VerifiedWebhook(
+        event_id="receipt-classification",
+        event_type="future.event",
+        occurred_at=NOW,
+        call_control_id=None,
+        call_leg_id=None,
+        call_session_id=None,
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"r" * 32,
+    )
+    received: list[str] = []
+
+    class Handle:
+        async def wait(self) -> Any:
+            return module.WebhookDisposition(200)
+
+    class Owner:
+        async def classify_webhook_receipt(self, _event: Any) -> str:
+            return classification
+
+        def start_webhook_finalization(
+            self,
+            _event: Any,
+            _resolution: Any,
+            receipt: str,
+        ) -> Handle:
+            received.append(receipt)
+            return Handle()
+
+    class Verifier:
+        def verify(self, **_kwargs: object) -> Any:
+            return event
+
+    processor = module.TelnyxWebhookProcessor(
+        verifier=Verifier(),
+        resolver=lambda _event: module.ResolvedWebhook(None),
+        duplicate_resolver=lambda _event: module.ResolvedWebhook(None),
+        finalizer_owner=Owner(),
+    )
+
+    observed = await processor.process_observed(body=b"{}", headers=[])
+
+    assert observed.disposition == module.WebhookDisposition(200)
+    assert observed.receipt == expected_receipt
+    assert received == [expected_receipt]
 
 
 @pytest.mark.asyncio

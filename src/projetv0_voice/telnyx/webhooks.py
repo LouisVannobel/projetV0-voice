@@ -162,6 +162,9 @@ class WebhookLocalReservation(Protocol):
     def abandon_before_submit(self) -> None:
         """Release a reservation synchronously before any durable submission."""
 
+    async def settle_after_submit_failure(self) -> None:
+        """Join the exact process-owned rollback descendant after submission."""
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ResolvedWebhook:
@@ -228,6 +231,15 @@ def _validated_lease(
 class WebhookDisposition:
     status_code: int
     body: bytes = b""
+    admission_rejection: ObservedAdmissionRejection | None = None
+
+    def __post_init__(self) -> None:
+        if self.admission_rejection is not None and (
+            type(self.admission_rejection) is not str
+            or self.admission_rejection
+            not in {"capacity", "draining", "qualification", "persistence", "invalid"}
+        ):
+            raise ValueError("webhook_disposition_invalid") from None
 
 
 type ObservedWebhookClass = Literal[
@@ -775,11 +787,16 @@ class TelnyxWebhookProcessor:
         self,
         event: VerifiedWebhook,
         resolution: ResolvedWebhook,
+        receipt: Literal["first", "duplicate"],
     ) -> WebhookFinalizationHandle | None:
         """Synchronously transfer ownership or abandon before any submission."""
 
         try:
-            handle = self._finalizer_owner.start_webhook_finalization(event, resolution)
+            handle = self._finalizer_owner.start_webhook_finalization(
+                event,
+                resolution,
+                receipt,
+            )
         except Exception:
             self._abandon(resolution)
             return None
@@ -823,8 +840,9 @@ class TelnyxWebhookProcessor:
             return _observed(event, "none", 500)
         if classification == "conflict":
             return _observed(event, "none", 400, "invalid")
+        receipt: Literal["first", "duplicate"]
         if classification == "duplicate":
-            receipt: ObservedWebhookReceipt = "duplicate"
+            receipt = "duplicate"
             if self._duplicate_resolver is None:
                 resolution: ResolvedWebhook | Awaitable[ResolvedWebhook] = ResolvedWebhook(None)
             else:
@@ -862,7 +880,7 @@ class TelnyxWebhookProcessor:
                 "duplicate" if receipt == "duplicate" else "none"
             )
             return _observed(event, terminal_receipt, 500)
-        handle = self.start_webhook_finalization(event, resolution)
+        handle = self.start_webhook_finalization(event, resolution, receipt)
         if handle is None:
             if receipt == "duplicate":
                 return _observed(event, "duplicate", 503)
@@ -879,10 +897,18 @@ class TelnyxWebhookProcessor:
             or disposition.body != b""
         ):
             return _observed(event, receipt, 500)
-        rejection: ObservedAdmissionRejection | None = None
-        if receipt == "first" and disposition.status_code == 503:
+        rejection = disposition.admission_rejection
+        if (
+            rejection is None
+            and receipt == "first"
+            and disposition.status_code == 503
+        ):
             rejection = "persistence"
-        elif receipt == "first" and disposition.status_code == 400:
+        elif (
+            rejection is None
+            and receipt == "first"
+            and disposition.status_code == 400
+        ):
             rejection = "invalid"
         return _observed(event, receipt, disposition.status_code, rejection)
 

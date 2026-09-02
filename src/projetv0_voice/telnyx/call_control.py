@@ -316,7 +316,11 @@ class CallControlClient:
         sdk_client: telnyx.AsyncTelnyx | None = None
         construction_failed = False
         try:
-            sdk_client = telnyx.AsyncTelnyx(api_key=api_key, max_retries=0)
+            sdk_client = telnyx.AsyncTelnyx(
+                api_key=api_key,
+                max_retries=0,
+                http_client=telnyx.DefaultAsyncHttpxClient(trust_env=False),
+            )
         except Exception:
             construction_failed = True
         if construction_failed or sdk_client is None:

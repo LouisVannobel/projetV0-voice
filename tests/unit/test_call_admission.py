@@ -1705,6 +1705,30 @@ async def test_cancelled_abandonment_waiting_registry_lock_still_releases() -> N
     await registry.join_until_empty()
 
     assert await registry.snapshot("control-a") is None
+
+
+@pytest.mark.asyncio
+async def test_post_submit_settlement_joins_abandonment_before_reraising_cancellation() -> None:
+    registry, _control = _registry()
+    resolution = await registry.resolve_webhook(_initiated())
+    reservation = resolution.reservation
+    assert reservation is not None
+
+    await registry._lock.acquire()  # noqa: SLF001
+    try:
+        settling = asyncio.create_task(reservation.settle_after_submit_failure())
+        await asyncio.sleep(0)
+        assert reservation._abandon_event.is_set()  # noqa: SLF001
+        settling.cancel()
+        await asyncio.sleep(0)
+        assert settling.done() is False
+    finally:
+        registry._lock.release()  # noqa: SLF001
+
+    with pytest.raises(asyncio.CancelledError):
+        await settling
+    await registry.join_until_empty()
+    assert await registry.snapshot("control-a") is None
     assert await registry.live_call_count() == 0
 
 

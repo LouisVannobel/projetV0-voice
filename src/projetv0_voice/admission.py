@@ -64,6 +64,7 @@ class WebhookFinalizerOwner(Protocol):
         self,
         event: VerifiedWebhook,
         resolution: ResolvedWebhook,
+        receipt: Literal["first", "duplicate"] = "first",
     ) -> WebhookFinalizationHandle: ...
 
 
@@ -317,6 +318,7 @@ class CallReservation:
     __slots__ = (
         "_abandoned",
         "_abandon_event",
+        "_abandonment_task",
         "_abandon_requested",
         "_entry",
         "_event_type",
@@ -345,6 +347,7 @@ class CallReservation:
         self._abandoned = False
         self._abandon_requested = False
         self._abandon_event = asyncio.Event()
+        self._abandonment_task: asyncio.Task[None] | None = None
         self._registry_applied = False
         self._settlement_task: asyncio.Task[None] | None = None
 
@@ -356,6 +359,10 @@ class CallReservation:
             return
         self._abandon_requested = True
         self._abandon_event.set()
+
+    async def settle_after_submit_failure(self) -> None:
+        self.abandon_before_submit()
+        await _join_owned_abandonment(self._abandonment_task)
 
     async def confirm(
         self,
@@ -405,6 +412,7 @@ class _PlaceholderReservation:
     __slots__ = (
         "_abandoned",
         "_abandon_event",
+        "_abandonment_task",
         "_abandon_requested",
         "_placeholder",
         "_registry",
@@ -419,6 +427,7 @@ class _PlaceholderReservation:
         self._abandoned = False
         self._abandon_requested = False
         self._abandon_event = asyncio.Event()
+        self._abandonment_task: asyncio.Task[None] | None = None
         self._registry_applied = False
 
     def __repr__(self) -> str:
@@ -429,6 +438,10 @@ class _PlaceholderReservation:
             return
         self._abandon_requested = True
         self._abandon_event.set()
+
+    async def settle_after_submit_failure(self) -> None:
+        self.abandon_before_submit()
+        await _join_owned_abandonment(self._abandonment_task)
 
     async def confirm(self, result: WebhookCommitValue) -> None:
         if self._settled:
@@ -468,6 +481,27 @@ class _PlaceholderReservation:
         self._abandoned = True
         if cancellation_seen:
             raise asyncio.CancelledError
+
+
+async def _join_owned_abandonment(task: asyncio.Task[None] | None) -> None:
+    """Join the already-owned reservation descendant without creating another owner."""
+
+    if task is None:
+        raise RuntimeError("reservation_settlement_unavailable") from None
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            break
+    if task.cancelled():
+        raise RuntimeError("reservation_settlement_failed") from None
+    task.result()
+    if cancellation is not None:
+        raise cancellation
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1322,9 +1356,11 @@ class CallRegistry:
             event_type,
             terminal_occurred_at=terminal_occurred_at,
         )
-        if self._background_owner.spawn(
+        abandonment = self._background_owner.start(
             reservation._run_abandonment(), name="voice-reservation-owner"
-        ):
+        )
+        if abandonment is not None:
+            reservation._abandonment_task = abandonment
             return reservation
         self._set_internal_failure("background_task_registration_failed")
         await self._settle_failed_call_registration(reservation)
@@ -1346,9 +1382,11 @@ class CallRegistry:
         self, placeholder: _AnsweredPlaceholder
     ) -> _PlaceholderReservation:
         reservation = _PlaceholderReservation(self, placeholder)
-        if self._background_owner.spawn(
+        abandonment = self._background_owner.start(
             reservation._run_abandonment(), name="voice-placeholder-owner"
-        ):
+        )
+        if abandonment is not None:
+            reservation._abandonment_task = abandonment
             return reservation
         self._set_internal_failure("background_task_registration_failed")
         await self._settle_failed_placeholder_registration(reservation)

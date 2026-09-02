@@ -95,6 +95,17 @@ def _signal_process_script(mode: str) -> str:
             input_used = True
             await asyncio.to_thread(sys.stdin.buffer.readline)
 
+        def observe_server_start(server):
+            started = asyncio.Event()
+            original_startup = server._server.startup
+
+            async def observed_startup(*args, **kwargs):
+                await original_startup(*args, **kwargs)
+                started.set()
+
+            server._server.startup = observed_startup
+            return started
+
         async def barrier(name):
             if MODE == name:
                 print("PHASE:" + name, flush=True)
@@ -140,6 +151,8 @@ def _signal_process_script(mode: str) -> str:
                     self.coordinator.publish_startup_failure()
                     raise
                 finally:
+                    self.coordinator.unpublish_runtime(self.supervisor)
+                    print("UNPUBLISHED", flush=True)
                     print("GATE:" + str(int(gate_opened)), flush=True)
                 if isinstance(failure, asyncio.CancelledError):
                     print("CANCELLED", flush=True)
@@ -195,9 +208,9 @@ def _signal_process_script(mode: str) -> str:
                     settings=settings,
                     coordinator=coordinator,
                 )
+                started = observe_server_start(server)
                 task = asyncio.create_task(server.serve(sockets=[listener]))
-                while not server.started:
-                    await asyncio.sleep(0)
+                await asyncio.wait_for(started.wait(), timeout=5.0)
                 print("READY", flush=True)
                 server.handle_exit(signal.SIGTERM, None)
                 try:
@@ -352,10 +365,10 @@ def _signal_process_script(mode: str) -> str:
                 settings=settings,
                 coordinator=coordinator,
             )
+            started = observe_server_start(server)
             task = asyncio.create_task(server.serve(sockets=[listener]))
             if MODE in {{"postgates", "hard_deadline"}}:
-                while not server.started:
-                    await asyncio.sleep(0)
+                await asyncio.wait_for(started.wait(), timeout=5.0)
                 print("READY", flush=True)
             try:
                 try:
@@ -427,6 +440,23 @@ def _settings(*, port: int = 8080, uvicorn_grace_seconds: int = 2) -> RuntimeSet
         bind_host="127.0.0.1",
         bind_port=port,
     )
+
+
+def _observe_server_start(
+    server: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> asyncio.Event:
+    """Return a test-owned event set at Uvicorn's actual startup boundary."""
+
+    started = asyncio.Event()
+    original_startup = server._server.startup  # noqa: SLF001
+
+    async def observed_startup(*args: Any, **kwargs: Any) -> None:
+        await original_startup(*args, **kwargs)
+        started.set()
+
+    monkeypatch.setattr(server._server, "startup", observed_startup)  # noqa: SLF001
+    return started
 
 
 class _LoopbackApp:
@@ -537,6 +567,7 @@ async def test_default_runtime_builder_uses_lazy_concrete_factories(
 async def test_real_loopback_server_preserves_lifespan_and_redacts_protocol_errors(
     caplog: pytest.LogCaptureFixture,
     capfd: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from projetv0_voice.server import FirstSignalDrainCoordinator, VoiceUvicornServer
 
@@ -549,12 +580,10 @@ async def test_real_loopback_server_preserves_lifespan_and_redacts_protocol_erro
     settings = _settings(port=port)
     coordinator = FirstSignalDrainCoordinator(settings=settings)
     server = VoiceUvicornServer(app, settings=settings, coordinator=coordinator)
+    server_started = _observe_server_start(server, monkeypatch)
     task = asyncio.create_task(server.serve(sockets=[listener]))
     await app.startup.wait()
-    for _ in range(10_000):
-        if server.started:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(server_started.wait(), timeout=5.0)
     assert server.started is True
 
     async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
@@ -581,7 +610,9 @@ async def test_real_loopback_server_preserves_lifespan_and_redacts_protocol_erro
 
 
 @pytest.mark.asyncio
-async def test_real_sansio_loopback_rejects_websocket_byte_524289() -> None:
+async def test_real_sansio_loopback_rejects_websocket_byte_524289(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed
 
@@ -621,12 +652,10 @@ async def test_real_sansio_loopback_rejects_websocket_byte_524289() -> None:
     settings = _settings(port=port)
     coordinator = FirstSignalDrainCoordinator(settings=settings)
     server = VoiceUvicornServer(app, settings=settings, coordinator=coordinator)
+    server_started = _observe_server_start(server, monkeypatch)
     task = asyncio.create_task(server.serve(sockets=[listener]))
     await app.startup.wait()
-    for _ in range(10_000):
-        if server.started:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(server_started.wait(), timeout=5.0)
     assert server.started is True
 
     try:
@@ -795,11 +824,9 @@ async def test_real_production_wss_route_owns_one_task6_permit_under_eager_facto
     previous_factory = loop.get_task_factory()
     loop.set_task_factory(asyncio.eager_task_factory)
     held = gate.try_acquire() if phase == "denial" else None
+    server_started = _observe_server_start(server, monkeypatch)
     task = asyncio.create_task(server.serve(sockets=[listener]))
-    for _ in range(10_000):
-        if server.started:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(server_started.wait(), timeout=5.0)
     assert server.started is True
     url = f"ws://127.0.0.1:{port}/telnyx/media"
     headers = {"x-telnyx-streaming-auth-token": token}
@@ -1431,6 +1458,7 @@ async def _start_asgi_inert_runtime(
     writer = PersistenceWriter(
         tmp_path / f"asgi-inert-{boundary}-{side}.sqlite3",
         keyring,
+        control_commit_timeout_seconds=10.0,
     )
     metrics = RuntimeMetrics.in_memory()
     raw_control = Control()
@@ -1705,11 +1733,12 @@ def _install_asgi_inert_boundary(
             current: Any,
             event: Any,
             resolution: Any,
+            receipt: Any = "first",
         ) -> Any:
             if current is not supervisor:
-                return original_start(current, event, resolution)
+                return original_start(current, event, resolution, receipt)
             state.target_wrapper_calls += 1
-            result = original_start(current, event, resolution)
+            result = original_start(current, event, resolution, receipt)
             state.target_real_calls += 1
             state.request_task = asyncio.current_task()
             state.target_argument = resolution
@@ -2481,7 +2510,9 @@ async def test_asgi_inert_matrix_uses_real_runtime_owners_across_uvicorn_timeout
 
 
 @pytest.mark.asyncio
-async def test_real_uvicorn_graceful_timeout_resumes_only_dependency_inert_wss_task() -> None:
+async def test_real_uvicorn_graceful_timeout_resumes_only_dependency_inert_wss_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
 
@@ -2545,11 +2576,9 @@ async def test_real_uvicorn_graceful_timeout_resumes_only_dependency_inert_wss_t
 
     app.router.lifespan_context = lifespan
     server = VoiceUvicornServer(app, settings=settings, coordinator=coordinator)
+    server_started = _observe_server_start(server, monkeypatch)
     task = asyncio.create_task(server.serve(sockets=[listener]))
-    for _ in range(10_000):
-        if server.started:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(server_started.wait(), timeout=5.0)
     assert server.started is True
 
     try:
@@ -2573,6 +2602,7 @@ async def test_real_uvicorn_graceful_timeout_resumes_only_dependency_inert_wss_t
 @pytest.mark.asyncio
 async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import base64
     from datetime import UTC, datetime
@@ -2695,6 +2725,7 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
     writer = PersistenceWriter(
         tmp_path / "real-asgi.sqlite3",
         keyring,
+        control_commit_timeout_seconds=10.0,
     )
     metrics = RuntimeMetrics.in_memory()
     raw_control = Control()
@@ -2830,7 +2861,7 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
-    listener.listen()
+    listener.listen(10)
     port = listener.getsockname()[1]
     settings = _settings(port=port, uvicorn_grace_seconds=2)
     signing_key = SigningKey.generate()
@@ -2880,12 +2911,10 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
     )
     app = create_app(settings, coordinator)
     server = VoiceUvicornServer(app, settings=settings, coordinator=coordinator)
+    server_started = _observe_server_start(server, monkeypatch)
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
     await asyncio.wait_for(runtime_started.wait(), timeout=10.0)
-    for _ in range(10_000):
-        if server.started:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(server_started.wait(), timeout=10.0)
     assert server.started is True
 
     def event(index: int, event_type: str) -> VerifiedWebhook:
@@ -2972,10 +3001,11 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
                     }
                 )
             )
-        await asyncio.wait_for(
-            asyncio.gather(*(ready.wait() for ready in activated.values())),
-            timeout=10.0,
-        )
+            await asyncio.wait_for(
+                activated[control_id].wait(),
+                timeout=30.0,
+            )
+        assert all(ready.is_set() for ready in activated.values())
         await connections[0].close()
         await connections[0].wait_closed()
         await asyncio.wait_for(session_0_terminated.wait(), timeout=30.0)
@@ -3009,7 +3039,9 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
 
 
 @pytest.mark.asyncio
-async def test_first_and_repeated_signals_begin_one_drain_without_force_exit() -> None:
+async def test_first_and_repeated_signals_begin_one_drain_without_force_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from projetv0_voice.server import FirstSignalDrainCoordinator, VoiceUvicornServer
 
     class Supervisor:
@@ -3043,23 +3075,61 @@ async def test_first_and_repeated_signals_begin_one_drain_without_force_exit() -
     assert server.force_exit is False
     await coordinator.aclose()
 
+    exit_set = asyncio.Event()
+    original_should_exit = VoiceUvicornServer.should_exit
+    getter = original_should_exit.fget
+    setter = original_should_exit.fset
+    assert getter is not None
+    assert setter is not None
+    observed_server: VoiceUvicornServer | None = None
+
+    def observe_should_exit(current: VoiceUvicornServer, value: bool) -> None:
+        setter(current, value)
+        if current is observed_server and value:
+            exit_set.set()
+
+    monkeypatch.setattr(
+        VoiceUvicornServer,
+        "should_exit",
+        property(getter, observe_should_exit),
+    )
     second = FirstSignalDrainCoordinator(settings=settings)
     second_server = VoiceUvicornServer(
         _LoopbackApp(),
         settings=settings,
         coordinator=second,
     )
+    observed_server = second_server
     second.bind_server(second_server, asyncio.get_running_loop())
     second.publish_startup_failure()
     second_server.handle_exit(signal.SIGTERM, None)
     second_server.handle_exit(signal.SIGTERM, None)
-    for _ in range(10_000):
-        if second_server.should_exit:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(exit_set.wait(), timeout=1.0)
     assert second_server.should_exit is True
     assert second_server.force_exit is False
     await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_unpublishes_only_the_exact_closed_runtime() -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.server import FirstSignalDrainCoordinator
+
+    coordinator = FirstSignalDrainCoordinator()
+    published = RuntimeSupervisor()
+    different = RuntimeSupervisor()
+
+    coordinator.publish_runtime(published)
+    coordinator.unpublish_runtime(different)
+    assert coordinator._runtime is published  # noqa: SLF001
+
+    coordinator.unpublish_runtime(published)
+    assert coordinator._runtime is None  # noqa: SLF001
+    assert coordinator._startup_owner is None  # noqa: SLF001
+
+    await coordinator.aclose()
+    await published.aclose()
+    await different.aclose()
 
 
 async def _read_process_marker(
@@ -3111,8 +3181,11 @@ async def test_programmatic_lifespan_closes_runtime_before_shutdown_complete(
         assert stderr == b""
         assert lines.count("ACLOSE_STARTED") == 1
         assert lines.count("ACLOSE_FINISHED") == 1
+        assert lines.count("UNPUBLISHED") == 1
         assert lines.count("SHUTDOWN_COMPLETE") == 1
         assert lines.index("ACLOSE_FINISHED") < lines.index("SHUTDOWN_COMPLETE")
+        assert lines.index("ACLOSE_FINISHED") < lines.index("UNPUBLISHED")
+        assert lines.index("UNPUBLISHED") < lines.index("SHUTDOWN_COMPLETE")
     finally:
         await _kill_process(process)
 
@@ -3180,6 +3253,7 @@ async def test_signal_proc_repeated_signal_permutations_preserve_lifespan(
     assert stderr == b""
     assert lines.count("ACLOSE_STARTED") == 1
     assert lines.count("ACLOSE_FINISHED") == 1
+    assert lines.count("UNPUBLISHED") == 1
     summary = next(line for line in lines if line.startswith("SUMMARY:"))
     _label, raw_calls, transitions, draining, forced, urgent, shutdown = summary.split(
         ":"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import threading
 from collections.abc import Coroutine
@@ -472,6 +473,260 @@ async def test_runtime_supervisor_is_real_webhook_finalizer_owner_and_forwards_a
     assert disposition.status_code == 200
     assert await supervisor.classify_webhook_receipt(event) == "duplicate"
     await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_candidate_latch_only_consumes_the_first_pending_initiated_effect(
+    tmp_path: Path,
+) -> None:
+    from projetv0_voice.admission import CallAdmissionRejected, ProcessLeaseAuthority
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.telnyx.webhooks import WebhookDisposition
+
+    class Control:
+        async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def start_streaming(
+            self, *_args: object, **_kwargs: object
+        ) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            return CallControlResult("accepted")
+
+        async def aclose(self) -> None:
+            return None
+
+    def event(
+        event_id: str,
+        event_type: str,
+        *,
+        call_control_id: str | None = "candidate-control",
+        call_state: str | None = None,
+    ) -> VerifiedWebhook:
+        return VerifiedWebhook(
+            event_id=event_id,
+            event_type=event_type,
+            occurred_at=NOW,
+            call_control_id=call_control_id,
+            call_leg_id=None if call_control_id is None else "candidate-leg",
+            call_session_id=None if call_control_id is None else "candidate-session",
+            recording_id=None,
+            stream_id=None,
+            client_state=None,
+            recording_started_at=None,
+            recording_ended_at=None,
+            recording_channels=None,
+            semantic_fingerprint_sha256=(event_id.encode() + b"_" * 32)[:32],
+            direction="incoming" if event_type == "call.initiated" else None,
+            call_state=call_state,  # type: ignore[arg-type]
+        )
+
+    run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    writer = PersistenceWriter(
+        tmp_path / "candidate-latch.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    control = Control()
+    registry = CallRegistry(
+        writer=writer,
+        call_control=control,
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        deployment_id="deployment-a",
+        capacity=1,
+        lease_ttl_seconds=30,
+        stream_url="wss://voice.invalid/telnyx/stream",
+        retention_days=7,
+        utcnow=lambda: NOW,
+        monotonic=lambda: 100.0,
+        candidate_run_id=run_id,
+    )
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        call_control=control,
+        registry=registry,
+        candidate_run_id=run_id,
+        metrics=RuntimeMetrics.in_memory(),
+        utcnow=lambda: NOW,
+        loop_interval_seconds=0.05,
+    )
+
+    async def finalize(
+        event_value: VerifiedWebhook,
+        resolution: ResolvedWebhook,
+        receipt: str = "first",
+    ) -> WebhookDisposition:
+        return await supervisor.start_webhook_finalization(
+            event_value,
+            resolution,
+            receipt,  # type: ignore[arg-type]
+        ).wait()
+
+    await supervisor.startup()
+    try:
+        unsupported = event("unsupported-first", "future.event", call_control_id=None)
+        assert (
+            await finalize(unsupported, await registry.resolve_webhook(unsupported))
+            == WebhookDisposition(200)
+        )
+        assert await writer.qualification_run_consumed(run_id) is False
+
+        initiated = event("initiated-first", "call.initiated", call_state="parked")
+        assert (
+            await finalize(initiated, await registry.resolve_webhook(initiated))
+            == WebhookDisposition(200)
+        )
+        assert await writer.qualification_run_consumed(run_id) is True
+
+        duplicate = await registry.resolve_duplicate_webhook(initiated)
+        assert await finalize(initiated, duplicate, "duplicate") == WebhookDisposition(200)
+
+        answered = event("answered-first", "call.answered", call_state="answered")
+        assert (
+            await finalize(answered, await registry.resolve_webhook(answered))
+            == WebhookDisposition(200)
+        )
+        snapshot = await registry.snapshot("candidate-control")
+        assert snapshot is not None
+        assert (
+            await ProcessLeaseAuthority(registry).claim_once(
+                call_control_id="candidate-control",
+                token_digest=snapshot.token_digest,
+            )
+        ) is not None
+
+        recording = event("recording-first", "call.recording.saved")
+        assert (
+            await finalize(recording, await registry.resolve_webhook(recording))
+            == WebhookDisposition(200)
+        )
+
+        hangup = event("hangup-first", "call.hangup")
+        assert (
+            await finalize(hangup, await registry.resolve_webhook(hangup))
+            == WebhookDisposition(200)
+        )
+
+        with pytest.raises(CallAdmissionRejected, match="^qualification_run_consumed$"):
+            await registry.resolve_webhook(
+                event(
+                    "initiated-after-consume",
+                    "call.initiated",
+                    call_control_id="candidate-control-2",
+                    call_state="parked",
+                )
+            )
+    finally:
+        await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["call.initiated", "call.answered"])
+async def test_post_submit_writer_failure_settles_reservation_before_503(
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.telnyx.webhooks import WebhookDisposition
+
+    class Control:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            self.actions.append("answer")
+            return CallControlResult("accepted")
+
+        async def start_streaming(
+            self, *_args: object, **_kwargs: object
+        ) -> CallControlResult:
+            self.actions.append("stream")
+            return CallControlResult("accepted")
+
+        async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            self.actions.append("hangup")
+            return CallControlResult("accepted")
+
+        async def aclose(self) -> None:
+            return None
+
+    failpoint_armed = False
+
+    async def failpoint(name: str) -> None:
+        if failpoint_armed and name == "after_mutation_before_commit":
+            raise RuntimeError("PRIVATE-WRITER-FAILPOINT")
+
+    event = VerifiedWebhook(
+        event_id=f"post-submit-{event_type}",
+        event_type=event_type,
+        occurred_at=NOW,
+        call_control_id="post-submit-control",
+        call_leg_id="post-submit-leg",
+        call_session_id="post-submit-session",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"p" * 32,
+        direction="incoming" if event_type == "call.initiated" else None,
+        call_state="parked" if event_type == "call.initiated" else "answered",
+    )
+    writer = PersistenceWriter(
+        tmp_path / "post-submit.sqlite",
+        CryptoKeyring({1: KEY}, active_version=1),
+        utcnow=lambda: NOW,
+        failpoint=failpoint,
+    )
+    control = Control()
+    registry = CallRegistry(
+        writer=writer,
+        call_control=control,
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        deployment_id="deployment-a",
+        capacity=1,
+        lease_ttl_seconds=30,
+        stream_url="wss://voice.invalid/telnyx/stream",
+        retention_days=7,
+        utcnow=lambda: NOW,
+        monotonic=lambda: 100.0,
+    )
+    supervisor = RuntimeSupervisor(
+        writer=writer,
+        call_control=control,
+        registry=registry,
+        metrics=RuntimeMetrics.in_memory(),
+        utcnow=lambda: NOW,
+        loop_interval_seconds=0.05,
+        shutdown_timeout_seconds=2.0,
+    )
+    resolution: ResolvedWebhook | None = None
+
+    await supervisor.startup()
+    failpoint_armed = True
+    try:
+        resolution = await registry.resolve_webhook(event)
+        assert (
+            await supervisor.start_webhook_finalization(event, resolution).wait()
+        ) == WebhookDisposition(503)
+        assert await registry.snapshot("post-submit-control") is None
+        if event_type == "call.initiated":
+            assert registry._permits_used == 0  # noqa: SLF001
+        else:
+            assert registry._answered_placeholders == {}  # noqa: SLF001
+        await asyncio.wait_for(registry.join_until_empty(), timeout=1.0)
+        assert control.actions == []
+    finally:
+        if resolution is not None and resolution.reservation is not None:
+            resolution.reservation.abandon_before_submit()
+        await asyncio.wait_for(registry.join_until_empty(), timeout=1.0)
+        with contextlib.suppress(Exception):
+            await supervisor.aclose()
 
 
 def test_relay_exposes_exact_claim_lease_for_ambiguity_supervision(
@@ -993,8 +1248,10 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     from projetv0_voice.qualified_profile import (
         InferenceProfileV1,
+        QualificationOverrideV1,
         QualifiedDeploymentProfileV1,
         canonical_inference_profile_sha256,
+        canonical_qualified_profile_sha256,
     )
     from projetv0_voice.runtime_config import (
         capture_runtime_environment,
@@ -1221,6 +1478,93 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     assert isinstance(graph.handshake, AuthenticatedTelnyxHandshakeService)
     assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
     await graph.supervisor.aclose()
+
+    from projetv0_voice.admission import CallAdmissionRejected
+
+    for capacity in (15, 20):
+        override = QualificationOverrideV1(
+            schema_version=1,
+            run_id=UUID(f"00000000-0000-4000-8000-{capacity:012d}"),
+            deployment_id=settings.deployment_id,
+            qualified_profile_sha256=canonical_qualified_profile_sha256(profile),
+            benchmark_max_calls=capacity,
+            created_at=NOW - timedelta(minutes=1),
+            expires_at=NOW + timedelta(hours=1),
+        )
+        override_settings = replace(
+            settings,
+            runtime_mode="qualification_override",
+            qualification_run_id=override.run_id,
+            deployment_max_calls=capacity,
+        )
+        object.__setattr__(
+            override_settings,
+            "_observability_token",
+            settings.observability_token(),
+        )
+        override_factories = replace(
+            factories,
+            load_profile=lambda _settings, _manifest, _now, current=override: (
+                RuntimeProfileSelection(profile=profile, override=current)
+            ),
+        )
+        override_graph = await build_production_runtime(
+            override_settings,
+            factories=override_factories,
+            utcnow=lambda: NOW,
+            monotonic=lambda: 10.0,
+            startup_phase_timeout_seconds=2.0,
+        )
+        reservations: list[ResolvedWebhook] = []
+        try:
+            assert override_graph.registry.candidate_run_id is None
+            assert override_graph.supervisor._candidate_run_id is None  # noqa: SLF001
+            assert override_graph.registry._capacity == capacity  # noqa: SLF001
+            for index in range(capacity):
+                event = VerifiedWebhook(
+                    event_id=f"override-{capacity}-{index}",
+                    event_type="call.initiated",
+                    occurred_at=NOW,
+                    call_control_id=f"override-control-{capacity}-{index}",
+                    call_leg_id=f"override-leg-{capacity}-{index}",
+                    call_session_id=f"override-session-{capacity}-{index}",
+                    recording_id=None,
+                    stream_id=None,
+                    client_state=None,
+                    recording_started_at=None,
+                    recording_ended_at=None,
+                    recording_channels=None,
+                    semantic_fingerprint_sha256=f"{index:032x}".encode(),
+                    direction="incoming",
+                    call_state="parked",
+                )
+                reservations.append(await override_graph.registry.resolve_webhook(event))
+            with pytest.raises(CallAdmissionRejected, match="^call_capacity_reached$"):
+                await override_graph.registry.resolve_webhook(
+                    VerifiedWebhook(
+                        event_id=f"override-{capacity}-overflow",
+                        event_type="call.initiated",
+                        occurred_at=NOW,
+                        call_control_id=f"override-control-{capacity}-overflow",
+                        call_leg_id=f"override-leg-{capacity}-overflow",
+                        call_session_id=f"override-session-{capacity}-overflow",
+                        recording_id=None,
+                        stream_id=None,
+                        client_state=None,
+                        recording_started_at=None,
+                        recording_ended_at=None,
+                        recording_channels=None,
+                        semantic_fingerprint_sha256=b"o" * 32,
+                        direction="incoming",
+                        call_state="parked",
+                    )
+                )
+        finally:
+            for resolution in reservations:
+                if resolution.reservation is not None:
+                    resolution.reservation.abandon_before_submit()
+            await override_graph.registry.join_until_empty()
+            await override_graph.supervisor.aclose()
 
     from projetv0_voice.persistence.postgres_sink import OperationSinkTransientError
 
@@ -1855,7 +2199,30 @@ async def test_public_shutdown_maps_private_fixed_supervisor_failure() -> None:
     from projetv0_voice.lifecycle import RuntimeSupervisor
 
     sentinel = "PRIVATE-FIXED-SENTINEL"
-    supervisor = RuntimeSupervisor(shutdown_timeout_seconds=1.0)
+    close_order: list[str] = []
+
+    class Control:
+        async def aclose(self) -> None:
+            close_order.append("control")
+
+    class Sink:
+        async def close(self) -> None:
+            close_order.append("sink")
+
+    metrics = RuntimeMetrics.in_memory()
+    original_metrics_close = metrics.aclose
+
+    async def close_metrics() -> None:
+        close_order.append("metrics")
+        await original_metrics_close()
+
+    metrics.aclose = close_metrics  # type: ignore[method-assign]
+    supervisor = RuntimeSupervisor(
+        call_control=Control(),  # type: ignore[arg-type]
+        sink=Sink(),
+        metrics=metrics,
+        shutdown_timeout_seconds=1.0,
+    )
 
     async def fail() -> None:
         raise RuntimeError(sentinel)
@@ -1868,12 +2235,61 @@ async def test_public_shutdown_maps_private_fixed_supervisor_failure() -> None:
     supervisor.fixed_supervisors.close_registration()
     await asyncio.gather(task, return_exceptions=True)
 
-    with pytest.raises(RuntimeError, match="^owned_task_failed$") as captured:
+    with pytest.raises(RuntimeError, match="^runtime_shutdown_failed$") as captured:
         await supervisor.aclose()
 
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     assert sentinel not in repr(captured.value)
+    assert close_order == ["control", "sink", "metrics"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_lifecycle_owner_failure_closes_all_dependencies_before_failure() -> None:
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+
+    close_order: list[str] = []
+
+    class Control:
+        async def aclose(self) -> None:
+            close_order.append("control")
+
+    class Sink:
+        async def close(self) -> None:
+            close_order.append("sink")
+
+    metrics = RuntimeMetrics.in_memory()
+    original_metrics_close = metrics.aclose
+
+    async def close_metrics() -> None:
+        close_order.append("metrics")
+        await original_metrics_close()
+
+    metrics.aclose = close_metrics  # type: ignore[method-assign]
+    supervisor = RuntimeSupervisor(
+        call_control=Control(),  # type: ignore[arg-type]
+        sink=Sink(),
+        metrics=metrics,
+        shutdown_timeout_seconds=1.0,
+    )
+
+    async def fail() -> None:
+        raise RuntimeError("PRIVATE-LIFECYCLE-SENTINEL")
+
+    task = supervisor.call_lifecycle_owners.try_start(
+        fail(), name="voice-lifecycle-owner"
+    )
+    assert task is not None
+    supervisor.call_lifecycle_owners.close_registration()
+    await asyncio.gather(task, return_exceptions=True)
+
+    with pytest.raises(RuntimeError, match="^runtime_shutdown_failed$") as captured:
+        await supervisor.aclose()
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "PRIVATE-LIFECYCLE-SENTINEL" not in repr(captured.value)
+    assert close_order == ["control", "sink", "metrics"]
 
 
 @pytest.mark.asyncio

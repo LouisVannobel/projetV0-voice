@@ -119,6 +119,12 @@ class FirstSignalDrainCoordinator:
             self._startup_owner = owner
         self._published.set()
 
+    def unpublish_runtime(self, supervisor: RuntimeSupervisor) -> None:
+        with self._lock:
+            if self._runtime is supervisor:
+                self._runtime = None
+                self._startup_owner = None
+
     def publish_startup_complete(self) -> None:
         with self._lock:
             if self._runtime is None or self._startup_failed:

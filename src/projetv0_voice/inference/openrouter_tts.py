@@ -58,7 +58,7 @@ class OpenRouterTTSService(TTSService):
         )
         self._input_sample_rate = profile.tts_pcm_sample_rate
         self._api_key = api_key
-        self._client = http_client or httpx.AsyncClient()
+        self._client = http_client or httpx.AsyncClient(trust_env=False)
         self._owns_client = http_client is None
         self._failed_contexts: dict[str, str] = {}
 

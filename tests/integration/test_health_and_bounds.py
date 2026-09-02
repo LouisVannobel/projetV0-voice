@@ -702,6 +702,102 @@ async def test_new_capacity_rejection_emits_one_exact_ingress_metric_outcome() -
 
 
 @pytest.mark.asyncio
+async def test_qualification_commit_rejection_emits_one_exact_ingress_metric_outcome() -> None:
+    from projetv0_voice.app import create_app
+    from projetv0_voice.metrics import RuntimeMetrics
+    from projetv0_voice.telnyx.webhooks import (
+        ResolvedWebhook,
+        TelnyxWebhookProcessor,
+        VerifiedWebhook,
+        WebhookDisposition,
+    )
+
+    event = VerifiedWebhook(
+        event_id="qualification-event",
+        event_type="call.initiated",
+        occurred_at=NOW,
+        call_control_id="qualification-control",
+        call_leg_id="qualification-leg",
+        call_session_id="qualification-session",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"q" * 32,
+        direction="incoming",
+        call_state="parked",
+    )
+
+    class Verifier:
+        def verify(self, **_: object) -> VerifiedWebhook:
+            return event
+
+    class Handle:
+        async def wait(self) -> WebhookDisposition:
+            return WebhookDisposition(503, admission_rejection="qualification")
+
+    class Owner:
+        async def classify_webhook_receipt(self, _: VerifiedWebhook) -> str:
+            return "missing"
+
+        def start_webhook_finalization(self, *_: object) -> Handle:
+            return Handle()
+
+    metrics = RuntimeMetrics.in_memory()
+    processor = TelnyxWebhookProcessor(
+        verifier=Verifier(),  # type: ignore[arg-type]
+        resolver=lambda _: ResolvedWebhook(None),
+        finalizer_owner=Owner(),  # type: ignore[arg-type]
+    )
+    app = create_app(_runtime_settings(), SimpleNamespace())
+    app.state.runtime_graph = SimpleNamespace(
+        webhook_processor=processor,
+        metrics=metrics,
+    )
+
+    sent = await _raw_http(
+        app,
+        path="/telnyx/events",
+        method="POST",
+        messages=[{"type": "http.request", "body": b"{}", "more_body": False}],
+    )
+    assert next(message for message in sent if message["type"] == "http.response.start")[
+        "status"
+    ] == 503
+    assert next(message for message in sent if message["type"] == "http.response.body")[
+        "body"
+    ] == b""
+
+    collected = metrics._metric_reader.get_metrics_data()  # noqa: SLF001
+    assert collected is not None
+    points = {
+        metric.name: list(metric.data.data_points)
+        for resource in collected.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name
+        in {
+            "projetv0.voice.admission.rejections",
+            "projetv0.voice.webhooks.total",
+        }
+    }
+    assert [point.value for point in points["projetv0.voice.webhooks.total"]] == [1]
+    assert dict(points["projetv0.voice.webhooks.total"][0].attributes) == {
+        "webhook_class": "initiated",
+        "receipt": "first",
+        "disposition": "unavailable",
+    }
+    assert [point.value for point in points["projetv0.voice.admission.rejections"]] == [
+        1
+    ]
+    assert dict(points["projetv0.voice.admission.rejections"][0].attributes) == {
+        "reason": "qualification"
+    }
+
+
+@pytest.mark.asyncio
 async def test_duplicate_resolver_rejection_emits_one_duplicate_and_zero_admission() -> None:
     from projetv0_voice.admission import CallAdmissionRejected
     from projetv0_voice.app import create_app
@@ -844,6 +940,10 @@ async def test_lifespan_publishes_startup_failure_after_runtime_startup_rejects(
         def publish_startup_failure(self) -> None:
             events.append("failure")
 
+        def unpublish_runtime(self, _supervisor: object) -> None:
+            assert events[-1] == "close"
+            events.append("unpublish")
+
     monkeypatch.setattr(app_module, "RuntimeProductionGraph", Graph)
     app = app_module.create_app(_runtime_settings(), Coordinator())  # type: ignore[arg-type]
 
@@ -851,4 +951,50 @@ async def test_lifespan_publishes_startup_failure_after_runtime_startup_rejects(
         async with app.router.lifespan_context(app):
             raise AssertionError("startup failure must not yield")
 
-    assert events == ["build", "runtime", "startup", "failure", "close"]
+    assert events == ["build", "runtime", "startup", "failure", "close", "unpublish"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_unpublishes_runtime_after_normal_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import projetv0_voice.app as app_module
+
+    events: list[str] = []
+
+    class Supervisor:
+        async def startup(self) -> None:
+            events.append("startup")
+
+        async def aclose(self) -> None:
+            events.append("close")
+
+    class Graph:
+        def __init__(self) -> None:
+            self.supervisor = Supervisor()
+
+    class Coordinator:
+        async def build_runtime(self, _settings: RuntimeSettingsV1) -> Graph:
+            events.append("build")
+            return Graph()
+
+        def publish_runtime(self, _supervisor: object) -> None:
+            events.append("runtime")
+
+        def publish_startup_complete(self) -> None:
+            events.append("complete")
+
+        def publish_startup_failure(self) -> None:
+            events.append("failure")
+
+        def unpublish_runtime(self, _supervisor: object) -> None:
+            assert events[-1] == "close"
+            events.append("unpublish")
+
+    monkeypatch.setattr(app_module, "RuntimeProductionGraph", Graph)
+    app = app_module.create_app(_runtime_settings(), Coordinator())  # type: ignore[arg-type]
+
+    async with app.router.lifespan_context(app):
+        assert events == ["build", "runtime", "startup", "complete"]
+
+    assert events == ["build", "runtime", "startup", "complete", "close", "unpublish"]

@@ -370,7 +370,10 @@ async def test_real_v1_migration_redelivery_accepts_only_verified_fingerprint_se
             )
 
         def start_webhook_finalization(
-            self, event: VerifiedWebhook, resolution: ResolvedWebhook
+            self,
+            event: VerifiedWebhook,
+            resolution: ResolvedWebhook,
+            _receipt: object = "first",
         ) -> Handle:
             assert resolution.effect is None
 
@@ -477,7 +480,12 @@ async def test_processor_maps_closed_admission_and_receipt_classifications(
         async def classify_webhook_receipt(self, _: VerifiedWebhook) -> str:
             return classification
 
-        def start_webhook_finalization(self, _: Any, resolution: Any) -> Handle:
+        def start_webhook_finalization(
+            self,
+            _: Any,
+            resolution: Any,
+            _receipt: object = "first",
+        ) -> Handle:
             nonlocal started
             started += 1
             assert resolution.effect is None
@@ -585,7 +593,12 @@ async def test_signed_initiated_flows_through_async_registry_and_postcommit_owne
                 semantic_fingerprint_sha256=event.semantic_fingerprint_sha256,
             )
 
-        def start_webhook_finalization(self, event: Any, resolution: Any) -> Handle:
+        def start_webhook_finalization(
+            self,
+            event: Any,
+            resolution: Any,
+            _receipt: object = "first",
+        ) -> Handle:
             async def finalize() -> Any:
                 effect = resolution.effect
                 result = await writer.submit_webhook(
@@ -675,7 +688,12 @@ async def test_http_cancellation_detaches_from_registered_webhook_finalizer() ->
         async def classify_webhook_receipt(self, _: Any) -> str:
             return "missing"
 
-        def start_webhook_finalization(self, received: Any, resolution: Any) -> Handle:
+        def start_webhook_finalization(
+            self,
+            received: Any,
+            resolution: Any,
+            _receipt: object = "first",
+        ) -> Handle:
             assert received is event
             assert resolution.reservation is reservation
 
@@ -868,7 +886,10 @@ async def test_consumed_candidate_restart_classifies_duplicate_before_any_mint(
             )
 
         def start_webhook_finalization(
-            self, event: VerifiedWebhook, resolution: ResolvedWebhook
+            self,
+            event: VerifiedWebhook,
+            resolution: ResolvedWebhook,
+            _receipt: object = "first",
         ) -> Handle:
             async def finalize() -> WebhookDisposition:
                 result = await writer.submit_webhook(
@@ -1163,7 +1184,10 @@ async def test_public_observed_ingress_preserves_both_legacy_alias_phases_unchan
             return "missing"
 
         def start_webhook_finalization(
-            self, received: VerifiedWebhook, resolution: ResolvedWebhook
+            self,
+            received: VerifiedWebhook,
+            resolution: ResolvedWebhook,
+            _receipt: object = "first",
         ) -> Handle:
             assert resolution.effect is None
             phases.append(
@@ -1266,7 +1290,10 @@ async def test_terminal_duplicate_never_becomes_new_admission_rejection(
             return "duplicate"
 
         def start_webhook_finalization(
-            self, _event: VerifiedWebhook, _resolution: ResolvedWebhook
+            self,
+            _event: VerifiedWebhook,
+            _resolution: ResolvedWebhook,
+            _receipt: object = "first",
         ) -> Handle:
             if failure == "finalizer-transfer":
                 raise RuntimeError("private-finalizer-transfer")

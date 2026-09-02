@@ -138,7 +138,8 @@ async def test_build_llm_serializes_one_openrouter_provider_object_via_native_sd
             http_client=transport_client,
         )
 
-    monkeypatch.setattr(OpenRouterLLMService, "create_client", create_client)
+    trustless = module._TrustlessOpenRouterLLMService
+    monkeypatch.setattr(trustless, "create_client", create_client)
     service = module.build_llm(profile, SecretStr("unit-secret"))
     source_policy = source["llm_provider_policy"]
     assert isinstance(source_policy, dict)
@@ -156,7 +157,7 @@ async def test_build_llm_serializes_one_openrouter_provider_object_via_native_sd
     await service._client.close()
 
     assert isinstance(service, OpenRouterLLMService)
-    assert type(service) is OpenRouterLLMService
+    assert type(service) is trustless
     assert str(service._client.base_url).rstrip("/") == OPENROUTER_BASE_URL
     assert service._settings.model == "test/llm"
     assert service._settings.extra == {

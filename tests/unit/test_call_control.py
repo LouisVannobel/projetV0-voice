@@ -84,6 +84,10 @@ class FakeSDK:
         self.close_count += 1
         if self._close_impl is not None:
             await self._close_impl()
+        http_client = self.constructor_kwargs.get("http_client")
+        close = getattr(http_client, "aclose", None)
+        if callable(close):
+            await close()
 
 
 def install_fake(
@@ -169,7 +173,6 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = call_control()
-    real_constructor = telnyx.AsyncTelnyx
     requests: list[tuple[str, str, dict[str, object], bytes]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -180,10 +183,17 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
     transport = httpx.MockTransport(handler)
     http_client = httpx.AsyncClient(transport=transport)
 
-    def factory(**kwargs: object) -> telnyx.AsyncTelnyx:
-        return real_constructor(**kwargs, http_client=http_client)  # type: ignore[arg-type]
+    constructed: list[dict[str, object]] = []
 
-    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", factory)
+    def transport_factory(**kwargs: object) -> httpx.AsyncClient:
+        constructed.append(dict(kwargs))
+        return http_client
+
+    monkeypatch.setattr(
+        module.telnyx,
+        "DefaultAsyncHttpxClient",
+        transport_factory,
+    )
     client = module.CallControlClient(api_key=API_KEY)
     await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID)
     await client.start_streaming(
@@ -213,6 +223,8 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
         client_state=SecretStr(CLIENT_STATE),
     )
     await client.aclose()
+
+    assert constructed == [{"trust_env": False}]
 
     command = str(COMMAND_ID)
     assert [(method, path, query) for method, path, _, query in requests] == [
@@ -384,7 +396,12 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     ]
 
     assert [result.outcome for result in results] == ["accepted"] * 4
-    assert constructions == [{"api_key": API_KEY, "max_retries": 0}]
+    assert len(constructions) == 1
+    assert constructions[0]["api_key"] == API_KEY
+    assert constructions[0]["max_retries"] == 0
+    transport = constructions[0]["http_client"]
+    assert isinstance(transport, telnyx.DefaultAsyncHttpxClient)
+    assert transport._mounts == {}  # noqa: SLF001
     assert len(instances) == 1
     calls = instances[0].actions.calls
     assert [call[:2] for call in calls] == [

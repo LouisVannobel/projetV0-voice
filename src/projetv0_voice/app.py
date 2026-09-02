@@ -48,6 +48,8 @@ class _Coordinator(Protocol):
 
     def publish_startup_failure(self) -> None: ...
 
+    def unpublish_runtime(self, supervisor: RuntimeSupervisor) -> None: ...
+
 
 def _runtime(app: FastAPI) -> Any:
     return getattr(app.state, "runtime_graph", None)
@@ -161,7 +163,10 @@ def create_app(
             if failed:
                 coordinator.publish_startup_failure()
             if supervisor is not None:
-                await supervisor.aclose()
+                try:
+                    await supervisor.aclose()
+                finally:
+                    coordinator.unpublish_runtime(supervisor)
             app.state.runtime_graph = None
 
     app = FastAPI(
