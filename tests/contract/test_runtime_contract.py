@@ -283,8 +283,12 @@ def test_golden_exercises_out_of_order_dotfile_and_distinct_nfc_nfd_paths() -> N
 def test_bundle_path_and_digest_bounds_are_closed() -> None:
     exporter = _exporter()
     digest = b"d" * 32
+    exact_4096_byte_path = (*tuple("x" * 255 for _ in range(15)), "y" * 256)
 
     assert len(exporter.validate_relative_path(tuple("x" * 255 for _ in range(16)))) == 4095
+    assert len("/".join(exact_4096_byte_path).encode()) == 4096
+    with pytest.raises(exporter.ExportError, match="^agent_bundle_invalid$"):
+        exporter.validate_relative_path(exact_4096_byte_path)
     for parts in [
         tuple("x" for _ in range(17)),
         ("x" * 256,),
