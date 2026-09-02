@@ -284,6 +284,17 @@ def _stable_identity(value: os.stat_result) -> tuple[int, int, int, int, int, in
     )
 
 
+def _is_windows_reparse_point(value: os.stat_result) -> bool:
+    attributes = getattr(value, "st_file_attributes", 0)
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(
+        isinstance(attributes, int)
+        and isinstance(reparse_point, int)
+        and reparse_point != 0
+        and attributes & reparse_point
+    )
+
+
 def _path_descriptor_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         value.st_dev,
@@ -307,6 +318,8 @@ def _snapshot_directory(path: Path) -> dict[str, tuple[int, int, int, int, int, 
                     observed = os.lstat(path / name)
                 except (OSError, UnicodeError):
                     raise _invalid() from None
+                if _is_windows_reparse_point(observed):
+                    raise _invalid()
                 snapshot[name] = _stable_identity(observed)
     except ExportError:
         raise
@@ -382,7 +395,9 @@ def _walk_source_tree(
         directory_before = os.lstat(directory)
     except OSError:
         raise _invalid() from None
-    if not stat.S_ISDIR(directory_before.st_mode):
+    if _is_windows_reparse_point(directory_before) or not stat.S_ISDIR(
+        directory_before.st_mode
+    ):
         raise _invalid()
     snapshot = _snapshot_directory(directory)
     ordered_names: list[tuple[bytes, str]] = []
@@ -398,7 +413,10 @@ def _walk_source_tree(
             observed = os.lstat(child)
         except OSError:
             raise _invalid() from None
-        if _stable_identity(observed) != snapshot[name]:
+        if (
+            _is_windows_reparse_point(observed)
+            or _stable_identity(observed) != snapshot[name]
+        ):
             raise _invalid()
         child_parts = (*parts, name)
         if len(child_parts) > MAX_BUNDLE_COMPONENTS:
@@ -421,7 +439,8 @@ def _walk_source_tree(
     except OSError:
         raise _invalid() from None
     if (
-        _stable_identity(directory_after) != _stable_identity(directory_before)
+        _is_windows_reparse_point(directory_after)
+        or _stable_identity(directory_after) != _stable_identity(directory_before)
         or _snapshot_directory(directory) != snapshot
     ):
         raise _invalid()

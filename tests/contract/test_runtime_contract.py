@@ -387,6 +387,37 @@ def test_source_tree_rejects_symlinks_and_special_files(tmp_path: Path) -> None:
         exporter.snapshot_agent_tree(tmp_path)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+@pytest.mark.parametrize("position", ["root", "child"])
+def test_windows_source_tree_rejects_directory_junction(
+    tmp_path: Path,
+    position: str,
+) -> None:
+    exporter = _exporter()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "escaped.txt").write_bytes(b"outside source authority")
+    source = tmp_path / "source"
+    junction = source
+    if position == "child":
+        source.mkdir()
+        junction = source / "escape"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    observed = os.lstat(junction)
+    assert stat.S_ISDIR(observed.st_mode)
+    assert observed.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+    with pytest.raises(exporter.ExportError, match="^agent_bundle_invalid$"):
+        exporter.snapshot_agent_tree(source)
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation unavailable")
 def test_source_tree_rejects_fifo(tmp_path: Path) -> None:
     exporter = _exporter()
