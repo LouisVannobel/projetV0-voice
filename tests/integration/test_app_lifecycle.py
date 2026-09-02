@@ -2046,12 +2046,14 @@ async def test_composition_cleanup_hard_exits_instead_of_abandoning_live_close()
     await asyncio.gather(*live_closes, return_exceptions=True)
 
 
-def test_composition_cleanup_production_hard_exit_is_nonreturning_subprocess() -> None:
-    import subprocess
+@pytest.mark.asyncio
+async def test_composition_cleanup_production_hard_exit_is_nonreturning_subprocess(
+) -> None:
     import sys
 
     script = r"""
 import asyncio
+import sys
 from projetv0_voice.lifecycle import _close_failed_composition
 
 class Control:
@@ -2061,20 +2063,40 @@ class Control:
         except asyncio.CancelledError:
             await asyncio.Event().wait()
 
+print("READY", flush=True)
+if sys.stdin.readline() != "GO\n":
+    raise RuntimeError("parent did not release the hard-exit probe")
 asyncio.run(_close_failed_composition(Control(), None, None, timeout_seconds=0.01))
 print("POST-HARD-EXIT-MARKER")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    stdout = b""
+    stderr = b""
+    try:
+        assert process.stdout is not None
+        ready = await asyncio.wait_for(process.stdout.readline(), timeout=30.0)
+        assert ready.rstrip(b"\r\n") == b"READY"
 
-    assert result.returncode == 72
-    assert "POST-HARD-EXIT-MARKER" not in result.stdout
-    assert "POST-HARD-EXIT-MARKER" not in result.stderr
+        assert process.stdin is not None
+        process.stdin.write(b"GO\n")
+        await process.stdin.drain()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=2.0)
+    finally:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        await process.wait()
+
+    assert process.returncode == 72
+    assert b"POST-HARD-EXIT-MARKER" not in stdout
+    assert b"POST-HARD-EXIT-MARKER" not in stderr
 
 
 @pytest.mark.asyncio
