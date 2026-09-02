@@ -151,7 +151,12 @@ def _signal_process_script(mode: str) -> str:
                 return None
 
         class ObservableSupervisor(RuntimeSupervisor):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.begin_drain_calls = 0
+
             async def begin_drain(self):
+                self.begin_drain_calls += 1
                 first = not self._draining
                 await super().begin_drain()
                 if first:
@@ -176,9 +181,13 @@ def _signal_process_script(mode: str) -> str:
             await seed.drain(2.0)
             await owner
 
-        def hard_exit(code):
-            print("HARD:" + str(code), flush=True)
+        def global_hard_exit(code):
+            print("GLOBAL_HARD:" + str(code), flush=True)
             os._exit(code)
+
+        def runtime_hard_exit(code):
+            print("RUNTIME_HARD:" + str(code), flush=True)
+            os._exit(73)
 
         shutdown_seen = False
         gate_opened = False
@@ -237,12 +246,14 @@ def _signal_process_script(mode: str) -> str:
                 sink=Sink(),
                 candidate_run_id=candidate,
                 startup_phase_timeout_seconds=30.0,
-                shutdown_timeout_seconds=5.0,
-                hard_exit=hard_exit,
+                shutdown_timeout_seconds=(
+                    30.0 if MODE == "hard_deadline" else 5.0
+                ),
+                hard_exit=runtime_hard_exit,
             )
             coordinator = FirstSignalDrainCoordinator(
                 settings=settings,
-                hard_exit=hard_exit,
+                hard_exit=global_hard_exit,
             )
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -272,6 +283,7 @@ def _signal_process_script(mode: str) -> str:
                 "SUMMARY:"
                 + ":".join(
                     (
+                        str(supervisor.begin_drain_calls),
                         str(int(supervisor._draining)),
                         str(int(server.force_exit)),
                         str(int(coordinator.urgent)),
@@ -783,6 +795,8 @@ class _AsgiInertState:
         self.target_result: object | None = None
         self.target_argument: object | None = None
         self.resolution: object | None = None
+        self.resolver_result: object | None = None
+        self.resolver_real_calls = 0
         self.claim_snapshot: object | None = None
         self.request_cancellation: asyncio.CancelledError | None = None
         self.target_cancellation: asyncio.CancelledError | None = None
@@ -1573,10 +1587,12 @@ def _install_asgi_inert_boundary(
         )
 
         original_resolver = processor._resolver
-        if state.side == "pre":
 
-            async def paused_resolver(event: Any) -> Any:
-                result = await original_resolver(event)
+        async def observed_resolver(event: Any) -> Any:
+            result = await original_resolver(event)
+            state.resolver_real_calls += 1
+            state.resolver_result = result
+            if state.side == "pre":
                 state.resolution = result
                 state.request_task = asyncio.current_task()
                 state.boundary_reached.set()
@@ -1590,9 +1606,9 @@ def _install_asgi_inert_boundary(
                     state.target_cancelled.set()
                     _asgi_inert_capture_cancellation(state, error)
                     await _asgi_inert_reraise_after_release(state, error)
-                return result
+            return result
 
-            processor._resolver = paused_resolver
+        processor._resolver = observed_resolver
 
         original_start = RuntimeSupervisor.start_webhook_finalization
 
@@ -1607,7 +1623,6 @@ def _install_asgi_inert_boundary(
             result = original_start(current, event, resolution)
             state.target_real_calls += 1
             state.request_task = asyncio.current_task()
-            state.resolution = resolution
             state.target_argument = resolution
             state.target_result = result
             tasks = tuple(current.webhook_finalizers._tasks)
@@ -2103,14 +2118,15 @@ async def _assert_asgi_inert_boundary(runtime: _AsgiInertRuntime) -> None:
     assert state.target_wrapper_calls == expected_wrapper_calls
 
     if state.boundary == "finalizer":
+        assert state.resolver_real_calls == 1
         if state.side == "pre":
             assert state.resolution is not None
             assert state.writer_submit_calls == 0
             assert not graph.supervisor.webhook_finalizers._tasks
         else:
             assert state.target_result is not None
-            assert state.resolution is not None
-            assert state.target_argument is state.resolution
+            assert state.resolver_result is not None
+            assert state.target_argument is state.resolver_result
             assert state.finalizer_task is not None
             assert state.finalizer_task.get_name() == "voice-webhook-finalizer"
         return
@@ -2877,7 +2893,13 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
         await asyncio.gather(lifecycle_tasks["control-0"], return_exceptions=True)
         assert terminal_calls == 1
         assert await registry.live_call_count() == 9
-        assert len(supervisor.call_lifecycle_owners._tasks) == 9
+        expected_live_owners = {
+            lifecycle_tasks[f"control-{index}"] for index in range(1, 10)
+        }
+        captured_owners = set(supervisor.call_lifecycle_owners._tasks)
+        assert captured_owners == expected_live_owners
+        assert all(not task.done() for task in expected_live_owners)
+        assert lifecycle_tasks["control-0"] not in captured_owners
         assert all(connection.close_code is None for connection in connections[1:])
         server.should_exit = True
         await asyncio.wait_for(server_task, timeout=35.0)
@@ -3001,8 +3023,8 @@ async def test_signal_proc_repeated_signal_permutations_preserve_lifespan(
     assert process.returncode == 0
     assert stderr == b""
     summary = next(line for line in lines if line.startswith("SUMMARY:"))
-    _label, calls, forced, urgent, shutdown = summary.split(":")
-    assert (calls, forced, shutdown) == ("1", "0", "1")
+    _label, calls, draining, forced, urgent, shutdown = summary.split(":")
+    assert (calls, draining, forced, shutdown) == ("1", "1", "0", "1")
     assert urgent == str(int(len(signals) > 1 and signals[1] == signal.SIGINT))
 
 
@@ -3063,7 +3085,7 @@ async def test_signal_proc_real_startup_failure_unwinds_without_hard_exit() -> N
 
     assert process.returncode == 0
     assert "GATE:0" in lines
-    assert not any(line.startswith("HARD:") for line in lines)
+    assert not any(line.startswith(("GLOBAL_HARD:", "RUNTIME_HARD:")) for line in lines)
     assert b"private" not in stderr
 
 
@@ -3085,7 +3107,8 @@ async def test_signal_proc_only_global_deadline_invokes_hard_exit_72() -> None:
     lines.extend(stdout.decode("utf-8", errors="strict").splitlines())
 
     assert process.returncode == 72
-    assert "HARD:72" in lines
+    assert lines.count("GLOBAL_HARD:72") == 1
+    assert not any(line.startswith("RUNTIME_HARD:") for line in lines)
     assert not any(line.startswith("SUMMARY:") for line in lines)
 
 
