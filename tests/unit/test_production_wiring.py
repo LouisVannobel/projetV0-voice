@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
+import sys
+import tarfile
 import tempfile
 import traceback
 from pathlib import Path, PurePosixPath
@@ -33,6 +36,7 @@ MANIFEST_BYTES = (
     b'"recording_play_beep":false}'
 )
 UTF8_BUNDLE_GOLDEN = "12cb8fc96a5fd5a9105538aeede00dfcd2335090a759106982807f04e36163ca"
+TASK11_GOLDEN_PATH = Path("tests/fixtures/agent-bundle-v1-golden.json")
 PRIVILEGED_FILES = (
     os.name == "posix"
     and os.environ.get("PROJETV0_PRIVILEGED_FILES_GATE") == "1"
@@ -51,6 +55,7 @@ def _settings(
     keyring_path: PurePosixPath = KEYRING_PATH,
     runtime_sha256: str = "a" * 64,
     bundle_sha256: str = "b" * 64,
+    deployment_max_calls: int = 1,
 ) -> RuntimeSettingsV1:
     return RuntimeSettingsV1(
         runtime_mode="strict",
@@ -68,7 +73,7 @@ def _settings(
         inference_profile_sha256="c" * 64,
         qualification_run_id=None,
         benchmark_did_sha256=None,
-        deployment_max_calls=1,
+        deployment_max_calls=deployment_max_calls,
         handshake_timeout_seconds=5,
         call_idle_timeout_seconds=300,
         call_cleanup_phase_timeout_seconds=10,
@@ -202,27 +207,26 @@ def test_keyring_file_is_exact_and_read_once_without_hot_reload(
 def test_bundle_consumer_matches_literal_task11_golden_without_a_producer() -> None:
     from projetv0_voice.production_wiring import _bundle_digest
 
-    assert (
-        _bundle_digest(
+    golden = json.loads(TASK11_GOLDEN_PATH.read_bytes())
+    assert [item["path"] for item in golden["files"]] != sorted(
+        (item["path"] for item in golden["files"]),
+        key=lambda path: path.encode("utf-8"),
+    )
+    entries: list[tuple[bytes, int, bytes]] = []
+    for item in golden["files"]:
+        content = bytes.fromhex(item["content_hex"])
+        assert len(content) == item["size"]
+        assert hashlib.sha256(content).hexdigest() == item["sha256"]
+        entries.append(
             (
-                (
-                    b".env",
-                    1,
-                    bytes.fromhex(
-                        "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
-                    ),
-                ),
-                (
-                    b"manifest.yaml",
-                    5,
-                    bytes.fromhex(
-                        "d4f0bc5a29de06b510f9aa428f1eedba926012b591fef7a518e776a7c9bd1824"
-                    ),
-                ),
+                item["path"].encode("utf-8"),
+                item["size"],
+                bytes.fromhex(item["sha256"]),
             )
         )
-        == BUNDLE_GOLDEN_SHA256
-    )
+
+    entries.sort(key=lambda entry: entry[0])
+    assert _bundle_digest(tuple(entries)) == golden["expected_bundle_sha256"]
 
 
 def test_rejected_ancestor_open_closes_every_acquired_descriptor_once(
@@ -851,3 +855,55 @@ def test_linux_kernel_success_and_failure_close_every_descriptor() -> None:
         after_failure = len(os.listdir("/proc/self/fd"))
 
         assert (after_success, after_failure) == (before, before)
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+def test_linux_kernel_accepts_real_task11_export_without_importing_producer() -> None:
+    from projetv0_voice.production_wiring import build_production_factories
+
+    repository = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-export-") as raw:
+        trusted = Path(raw)
+        output = trusted / "dist"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(repository / "scripts" / "export_runtime_contract.py"),
+                "--repo-root",
+                str(repository),
+                "--output-dir",
+                str(output),
+            ],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stderr == ""
+
+        archive_path = output / "agent-a-bundle.tar.gz"
+        bundle = trusted / "bundle"
+        bundle.mkdir()
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            assert members
+            assert all(member.isreg() for member in members)
+            archive.extractall(bundle, filter="data")
+
+        runtime = output / "runtime-contract.json"
+        manifest = json.loads(
+            (output / "agent-a-bundle-v1.manifest.json").read_bytes()
+        )
+        settings = _settings(
+            runtime_contract_path=PurePosixPath(str(runtime)),
+            agent_bundle_path=PurePosixPath(str(bundle)),
+            runtime_sha256=hashlib.sha256(runtime.read_bytes()).hexdigest(),
+            bundle_sha256=manifest["bundle_sha256"],
+            deployment_max_calls=10,
+        )
+
+        factories = build_production_factories(settings)
+        factories.validate_artifacts(settings)
+        assert factories.load_manifest(settings).agent_id == "agent-a"

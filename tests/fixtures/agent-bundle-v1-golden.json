@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "bundle_format": "projetv0-agent-bundle-v1",
+  "files": [
+    {
+      "path": "z-last.txt",
+      "content_hex": "7a",
+      "size": 1,
+      "sha256": "594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06"
+    },
+    {
+      "path": "é.txt",
+      "content_hex": "6e6663",
+      "size": 3,
+      "sha256": "8c8a7a3c5ef6f3ecc78042144c3744a4ac87b52477d2ee847c78cf0e5d422a25"
+    },
+    {
+      "path": ".agent",
+      "content_hex": "68696464656e",
+      "size": 6,
+      "sha256": "e564b4081d7a9ea4b00dada53bdae70c99b87b6fce869f0c3dd4d2bfa1e53e1c"
+    },
+    {
+      "path": "nested/prompt.md",
+      "content_hex": "626f6e6a6f75720a",
+      "size": 8,
+      "sha256": "9cec0af545144159bac85c7b908d5e0b9b0ef961497401c5ad8da26f065ad926"
+    },
+    {
+      "path": "é.txt",
+      "content_hex": "6e6664",
+      "size": 3,
+      "sha256": "df7353de1c454ee3ce46ede1f61a0a89aeb6310f6814e325b0cf7ec5bfadad80"
+    }
+  ],
+  "expected_bundle_sha256": "722445717b1c09896c6ead4a235619caf08d6e54e8f5c2ccf90aa85556edc15b"
+}
