@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
 import sys
 import tomllib
 from importlib.metadata import version
@@ -49,6 +51,33 @@ def test_runtime_uses_python_3_13() -> None:
 
 def test_runtime_package_imports() -> None:
     assert importlib.import_module("projetv0_voice") is not None
+
+
+def test_production_wiring_module_is_packaged() -> None:
+    assert importlib.import_module("projetv0_voice.production_wiring") is not None
+
+
+def test_module_entrypoint_rejects_forbidden_environment_before_heavy_imports() -> None:
+    environment = dict(os.environ)
+    environment["VOICE_TELNYX_API_KEY"] = "SYNTHETIC-SENTINEL"
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "projetv0_voice.server"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    rendered = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert "runtime_environment_forbidden" in rendered
+    assert "SYNTHETIC-SENTINEL" not in rendered
+    assert "Pipecat" not in rendered
+    assert "uvicorn" not in rendered.casefold()
 
 
 def test_pipecat_is_pinned_to_1_7_0() -> None:
@@ -141,7 +170,8 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
             "run": (
                 'sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 '
                 'uv run pytest tests/unit/test_runtime_config.py '
-                'tests/unit/test_qualified_profile.py -q -k '
+                'tests/unit/test_qualified_profile.py '
+                'tests/unit/test_production_wiring.py -q -k '
                 '"linux_kernel or fifo or socket or grows"'
             ),
         },

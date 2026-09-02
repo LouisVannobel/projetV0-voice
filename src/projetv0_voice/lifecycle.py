@@ -301,7 +301,7 @@ class RuntimeProductionFactories:
     sink_factory: Callable[[SecretStr], _RuntimeSink]
     call_control_factory: Callable[[SecretStr], _ProcessCallControl]
     inference_factory: Callable[
-        [SecretStr, RuntimeDeploymentProfileV1], RuntimeInferenceFactories
+        [SecretStr, RuntimeDeploymentProfileV1, str], RuntimeInferenceFactories
     ]
 
     def __post_init__(self) -> None:
@@ -1712,7 +1712,9 @@ async def build_production_runtime(
         )
         raw_call_control = factories.call_control_factory(telnyx_api_key)
         inference = factories.inference_factory(
-            openrouter_api_key, selection.profile
+            openrouter_api_key,
+            selection.profile,
+            manifest.language,
         )
         if not isinstance(inference, RuntimeInferenceFactories):
             raise RuntimeError("runtime_inference_composition_invalid")

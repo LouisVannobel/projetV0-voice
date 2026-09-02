@@ -2647,3 +2647,39 @@ async def test_real_active_websocket_disconnect_does_not_wait_for_idle_timeout()
 
     assert admission.allows_audio() is False
     assert lease.calls == [("failed", "transport_disconnected")]
+
+
+@pytest.mark.asyncio
+async def test_ten_real_local_sessions_isolate_one_terminated_call() -> None:
+    fixtures = [
+        _real_websocket_session(timeout=False, active_before_disconnect=True)
+        for _ in range(10)
+    ]
+    tasks = [
+        asyncio.create_task(session.run(session.handshake))
+        for session, _lease, _writer, _admission, _disconnect in fixtures
+    ]
+    await asyncio.gather(
+        *(writer.disclosure_committed.wait() for _, _, writer, _, _ in fixtures)
+    )
+    assert all(admission.allows_audio() for _, _, _, admission, _ in fixtures)
+
+    fixtures[0][4].set()
+    with pytest.raises(session_module.CallSessionError, match="transport_disconnected"):
+        await asyncio.wait_for(tasks[0], timeout=3)
+
+    assert all(not task.done() for task in tasks[1:])
+    assert all(
+        admission.allows_audio() for _, _, _, admission, _ in fixtures[1:]
+    )
+
+    for _session, _lease, _writer, _admission, disconnect in fixtures[1:]:
+        disconnect.set()
+    results = await asyncio.gather(*tasks[1:], return_exceptions=True)
+
+    assert all(
+        isinstance(result, session_module.CallSessionError)
+        and str(result) == "transport_disconnected"
+        for result in results
+    )
+    assert all(not admission.allows_audio() for _, _, _, admission, _ in fixtures)

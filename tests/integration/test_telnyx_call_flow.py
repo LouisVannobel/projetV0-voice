@@ -1121,3 +1121,94 @@ async def test_timeout_then_late_commit_uses_fail_closed_confirmation_only(
     assert await registry.snapshot("control-a") is None
     await writer.drain(2)
     await writer_task
+
+
+@pytest.mark.asyncio
+async def test_public_observed_ingress_preserves_both_legacy_alias_phases_unchanged() -> None:
+    from projetv0_voice.telnyx.webhooks import ResolvedWebhook, VerifiedWebhook
+
+    event = VerifiedWebhook(
+        event_id="event-a",
+        event_type="call.initiated",
+        occurred_at=datetime(2026, 8, 29, 10, tzinfo=UTC),
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"n" * 32,
+        legacy_v1_semantic_fingerprint_sha256=b"l" * 32,
+        direction="incoming",
+        call_state="parked",
+    )
+    phases: list[tuple[str, bytes | None]] = []
+
+    class Verifier:
+        def verify(self, **_: object) -> VerifiedWebhook:
+            return event
+
+    class Handle:
+        async def wait(self) -> WebhookDisposition:
+            return WebhookDisposition(200)
+
+    class Owner:
+        async def classify_webhook_receipt(self, received: VerifiedWebhook) -> str:
+            phases.append(
+                ("classification", received.legacy_v1_semantic_fingerprint_sha256)
+            )
+            return "missing"
+
+        def start_webhook_finalization(
+            self, received: VerifiedWebhook, resolution: ResolvedWebhook
+        ) -> Handle:
+            assert resolution.effect is None
+            phases.append(
+                ("submission", received.legacy_v1_semantic_fingerprint_sha256)
+            )
+            return Handle()
+
+    async def resolve(received: VerifiedWebhook) -> ResolvedWebhook:
+        assert received is event
+        return ResolvedWebhook(None)
+
+    processor = TelnyxWebhookProcessor(
+        verifier=Verifier(),  # type: ignore[arg-type]
+        resolver=resolve,
+        finalizer_owner=Owner(),  # type: ignore[arg-type]
+    )
+
+    outcome = await processor.process_observed(body=b"{}", headers=[])
+    compatibility = await TelnyxWebhookProcessor(
+        verifier=Verifier(),  # type: ignore[arg-type]
+        resolver=resolve,
+        finalizer_owner=Owner(),  # type: ignore[arg-type]
+    ).process(body=b"{}", headers=[])
+
+    assert outcome.disposition == WebhookDisposition(200)
+    assert compatibility == outcome.disposition
+    assert phases == [
+        ("classification", b"l" * 32),
+        ("submission", b"l" * 32),
+        ("classification", b"l" * 32),
+        ("submission", b"l" * 32),
+    ]
+    assert outcome.webhook_class == "initiated"
+    assert outcome.receipt == "first"
+    assert outcome.metric_disposition == "ok"
+    assert outcome.admission_rejection is None
+
+
+def test_public_observed_result_rejects_values_outside_closed_domains() -> None:
+    from projetv0_voice.telnyx.webhooks import ObservedWebhookResult
+
+    with pytest.raises(ValueError, match="^observed_webhook_result_invalid$"):
+        ObservedWebhookResult(
+            disposition=WebhookDisposition(200),
+            webhook_class="private",  # type: ignore[arg-type]
+            receipt="first",
+            metric_disposition="ok",
+        )

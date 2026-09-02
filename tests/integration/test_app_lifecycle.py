@@ -1177,8 +1177,8 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         ),
         sink_factory=lambda _dsn: order.append("sink") or Sink(),
         call_control_factory=lambda _key: order.append("call-control") or Control(),
-        inference_factory=lambda _key, _profile: (
-            order.append("inference")
+        inference_factory=lambda _key, _profile, language: (
+            order.append(f"inference:{language}")
             or RuntimeInferenceFactories(
                 stt_http_client_factory=lambda: object(),  # type: ignore[arg-type]
                 stt_factory=lambda _client: object(),  # type: ignore[arg-type]
@@ -1208,7 +1208,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         "metrics",
         "sink",
         "call-control",
-        "inference",
+        "inference:fr",
     ]
     assert graph.raw_call_control is not graph.measured_call_control
     assert graph.supervisor.call_control_facade is graph.measured_call_control

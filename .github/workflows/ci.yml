@@ -25,6 +25,6 @@ jobs:
       - run: uv sync --all-groups --frozen
       - run: uv run pytest -q
       - name: Run privileged Linux descriptor cases
-        run: sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 uv run pytest tests/unit/test_runtime_config.py tests/unit/test_qualified_profile.py -q -k "linux_kernel or fifo or socket or grows"
+        run: sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 uv run pytest tests/unit/test_runtime_config.py tests/unit/test_qualified_profile.py tests/unit/test_production_wiring.py -q -k "linux_kernel or fifo or socket or grows"
       - run: uv run ruff check .
       - run: uv run mypy --strict src

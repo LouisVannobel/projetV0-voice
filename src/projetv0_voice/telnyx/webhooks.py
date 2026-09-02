@@ -230,6 +230,65 @@ class WebhookDisposition:
     body: bytes = b""
 
 
+type ObservedWebhookClass = Literal[
+    "initiated", "answered", "terminal", "recording", "unsupported", "invalid"
+]
+type ObservedWebhookReceipt = Literal["none", "first", "duplicate"]
+type ObservedWebhookMetricDisposition = Literal[
+    "ok", "bad_request", "forbidden", "too_large", "unavailable", "internal_error"
+]
+type ObservedAdmissionRejection = Literal[
+    "capacity", "draining", "qualification", "persistence", "invalid"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedWebhookResult:
+    """One closed terminal result owned by a webhook delivery."""
+
+    disposition: WebhookDisposition
+    webhook_class: ObservedWebhookClass
+    receipt: ObservedWebhookReceipt
+    metric_disposition: ObservedWebhookMetricDisposition
+    admission_rejection: ObservedAdmissionRejection | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.disposition, WebhookDisposition)
+            or self.disposition.status_code not in {200, 400, 403, 413, 500, 503}
+            or self.disposition.body != b""
+            or self.webhook_class
+            not in {
+                "initiated",
+                "answered",
+                "terminal",
+                "recording",
+                "unsupported",
+                "invalid",
+            }
+            or self.receipt not in {"none", "first", "duplicate"}
+            or self.metric_disposition
+            not in {
+                "ok",
+                "bad_request",
+                "forbidden",
+                "too_large",
+                "unavailable",
+                "internal_error",
+            }
+            or self.admission_rejection
+            not in {
+                None,
+                "capacity",
+                "draining",
+                "qualification",
+                "persistence",
+                "invalid",
+            }
+        ):
+            raise ValueError("observed_webhook_result_invalid") from None
+
+
 WebhookResolver = Callable[
     [VerifiedWebhook], ResolvedWebhook | Awaitable[ResolvedWebhook]
 ]
@@ -621,6 +680,70 @@ class TelnyxWebhookVerifier:
         return verified
 
 
+def _observed_rejection(
+    error: CallAdmissionRejected,
+) -> ObservedAdmissionRejection | None:
+    code = error.args[0] if error.args and isinstance(error.args[0], str) else ""
+    if code in {"call_capacity_reached", "placeholder_capacity_reached"}:
+        return "capacity"
+    if code == "call_draining":
+        return "draining"
+    if code in {"qualification_run_consumed", "qualification_window_expired"}:
+        return "qualification"
+    if code in {
+        "call_event_invalid",
+        "call_identity_conflict",
+        "call_clock_invalid",
+        "stream_token_invalid",
+        "call_identifier_invalid",
+    }:
+        return "invalid"
+    if code == "owner_registration_failed":
+        return "persistence"
+    return None
+
+
+def _observed_class(event: VerifiedWebhook | None) -> ObservedWebhookClass:
+    if event is None:
+        return "invalid"
+    if event.event_type == "call.initiated":
+        return "initiated"
+    if event.event_type == "call.answered":
+        return "answered"
+    if event.event_type == "call.hangup":
+        return "terminal"
+    if event.event_type in {"call.recording.saved", "call.recording.error"}:
+        return "recording"
+    return "unsupported"
+
+
+def _observed(
+    event: VerifiedWebhook | None,
+    receipt: ObservedWebhookReceipt,
+    status_code: int,
+    rejection: ObservedAdmissionRejection | None = None,
+) -> ObservedWebhookResult:
+    if status_code == 200:
+        metric_disposition: ObservedWebhookMetricDisposition = "ok"
+    elif status_code == 400:
+        metric_disposition = "bad_request"
+    elif status_code == 403:
+        metric_disposition = "forbidden"
+    elif status_code == 413:
+        metric_disposition = "too_large"
+    elif status_code == 503:
+        metric_disposition = "unavailable"
+    else:
+        metric_disposition = "internal_error"
+    return ObservedWebhookResult(
+        disposition=WebhookDisposition(status_code),
+        webhook_class=_observed_class(event),
+        receipt=receipt,
+        metric_disposition=metric_disposition,
+        admission_rejection=rejection,
+    )
+
+
 class TelnyxWebhookProcessor:
     """Verify, resolve, and synchronously transfer finalization to the process owner."""
 
@@ -672,34 +795,36 @@ class TelnyxWebhookProcessor:
             return None
         return handle
 
-    async def process(
+    async def process_observed(
         self,
         *,
         body: bytes,
         headers: Sequence[tuple[str, str]],
-    ) -> WebhookDisposition:
+    ) -> ObservedWebhookResult:
+        event: VerifiedWebhook | None = None
         try:
             event = self._verifier.verify(body=body, headers=headers)
         except WebhookBodyTooLarge:
-            return WebhookDisposition(413)
+            return _observed(None, "none", 413, "invalid")
         except InvalidWebhookSignature:
-            return WebhookDisposition(403)
+            return _observed(None, "none", 403, "invalid")
         except InvalidWebhookPayload:
-            return WebhookDisposition(400)
+            return _observed(None, "none", 400, "invalid")
         except WebhookInternalError:
-            return WebhookDisposition(500)
+            return _observed(None, "none", 500)
         except Exception:
-            return WebhookDisposition(500)
+            return _observed(None, "none", 500)
 
         try:
             classification = await self._finalizer_owner.classify_webhook_receipt(event)
         except (PersistenceError, TimeoutError):
-            return WebhookDisposition(503)
+            return _observed(event, "none", 503, "persistence")
         except Exception:
-            return WebhookDisposition(500)
+            return _observed(event, "none", 500)
         if classification == "conflict":
-            return WebhookDisposition(400)
+            return _observed(event, "none", 400, "invalid")
         if classification == "duplicate":
+            receipt: ObservedWebhookReceipt = "duplicate"
             if self._duplicate_resolver is None:
                 resolution: ResolvedWebhook | Awaitable[ResolvedWebhook] = ResolvedWebhook(None)
             else:
@@ -708,35 +833,61 @@ class TelnyxWebhookProcessor:
                     if inspect.isawaitable(resolution):
                         resolution = await resolution
                 except CallAdmissionRejected as error:
-                    return WebhookDisposition(error.status_code)
+                    return _observed(
+                        event,
+                        "none",
+                        error.status_code,
+                        _observed_rejection(error),
+                    )
                 except Exception:
-                    return WebhookDisposition(500)
+                    return _observed(event, "none", 500)
         elif classification == "missing":
+            receipt = "first"
             try:
                 resolution = self._resolver(event)
                 if inspect.isawaitable(resolution):
                     resolution = await resolution
             except CallAdmissionRejected as error:
-                return WebhookDisposition(error.status_code)
+                return _observed(
+                    event,
+                    "none",
+                    error.status_code,
+                    _observed_rejection(error),
+                )
             except Exception:
-                return WebhookDisposition(500)
+                return _observed(event, "none", 500)
         else:
-            return WebhookDisposition(500)
+            return _observed(event, "none", 500)
         if not isinstance(resolution, ResolvedWebhook):
-            return WebhookDisposition(500)
+            return _observed(event, "none", 500)
         handle = self.start_webhook_finalization(event, resolution)
         if handle is None:
-            return WebhookDisposition(503)
+            return _observed(event, "none", 503, "persistence")
         try:
             disposition = await asyncio.shield(handle.wait())
         except asyncio.CancelledError:
             raise
         except Exception:
-            return WebhookDisposition(500)
+            return _observed(event, receipt, 500)
         if (
             not isinstance(disposition, WebhookDisposition)
             or disposition.status_code not in {200, 400, 500, 503}
             or disposition.body != b""
         ):
-            return WebhookDisposition(500)
-        return disposition
+            return _observed(event, receipt, 500)
+        rejection: ObservedAdmissionRejection | None = None
+        if receipt == "first" and disposition.status_code == 503:
+            rejection = "persistence"
+        elif receipt == "first" and disposition.status_code == 400:
+            rejection = "invalid"
+        return _observed(event, receipt, disposition.status_code, rejection)
+
+    async def process(
+        self,
+        *,
+        body: bytes,
+        headers: Sequence[tuple[str, str]],
+    ) -> WebhookDisposition:
+        """Compatibility wrapper returning only the historical disposition."""
+
+        return (await self.process_observed(body=body, headers=headers)).disposition
