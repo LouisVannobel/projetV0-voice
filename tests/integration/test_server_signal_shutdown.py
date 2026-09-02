@@ -32,58 +32,59 @@ def _signal_process_script(mode: str) -> str:
         f"""
         import asyncio
         import os
+        import signal
         import socket
         import sys
         import tempfile
         from datetime import UTC, datetime, timedelta
-        from pathlib import Path, PurePosixPath
+        from pathlib import Path
         from uuid import UUID
 
-        from loguru import logger
-
-        logger.disable("pipecat")
-
-        from projetv0_voice.crypto import CryptoKeyring
-        from projetv0_voice.lifecycle import RuntimeSupervisor
-        from projetv0_voice.metrics import RuntimeMetrics
-        from projetv0_voice.persistence.writer import PersistenceWriter
-        from projetv0_voice.runtime_config import RuntimeSettingsV1
-        from projetv0_voice.server import FirstSignalDrainCoordinator, VoiceUvicornServer
-        from projetv0_voice.telnyx.call_control import CallControlResult
-
         MODE = {mode!r}
-        settings = RuntimeSettingsV1(
-            runtime_mode="strict",
-            deployment_id="voice-agent-a",
-            runtime_contract_path=PurePosixPath("/srv/runtime.json"),
-            agent_bundle_path=PurePosixPath("/srv/bundle"),
-            qualified_profile_path=PurePosixPath("/srv/profile.json"),
-            qualification_candidate_path=None,
-            qualification_override_path=None,
-            keyring_path=PurePosixPath("/run/secrets/aead_keyring_v1.json"),
-            sqlite_path=PurePosixPath("/var/lib/voice.sqlite3"),
-            runtime_contract_sha256="a" * 64,
-            image_digest="ghcr.io/example/voice@sha256:" + "d" * 64,
-            agent_bundle_sha256="b" * 64,
-            inference_profile_sha256="c" * 64,
-            qualification_run_id=None,
-            benchmark_did_sha256=None,
-            deployment_max_calls=1,
-            handshake_timeout_seconds=5,
-            call_idle_timeout_seconds=300,
-            call_cleanup_phase_timeout_seconds=10,
-            pre_drain_grace_seconds=1,
-            uvicorn_grace_seconds=1,
-            shutdown_grace_seconds=5,
-            telnyx_api_key_file=PurePosixPath("/run/secrets/telnyx"),
-            telnyx_webhook_public_key_file=PurePosixPath("/run/secrets/webhook"),
-            openrouter_api_key_file=PurePosixPath("/run/secrets/openrouter"),
-            postgres_dsn_file=PurePosixPath("/run/secrets/postgres"),
-            telnyx_media_wss_url="wss://voice.invalid/telnyx/media",
-            otlp_http_endpoint="https://collector.invalid/v1/metrics",
-            bind_host="127.0.0.1",
-            bind_port=18080,
+        from projetv0_voice.runtime_config import (
+            capture_runtime_environment,
+            parse_runtime_settings,
         )
+        runtime_environment = {{
+            "VOICE_RUNTIME_MODE": "strict",
+            "VOICE_DEPLOYMENT_ID": "voice-agent-a",
+            "VOICE_RUNTIME_CONTRACT_PATH": "/srv/runtime.json",
+            "VOICE_AGENT_BUNDLE_PATH": "/srv/bundle",
+            "VOICE_QUALIFIED_PROFILE_PATH": "/srv/profile.json",
+            "VOICE_KEYRING_PATH": "/run/secrets/aead_keyring_v1.json",
+            "VOICE_SQLITE_PATH": "/var/lib/voice.sqlite3",
+            "VOICE_RUNTIME_CONTRACT_SHA256": "a" * 64,
+            "VOICE_IMAGE_DIGEST": "ghcr.io/example/voice@sha256:" + "d" * 64,
+            "VOICE_AGENT_BUNDLE_SHA256": "b" * 64,
+            "VOICE_INFERENCE_PROFILE_SHA256": "c" * 64,
+            "VOICE_DEPLOYMENT_MAX_CALLS": "1",
+            "VOICE_HANDSHAKE_TIMEOUT_SECONDS": "5",
+            "VOICE_CALL_IDLE_TIMEOUT_SECONDS": "300",
+            "VOICE_CALL_CLEANUP_PHASE_TIMEOUT_SECONDS": "10",
+            "VOICE_PRE_DRAIN_GRACE_SECONDS": "1",
+            "VOICE_UVICORN_GRACE_SECONDS": "1",
+            "VOICE_SHUTDOWN_GRACE_SECONDS": "5",
+            "VOICE_TELNYX_API_KEY_FILE": "/run/secrets/telnyx",
+            "VOICE_TELNYX_WEBHOOK_PUBLIC_KEY_FILE": "/run/secrets/webhook",
+            "VOICE_OPENROUTER_API_KEY_FILE": "/run/secrets/openrouter",
+            "VOICE_POSTGRES_DSN_FILE": "/run/secrets/postgres",
+            "VOICE_TELNYX_MEDIA_WSS_URL": "wss://voice.invalid/telnyx/media",
+            "VOICE_OTLP_HTTP_ENDPOINT": "https://collector.invalid/v1/metrics",
+            "VOICE_BIND_HOST": "127.0.0.1",
+            "VOICE_BIND_PORT": "18080",
+        }}
+        capture = capture_runtime_environment(runtime_environment)
+        settings = parse_runtime_settings(
+            capture,
+            geteuid=lambda: 10001,
+            getegid=lambda: 10001,
+        )
+
+        from projetv0_voice.dependency_logging import configure_dependency_logging
+
+        configure_dependency_logging(settings.observability_token())
+
+        from projetv0_voice.server import FirstSignalDrainCoordinator, VoiceUvicornServer
 
         input_used = False
 
@@ -92,17 +93,140 @@ def _signal_process_script(mode: str) -> str:
             if input_used:
                 return
             input_used = True
-            reader = asyncio.StreamReader()
-            protocol = asyncio.StreamReaderProtocol(reader)
-            await asyncio.get_running_loop().connect_read_pipe(
-                lambda: protocol, sys.stdin
-            )
-            await reader.readline()
+            await asyncio.to_thread(sys.stdin.buffer.readline)
 
         async def barrier(name):
             if MODE == name:
                 print("PHASE:" + name, flush=True)
                 await input_line()
+
+        def global_hard_exit(code):
+            print("GLOBAL_HARD:" + str(code), flush=True)
+            os._exit(code)
+
+        def runtime_hard_exit(code):
+            print("RUNTIME_HARD:" + str(code), flush=True)
+            os._exit(73)
+
+        shutdown_seen = False
+        gate_opened = False
+
+        class App:
+            def __init__(self, coordinator, supervisor):
+                self.coordinator = coordinator
+                self.supervisor = supervisor
+
+            async def __call__(self, scope, receive, send):
+                global shutdown_seen, gate_opened
+                assert scope["type"] == "lifespan"
+                assert (await receive())["type"] == "lifespan.startup"
+                failure = None
+                try:
+                    if MODE == "before_runtime_publication":
+                        await barrier("before_runtime_publication")
+                    self.coordinator.publish_runtime(self.supervisor)
+                    await self.supervisor.startup()
+                    gate_opened = True
+                    self.coordinator.publish_startup_complete()
+                    await send({{"type": "lifespan.startup.complete"}})
+                    assert (await receive())["type"] == "lifespan.shutdown"
+                    shutdown_seen = True
+                except BaseException as error:
+                    failure = error
+                    self.coordinator.publish_startup_failure()
+                try:
+                    await self.supervisor.aclose()
+                except BaseException:
+                    self.coordinator.publish_startup_failure()
+                    raise
+                finally:
+                    print("GATE:" + str(int(gate_opened)), flush=True)
+                if isinstance(failure, asyncio.CancelledError):
+                    print("CANCELLED", flush=True)
+                    raise failure
+                if failure is not None:
+                    await send({{
+                        "type": "lifespan.startup.failed",
+                        "message": "runtime_startup_failed",
+                    }})
+                    return
+                print("SHUTDOWN_COMPLETE", flush=True)
+                await send({{"type": "lifespan.shutdown.complete"}})
+
+        if MODE.startswith("programmatic_"):
+            class ProgrammaticSupervisor:
+                def __init__(self):
+                    self.raw_begin_drain_calls = 0
+                    self.effective_drain_transitions = 0
+                    self.aclose_calls = 0
+                    self._draining = False
+
+                async def startup(self):
+                    return None
+
+                async def begin_drain(self):
+                    self.raw_begin_drain_calls += 1
+                    if not self._draining:
+                        self._draining = True
+                        self.effective_drain_transitions += 1
+                        print("DRAIN", flush=True)
+
+                async def aclose(self):
+                    self.aclose_calls += 1
+                    print("ACLOSE_STARTED", flush=True)
+                    await self.begin_drain()
+                    if MODE == "programmatic_hard_deadline":
+                        await asyncio.Event().wait()
+                    await input_line()
+                    print("ACLOSE_FINISHED", flush=True)
+
+            async def run_programmatic():
+                supervisor = ProgrammaticSupervisor()
+                coordinator = FirstSignalDrainCoordinator(
+                    settings=settings,
+                    hard_exit=global_hard_exit,
+                )
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                server = VoiceUvicornServer(
+                    App(coordinator, supervisor),
+                    settings=settings,
+                    coordinator=coordinator,
+                )
+                task = asyncio.create_task(server.serve(sockets=[listener]))
+                while not server.started:
+                    await asyncio.sleep(0)
+                print("READY", flush=True)
+                server.handle_exit(signal.SIGTERM, None)
+                try:
+                    await task
+                finally:
+                    listener.close()
+                print(
+                    "SUMMARY:"
+                    + ":".join(
+                        (
+                            str(supervisor.raw_begin_drain_calls),
+                            str(supervisor.effective_drain_transitions),
+                            str(int(supervisor._draining)),
+                            str(int(server.force_exit)),
+                            str(int(coordinator.urgent)),
+                            str(int(shutdown_seen)),
+                        )
+                    ),
+                    flush=True,
+                )
+
+            asyncio.run(run_programmatic())
+            raise SystemExit(0)
+
+        from projetv0_voice.crypto import CryptoKeyring
+        from projetv0_voice.lifecycle import RuntimeSupervisor
+        from projetv0_voice.metrics import RuntimeMetrics
+        from projetv0_voice.persistence.writer import PersistenceWriter
+        from projetv0_voice.telnyx.call_control import CallControlResult
 
         class BarrierWriter(PersistenceWriter):
             async def wait_ready(self):
@@ -155,6 +279,7 @@ def _signal_process_script(mode: str) -> str:
                 super().__init__(*args, **kwargs)
                 self.raw_begin_drain_calls = 0
                 self.effective_drain_transitions = 0
+                self.aclose_calls = 0
 
             async def begin_drain(self):
                 self.raw_begin_drain_calls += 1
@@ -163,6 +288,12 @@ def _signal_process_script(mode: str) -> str:
                 if not was_draining and self._draining:
                     self.effective_drain_transitions += 1
                     print("DRAIN", flush=True)
+
+            async def aclose(self):
+                self.aclose_calls += 1
+                print("ACLOSE_STARTED", flush=True)
+                await super().aclose()
+                print("ACLOSE_FINISHED", flush=True)
 
         async def seed_stale(path, keyring):
             seed = PersistenceWriter(path, keyring)
@@ -182,51 +313,6 @@ def _signal_process_script(mode: str) -> str:
             )
             await seed.drain(2.0)
             await owner
-
-        def global_hard_exit(code):
-            print("GLOBAL_HARD:" + str(code), flush=True)
-            os._exit(code)
-
-        def runtime_hard_exit(code):
-            print("RUNTIME_HARD:" + str(code), flush=True)
-            os._exit(73)
-
-        shutdown_seen = False
-        gate_opened = False
-
-        class App:
-            def __init__(self, coordinator, supervisor):
-                self.coordinator = coordinator
-                self.supervisor = supervisor
-
-            async def __call__(self, scope, receive, send):
-                global shutdown_seen, gate_opened
-                assert scope["type"] == "lifespan"
-                assert (await receive())["type"] == "lifespan.startup"
-                try:
-                    if MODE == "before_runtime_publication":
-                        await barrier("before_runtime_publication")
-                    self.coordinator.publish_runtime(self.supervisor)
-                    await self.supervisor.startup()
-                    gate_opened = True
-                    self.coordinator.publish_startup_complete()
-                    await send({{"type": "lifespan.startup.complete"}})
-                    assert (await receive())["type"] == "lifespan.shutdown"
-                    shutdown_seen = True
-                    await send({{"type": "lifespan.shutdown.complete"}})
-                except asyncio.CancelledError:
-                    self.coordinator.publish_startup_failure()
-                    print("CANCELLED", flush=True)
-                    raise
-                except BaseException:
-                    self.coordinator.publish_startup_failure()
-                    await send({{
-                        "type": "lifespan.startup.failed",
-                        "message": "runtime_startup_failed",
-                    }})
-                finally:
-                    await self.supervisor.aclose()
-                    print("GATE:" + str(int(gate_opened)), flush=True)
 
         async def run():
             temporary = tempfile.TemporaryDirectory(prefix="voice-signal-")
@@ -2992,6 +3078,73 @@ async def _read_process_marker(
             return lines
 
 
+async def _kill_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_programmatic_lifespan_closes_runtime_before_shutdown_complete(
+) -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _signal_process_script("programmatic_order"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        lines = await _read_process_marker(process, "READY")
+        lines.extend(await _read_process_marker(process, "ACLOSE_STARTED"))
+        assert "SHUTDOWN_COMPLETE" not in lines
+
+        assert process.stdin is not None
+        process.stdin.write(b"continue\n")
+        await process.stdin.drain()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=8.0)
+        lines.extend(stdout.decode("utf-8", errors="strict").splitlines())
+
+        assert process.returncode == 0
+        assert stderr == b""
+        assert lines.count("ACLOSE_STARTED") == 1
+        assert lines.count("ACLOSE_FINISHED") == 1
+        assert lines.count("SHUTDOWN_COMPLETE") == 1
+        assert lines.index("ACLOSE_FINISHED") < lines.index("SHUTDOWN_COMPLETE")
+    finally:
+        await _kill_process(process)
+
+
+@pytest.mark.asyncio
+async def test_programmatic_lifespan_hard_deadline_waits_for_global_seam(
+) -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _signal_process_script("programmatic_hard_deadline"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        lines = await _read_process_marker(process, "READY")
+        lines.extend(await _read_process_marker(process, "ACLOSE_STARTED"))
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=8.0)
+        lines.extend(stdout.decode("utf-8", errors="strict").splitlines())
+
+        assert process.returncode == 72
+        assert stderr == b""
+        assert lines.count("GLOBAL_HARD:72") == 1
+        assert "ACLOSE_FINISHED" not in lines
+        assert "SHUTDOWN_COMPLETE" not in lines
+        assert not any(line.startswith("RUNTIME_HARD:") for line in lines)
+        assert not any(line.startswith("SUMMARY:") for line in lines)
+    finally:
+        await _kill_process(process)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process signals")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -3025,6 +3178,8 @@ async def test_signal_proc_repeated_signal_permutations_preserve_lifespan(
 
     assert process.returncode == 0
     assert stderr == b""
+    assert lines.count("ACLOSE_STARTED") == 1
+    assert lines.count("ACLOSE_FINISHED") == 1
     summary = next(line for line in lines if line.startswith("SUMMARY:"))
     _label, raw_calls, transitions, draining, forced, urgent, shutdown = summary.split(
         ":"
@@ -3076,6 +3231,8 @@ async def test_signal_proc_before_every_startup_await_prevents_gate_open(
     assert process.returncode != 72
     assert "GATE:1" not in lines
     assert "GATE:0" in lines
+    assert lines.count("ACLOSE_STARTED") == 1
+    assert lines.count("ACLOSE_FINISHED") == 1
     assert b"force_exit" not in stderr
 
 
@@ -3096,6 +3253,8 @@ async def test_signal_proc_real_startup_failure_unwinds_without_hard_exit() -> N
 
     assert process.returncode == 0
     assert "GATE:0" in lines
+    assert lines.count("ACLOSE_STARTED") == 1
+    assert lines.count("ACLOSE_FINISHED") == 1
     assert not any(line.startswith(("GLOBAL_HARD:", "RUNTIME_HARD:")) for line in lines)
     assert b"private" not in stderr
 
@@ -3119,6 +3278,8 @@ async def test_signal_proc_only_global_deadline_invokes_hard_exit_72() -> None:
 
     assert process.returncode == 72
     assert lines.count("GLOBAL_HARD:72") == 1
+    assert lines.count("ACLOSE_STARTED") == 1
+    assert "ACLOSE_FINISHED" not in lines
     assert not any(line.startswith("RUNTIME_HARD:") for line in lines)
     assert not any(line.startswith("SUMMARY:") for line in lines)
 
