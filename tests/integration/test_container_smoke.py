@@ -25,7 +25,10 @@ UV_IMAGE = (
     "ghcr.io/astral-sh/uv:0.12.4"
     "@sha256:d0a6eca6c669dc7e9c51218707b8438a3d30402733d739dcc00adb3e213e8f5c"
 )
-POSTGRES_IMAGE = "postgres:16-bookworm"
+POSTGRES_IMAGE = (
+    "postgres:16.15-bookworm"
+    "@sha256:bb3e1a57e5407e0a5280b4211980a5e537f4abd234a87014ac979849a78dd825"
+)
 SMOKE_ENABLED = os.environ.get("PROJETV0_CONTAINER_SMOKE") == "1"
 
 
@@ -268,6 +271,13 @@ def test_dockerignore_is_a_minimal_allowlist() -> None:
         "!dist/",
         "!dist/runtime-contract.json",
     ]
+
+
+def test_container_smoke_database_image_is_immutable() -> None:
+    assert POSTGRES_IMAGE == (
+        "postgres:16.15-bookworm"
+        "@sha256:bb3e1a57e5407e0a5280b4211980a5e537f4abd234a87014ac979849a78dd825"
+    )
 
 
 @pytest.mark.skipif(
