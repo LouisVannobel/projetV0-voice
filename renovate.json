@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "schedule:weekly"],
+  "automerge": false,
+  "pinDigests": true,
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Pin declared Python dependencies",
+      "matchManagers": ["pep621"],
+      "matchDepTypes": [
+        "project.dependencies",
+        "dependency-groups",
+        "build-system.requires"
+      ],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Group the Pipecat compatibility surface",
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["pipecat-ai"],
+      "groupName": "Pipecat compatibility surface"
+    },
+    {
+      "description": "Keep the Python base separate",
+      "matchPackageNames": ["python"],
+      "groupName": "Python base"
+    },
+    {
+      "description": "Keep Telnyx separate",
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["telnyx"],
+      "groupName": "Telnyx SDK"
+    }
+  ]
+}

@@ -1,56 +1,65 @@
-name: Voice runtime CI
+name: Publish immutable Voice image
 
 on:
-  push:
-    branches: [main, "z/**"]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        type: string
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  shared-repository-ci:
-    uses: LouisVannobel/projetV0-pipelines/.github/workflows/reusable-repository-ci.yml@399df8dcb93a28734269ad11b63e847896684487
+  release:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    permissions:
+      contents: read
+      packages: write
+    uses: LouisVannobel/projetV0-pipelines/.github/workflows/reusable-oci-release.yml@97cf6d2c5348f202c232fd872c4d4592d430297b # v1.2.0
+    with:
+      registry-username: ${{ github.actor }}
+      image: ghcr.io/louisvannobel/projetv0-voice
+      version: ${{ inputs.version }}
+      docker-context: .
+      dockerfile: Dockerfile
+      platforms: linux/amd64
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+      registry-read-password: ${{ secrets.GITHUB_TOKEN }}
 
-  python-linux:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
-        with:
-          version: "0.12.4"
-          python-version: "3.13.15"
-      - run: uv sync --all-groups --frozen
-      - run: uv run pytest -q
-      - name: Run privileged Linux descriptor cases
-        run: sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 uv run pytest tests/unit/test_runtime_config.py tests/unit/test_qualified_profile.py tests/unit/test_production_wiring.py -q -k "linux_kernel or fifo or socket or grows"
-      - run: uv run ruff check .
-      - run: uv run mypy --strict src
-
-  packaging-image:
+  handoff:
+    needs: release
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           version: "0.12.4"
           python-version: "3.13.15"
-      - run: uv lock --check
-      - run: uv sync --all-groups --frozen
-      - name: Export and prove runtime and bundle parity
+      - name: Regenerate the six pre-image artifacts
         shell: bash
         run: |
           set -Eeuo pipefail
+          uv lock --check
+          uv sync --all-groups --frozen
           uv run python scripts/export_runtime_contract.py --repo-root . --output-dir dist
-          uv run pytest tests/contract/test_runtime_contract.py tests/unit/test_production_wiring.py::test_bundle_consumer_matches_literal_task11_golden_without_a_producer -q
-          sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 uv run pytest tests/unit/test_production_wiring.py::test_linux_kernel_accepts_real_task11_export_without_importing_producer -q
-      - name: Validate the six pre-image artifacts
+      - name: Record the immutable image reference
+        shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ needs.release.outputs.image-reference }}
+        run: printf '%s\n' "$IMAGE_REFERENCE" > dist/image-reference.txt
+      - name: Download the validated SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ needs.release.outputs.sbom-artifact }}
+          path: dist
+      - name: Validate the exact release handoff
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -68,6 +77,8 @@ jobs:
               "qualification-override-v1.schema.json",
               "agent-a-bundle.tar.gz",
               "agent-a-bundle-v1.manifest.json",
+              "image-reference.txt",
+              "sbom.spdx.json",
           }
           root = Path("dist")
           entries = list(root.iterdir())
@@ -79,8 +90,7 @@ jobs:
               if name.endswith(".schema.json"):
                   schema = json.loads((root / name).read_bytes())
                   assert schema["$schema"].startswith("https://json-schema.org/")
-          manifest_bytes = (root / "agent-a-bundle-v1.manifest.json").read_bytes()
-          manifest = json.loads(manifest_bytes)
+          manifest = json.loads((root / "agent-a-bundle-v1.manifest.json").read_bytes())
           assert set(manifest) == {
               "schema_version", "bundle_format", "bundle_sha256", "archive_sha256", "files"
           }
@@ -91,11 +101,19 @@ jobs:
           assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest["archive_sha256"]
           with tarfile.open(archive, mode="r:gz") as bundle:
               assert all(member.isfile() for member in bundle.getmembers())
+          image_reference = (root / "image-reference.txt").read_bytes()
+          assert re.fullmatch(
+              rb"ghcr\.io/louisvannobel/projetv0-voice@sha256:[0-9a-f]{64}\n",
+              image_reference,
+          )
+          sbom = json.loads((root / "sbom.spdx.json").read_bytes())
+          assert sbom["SPDXID"] == "SPDXRef-DOCUMENT"
+          assert sbom["spdxVersion"].startswith("SPDX-")
           PY
-      - name: Upload pre-image handoff
+      - name: Upload the immutable release handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: voice-pre-image-${{ github.sha }}
+          name: voice-release-handoff-${{ inputs.version }}-${{ github.sha }}
           path: |
             dist/runtime-contract.json
             dist/qualified-deployment-profile-v1.schema.json
@@ -103,7 +121,8 @@ jobs:
             dist/qualification-override-v1.schema.json
             dist/agent-a-bundle.tar.gz
             dist/agent-a-bundle-v1.manifest.json
+            dist/image-reference.txt
+            dist/sbom.spdx.json
           if-no-files-found: error
-          retention-days: 14
-      - name: Build and run the required offline container smoke
-        run: PROJETV0_CONTAINER_SMOKE=1 uv run pytest tests/integration/test_container_smoke.py -q
+          overwrite: false
+          retention-days: 90

@@ -40,6 +40,19 @@ EXPECTED_DEVELOPMENT_DEPENDENCIES = [
     "respx==0.23.1",
     "ruff==0.16.4",
 ]
+EXPECTED_PRE_IMAGE_ARTIFACTS = [
+    "dist/runtime-contract.json",
+    "dist/qualified-deployment-profile-v1.schema.json",
+    "dist/qualification-candidate-profile-v1.schema.json",
+    "dist/qualification-override-v1.schema.json",
+    "dist/agent-a-bundle.tar.gz",
+    "dist/agent-a-bundle-v1.manifest.json",
+]
+EXPECTED_RELEASE_HANDOFF_ARTIFACTS = [
+    *EXPECTED_PRE_IMAGE_ARTIFACTS,
+    "dist/image-reference.txt",
+    "dist/sbom.spdx.json",
+]
 
 
 def load_project_metadata() -> dict[str, object]:
@@ -201,7 +214,11 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
         "pull_request": "",
     }
     assert workflow["permissions"] == {"contents": "read"}
-    assert set(workflow["jobs"]) == {"shared-repository-ci", "python-linux"}
+    assert set(workflow["jobs"]) == {
+        "shared-repository-ci",
+        "python-linux",
+        "packaging-image",
+    }
     assert workflow["jobs"]["shared-repository-ci"] == {
         "uses": (
             "LouisVannobel/projetV0-pipelines/.github/workflows/"
@@ -234,3 +251,198 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
         {"run": "uv run ruff check ."},
         {"run": "uv run mypy --strict src"},
     ]
+
+    packaging = workflow["jobs"]["packaging-image"]
+    assert packaging["runs-on"] == "ubuntu-24.04"
+    assert packaging.get("permissions") == {"contents": "read"}
+    steps = packaging["steps"]
+    assert steps[:4] == [
+        {
+            "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "with": {"persist-credentials": "false"},
+        },
+        {
+            "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+            "with": {"version": "0.12.4", "python-version": "3.13.15"},
+        },
+        {"run": "uv lock --check"},
+        {"run": "uv sync --all-groups --frozen"},
+    ]
+    commands = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "scripts/export_runtime_contract.py" in commands
+    assert "tests/contract/test_runtime_contract.py" in commands
+    assert (
+        "test_bundle_consumer_matches_literal_task11_golden_without_a_producer"
+        in commands
+    )
+    assert "test_linux_kernel_accepts_real_task11_export_without_importing_producer" in commands
+    assert (
+        "PROJETV0_CONTAINER_SMOKE=1 uv run pytest "
+        "tests/integration/test_container_smoke.py -q"
+    ) in commands
+
+    uploads = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1
+    assert uploads[0]["uses"] == (
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    )
+    assert uploads[0]["with"]["path"].splitlines() == EXPECTED_PRE_IMAGE_ARTIFACTS
+    assert uploads[0]["with"]["if-no-files-found"] == "error"
+
+
+def test_manual_release_builds_once_on_default_main_and_assembles_handoff() -> None:
+    workflow_path = REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
+    assert workflow_path.is_file()
+    workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+    assert workflow["on"] == {
+        "workflow_dispatch": {
+            "inputs": {
+                "version": {
+                    "description": "Release version",
+                    "required": "true",
+                    "type": "string",
+                }
+            }
+        }
+    }
+    assert workflow["permissions"] == {}
+    assert set(workflow["jobs"]) == {"release", "handoff"}
+
+    release = workflow["jobs"]["release"]
+    assert release == {
+        "if": (
+            "github.ref == 'refs/heads/main' && "
+            "github.event.repository.default_branch == 'main'"
+        ),
+        "permissions": {"contents": "read", "packages": "write"},
+        "uses": (
+            "LouisVannobel/projetV0-pipelines/.github/workflows/"
+            "reusable-oci-release.yml@97cf6d2c5348f202c232fd872c4d4592d430297b"
+        ),
+        "with": {
+            "registry-username": "${{ github.actor }}",
+            "image": "ghcr.io/louisvannobel/projetv0-voice",
+            "version": "${{ inputs.version }}",
+            "docker-context": ".",
+            "dockerfile": "Dockerfile",
+            "platforms": "linux/amd64",
+        },
+        "secrets": {
+            "registry-password": "${{ secrets.GITHUB_TOKEN }}",
+            "registry-read-password": "${{ secrets.GITHUB_TOKEN }}",
+        },
+    }
+
+    handoff = workflow["jobs"]["handoff"]
+    assert handoff["needs"] == "release"
+    assert handoff["runs-on"] == "ubuntu-24.04"
+    assert handoff["permissions"] == {"contents": "read"}
+    steps = handoff["steps"]
+    assert steps[0] == {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {"ref": "${{ github.sha }}", "persist-credentials": "false"},
+    }
+    assert steps[1] == {
+        "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+        "with": {"version": "0.12.4", "python-version": "3.13.15"},
+    }
+    commands = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "uv lock --check" in commands
+    assert "uv sync --all-groups --frozen" in commands
+    assert "scripts/export_runtime_contract.py" in commands
+    assert "dist/image-reference.txt" in commands
+    assert "docker build" not in commands
+    assert "trivy" not in commands.casefold()
+
+    downloads = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+    ]
+    assert len(downloads) == 1
+    assert downloads[0]["with"] == {
+        "name": "${{ needs.release.outputs.sbom-artifact }}",
+        "path": "dist",
+    }
+    uploads = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1
+    assert uploads[0]["with"]["path"].splitlines() == EXPECTED_RELEASE_HANDOFF_ARTIFACTS
+    assert uploads[0]["with"]["if-no-files-found"] == "error"
+    assert uploads[0]["with"]["overwrite"] == "false"
+
+
+def test_renovate_keeps_pinned_compatibility_surfaces_separate() -> None:
+    config_path = REPOSITORY_ROOT / "renovate.json"
+    assert config_path.is_file()
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["$schema"] == "https://docs.renovatebot.com/renovate-schema.json"
+    assert config["extends"] == ["config:recommended", "schedule:weekly"]
+    assert config["automerge"] is False
+    assert config["pinDigests"] is True
+    assert config["lockFileMaintenance"] == {"enabled": True}
+    assert config["packageRules"] == [
+        {
+            "description": "Pin declared Python dependencies",
+            "matchManagers": ["pep621"],
+            "matchDepTypes": [
+                "project.dependencies",
+                "dependency-groups",
+                "build-system.requires",
+            ],
+            "rangeStrategy": "pin",
+        },
+        {
+            "description": "Group the Pipecat compatibility surface",
+            "matchManagers": ["pep621"],
+            "matchPackageNames": ["pipecat-ai"],
+            "groupName": "Pipecat compatibility surface",
+        },
+        {
+            "description": "Keep the Python base separate",
+            "matchPackageNames": ["python"],
+            "groupName": "Python base",
+        },
+        {
+            "description": "Keep Telnyx separate",
+            "matchManagers": ["pep621"],
+            "matchPackageNames": ["telnyx"],
+            "groupName": "Telnyx SDK",
+        },
+    ]
+
+
+def test_task11_docs_record_artifact_release_and_live_boundaries() -> None:
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    agents = (REPOSITORY_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    combined = readme + "\n" + agents
+
+    for required in (
+        "six pre-image artifacts",
+        "eight-file release handoff",
+        "PROJETV0_CONTAINER_SMOKE=1",
+        "main-only manual release",
+        "secrets.GITHUB_TOKEN",
+        "pipecat-ai[cli]==1.7.0",
+        "outside the lock, image, and CI",
+        "No live key or provider call belongs to Task 11",
+        "Telnyx webhook public key",
+        "PostgreSQL DSN",
+        "AEAD keyring",
+        "Call Control connection ID",
+        "benchmark from/DID",
+        "WSS/Funnel URL",
+        "OTLP endpoint",
+        "candidate and qualified profiles",
+        "infrastructure readiness",
+    ):
+        assert required in combined
