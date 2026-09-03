@@ -56,6 +56,20 @@ EXPECTED_RELEASE_HANDOFF_ARTIFACTS = [
     "dist/image-reference.txt",
     "dist/sbom.spdx.json",
 ]
+EXPECTED_SCHEMA_AUTHORITIES = [
+    (
+        "qualified-deployment-profile-v1.schema.json",
+        "qualified-v1.schema.json",
+    ),
+    (
+        "qualification-candidate-profile-v1.schema.json",
+        "qualification-candidate-v1.schema.json",
+    ),
+    (
+        "qualification-override-v1.schema.json",
+        "qualification-override-v1.schema.json",
+    ),
+]
 CONTAINER_SMOKE_COMMAND = (
     "PROJETV0_CONTAINER_SMOKE=1 uv run pytest "
     "tests/integration/test_container_smoke.py -q"
@@ -136,7 +150,7 @@ def assert_packaging_orchestration(workflow: dict[str, object]) -> None:
             None,
             "bash",
             None,
-            "efe22a0edbe0bbb223a37fd7f6d11151d1a67cd075ce31003be31f2265198a13",
+            "7ffffe48d42bb6b3c2cffaa0eb33140adf9bb8acd78ac0758a328b32aa1e9ac4",
         ),
         (
             ("name", "uses", "with"),
@@ -250,7 +264,7 @@ def assert_handoff_orchestration(workflow: dict[str, object]) -> None:
             None,
             "bash",
             None,
-            "7524bce0c8eab100b79db50353bdecdeecb1590cc233d4939612fbdbb6d38e4a",
+            "e62230bd6ff4f68ffe835e41d23bf810f87753145431cc200bd556099357a843",
         ),
         (
             ("name", "uses", "with"),
@@ -735,3 +749,34 @@ def test_handoff_contract_rejects_extra_actions_and_alternate_runs(mutation: str
 
     with pytest.raises(AssertionError):
         assert_handoff_orchestration(mutated)
+
+
+def test_ci_and_release_validate_exported_schemas_against_authority_bytes() -> None:
+    validators = []
+    for workflow_name, job_name, step_name in (
+        ("ci.yml", "packaging-image", "Validate the six pre-image artifacts"),
+        ("release.yml", "handoff", "Validate the exact release handoff"),
+    ):
+        workflow = yaml.load(
+            (REPOSITORY_ROOT / ".github" / "workflows" / workflow_name).read_text(
+                encoding="utf-8"
+            ),
+            Loader=yaml.BaseLoader,
+        )
+        validators.append(
+            next(
+                step["run"]
+                for step in workflow["jobs"][job_name]["steps"]
+                if step.get("name") == step_name
+            )
+        )
+
+    for validator in validators:
+        assert '"$schema"' not in validator
+        assert 'name.endswith(".schema.json")' not in validator
+        for generated_name, authority_name in EXPECTED_SCHEMA_AUTHORITIES:
+            comparison = (
+                f'assert (root / "{generated_name}").read_bytes() == '
+                f'Path("deployment-profiles/{authority_name}").read_bytes()'
+            )
+            assert comparison in validator

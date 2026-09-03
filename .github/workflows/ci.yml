@@ -75,10 +75,9 @@ jobs:
           assert {path.name for path in entries} == expected
           runtime = json.loads((root / "runtime-contract.json").read_bytes())
           assert runtime["schema_version"] == 1
-          for name in expected:
-              if name.endswith(".schema.json"):
-                  schema = json.loads((root / name).read_bytes())
-                  assert schema["$schema"].startswith("https://json-schema.org/")
+          assert (root / "qualified-deployment-profile-v1.schema.json").read_bytes() == Path("deployment-profiles/qualified-v1.schema.json").read_bytes()
+          assert (root / "qualification-candidate-profile-v1.schema.json").read_bytes() == Path("deployment-profiles/qualification-candidate-v1.schema.json").read_bytes()
+          assert (root / "qualification-override-v1.schema.json").read_bytes() == Path("deployment-profiles/qualification-override-v1.schema.json").read_bytes()
           manifest_bytes = (root / "agent-a-bundle-v1.manifest.json").read_bytes()
           manifest = json.loads(manifest_bytes)
           assert set(manifest) == {
