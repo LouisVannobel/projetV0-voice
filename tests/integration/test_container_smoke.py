@@ -179,6 +179,26 @@ def _volume_file_size(image: str, volume: str, path: str) -> int:
     return int(_output(result).strip())
 
 
+def _write_volume_marker(image: str, volume: str, path: str) -> None:
+    program = "import sys;from pathlib import Path;Path('/capture',sys.argv[1]).write_text('1')"
+    _docker(
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--mount",
+        f"type=volume,src={volume},dst=/capture",
+        "--entrypoint",
+        "python",
+        image,
+        "-c",
+        program,
+        path,
+        timeout=10,
+    )
+
+
 def _assert_container_running(container: str, label: str) -> None:
     state = _docker(
         "inspect",
@@ -471,7 +491,9 @@ def test_container_smoke(tmp_path: Path) -> None:
             "\n  b=self.rfile.read(int(self.headers.get('content-length','0')));"
             "Path('/capture/otlp.bin').write_bytes(b);self.send_response(200);self.end_headers()"
             "\n def log_message(self,*args): pass"
-            "\nHTTPServer(('0.0.0.0',4318),H).serve_forever()"
+            "\nserver=HTTPServer(('0.0.0.0',4318),H)"
+            "\nPath('/capture/otlp-ready').write_text('ready')"
+            "\nserver.serve_forever()"
         )
         _docker(
             "run",
@@ -493,19 +515,32 @@ def test_container_smoke(tmp_path: Path) -> None:
             "-c",
             otlp_server,
         )
+        _wait_for_volume_marker(
+            image,
+            volumes["capture"],
+            "otlp-ready",
+            containers["otlp"],
+            "OTLP capture",
+        )
 
         tripwire = (
             "import selectors,socket;from pathlib import Path;"
-            "selector=selectors.DefaultSelector()"
+            "selector=selectors.DefaultSelector();capture=Path('/capture')"
+            "\ndef observe(key):"
+            "\n while True:"
+            "\n  try: client,_=key.fileobj.accept()"
+            "\n  except BlockingIOError: return"
+            "\n  capture.joinpath('provider-connected').write_text(str(key.data));client.close()"
             "\nfor port in (443,8443):"
             "\n sock=socket.socket();sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
-            "sock.bind(('0.0.0.0',port));sock.listen();"
+            "sock.setblocking(False);sock.bind(('0.0.0.0',port));sock.listen();"
             "selector.register(sock,selectors.EVENT_READ,port)"
-            "\nPath('/capture/provider-tripwire-ready').write_text('ready')"
+            "\ncapture.joinpath('provider-tripwire-ready').write_text('ready')"
             "\nwhile True:"
-            "\n for key,_ in selector.select():"
-            "\n  client,_=key.fileobj.accept();"
-            "Path('/capture/provider-connected').write_text(str(key.data));client.close()"
+            "\n for key,_ in selector.select(.05): observe(key)"
+            "\n if capture.joinpath('provider-drain-request').exists():"
+            "\n  for key in selector.get_map().values(): observe(key)"
+            "\n  capture.joinpath('provider-drain-ack').write_text('drained')"
         )
         _docker(
             "run",
@@ -698,6 +733,14 @@ def test_container_smoke(tmp_path: Path) -> None:
         _docker("kill", "--signal", "SIGTERM", containers["runtime"])
         exit_code = int(_output(_docker("wait", containers["runtime"], timeout=30)).strip())
         assert exit_code == 0
+        _write_volume_marker(image, volumes["capture"], "provider-drain-request")
+        _wait_for_volume_marker(
+            image,
+            volumes["capture"],
+            "provider-drain-ack",
+            containers["tripwire"],
+            "provider tripwire drain",
+        )
         _docker("wait", containers["observer"], timeout=10)
         observed = [
             line.strip()
