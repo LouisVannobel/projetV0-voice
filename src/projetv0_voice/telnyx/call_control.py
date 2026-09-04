@@ -245,6 +245,10 @@ def _strict_catalog_text(value: object, maximum: int = 256) -> str | None:
     return value
 
 
+def _valid_optional_catalog_filter_id(value: object) -> bool:
+    return value is None or isinstance(value, str) and 0 < len(value) <= 256
+
+
 def _strict_catalog_datetime(value: object) -> datetime | None:
     if value is None:
         return None
@@ -492,10 +496,8 @@ class CallControlClient:
             raise CallControlClosedError("call_control_client_closed")
         if (
             not _valid_call_control_id(call_control_id)
-            or call_leg_id is not None
-            and not _strict_catalog_text(call_leg_id)
-            or call_session_id is not None
-            and not _strict_catalog_text(call_session_id)
+            or not _valid_optional_catalog_filter_id(call_leg_id)
+            or not _valid_optional_catalog_filter_id(call_session_id)
             or not all(
                 _valid_catalog_filter_time(value)
                 for value in (

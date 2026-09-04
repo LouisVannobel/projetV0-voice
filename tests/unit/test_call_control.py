@@ -667,6 +667,46 @@ async def test_catalog_list_and_retrieve_preserve_long_call_control_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call_leg_id", "call_session_id"),
+    [("", None), (None, "s" * 257)],
+)
+async def test_recording_list_rejects_invalid_optional_ids_without_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    call_leg_id: str | None,
+    call_session_id: str | None,
+) -> None:
+    module = call_control()
+
+    class ForbiddenRecordings:
+        def list(self, **_: object) -> None:
+            raise AssertionError("recording list must not dispatch")
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = ForbiddenRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: CatalogSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(module.CallControlInputError, match="call_control_input_invalid"):
+        await client.list_recordings_one_page(
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id=call_leg_id,
+            call_session_id=call_session_id,
+            start_gte_iso="2026-08-29T11:59:55Z",
+            start_lte_iso="2026-08-29T12:00:05Z",
+            end_gte_iso="2026-08-29T12:00:55Z",
+            end_lte_iso="2026-08-29T12:01:05Z",
+            timeout_seconds=0.75,
+        )
+
+
+@pytest.mark.asyncio
 async def test_catalog_list_and_retrieve_reject_returned_call_control_id_over_1024(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
