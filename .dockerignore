@@ -4,5 +4,12 @@
 !README.md
 !src/
 !src/**
-!dist/
-!dist/runtime-contract.json
+!scripts/
+!scripts/export_runtime_contract.py
+!agents/
+!agents/agent-a/
+!agents/agent-a/**
+!deployment-profiles/
+!deployment-profiles/qualified-v1.schema.json
+!deployment-profiles/qualification-candidate-v1.schema.json
+!deployment-profiles/qualification-override-v1.schema.json

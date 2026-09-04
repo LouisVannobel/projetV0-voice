@@ -235,7 +235,7 @@ def _wait_for_volume_marker(
     raise AssertionError(f"{label} did not publish its readiness marker:\n{_output(logs)}")
 
 
-def test_dockerfile_declares_the_pinned_non_root_runtime() -> None:
+def test_dockerfile_generates_the_contract_without_a_dist_context() -> None:
     source = DOCKERFILE.read_text(encoding="utf-8")
 
     assert f"ARG PYTHON_IMAGE={PYTHON_IMAGE}" in source
@@ -248,7 +248,17 @@ def test_dockerfile_declares_the_pinned_non_root_runtime() -> None:
     assert "apt-get install -y --no-install-recommends libgomp1" in source
     assert "rm -rf /var/lib/apt/lists/*" in source
     assert "COPY --from=builder /opt/projetv0-voice/.venv" in source
-    assert "COPY --chown=0:10001 --chmod=0440 dist/runtime-contract.json" in source
+    assert "COPY scripts/export_runtime_contract.py ./scripts/export_runtime_contract.py" in source
+    assert "COPY agents/agent-a/ ./agents/agent-a/" in source
+    assert "COPY deployment-profiles/ ./deployment-profiles/" in source
+    assert "python scripts/export_runtime_contract.py" in source
+    assert "--output-dir /opt/projetv0-voice/build-artifacts" in source
+    assert (
+        "COPY --from=builder --chown=0:10001 --chmod=0440 "
+        "/opt/projetv0-voice/build-artifacts/runtime-contract.json ./runtime-contract.json"
+        in source
+    )
+    assert "dist/runtime-contract.json" not in source
     assert "USER 10001:10001" in source
     assert 'ENTRYPOINT ["python", "-m", "projetv0_voice.server"]' in source
     assert "HEALTHCHECK" not in source
@@ -268,8 +278,15 @@ def test_dockerignore_is_a_minimal_allowlist() -> None:
         "!README.md",
         "!src/",
         "!src/**",
-        "!dist/",
-        "!dist/runtime-contract.json",
+        "!scripts/",
+        "!scripts/export_runtime_contract.py",
+        "!agents/",
+        "!agents/agent-a/",
+        "!agents/agent-a/**",
+        "!deployment-profiles/",
+        "!deployment-profiles/qualified-v1.schema.json",
+        "!deployment-profiles/qualification-candidate-v1.schema.json",
+        "!deployment-profiles/qualification-override-v1.schema.json",
     ]
 
 
@@ -318,17 +335,25 @@ def test_container_smoke(tmp_path: Path) -> None:
         for name in ("Dockerfile", ".dockerignore", "pyproject.toml", "uv.lock", "README.md"):
             shutil.copy2(REPO_ROOT / name, context / name)
         shutil.copytree(REPO_ROOT / "src", context / "src")
-        output_dir = context / "dist"
+        (context / "scripts").mkdir()
+        shutil.copy2(
+            REPO_ROOT / "scripts/export_runtime_contract.py",
+            context / "scripts/export_runtime_contract.py",
+        )
+        shutil.copytree(REPO_ROOT / "agents/agent-a", context / "agents/agent-a")
+        shutil.copytree(REPO_ROOT / "deployment-profiles", context / "deployment-profiles")
+        output_dir = tmp_path / "host-artifacts"
         _run(
             [
                 sys.executable,
-                str(REPO_ROOT / "scripts" / "export_runtime_contract.py"),
+                str(context / "scripts" / "export_runtime_contract.py"),
                 "--repo-root",
-                str(REPO_ROOT),
+                str(context),
                 "--output-dir",
                 str(output_dir),
             ]
         )
+        assert not (context / "dist").exists()
         _docker("build", "--pull", "--tag", image, str(context), timeout=900)
 
         inspected = json.loads(_output(_docker("image", "inspect", image)))[0]
@@ -341,6 +366,7 @@ def test_container_smoke(tmp_path: Path) -> None:
 
         import_program = (
             "import importlib.util,os,shutil;"
+            "from pathlib import Path;"
             "import onnxruntime;"
             "from pipecat.audio.vad.silero import SileroVADAnalyzer;"
             "SileroVADAnalyzer();"
@@ -349,7 +375,11 @@ def test_container_smoke(tmp_path: Path) -> None:
             "assert importlib.util.find_spec('mypy') is None;"
             "assert importlib.util.find_spec('ruff') is None;"
             "assert shutil.which('uv') is None;"
-            "assert shutil.which('gcc') is None"
+            "assert shutil.which('gcc') is None;"
+            "assert not Path('/opt/projetv0-voice/scripts').exists();"
+            "assert not Path('/opt/projetv0-voice/agents').exists();"
+            "assert not Path('/opt/projetv0-voice/deployment-profiles').exists();"
+            "assert not Path('/opt/projetv0-voice/build-artifacts').exists()"
         )
         _docker(
             "run",
@@ -400,7 +430,7 @@ def test_container_smoke(tmp_path: Path) -> None:
         profile_bytes = (
             json.dumps(profile, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode("utf-8")
-        agent_root = REPO_ROOT / "agents/agent-a"
+        agent_root = context / "agents/agent-a"
         agent_files = {
             record["path"]: agent_root.joinpath(*record["path"].split("/")).read_bytes()
             for record in manifest["files"]

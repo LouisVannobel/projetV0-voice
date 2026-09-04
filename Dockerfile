@@ -11,9 +11,15 @@ WORKDIR /opt/projetv0-voice
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
+COPY scripts/export_runtime_contract.py ./scripts/export_runtime_contract.py
+COPY agents/agent-a/ ./agents/agent-a/
+COPY deployment-profiles/ ./deployment-profiles/
 
 RUN uv lock --check \
     && uv sync --locked --no-dev --no-editable \
+    && python scripts/export_runtime_contract.py \
+        --repo-root /opt/projetv0-voice \
+        --output-dir /opt/projetv0-voice/build-artifacts \
     && rm -rf /root/.cache/uv
 
 FROM ${PYTHON_IMAGE} AS runtime
@@ -27,7 +33,7 @@ WORKDIR /opt/projetv0-voice
 ENV PATH="/opt/projetv0-voice/.venv/bin:$PATH"
 
 COPY --from=builder /opt/projetv0-voice/.venv /opt/projetv0-voice/.venv
-COPY --chown=0:10001 --chmod=0440 dist/runtime-contract.json ./runtime-contract.json
+COPY --from=builder --chown=0:10001 --chmod=0440 /opt/projetv0-voice/build-artifacts/runtime-contract.json ./runtime-contract.json
 
 EXPOSE 8080
 
