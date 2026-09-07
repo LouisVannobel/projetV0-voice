@@ -7,6 +7,8 @@ import hashlib
 import hmac
 import json
 import math
+import threading
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -16,10 +18,14 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 from pydantic import SecretStr
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketState
 
-from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
-from projetv0_voice.telnyx.serializer import ProjetV0TelnyxFrameSerializer
+from projetv0_voice.qualified_profile import (
+    QualificationCandidateProfileV1,
+    QualifiedDeploymentProfileV1,
+    RuntimeDeploymentProfileV1,
+)
+from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
 TOKEN_HEADER = b"x-telnyx-streaming-auth-token"
 TOKEN_FIELD = "x-telnyx-streaming-auth-token"
@@ -79,6 +85,7 @@ class AuthenticatedTelnyxHandshake:
     token_locator_id: str
     lease_claim: LeaseClaim = field(repr=False)
     transport: FastAPIWebsocketTransport = field(repr=False)
+    audio_admission: AudioAdmission = field(repr=False)
 
     def __repr__(self) -> str:
         return "AuthenticatedTelnyxHandshake()"
@@ -92,6 +99,84 @@ class _CapturedTelnyxHandshake:
     redacted_fixture_bytes: bytes = field(repr=False)
     fixture_sha256: str
     safe_summary: tuple[tuple[str, str | int], ...]
+
+
+class _TransferredAuthentication(
+    Coroutine[Any, Any, AuthenticatedTelnyxHandshake]
+):
+    """An eager-safe permit owner whose close path releases before first send."""
+
+    __slots__ = (
+        "_active_permits",
+        "_permit",
+        "_permit_id",
+        "_release_failed",
+        "_released",
+        "_runner",
+    )
+
+    def __init__(
+        self,
+        service: AuthenticatedTelnyxHandshakeService,
+        websocket: WebSocket,
+        permit: UnauthenticatedPermit,
+        permit_id: int,
+    ) -> None:
+        self._active_permits = service._active_permits  # noqa: SLF001
+        self._permit = permit
+        self._permit_id = permit_id
+        self._release_failed = False
+        self._released = False
+        self._runner = self._run(service, websocket)
+
+    def __await__(self) -> _TransferredAuthentication:
+        return self
+
+    def __iter__(self) -> _TransferredAuthentication:
+        return self
+
+    def __next__(self) -> Any:
+        return self.send(None)
+
+    def send(self, value: Any) -> Any:
+        return self._runner.send(value)
+
+    def throw(self, typ: Any, val: Any = None, tb: Any = None) -> Any:
+        if val is None and tb is None:
+            return self._runner.throw(typ)
+        return self._runner.throw(typ, val, tb)
+
+    def close(self) -> None:
+        try:
+            self._runner.close()
+        finally:
+            self._finish()
+
+    def _finish(self) -> bool:
+        if self._released:
+            return self._release_failed
+        self._released = True
+        try:
+            self._permit.release()
+        except Exception:
+            self._release_failed = True
+        finally:
+            with self._active_permits[0]:
+                self._active_permits[1].discard(self._permit_id)
+        return self._release_failed
+
+    async def _run(
+        self,
+        service: AuthenticatedTelnyxHandshakeService,
+        websocket: WebSocket,
+    ) -> AuthenticatedTelnyxHandshake:
+        try:
+            return await service._authenticate_owned(  # noqa: SLF001
+                websocket,
+                finish_permit=self._finish,
+            )
+        finally:
+            self._finish()
 
 
 class _InvalidJson(ValueError):
@@ -339,13 +424,15 @@ class AuthenticatedTelnyxHandshakeService:
     def __init__(
         self,
         *,
-        profile: QualifiedDeploymentProfileV1,
+        profile: RuntimeDeploymentProfileV1,
         lease_authority: LeaseAuthority,
         unauthenticated_gate: UnauthenticatedGate,
         timeout_seconds: float,
     ) -> None:
         if (
-            not isinstance(profile, QualifiedDeploymentProfileV1)
+            not isinstance(
+                profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
+            )
             or profile.token_locator_id != TOKEN_LOCATOR_ID
             or not isinstance(timeout_seconds, int | float)
             or isinstance(timeout_seconds, bool)
@@ -357,6 +444,10 @@ class AuthenticatedTelnyxHandshakeService:
         self._lease_authority = lease_authority
         self._unauthenticated_gate = unauthenticated_gate
         self._timeout_seconds = float(timeout_seconds)
+        self._active_permits: tuple[threading.Lock, set[int]] = (
+            threading.Lock(),
+            set(),
+        )
 
     def __repr__(self) -> str:
         return "AuthenticatedTelnyxHandshakeService()"
@@ -374,6 +465,51 @@ class AuthenticatedTelnyxHandshakeService:
             raise TelnyxHandshakeError("telnyx_handshake_gate_failed")
         if permit is None:
             raise TelnyxHandshakeCapacityError("telnyx_handshake_capacity")
+        try:
+            operation = self.transfer_authentication(websocket, permit)
+        except BaseException:
+            try:
+                permit.release()
+            except Exception:
+                raise TelnyxHandshakeError("telnyx_handshake_cleanup_failed") from None
+            raise
+        return await operation
+
+    def transfer_authentication(
+        self,
+        websocket: WebSocket,
+        permit: UnauthenticatedPermit,
+    ) -> Coroutine[Any, Any, AuthenticatedTelnyxHandshake]:
+        """Synchronously transfer one already-acquired accepted-WebSocket permit."""
+
+        if (
+            not isinstance(websocket, WebSocket)
+            or websocket.application_state is not WebSocketState.CONNECTED
+            or websocket.client_state is not WebSocketState.CONNECTED
+        ):
+            raise TelnyxHandshakeError("telnyx_handshake_context_invalid") from None
+        release = getattr(permit, "release", None)
+        if not callable(release):
+            raise TelnyxHandshakeError("telnyx_handshake_permit_invalid") from None
+        permit_id = id(permit)
+        lock, active = self._active_permits
+        with lock:
+            if permit_id in active:
+                raise TelnyxHandshakeError("telnyx_handshake_permit_invalid") from None
+            active.add(permit_id)
+        try:
+            return _TransferredAuthentication(self, websocket, permit, permit_id)
+        except BaseException:
+            with lock:
+                active.discard(permit_id)
+            raise TelnyxHandshakeError("telnyx_handshake_permit_invalid") from None
+
+    async def _authenticate_owned(
+        self,
+        websocket: WebSocket,
+        *,
+        finish_permit: Callable[[], bool],
+    ) -> AuthenticatedTelnyxHandshake:
 
         call_control_id: str | None = None
         token_digest: bytes | None = None
@@ -408,9 +544,11 @@ class AuthenticatedTelnyxHandshakeService:
                         abort_required = False
                         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
 
+                    audio_admission = AudioAdmission()
                     serializer = ProjetV0TelnyxFrameSerializer(
                         captured.call_data.stream_id or "",
                         expected_call_control_id=call_control_id,
+                        audio_admission=audio_admission,
                     )
                     params = FastAPIWebsocketParams(
                         audio_in_enabled=True,
@@ -424,6 +562,7 @@ class AuthenticatedTelnyxHandshakeService:
                         token_locator_id=TOKEN_LOCATOR_ID,
                         lease_claim=lease_claim,
                         transport=transport,
+                        audio_admission=audio_admission,
                     )
                     handoff_complete = True
                     abort_required = False
@@ -450,9 +589,8 @@ class AuthenticatedTelnyxHandshakeService:
             except Exception:
                 cleanup_failed = True
             finally:
-                try:
-                    permit.release()
-                except Exception:
+                permit_release_failed = finish_permit()
+                if permit_release_failed:
                     cleanup_failed = True
                     if (
                         handoff_complete

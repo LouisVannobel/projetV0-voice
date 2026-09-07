@@ -15,7 +15,12 @@ import aiosqlite
 import pytest
 
 from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.models import (
+    CallUpsertPayloadV1,
+    RecordingUpsertPayloadV1,
+    TurnUpsertPayloadV1,
+    VoiceOperationV1,
+)
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
     CommandSerializationError,
@@ -90,6 +95,27 @@ def turn_operation(
     )
 
 
+def recording_operation() -> VoiceOperationV1:
+    return VoiceOperationV1(
+        schema_version=1,
+        operation_id=UUID("b10b98ee-616c-50d0-81e4-af5d8762e082"),
+        deployment_id="agent-a",
+        call_id=UUID(int=123),
+        occurred_at=NOW + timedelta(minutes=2),
+        kind="recording.upsert",
+        payload=RecordingUpsertPayloadV1(
+            recording_id=UUID(int=456),
+            status="saved",
+            telnyx_recording_id="recording_Ab-12",
+            channels="dual",
+            format="wav",
+            started_at=NOW,
+            ended_at=NOW + timedelta(minutes=1),
+            retention_until=NOW + timedelta(days=30),
+        ),
+    )
+
+
 def lease_payload(
     *,
     call_control_id: str = "control-1",
@@ -117,6 +143,7 @@ def receipt_payload(event_id: str = "event-1") -> dict[str, object]:
         "call_control_id": "control-1",
         "occurred_at": NOW,
         "received_at": NOW,
+        "semantic_fingerprint_sha256": bytes(range(32)),
     }
 
 
@@ -334,12 +361,15 @@ async def test_startup_and_periodic_quick_check_are_owner_executed_without_publi
 ) -> None:
     clock_value = 10.0
     checks: list[float] = []
+    second_check = asyncio.Event()
 
     def clock() -> float:
         return clock_value
 
     def on_check(when: float) -> None:
         checks.append(when)
+        if len(checks) == 2:
+            second_check.set()
 
     writer, task = await start_writer(
         tmp_path / "voice.sqlite",
@@ -352,6 +382,7 @@ async def test_startup_and_periodic_quick_check_are_owner_executed_without_publi
 
     clock_value = 16.0
     await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+    await asyncio.wait_for(second_check.wait(), timeout=1)
     assert checks == [10.0, 16.0]
     assert await writer.quick_check() is True
     await stop_writer(writer, task)
@@ -540,6 +571,85 @@ async def test_webhook_receipt_and_effect_are_atomic_and_duplicate_is_idempotent
 
 
 @pytest.mark.asyncio
+async def test_duplicate_webhook_semantic_fingerprint_conflict_fails_before_effect(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "webhook-fingerprint.sqlite"
+    writer, task = await start_writer(database)
+    await writer.commit_control(
+        PersistenceCommand(
+            "webhook_effect",
+            {"receipt": receipt_payload(), "lease": None, "operation": None},
+            None,
+        )
+    )
+    changed = {**receipt_payload(), "semantic_fingerprint_sha256": b"z" * 32}
+
+    with pytest.raises(CommandConflictError, match="webhook_identity_conflict"):
+        await writer.commit_control(
+            PersistenceCommand(
+                "webhook_effect",
+                {"receipt": changed, "lease": lease_payload(), "operation": operation()},
+                None,
+            )
+        )
+    await task
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM call_leases").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_enrichment_fingerprint_must_match_complete_canonical_operation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "enrichment-fingerprint.sqlite"
+    writer, task = await start_writer(database)
+    receipt = {
+        **receipt_payload(),
+        "event_type": "call.recording.saved",
+        "call_control_id": None,
+    }
+    await writer.commit_control(
+        PersistenceCommand(
+            "webhook_effect",
+            {"receipt": receipt, "lease": None, "operation": None},
+            None,
+        )
+    )
+
+    with pytest.raises(FatalPersistenceError, match="invalid_webhook_enrichment"):
+        await writer.commit_control(
+            PersistenceCommand(
+                "webhook_enrichment",
+                {
+                    "receipt": {
+                        key: receipt[key]
+                        for key in (
+                            "event_id",
+                            "event_type",
+                            "call_control_id",
+                            "occurred_at",
+                            "semantic_fingerprint_sha256",
+                        )
+                    },
+                    "enrichment_fingerprint_sha256": b"wrong-fingerprint".ljust(32, b"!"),
+                    "operation": recording_operation(),
+                },
+                None,
+            )
+        )
+    await task
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT provider_enrichment_fingerprint_sha256 FROM webhook_receipts"
+        ).fetchone() == (None,)
+
+
+@pytest.mark.asyncio
 async def test_injected_failure_rolls_back_receipt_and_effect_and_completes_future(
     tmp_path: Path,
 ) -> None:
@@ -655,7 +765,7 @@ async def test_just_over_64_kib_is_fatal_and_never_inserted(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_journal(
+async def test_schema_has_exact_v2_tables_required_columns_checks_and_delete_journal(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -683,7 +793,12 @@ async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
         user_version = connection.execute("PRAGMA user_version").fetchone()
 
-    assert tables == {"call_leases", "webhook_receipts", "outbox"}
+    assert tables == {
+        "call_leases",
+        "webhook_receipts",
+        "outbox",
+        "qualification_runs",
+    }
     assert "natural_key" not in ddl
     assert "delivered_at" not in ddl
     assert "generic" not in ddl
@@ -691,8 +806,11 @@ async def test_schema_has_exact_three_tables_required_columns_checks_and_delete_
         assert column in ddl
     assert "check" in ddl
     assert "length(token_hash) = 32" in ddl
+    assert "semantic_fingerprint_sha256" in ddl
+    assert "provider_enrichment_fingerprint_sha256" in ddl
+    assert "length(semantic_fingerprint_sha256) = 32" in ddl
     assert journal_mode == ("delete",)
-    assert user_version == (1,)
+    assert user_version == (2,)
 
 
 @pytest.mark.asyncio

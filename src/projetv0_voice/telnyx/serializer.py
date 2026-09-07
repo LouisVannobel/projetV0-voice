@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from pipecat.frames.frames import Frame, InputTransportMessageFrame
+from pipecat.frames.frames import Frame, InputAudioRawFrame, InputTransportMessageFrame
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 
 from projetv0_voice.telnyx.frames import (
@@ -27,6 +27,37 @@ MAX_ERROR_CODE = 2_147_483_647
 
 class _InvalidJson(ValueError):
     pass
+
+
+class AudioAdmissionError(RuntimeError):
+    """A constant-safe audio-admission contract error."""
+
+
+class AudioAdmission:
+    """A closed-by-default reference bound once to a synchronous predicate."""
+
+    def __init__(self) -> None:
+        self._predicate: Callable[[], bool] | None = None
+
+    @property
+    def is_bound(self) -> bool:
+        return self._predicate is not None
+
+    def bind(self, predicate: Callable[[], bool]) -> None:
+        if self._predicate is not None:
+            raise AudioAdmissionError("audio_admission_already_bound")
+        if not callable(predicate):
+            raise AudioAdmissionError("audio_admission_invalid")
+        self._predicate = predicate
+
+    def allows_audio(self) -> bool:
+        predicate = self._predicate
+        if predicate is None:
+            return False
+        try:
+            return predicate() is True
+        except Exception:
+            raise AudioAdmissionError("audio_admission_failed") from None
 
 
 def _reject_constant(_value: str) -> None:
@@ -76,7 +107,13 @@ def _require_mapping(value: object) -> dict[str, Any]:
 class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
     """Add only bounded Telnyx mark/stop/error messages to the native serializer."""
 
-    def __init__(self, stream_id: str, *, expected_call_control_id: str) -> None:
+    def __init__(
+        self,
+        stream_id: str,
+        *,
+        expected_call_control_id: str,
+        audio_admission: AudioAdmission | None = None,
+    ) -> None:
         authenticated_stream_id = bounded_utf8_text(
             stream_id,
             maximum_bytes=MAX_STREAM_ID_BYTES,
@@ -85,6 +122,7 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
             expected_call_control_id,
             maximum_bytes=MAX_CALL_CONTROL_ID_BYTES,
         )
+        self.audio_admission = audio_admission or AudioAdmission()
         params = TelnyxFrameSerializer.InputParams(
             telnyx_sample_rate=8000,
             outbound_encoding="PCMU",
@@ -118,7 +156,13 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
             "stop",
             "error",
         }:
-            return await super().deserialize(data)
+            frame = await super().deserialize(data)
+            if isinstance(frame, InputAudioRawFrame):
+                try:
+                    return frame if self.audio_admission.allows_audio() else None
+                except AudioAdmissionError:
+                    raise TelnyxSerializerError("telnyx_audio_admission_failed") from None
+            return frame
 
         message = _require_mapping(
             _load_json(
@@ -168,4 +212,9 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
         raise TelnyxSerializerError("telnyx_serializer_invalid")
 
 
-__all__ = ["ProjetV0TelnyxFrameSerializer", "TelnyxSerializerError"]
+__all__ = [
+    "AudioAdmission",
+    "AudioAdmissionError",
+    "ProjetV0TelnyxFrameSerializer",
+    "TelnyxSerializerError",
+]

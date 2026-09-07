@@ -1,10 +1,10 @@
-"""SQLite v1 schema for leases, webhook receipts, and the encrypted outbox."""
+"""Exact SQLite schemas for durable local Voice Cell authority."""
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-SCHEMA_SQL = """
+V1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS call_leases (
     call_control_id TEXT PRIMARY KEY NOT NULL,
     call_id TEXT NOT NULL,
@@ -26,7 +26,14 @@ CREATE TABLE IF NOT EXISTS webhook_receipts (
     event_type TEXT NOT NULL,
     call_control_id TEXT,
     occurred_at TEXT NOT NULL,
-    received_at TEXT NOT NULL
+    received_at TEXT NOT NULL,
+    semantic_fingerprint_sha256 BLOB NOT NULL
+        CHECK (length(semantic_fingerprint_sha256) = 32),
+    provider_enrichment_fingerprint_sha256 BLOB
+        CHECK (
+            provider_enrichment_fingerprint_sha256 IS NULL
+            OR length(provider_enrichment_fingerprint_sha256) = 32
+        )
 );
 
 CREATE TABLE IF NOT EXISTS outbox (
@@ -53,3 +60,13 @@ CREATE INDEX IF NOT EXISTS outbox_due_fifo_idx
 
 PRAGMA user_version = 1;
 """
+
+QUALIFICATION_RUNS_SQL = """CREATE TABLE qualification_runs (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    consumed_at TEXT NOT NULL
+)"""
+
+SCHEMA_SQL = V1_SCHEMA_SQL.replace(
+    "PRAGMA user_version = 1;",
+    f"{QUALIFICATION_RUNS_SQL};\n\nPRAGMA user_version = 2;",
+)

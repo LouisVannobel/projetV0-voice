@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from loguru import logger
-from openai import NOT_GIVEN, AsyncOpenAI
+from openai import NOT_GIVEN, AsyncOpenAI, DefaultAsyncHttpxClient
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pydantic import SecretStr
@@ -66,6 +66,31 @@ async def test_build_stt_uses_native_openrouter_multipart_with_manifest_language
     }
 
 
+@pytest.mark.asyncio
+async def test_build_stt_passes_the_publicly_injected_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _services_module()
+    profile = InferenceProfileV1.model_validate(_profile_data())
+    client = DefaultAsyncHttpxClient()
+    captured: dict[str, object] = {}
+
+    def capture_init(_self: OpenAISTTService, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(OpenAISTTService, "__init__", capture_init)
+    try:
+        module.build_stt(
+            profile,
+            SecretStr("unit-secret"),
+            language="fr-FR",
+            http_client=client,
+        )
+        assert captured["http_client"] is client
+    finally:
+        await client.aclose()
+
+
 @pytest.mark.parametrize("language", ["not-a-language", "ast"])
 def test_build_stt_rejects_non_iso_639_1_language_before_client_construction(
     language: str,
@@ -113,7 +138,8 @@ async def test_build_llm_serializes_one_openrouter_provider_object_via_native_sd
             http_client=transport_client,
         )
 
-    monkeypatch.setattr(OpenRouterLLMService, "create_client", create_client)
+    trustless = module._TrustlessOpenRouterLLMService
+    monkeypatch.setattr(trustless, "create_client", create_client)
     service = module.build_llm(profile, SecretStr("unit-secret"))
     source_policy = source["llm_provider_policy"]
     assert isinstance(source_policy, dict)
@@ -131,7 +157,7 @@ async def test_build_llm_serializes_one_openrouter_provider_object_via_native_sd
     await service._client.close()
 
     assert isinstance(service, OpenRouterLLMService)
-    assert type(service) is OpenRouterLLMService
+    assert type(service) is trustless
     assert str(service._client.base_url).rstrip("/") == OPENROUTER_BASE_URL
     assert service._settings.model == "test/llm"
     assert service._settings.extra == {

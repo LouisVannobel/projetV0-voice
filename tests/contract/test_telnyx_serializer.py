@@ -4,6 +4,7 @@ import base64
 import inspect
 import json
 import struct
+from importlib import import_module
 from importlib.metadata import version
 
 import pytest
@@ -28,10 +29,9 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.utils.frame_queue import FrameQueue
 
 from projetv0_voice.telnyx.frames import MAX_MARK_NAME_BYTES, TelnyxMarkFrame
-from projetv0_voice.telnyx.serializer import (
-    ProjetV0TelnyxFrameSerializer,
-    TelnyxSerializerError,
-)
+from projetv0_voice.telnyx.serializer import ProjetV0TelnyxFrameSerializer, TelnyxSerializerError
+
+serializer_module = import_module("projetv0_voice.telnyx.serializer")
 
 
 class _UnknownSystemFrame(SystemFrame):
@@ -96,8 +96,12 @@ def test_pinned_native_types_and_constructor_contract() -> None:
 @pytest.mark.asyncio
 async def test_native_pcmu_audio_dtmf_and_clear_remain_equivalent() -> None:
     native = _native_serializer()
+    admission = serializer_module.AudioAdmission()
+    admission.bind(lambda: True)
     project = ProjetV0TelnyxFrameSerializer(
-        "stream-one", expected_call_control_id="call-one"
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=admission,
     )
     start = StartFrame(audio_in_sample_rate=8000, audio_out_sample_rate=16000)
     await native.setup(start)
@@ -136,8 +140,12 @@ async def test_native_pcmu_audio_dtmf_and_clear_remain_equivalent() -> None:
 @pytest.mark.asyncio
 async def test_documented_large_media_payload_still_delegates_to_native() -> None:
     native = _native_serializer()
+    admission = serializer_module.AudioAdmission()
+    admission.bind(lambda: True)
     project = ProjetV0TelnyxFrameSerializer(
-        "stream-one", expected_call_control_id="call-one"
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=admission,
     )
     start = StartFrame(audio_in_sample_rate=8000)
     await native.setup(start)
@@ -159,6 +167,53 @@ async def test_documented_large_media_payload_still_delegates_to_native() -> Non
     assert isinstance(project_frame, InputAudioRawFrame)
     assert project_frame.audio == native_frame.audio
     assert project_frame.sample_rate == native_frame.sample_rate
+
+
+@pytest.mark.asyncio
+async def test_audio_admission_is_closed_until_once_bound_and_fails_closed() -> None:
+    admission = serializer_module.AudioAdmission()
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=admission,
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    media = json.dumps(
+        {
+            "event": "media",
+            "stream_id": "stream-one",
+            "media": {"payload": base64.b64encode(bytes(range(80))).decode("ascii")},
+        }
+    )
+
+    assert await serializer.deserialize(media) is None
+
+    active = False
+    admission.bind(lambda: active)
+    assert await serializer.deserialize(media) is None
+    active = True
+    assert isinstance(await serializer.deserialize(media), InputAudioRawFrame)
+
+    with pytest.raises(
+        serializer_module.AudioAdmissionError, match="audio_admission_already_bound"
+    ) as duplicate:
+        admission.bind(lambda: True)
+    assert duplicate.value.__cause__ is None
+    assert duplicate.value.__context__ is None
+
+    raising = serializer_module.AudioAdmission()
+    raising.bind(lambda: (_ for _ in ()).throw(RuntimeError("provider-secret")))
+    guarded = ProjetV0TelnyxFrameSerializer(
+        "stream-one",
+        expected_call_control_id="call-one",
+        audio_admission=raising,
+    )
+    await guarded.setup(StartFrame(audio_in_sample_rate=8000))
+    with pytest.raises(TelnyxSerializerError) as failed:
+        await guarded.deserialize(media)
+    assert str(failed.value) == "telnyx_audio_admission_failed"
+    assert "provider-secret" not in repr(failed.value)
+    assert failed.value.__cause__ is None
 
 
 @pytest.mark.asyncio

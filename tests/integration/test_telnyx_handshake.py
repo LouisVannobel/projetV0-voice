@@ -320,6 +320,8 @@ async def test_authenticate_builds_exact_native_call_data_and_transport_after_cl
     assert params.audio_out_enabled is True
     assert params.add_wav_header is False
     assert isinstance(params.serializer, ProjetV0TelnyxFrameSerializer)
+    assert result.audio_admission.is_bound is False
+    assert params.serializer.audio_admission is result.audio_admission
     assert params.serializer._stream_id == STREAM_ID
     assert params.serializer._expected_call_control_id == CALL_CONTROL_ID
     assert params.serializer._call_control_id is None
@@ -336,6 +338,68 @@ async def test_authenticate_builds_exact_native_call_data_and_transport_after_cl
     ):
         assert secret not in rendered
         assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transferred_permit_reuses_strict_task6_parser_without_second_acquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket, state = _websocket()
+    permit = _Permit()
+    gate = _Gate(None)
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    service = _service(authority, gate)
+    helper_calls: list[object] = []
+
+    async def forbidden_helper(websocket: object) -> object:
+        helper_calls.append(websocket)
+        raise AssertionError("Pipecat helper must not see authenticated messages")
+
+    monkeypatch.setattr(
+        handshake_module,
+        "parse_telephony_websocket",
+        forbidden_helper,
+        raising=False,
+    )
+
+    operation = service.transfer_authentication(websocket, permit)
+    assert gate.acquire_count == 0
+
+    result = await operation
+
+    assert isinstance(result.call_data, TelnyxCallData)
+    assert state["receive_count"] == 2
+    assert gate.acquire_count == 0
+    assert permit.release_count == 1
+    assert helper_calls == []
+    assert not hasattr(websocket, "_pipecat_parsed_telephony")
+
+
+@pytest.mark.asyncio
+async def test_transferred_permit_is_all_or_nothing_and_cannot_be_transferred_twice(
+) -> None:
+    websocket, _ = _websocket()
+    permit = _Permit()
+    service = _service(
+        _LeaseAuthority(expected_digest=_token_digest()),
+        _Gate(None),
+    )
+
+    operation = service.transfer_authentication(websocket, permit)
+    with pytest.raises(TelnyxHandshakeError, match="telnyx_handshake_permit_invalid"):
+        service.transfer_authentication(websocket, permit)
+    assert permit.release_count == 0
+
+    await operation
+    assert permit.release_count == 1
+
+    rejected_websocket, rejected_state = _websocket()
+    rejected_websocket.application_state = WebSocketState.DISCONNECTED
+    rejected_permit = _Permit()
+    with pytest.raises(TelnyxHandshakeError, match="telnyx_handshake_context_invalid"):
+        service.transfer_authentication(rejected_websocket, rejected_permit)
+    assert rejected_state["receive_count"] == 0
+    assert rejected_permit.release_count == 0
 
 
 @pytest.mark.asyncio

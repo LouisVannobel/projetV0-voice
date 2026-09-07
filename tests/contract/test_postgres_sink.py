@@ -588,7 +588,7 @@ async def test_purge_lease_rejects_extra_unsafe_invalid_and_duplicate_rows(
         [purge_row(), purge_row(lease_token=str(UUID(int=12)))],
         [purge_row(purge_attempt=0)],
         [purge_row(purge_attempt=1_000_001)],
-        [purge_row(telnyx_recording_id="x" * 129)],
+        [purge_row(telnyx_recording_id="x" * 257)],
         [purge_row(recording_id="NOT-A-UUID")],
         [purge_row(lease_token="NOT-A-UUID")],
     ],
@@ -599,6 +599,29 @@ async def test_purge_lease_rejects_each_identity_and_bound_violation(
     sink, _, _, _ = sink_with_rows(rows)
     with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):
         await sink.lease_recording_purges("worker-1", 30, 10)
+
+
+@pytest.mark.asyncio
+async def test_purge_lease_accepts_256_url_safe_opaque_provider_id() -> None:
+    provider_id = "r." + "A" * 251 + "~_-"
+    sink, _, _, _ = sink_with_rows(
+        [purge_row(telnyx_recording_id=provider_id)]
+    )
+
+    leases = await sink.lease_recording_purges("worker-1", 30, 1)
+
+    assert leases[0].telnyx_recording_id == provider_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", [".", ".."])
+async def test_purge_lease_rejects_recording_dot_segments(provider_id: str) -> None:
+    sink, _, _, _ = sink_with_rows(
+        [purge_row(telnyx_recording_id=provider_id)]
+    )
+
+    with pytest.raises(OperationSinkContractError, match="purge_lease_result_invalid"):
+        await sink.lease_recording_purges("worker-1", 30, 1)
 
 
 @pytest.mark.asyncio

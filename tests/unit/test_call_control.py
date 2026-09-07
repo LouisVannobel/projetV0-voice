@@ -6,6 +6,7 @@ import inspect
 import json
 import time
 from collections import deque
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, get_args
 from uuid import UUID, uuid4
@@ -22,6 +23,7 @@ from telnyx.types import (
 
 API_KEY = "RAW-API-KEY-SENTINEL"
 TOKEN = "RAW-STREAM-TOKEN-SENTINEL"
+CLIENT_STATE = "RAW-CLIENT-STATE-SENTINEL"
 URL = "wss://voice.example.test/telnyx/media"
 CALL_CONTROL_ID = "RAW-CALL-CONTROL-SENTINEL"
 COMMAND_ID = UUID("12345678-1234-4abc-8def-1234567890ab")
@@ -56,6 +58,9 @@ class FakeActions:
     async def start_recording(self, call_control_id: str, **kwargs: object) -> object:
         return await self._invoke("start_recording", call_control_id, kwargs)
 
+    async def stop_recording(self, call_control_id: str, **kwargs: object) -> object:
+        return await self._invoke("stop_recording", call_control_id, kwargs)
+
     async def hangup(self, call_control_id: str, **kwargs: object) -> object:
         return await self._invoke("hangup", call_control_id, kwargs)
 
@@ -79,6 +84,10 @@ class FakeSDK:
         self.close_count += 1
         if self._close_impl is not None:
             await self._close_impl()
+        http_client = self.constructor_kwargs.get("http_client")
+        close = getattr(http_client, "aclose", None)
+        if callable(close):
+            await close()
 
 
 def install_fake(
@@ -119,6 +128,16 @@ def status_error(status_code: int) -> telnyx.APIStatusError:
     )
 
 
+def not_found_error() -> telnyx.NotFoundError:
+    request = httpx.Request("GET", "https://api.telnyx.com/v2/recordings/RAW-SENTINEL")
+    response = httpx.Response(404, request=request, text="RAW-BODY-SENTINEL")
+    return telnyx.NotFoundError(
+        "RAW-NOT-FOUND-SENTINEL",
+        response=response,
+        body={"secret": "RAW-BODY-SENTINEL"},
+    )
+
+
 def response_validation_error() -> telnyx.APIResponseValidationError:
     request = httpx.Request("POST", "https://api.telnyx.com/v2/calls/RAW-REQUEST-SENTINEL")
     response = httpx.Response(200, request=request, text="RAW-BODY-SENTINEL")
@@ -141,8 +160,10 @@ def test_locked_sdk_surface_matches_task5_contract() -> None:
     assert set(get_args(StreamBidirectionalTargetLegs)) == {"both", "self", "opposite"}
     assert 8000 in get_args(StreamBidirectionalSamplingRate)
     recording = inspect.signature(AsyncActionsResource.start_recording)
+    recording_stop = inspect.signature(AsyncActionsResource.stop_recording)
     streaming = inspect.signature(AsyncActionsResource.start_streaming)
     assert "max_length" in recording.parameters
+    assert "recording_id" in recording_stop.parameters
     assert "stream_auth_token" in streaming.parameters
     assert inspect.signature(telnyx.AsyncTelnyx).parameters["max_retries"].default == 2
 
@@ -152,7 +173,6 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = call_control()
-    real_constructor = telnyx.AsyncTelnyx
     requests: list[tuple[str, str, dict[str, object], bytes]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -163,10 +183,17 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
     transport = httpx.MockTransport(handler)
     http_client = httpx.AsyncClient(transport=transport)
 
-    def factory(**kwargs: object) -> telnyx.AsyncTelnyx:
-        return real_constructor(**kwargs, http_client=http_client)  # type: ignore[arg-type]
+    constructed: list[dict[str, object]] = []
 
-    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", factory)
+    def transport_factory(**kwargs: object) -> httpx.AsyncClient:
+        constructed.append(dict(kwargs))
+        return http_client
+
+    monkeypatch.setattr(
+        module.telnyx,
+        "DefaultAsyncHttpxClient",
+        transport_factory,
+    )
     client = module.CallControlClient(api_key=API_KEY)
     await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID)
     await client.start_streaming(
@@ -176,17 +203,35 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
     )
     await client.start_recording(
         CALL_CONTROL_ID,
-        module.RecordingStartV1(play_beep=False),
+        module.RecordingStartV1(
+            play_beep=False,
+            client_state=SecretStr(CLIENT_STATE),
+        ),
         command_id=COMMAND_ID,
     )
-    await client.hangup(CALL_CONTROL_ID, command_id=COMMAND_ID)
+    await client.stop_recording(
+        CALL_CONTROL_ID,
+        module.RecordingStopV1(
+            client_state=SecretStr(CLIENT_STATE),
+            recording_id=None,
+        ),
+        command_id=COMMAND_ID,
+    )
+    await client.hangup(
+        CALL_CONTROL_ID,
+        command_id=COMMAND_ID,
+        client_state=SecretStr(CLIENT_STATE),
+    )
     await client.aclose()
+
+    assert constructed == [{"trust_env": False}]
 
     command = str(COMMAND_ID)
     assert [(method, path, query) for method, path, _, query in requests] == [
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/answer", b""),
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/streaming_start", b""),
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/record_start", b""),
+        ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/record_stop", b""),
         ("POST", f"/v2/calls/{CALL_CONTROL_ID}/actions/hangup", b""),
     ]
     assert [body for _, _, body, _ in requests] == [
@@ -204,6 +249,7 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
         },
         {
             "channels": "dual",
+            "client_state": CLIENT_STATE,
             "command_id": command,
             "format": "wav",
             "max_length": 0,
@@ -212,14 +258,18 @@ async def test_real_sdk_serializes_exact_paths_bodies_and_omissions(
             "timeout_secs": 0,
             "transcription": False,
         },
-        {"command_id": command},
+        {"client_state": CLIENT_STATE, "command_id": command},
+        {"client_state": CLIENT_STATE, "command_id": command},
     ]
 
 
 def test_request_models_are_strict_frozen_and_input_redacting() -> None:
     module = call_control()
     streaming = module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)
-    recording = module.RecordingStartV1(play_beep=True)
+    recording = module.RecordingStartV1(
+        play_beep=True,
+        client_state=SecretStr(CLIENT_STATE),
+    )
 
     assert streaming.stream_url == URL
     assert isinstance(streaming.stream_auth_token, SecretStr)
@@ -230,7 +280,39 @@ def test_request_models_are_strict_frozen_and_input_redacting() -> None:
     with pytest.raises(ValidationError, match="frozen"):
         streaming.stream_url = "wss://changed.example.test"  # type: ignore[misc]
     with pytest.raises(ValidationError):
-        module.RecordingStartV1(play_beep=True, trim="trim-silence")
+        module.RecordingStartV1(
+            play_beep=True,
+            client_state=SecretStr(CLIENT_STATE),
+            trim="trim-silence",
+        )
+
+
+def test_recording_stop_provider_id_uses_shared_url_safe_opaque_contract() -> None:
+    module = call_control()
+    provider_id = "r." + "A" * 251 + "~_-"
+
+    accepted = module.RecordingStopV1(
+        client_state=SecretStr(CLIENT_STATE),
+        recording_id=provider_id,
+    )
+    assert accepted.recording_id == provider_id
+
+    with pytest.raises(ValidationError, match="recording_id"):
+        module.RecordingStopV1(
+            client_state=SecretStr(CLIENT_STATE),
+            recording_id="segment/child",
+        )
+
+
+@pytest.mark.parametrize("provider_id", [".", ".."])
+def test_recording_stop_rejects_exact_dot_segments(provider_id: str) -> None:
+    module = call_control()
+
+    with pytest.raises(ValidationError, match="recording_id"):
+        module.RecordingStopV1(
+            client_state=SecretStr(CLIENT_STATE),
+            recording_id=provider_id,
+        )
 
 
 def test_stream_transport_fields_are_absent_from_dumps_and_safe_in_repr_and_str() -> None:
@@ -301,7 +383,10 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     constructions, instances = install_fake(monkeypatch, module, [ok_response()] * 4)
     client = module.CallControlClient(api_key=API_KEY)
     streaming = module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)
-    recording = module.RecordingStartV1(play_beep=True)
+    recording = module.RecordingStartV1(
+        play_beep=True,
+        client_state=SecretStr(CLIENT_STATE),
+    )
 
     results = [
         await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID),
@@ -311,7 +396,12 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     ]
 
     assert [result.outcome for result in results] == ["accepted"] * 4
-    assert constructions == [{"api_key": API_KEY, "max_retries": 0}]
+    assert len(constructions) == 1
+    assert constructions[0]["api_key"] == API_KEY
+    assert constructions[0]["max_retries"] == 0
+    transport = constructions[0]["http_client"]
+    assert isinstance(transport, telnyx.DefaultAsyncHttpxClient)
+    assert transport._mounts == {}  # noqa: SLF001
     assert len(instances) == 1
     calls = instances[0].actions.calls
     assert [call[:2] for call in calls] == [
@@ -343,6 +433,7 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
         "timeout_secs": 0,
         "transcription": False,
         "play_beep": True,
+        "client_state": CLIENT_STATE,
         "command_id": command,
         "timeout": calls[2][2]["timeout"],
     }
@@ -355,6 +446,532 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     rendered = repr(client) + "".join(repr(result) for result in results)
     for secret in (API_KEY, TOKEN, URL, CALL_CONTROL_ID, str(COMMAND_ID)):
         assert secret not in rendered
+
+
+@pytest.mark.asyncio
+async def test_recording_actions_send_one_redacted_capsule_and_omit_unknown_recording_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    _, instances = install_fake(monkeypatch, module, [ok_response()] * 3)
+    client = module.CallControlClient(api_key=API_KEY)
+    capsule = SecretStr(CLIENT_STATE)
+
+    await client.start_recording(
+        CALL_CONTROL_ID,
+        module.RecordingStartV1(play_beep=False, client_state=capsule),
+        command_id=COMMAND_ID,
+    )
+    await client.stop_recording(
+        CALL_CONTROL_ID,
+        module.RecordingStopV1(client_state=capsule, recording_id=None),
+        command_id=COMMAND_ID,
+    )
+    await client.hangup(
+        CALL_CONTROL_ID,
+        command_id=COMMAND_ID,
+        client_state=capsule,
+    )
+
+    calls = instances[0].actions.calls
+    assert [call[:2] for call in calls] == [
+        ("start_recording", CALL_CONTROL_ID),
+        ("stop_recording", CALL_CONTROL_ID),
+        ("hangup", CALL_CONTROL_ID),
+    ]
+    assert calls[0][2]["client_state"] == CLIENT_STATE
+    assert calls[1][2]["client_state"] == CLIENT_STATE
+    assert "recording_id" not in calls[1][2]
+    assert calls[2][2]["client_state"] == CLIENT_STATE
+    request = module.RecordingStopV1(client_state=capsule, recording_id=None)
+    assert request.model_dump() == {}
+    assert CLIENT_STATE not in repr(request) + str(request)
+
+
+@pytest.mark.asyncio
+async def test_recording_catalog_adapter_awaits_exactly_one_page_and_never_reads_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    await_count = 0
+
+    class PoisonRow:
+        id = "recording_Ab-12"
+        call_control_id = CALL_CONTROL_ID
+        call_leg_id = "leg-1"
+        call_session_id = "session-1"
+        channels = "dual"
+        status = "completed"
+        source = "call"
+        initiated_by = "StartCallRecordingAPI"
+        recording_started_at = "2026-08-29T12:00:00Z"
+        recording_ended_at = "2026-08-29T12:01:00Z"
+
+        @property
+        def download_urls(self) -> object:
+            raise AssertionError("recording URL must never be read")
+
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[PoisonRow()],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            nonlocal await_count
+            await_count += 1
+            if await_count != 1:
+                raise AssertionError("paginator awaited more than once")
+            if False:
+                yield None
+            return page
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("paginator iteration is forbidden")
+
+        async def get_next_page(self) -> object:
+            raise AssertionError("next page is forbidden")
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            self.calls.append(dict(kwargs))
+            return OnePageAwaitable()
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = CatalogSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    result = await client.list_recordings_one_page(
+        call_control_id=CALL_CONTROL_ID,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        start_gte_iso="2026-08-29T11:59:55Z",
+        start_lte_iso="2026-08-29T12:00:05Z",
+        end_gte_iso="2026-08-29T12:00:55Z",
+        end_lte_iso="2026-08-29T12:01:05Z",
+        timeout_seconds=0.75,
+    )
+
+    assert await_count == 1
+    assert sdk.recordings.calls == [
+        {
+            "filter": {
+                "call_control_id": CALL_CONTROL_ID,
+                "call_leg_id": "leg-1",
+                "call_session_id": "session-1",
+                "start_time": {
+                    "gte": "2026-08-29T11:59:55Z",
+                    "lte": "2026-08-29T12:00:05Z",
+                },
+                "end_time": {
+                    "gte": "2026-08-29T12:00:55Z",
+                    "lte": "2026-08-29T12:01:05Z",
+                },
+            },
+            "page_size": 2,
+            "timeout": 0.75,
+        }
+    ]
+    assert result.page_number == 1
+    assert result.total_pages == 1
+    assert len(result.items) == 1
+    assert result.items[0].recording_id == "recording_Ab-12"
+    assert result.items[0].recording_started_at == datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [257, 1024])
+async def test_catalog_list_and_retrieve_preserve_long_call_control_id(
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+) -> None:
+    module = call_control()
+    call_control_id = "c" * length
+    row = SimpleNamespace(
+        id="recording_Ab-12",
+        call_control_id=call_control_id,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        channels="dual",
+        status="completed",
+        source="call",
+        initiated_by="StartCallRecordingAPI",
+        recording_started_at="2026-08-29T12:00:00Z",
+        recording_ended_at="2026-08-29T12:01:00Z",
+    )
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[row],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.list_calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            self.list_calls.append(dict(kwargs))
+            return OnePageAwaitable()
+
+        async def retrieve(self, recording_id: str, **kwargs: object) -> object:
+            assert recording_id == "recording_Ab-12"
+            assert kwargs == {"timeout": 0.75}
+            return SimpleNamespace(data=row)
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = CatalogSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    listed = await client.list_recordings_one_page(
+        call_control_id=call_control_id,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        start_gte_iso="2026-08-29T11:59:55Z",
+        start_lte_iso="2026-08-29T12:00:05Z",
+        end_gte_iso="2026-08-29T12:00:55Z",
+        end_lte_iso="2026-08-29T12:01:05Z",
+        timeout_seconds=0.75,
+    )
+    retrieved = await client.retrieve_recording(
+        "recording_Ab-12",
+        timeout_seconds=0.75,
+    )
+
+    assert listed.items[0].call_control_id == call_control_id
+    assert retrieved.call_control_id == call_control_id
+    assert sdk.recordings.list_calls[0]["filter"]["call_control_id"] == call_control_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call_leg_id", "call_session_id"),
+    [("", None), (None, "s" * 257)],
+)
+async def test_recording_list_rejects_invalid_optional_ids_without_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    call_leg_id: str | None,
+    call_session_id: str | None,
+) -> None:
+    module = call_control()
+
+    class ForbiddenRecordings:
+        def list(self, **_: object) -> None:
+            raise AssertionError("recording list must not dispatch")
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = ForbiddenRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: CatalogSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(module.CallControlInputError, match="call_control_input_invalid"):
+        await client.list_recordings_one_page(
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id=call_leg_id,
+            call_session_id=call_session_id,
+            start_gte_iso="2026-08-29T11:59:55Z",
+            start_lte_iso="2026-08-29T12:00:05Z",
+            end_gte_iso="2026-08-29T12:00:55Z",
+            end_lte_iso="2026-08-29T12:01:05Z",
+            timeout_seconds=0.75,
+        )
+
+
+@pytest.mark.asyncio
+async def test_catalog_list_and_retrieve_reject_returned_call_control_id_over_1024(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+    row = SimpleNamespace(
+        id="recording_Ab-12",
+        call_control_id="c" * 1025,
+        call_leg_id="leg-1",
+        call_session_id="session-1",
+        channels="dual",
+        status="completed",
+        source="call",
+        initiated_by="StartCallRecordingAPI",
+        recording_started_at="2026-08-29T12:00:00Z",
+        recording_ended_at="2026-08-29T12:01:00Z",
+    )
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[row],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def list(self, **_: object) -> OnePageAwaitable:
+            return OnePageAwaitable()
+
+        async def retrieve(self, *_: object, **__: object) -> object:
+            return SimpleNamespace(data=row)
+
+    class CatalogSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: CatalogSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(module.RecordingCatalogInvalidError):
+        await client.list_recordings_one_page(
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id="leg-1",
+            call_session_id="session-1",
+            start_gte_iso="2026-08-29T11:59:55Z",
+            start_lte_iso="2026-08-29T12:00:05Z",
+            end_gte_iso="2026-08-29T12:00:55Z",
+            end_lte_iso="2026-08-29T12:01:05Z",
+            timeout_seconds=0.75,
+        )
+    with pytest.raises(module.RecordingCatalogInvalidError):
+        await client.retrieve_recording("recording_Ab-12", timeout_seconds=0.75)
+
+
+@pytest.mark.asyncio
+async def test_recording_retrieve_404_is_transient_not_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+
+    class FakeRecordings:
+        async def retrieve(self, recording_id: str, **kwargs: object) -> object:
+            del recording_id, kwargs
+            raise not_found_error()
+
+    class RetrieveSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = RetrieveSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(
+        module.RecordingCatalogTransientError,
+        match="recording_catalog_transient",
+    ) as raised:
+        await client.retrieve_recording("recording_Ab-12", timeout_seconds=0.75)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "RAW-BODY-SENTINEL" not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", [".", ".."])
+async def test_recording_retrieve_and_delete_reject_dot_segments_without_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_id: str,
+) -> None:
+    module = call_control()
+    calls: list[str] = []
+
+    class ForbiddenRecordings:
+        async def retrieve(self, *_: object, **__: object) -> object:
+            calls.append("retrieve")
+            raise AssertionError("retrieve must not dispatch")
+
+        async def delete(self, *_: object, **__: object) -> object:
+            calls.append("delete")
+            raise AssertionError("delete must not dispatch")
+
+    class DotSegmentSDK:
+        def __init__(self) -> None:
+            self.recordings = ForbiddenRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: DotSegmentSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+
+    with pytest.raises(module.CallControlInputError, match="call_control_input_invalid"):
+        await client.retrieve_recording(provider_id, timeout_seconds=0.75)
+    with pytest.raises(module.CallControlInputError, match="call_control_input_invalid"):
+        await client.delete_recording(provider_id, timeout_seconds=0.75)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "error_name"),
+    [
+        ("provider_status", "RecordingCatalogTransientError"),
+        ("invalid_datetime", "RecordingCatalogInvalidError"),
+        ("poison_scalar", "RecordingCatalogInvalidError"),
+    ],
+)
+async def test_recording_list_errors_discard_provider_exception_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    error_name: str,
+) -> None:
+    module = call_control()
+
+    class PoisonRow:
+        id = "recording_Ab-12"
+        call_leg_id = "leg-1"
+        call_session_id = "session-1"
+        channels = "dual"
+        status = "completed"
+        source = "call"
+        initiated_by = "StartCallRecordingAPI"
+        recording_started_at = "2026-08-29T12:00:00Z"
+        recording_ended_at = "2026-08-29T12:01:00Z"
+
+        @property
+        def call_control_id(self) -> str:
+            if scenario == "poison_scalar":
+                raise RuntimeError("RAW-SCALAR-SENTINEL")
+            return CALL_CONTROL_ID
+
+    row = PoisonRow()
+    if scenario == "invalid_datetime":
+        row.recording_started_at = "RAW-DATETIME-SENTINEL"
+    page = SimpleNamespace(
+        meta=SimpleNamespace(page_number=1, total_pages=1),
+        data=[row],
+    )
+
+    class OnePageAwaitable:
+        def __await__(self):  # type: ignore[no-untyped-def]
+            if False:
+                yield None
+            return page
+
+    class FakeRecordings:
+        def list(self, **kwargs: object) -> OnePageAwaitable:
+            del kwargs
+            if scenario == "provider_status":
+                raise status_error(500)
+            return OnePageAwaitable()
+
+    class ListSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: ListSDK())
+    client = module.CallControlClient(api_key=API_KEY)
+    error_type = getattr(module, error_name)
+
+    with pytest.raises(error_type) as raised:
+        await client.list_recordings_one_page(
+            call_control_id=CALL_CONTROL_ID,
+            call_leg_id="leg-1",
+            call_session_id="session-1",
+            start_gte_iso="2026-08-29T11:59:55Z",
+            start_lte_iso="2026-08-29T12:00:05Z",
+            end_gte_iso="2026-08-29T12:00:55Z",
+            end_lte_iso="2026-08-29T12:01:05Z",
+            timeout_seconds=0.75,
+        )
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    rendered = repr(raised.value)
+    for sentinel in (
+        "RAW-BODY-SENTINEL",
+        "RAW-SCALAR-SENTINEL",
+        "RAW-DATETIME-SENTINEL",
+    ):
+        assert sentinel not in rendered
+
+
+@pytest.mark.asyncio
+async def test_recording_delete_extracts_only_exact_id_and_maps_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = call_control()
+
+    class FakeRecordings:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+            self.responses: deque[object] = deque(
+                [
+                    SimpleNamespace(data=SimpleNamespace(id="recording_Ab-12")),
+                    status_error(404),
+                ]
+            )
+
+        async def delete(self, recording_id: str, **kwargs: object) -> object:
+            self.calls.append((recording_id, dict(kwargs)))
+            result = self.responses.popleft()
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    class DeleteSDK:
+        def __init__(self) -> None:
+            self.recordings = FakeRecordings()
+            self.calls = SimpleNamespace(actions=FakeActions([]))
+
+        async def close(self) -> None:
+            return None
+
+    sdk = DeleteSDK()
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", lambda **_: sdk)
+    client = module.CallControlClient(api_key=API_KEY)
+
+    deleted = await client.delete_recording("recording_Ab-12", timeout_seconds=0.75)
+    missing = await client.delete_recording("recording_Ab-12", timeout_seconds=0.75)
+
+    assert deleted.outcome == "deleted"
+    assert deleted.recording_id == "recording_Ab-12"
+    assert missing.outcome == "not_found"
+    assert missing.recording_id is None
+    assert sdk.recordings.calls == [
+        ("recording_Ab-12", {"timeout": 0.75}),
+        ("recording_Ab-12", {"timeout": 0.75}),
+    ]
 
 
 @pytest.mark.asyncio

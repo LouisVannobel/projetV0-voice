@@ -13,6 +13,7 @@ from uuid import UUID
 
 import pytest
 from nacl.signing import SigningKey
+from pydantic import SecretStr
 
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
@@ -20,6 +21,7 @@ from projetv0_voice.persistence.commands import (
     CommandConflictError,
     FatalPersistenceError,
     PersistenceCommand,
+    PersistenceError,
 )
 from projetv0_voice.persistence.writer import PersistenceWriter
 
@@ -39,11 +41,17 @@ def event_body(
     payload: dict[str, object] | None = None,
     extra: dict[str, object] | None = None,
 ) -> bytes:
+    selected_payload = dict(payload) if payload is not None else {"call_control_id": "control-1"}
+    if event_type == "call.initiated":
+        selected_payload.setdefault("direction", "incoming")
+        selected_payload.setdefault("state", "parked")
+    elif event_type == "call.answered":
+        selected_payload.setdefault("state", "answered")
     data: dict[str, object] = {
         "id": event_id,
         "event_type": event_type,
         "occurred_at": occurred_at,
-        "payload": payload if payload is not None else {"call_control_id": "control-1"},
+        "payload": selected_payload,
     }
     data.update(extra or {})
     return json.dumps({"data": data, "provider_extra": "ignored"}).encode()
@@ -318,7 +326,6 @@ def test_fresh_signature_accepts_old_occurred_at_without_using_it_for_freshness(
     [
         event_body(event_id="x" * 257),
         event_body(event_type="x" * 129),
-        event_body(payload={"call_control_id": "x" * 257}),
     ],
 )
 def test_minimal_envelope_identifiers_have_fixed_structural_bounds(
@@ -328,6 +335,51 @@ def test_minimal_envelope_identifiers_have_fixed_structural_bounds(
     verifier, headers = verifier_for(monkeypatch, body)
 
     with pytest.raises(module.InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
+@pytest.mark.parametrize("length", [257, 1024])
+@pytest.mark.parametrize("required", [False, True])
+def test_signed_call_control_id_preserves_1024_bound_and_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+    required: bool,
+) -> None:
+    call_control_id = "c" * length
+    event_type = "call.initiated" if required else "call.recording.saved"
+    body = event_body(
+        event_type=event_type,
+        payload={"call_control_id": call_control_id},
+    )
+    verifier, headers = verifier_for(
+        monkeypatch,
+        body,
+        required_types=frozenset({event_type}) if required else frozenset(),
+    )
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.call_control_id == call_control_id
+    assert call_control_id not in repr(verified)
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_signed_call_control_id_rejects_1025_characters(
+    monkeypatch: pytest.MonkeyPatch,
+    required: bool,
+) -> None:
+    event_type = "call.initiated" if required else "call.recording.saved"
+    body = event_body(
+        event_type=event_type,
+        payload={"call_control_id": "c" * 1025},
+    )
+    verifier, headers = verifier_for(
+        monkeypatch,
+        body,
+        required_types=frozenset({event_type}) if required else frozenset(),
+    )
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
         verifier.verify(body=body, headers=headers)
 
 
@@ -381,6 +433,141 @@ def test_verified_webhook_is_canonical_minimal_frozen_and_input_redacting(
         assert sentinel not in rendered
     with pytest.raises((AttributeError, TypeError)):
         verified.event_id = "changed"  # type: ignore[misc]
+
+
+def test_current_recording_saved_shape_extracts_only_url_free_semantic_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={
+            "call_leg_id": "leg-1",
+            "call_session_id": "session-1",
+            "client_state": "RAW-CLIENT-STATE-SENTINEL",
+            "recording_started_at": "2026-08-25T11:59:00Z",
+            "recording_ended_at": "2026-08-25T12:00:00Z",
+            "channels": "dual",
+            "public_recording_urls": {"wav": "https://RAW-URL-SENTINEL"},
+        },
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.call_control_id is None
+    assert verified.recording_id is None
+    assert verified.recording_started_at == NOW - timedelta(minutes=1)
+    assert verified.recording_ended_at == NOW
+    assert verified.recording_channels == "dual"
+    assert isinstance(verified.client_state, SecretStr)
+    assert verified.client_state.get_secret_value() == "RAW-CLIENT-STATE-SENTINEL"
+    assert len(verified.semantic_fingerprint_sha256) == 32
+    rendered = repr(verified)
+    for sentinel in (
+        "RAW-CLIENT-STATE-SENTINEL",
+        "RAW-URL-SENTINEL",
+        "leg-1",
+        "session-1",
+    ):
+        assert sentinel not in rendered
+    assert not hasattr(verified, "public_recording_urls")
+
+
+def test_recording_error_shape_ignores_reason_and_semantic_fingerprint_ignores_retry_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def body(*, attempt: int, reason: str, url: str) -> bytes:
+        return event_body(
+            event_type="call.recording.error",
+            payload={
+                "client_state": "RAW-CLIENT-STATE-SENTINEL",
+                "reason": reason,
+                "public_recording_urls": {"wav": url},
+            },
+            extra={"meta": {"attempt": attempt}},
+        )
+
+    first_body = body(attempt=1, reason="first", url="https://one.invalid")
+    second_body = body(attempt=9, reason="changed", url="https://two.invalid")
+    first_verifier, first_headers = verifier_for(monkeypatch, first_body)
+    first = first_verifier.verify(body=first_body, headers=first_headers)
+    second_verifier, second_headers = verifier_for(monkeypatch, second_body)
+    second = second_verifier.verify(body=second_body, headers=second_headers)
+
+    assert first.semantic_fingerprint_sha256 == second.semantic_fingerprint_sha256
+    assert first.recording_started_at is None
+    assert first.recording_ended_at is None
+    assert first.recording_channels is None
+    assert not hasattr(first, "reason")
+
+
+def test_semantic_fingerprint_changes_when_an_effect_driving_field_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints: list[bytes] = []
+    for client_state, ended_at in (
+        ("capsule-a", "2026-08-25T12:00:00Z"),
+        ("capsule-b", "2026-08-25T12:00:00Z"),
+        ("capsule-a", "2026-08-25T12:00:01Z"),
+    ):
+        body = event_body(
+            event_type="call.recording.saved",
+            payload={
+                "client_state": client_state,
+                "recording_started_at": "2026-08-25T11:59:00Z",
+                "recording_ended_at": ended_at,
+                "channels": "dual",
+            },
+        )
+        verifier, headers = verifier_for(monkeypatch, body)
+        fingerprints.append(
+            verifier.verify(body=body, headers=headers).semantic_fingerprint_sha256
+        )
+
+    assert len(set(fingerprints)) == 3
+
+
+def test_signed_recording_id_rejects_url_shape_before_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={"recording_id": "https://RAW-URL-SENTINEL"},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
+def test_signed_recording_id_accepts_256_url_safe_opaque_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_id = "r." + "A" * 251 + "~_-"
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={"recording_id": provider_id},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.recording_id == provider_id
+
+
+@pytest.mark.parametrize("provider_id", [".", ".."])
+def test_signed_recording_id_rejects_exact_dot_segments(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_id: str,
+) -> None:
+    body = event_body(
+        event_type="call.recording.saved",
+        payload={"recording_id": provider_id},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
 
 
 def test_explicit_handled_type_may_require_call_control_id(
@@ -441,6 +628,300 @@ class StubWriter:
             raise self.error
 
 
+class _FinalizationHandle:
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self.task = task
+
+    async def wait(self) -> Any:
+        return await self.task
+
+
+class FakeFinalizerOwner:
+    def __init__(
+        self,
+        *,
+        module: Any,
+        writer: Any,
+        utcnow: Any,
+        after_commit: Any = None,
+    ) -> None:
+        self.module = module
+        self.writer = writer
+        self.utcnow = utcnow
+        self.after_commit = after_commit
+        self.tasks: list[asyncio.Task[Any]] = []
+
+    async def classify_webhook_receipt(self, event: Any) -> str:
+        if isinstance(self.writer, PersistenceWriter):
+            return await self.writer.classify_webhook_receipt(
+                event_id=event.event_id,
+                semantic_fingerprint_sha256=event.semantic_fingerprint_sha256,
+            )
+        return "missing"
+
+    def start_webhook_finalization(
+        self,
+        event: Any,
+        resolution: Any,
+        _receipt: str,
+    ) -> _FinalizationHandle:
+        task = asyncio.create_task(self._run(event, resolution))
+        self.tasks.append(task)
+        return _FinalizationHandle(task)
+
+    async def _run(self, event: Any, resolution: Any) -> Any:
+        effect = resolution.effect
+        receipt = {
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "call_control_id": event.call_control_id,
+            "occurred_at": event.occurred_at,
+            "received_at": self.utcnow(),
+            "semantic_fingerprint_sha256": event.semantic_fingerprint_sha256,
+        }
+        try:
+            if isinstance(self.writer, PersistenceWriter):
+                ticket = self.writer.submit_webhook(
+                    receipt=receipt,
+                    lease=None if effect is None else effect.lease,
+                    operation=None if effect is None else effect.operation,
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(ticket.wait()),
+                        timeout=self.writer.control_commit_timeout_seconds,
+                    )
+                except TimeoutError:
+                    self.writer._signal_fatal("control_commit_timeout")  # type: ignore[attr-defined]
+                    return self.module.WebhookDisposition(503)
+            else:
+                await self.writer.commit_control(
+                    PersistenceCommand(
+                        "webhook_effect",
+                        {
+                            "receipt": receipt,
+                            "lease": None if effect is None else effect.lease,
+                            "operation": None if effect is None else effect.operation,
+                        },
+                        None,
+                    )
+                )
+        except CommandConflictError as error:
+            return self.module.WebhookDisposition(
+                400 if error.args == ("webhook_identity_conflict",) else 500
+            )
+        except (PersistenceError, TimeoutError):
+            return self.module.WebhookDisposition(503)
+        except Exception:
+            return self.module.WebhookDisposition(500)
+        if self.after_commit is not None:
+            disposition = await self.after_commit(event, effect)
+            if disposition is not None:
+                return disposition
+        return self.module.WebhookDisposition(200)
+
+
+def processor_with_fake_owner(
+    *,
+    module: Any,
+    verifier: Any,
+    writer: Any,
+    resolver: Any,
+    utcnow: Any,
+    after_commit: Any = None,
+) -> Any:
+    def wrapped(event: Any) -> Any:
+        value = resolver(event)
+        if value is None:
+            return module.ResolvedWebhook(None)
+        if isinstance(value, module.WebhookDurableEffect):
+            return module.ResolvedWebhook(value)
+        return value
+
+    return module.TelnyxWebhookProcessor(
+        verifier=verifier,
+        resolver=wrapped,
+        duplicate_resolver=wrapped,
+        finalizer_owner=FakeFinalizerOwner(
+            module=module,
+            writer=writer,
+            utcnow=utcnow,
+            after_commit=after_commit,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_processor_awaits_after_commit_and_accepts_only_recording_dispositions() -> None:
+    module = webhooks()
+    event = module.VerifiedWebhook(
+        event_id="event-1",
+        event_type="call.recording.saved",
+        occurred_at=NOW,
+        call_control_id=None,
+        call_leg_id=None,
+        call_session_id=None,
+        recording_id=None,
+        stream_id=None,
+        client_state=SecretStr("capsule"),
+        recording_started_at=NOW - timedelta(minutes=1),
+        recording_ended_at=NOW,
+        recording_channels="dual",
+        semantic_fingerprint_sha256=b"s" * 32,
+    )
+    order: list[str] = []
+
+    class StubVerifier:
+        def verify(self, **_: object) -> Any:
+            return event
+
+    class OrderedWriter(StubWriter):
+        async def commit_control(self, command: PersistenceCommand) -> None:
+            await super().commit_control(command)
+            order.append("committed")
+
+    async def after_commit(received: Any, effect: Any) -> Any:
+        assert received is event
+        assert effect is None
+        order.append("after_commit")
+        return module.WebhookDisposition(503)
+
+    response = await processor_with_fake_owner(
+        module=module,
+        verifier=StubVerifier(),
+        writer=OrderedWriter(),
+        resolver=lambda _: None,
+        utcnow=lambda: NOW,
+        after_commit=after_commit,
+    ).process(body=b"{}", headers=[])
+
+    assert response == module.WebhookDisposition(503)
+    assert order == ["committed", "after_commit"]
+
+
+@pytest.mark.asyncio
+async def test_processor_preserves_the_closed_qualification_rejection_reason() -> None:
+    module = webhooks()
+    event = module.VerifiedWebhook(
+        event_id="qualification-consumed",
+        event_type="call.initiated",
+        occurred_at=NOW,
+        call_control_id="control-a",
+        call_leg_id="leg-a",
+        call_session_id="session-a",
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"q" * 32,
+        direction="incoming",
+        call_state="parked",
+    )
+
+    class Handle:
+        async def wait(self) -> Any:
+            return module.WebhookDisposition(
+                503,
+                admission_rejection="qualification",
+            )
+
+    class Owner:
+        async def classify_webhook_receipt(self, _event: Any) -> str:
+            return "missing"
+
+        def start_webhook_finalization(self, *_args: object) -> Handle:
+            return Handle()
+
+    class Verifier:
+        def verify(self, **_kwargs: object) -> Any:
+            return event
+
+    processor = module.TelnyxWebhookProcessor(
+        verifier=Verifier(),
+        resolver=lambda _event: module.ResolvedWebhook(None),
+        finalizer_owner=Owner(),
+    )
+
+    observed = await processor.process_observed(body=b"{}", headers=[])
+
+    assert observed.disposition == module.WebhookDisposition(503)
+    assert observed.webhook_class == "initiated"
+    assert observed.receipt == "first"
+    assert observed.metric_disposition == "unavailable"
+    assert observed.admission_rejection == "qualification"
+
+
+def test_webhook_disposition_rejects_dynamic_admission_rejection() -> None:
+    module = webhooks()
+
+    with pytest.raises(ValueError, match="^webhook_disposition_invalid$"):
+        module.WebhookDisposition(503, admission_rejection="PRIVATE-REASON")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("classification", "expected_receipt"),
+    [("missing", "first"), ("duplicate", "duplicate")],
+)
+async def test_processor_transfers_closed_receipt_classification_to_finalizer(
+    classification: str,
+    expected_receipt: str,
+) -> None:
+    module = webhooks()
+    event = module.VerifiedWebhook(
+        event_id="receipt-classification",
+        event_type="future.event",
+        occurred_at=NOW,
+        call_control_id=None,
+        call_leg_id=None,
+        call_session_id=None,
+        recording_id=None,
+        stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"r" * 32,
+    )
+    received: list[str] = []
+
+    class Handle:
+        async def wait(self) -> Any:
+            return module.WebhookDisposition(200)
+
+    class Owner:
+        async def classify_webhook_receipt(self, _event: Any) -> str:
+            return classification
+
+        def start_webhook_finalization(
+            self,
+            _event: Any,
+            _resolution: Any,
+            receipt: str,
+        ) -> Handle:
+            received.append(receipt)
+            return Handle()
+
+    class Verifier:
+        def verify(self, **_kwargs: object) -> Any:
+            return event
+
+    processor = module.TelnyxWebhookProcessor(
+        verifier=Verifier(),
+        resolver=lambda _event: module.ResolvedWebhook(None),
+        duplicate_resolver=lambda _event: module.ResolvedWebhook(None),
+        finalizer_owner=Owner(),
+    )
+
+    observed = await processor.process_observed(body=b"{}", headers=[])
+
+    assert observed.disposition == module.WebhookDisposition(200)
+    assert observed.receipt == expected_receipt
+    assert received == [expected_receipt]
+
+
 @pytest.mark.asyncio
 async def test_processor_commits_one_atomic_receipt_only_effect_before_empty_200(
     monkeypatch: pytest.MonkeyPatch,
@@ -455,7 +936,8 @@ async def test_processor_commits_one_atomic_receipt_only_effect_before_empty_200
         resolved.append(event)
         return None
 
-    processor = module.TelnyxWebhookProcessor(
+    processor = processor_with_fake_owner(
+        module=module,
         verifier=verifier,
         writer=writer,
         resolver=resolver,
@@ -476,6 +958,7 @@ async def test_processor_commits_one_atomic_receipt_only_effect_before_empty_200
             "call_control_id": None,
             "occurred_at": NOW,
             "received_at": NOW + timedelta(seconds=1),
+            "semantic_fingerprint_sha256": resolved[0].semantic_fingerprint_sha256,
         },
         "lease": None,
         "operation": None,
@@ -508,6 +991,11 @@ async def test_processor_has_exact_empty_safe_status_matrix(source: str, expecte
         call_session_id=None,
         recording_id=None,
         stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"s" * 32,
     )
 
     class StubVerifier:
@@ -535,7 +1023,8 @@ async def test_processor_has_exact_empty_safe_status_matrix(source: str, expecte
             raise RuntimeError("RAW-RESOLVER-SENTINEL")
         return None
 
-    response = await module.TelnyxWebhookProcessor(
+    response = await processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(), writer=writer, resolver=resolver, utcnow=lambda: NOW
     ).process(body=b"RAW-BODY-SENTINEL", headers=[])
 
@@ -557,6 +1046,11 @@ async def test_processor_rejects_async_or_invalid_resolver_without_committing() 
         call_session_id=None,
         recording_id=None,
         stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"s" * 32,
     )
 
     class StubVerifier:
@@ -568,7 +1062,8 @@ async def test_processor_rejects_async_or_invalid_resolver_without_committing() 
 
     for resolver in (async_resolver, lambda _: SimpleNamespace(lease=None, operation=None)):
         writer = StubWriter()
-        response = await module.TelnyxWebhookProcessor(
+        response = await processor_with_fake_owner(
+            module=module,
             verifier=StubVerifier(), writer=writer, resolver=resolver, utcnow=lambda: NOW
         ).process(body=b"{}", headers=[])
         assert (response.status_code, response.body) == (500, b"")
@@ -593,6 +1088,7 @@ async def test_identical_duplicate_discards_entire_different_candidate_effect(
         "call_control_id": None,
         "occurred_at": NOW,
         "received_at": NOW,
+        "semantic_fingerprint_sha256": b"s" * 32,
     }
     first = PersistenceCommand(
         "webhook_effect",
@@ -655,7 +1151,8 @@ async def test_concurrent_duplicate_processor_calls_commit_one_durable_effect(
         },
         operation=call_operation(),
     )
-    processor = module.TelnyxWebhookProcessor(
+    processor = processor_with_fake_owner(
+        module=module,
         verifier=verifier,
         writer=writer,
         resolver=lambda _: effect,
@@ -695,6 +1192,11 @@ async def test_real_writer_late_commit_requires_restart_then_redelivery_is_dupli
         call_session_id=None,
         recording_id=None,
         stream_id=None,
+        client_state=None,
+        recording_started_at=None,
+        recording_ended_at=None,
+        recording_channels=None,
+        semantic_fingerprint_sha256=b"s" * 32,
     )
 
     class StubVerifier:
@@ -729,7 +1231,8 @@ async def test_real_writer_late_commit_requires_restart_then_redelivery_is_dupli
     )
     writer_task = asyncio.create_task(writer.run())
     assert await writer.wait_ready() is True
-    processor = module.TelnyxWebhookProcessor(
+    processor = processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(),
         writer=writer,
         resolver=lambda _: effect,
@@ -750,7 +1253,8 @@ async def test_real_writer_late_commit_requires_restart_then_redelivery_is_dupli
     await writer_task
 
     restarted, restarted_task = await start_writer(database)
-    restarted_processor = module.TelnyxWebhookProcessor(
+    restarted_processor = processor_with_fake_owner(
+        module=module,
         verifier=StubVerifier(),
         writer=restarted,
         resolver=lambda _: effect,

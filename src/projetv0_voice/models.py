@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import string
 from datetime import UTC, datetime
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, TypeGuard
 from uuid import UUID
 
 from pydantic import (
@@ -27,6 +28,19 @@ def _require_exact_int(value: object) -> object:
 
 SchemaVersionV1 = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
 PositiveInt = Annotated[int, Field(gt=0), BeforeValidator(_require_exact_int)]
+MAX_PROVIDER_RECORDING_ID_CHARS = 256
+_PROVIDER_RECORDING_ID_CHARS = frozenset(
+    string.ascii_letters + string.digits + "-._~"
+)
+
+
+def is_valid_provider_recording_id(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MAX_PROVIDER_RECORDING_ID_CHARS
+        and value not in {".", ".."}
+        and all(character in _PROVIDER_RECORDING_ID_CHARS for character in value)
+    )
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -158,7 +172,7 @@ class TurnUpsertPayloadV1(_StrictFrozenModel):
 class RecordingUpsertPayloadV1(_StrictFrozenModel):
     recording_id: UUID
     status: Literal["off", "pending", "active", "saved", "failed", "purged"]
-    telnyx_recording_id: str | None
+    telnyx_recording_id: str | None = None
     channels: Literal["dual"] | None
     format: Literal["wav"] | None
     started_at: datetime | None
@@ -171,6 +185,13 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
     _normalize_datetimes = field_validator(
         "started_at", "ended_at", "retention_until", mode="after"
     )(_optional_utc_datetime)
+
+    @field_validator("telnyx_recording_id")
+    @classmethod
+    def validate_provider_recording_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_provider_recording_id(value):
+            raise ValueError("provider recording ID is invalid")
+        return value
 
     @model_validator(mode="after")
     def validate_recording(self) -> Self:
@@ -186,10 +207,29 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
             raise ValueError("off recording cannot contain recording metadata")
         if self.status != "off" and (self.channels != "dual" or self.format != "wav"):
             raise ValueError("enabled recording requires dual-channel WAV metadata")
-        if self.status in {"active", "saved", "failed", "purged"} and self.started_at is None:
-            raise ValueError("active or final recording requires started_at")
-        if self.status in {"saved", "failed", "purged"} and self.ended_at is None:
-            raise ValueError("final recording requires ended_at")
+        timeline_present = self.started_at is not None or self.ended_at is not None
+        if timeline_present and (self.started_at is None or self.ended_at is None):
+            raise ValueError("recording timeline must be wholly present or absent")
+        if self.status in {"pending", "active"} and any(
+            item is not None
+            for item in (
+                self.telnyx_recording_id,
+                self.started_at,
+                self.ended_at,
+                self.retention_until,
+            )
+        ):
+            raise ValueError("pending or reserved active recording has no provider truth")
+        if self.status == "failed" and self.retention_until is not None:
+            raise ValueError("failed recording has no retention deadline")
+        if self.status in {"saved", "purged"} and (
+            self.started_at is None
+            or self.ended_at is None
+            or self.retention_until is None
+        ):
+            raise ValueError("saved or purged recording requires timeline and retention")
+        if self.status == "purged" and self.telnyx_recording_id is None:
+            raise ValueError("purged recording requires provider identity")
         if (
             self.started_at is not None
             and self.ended_at is not None
