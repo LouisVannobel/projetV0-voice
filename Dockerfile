@@ -28,6 +28,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
+# The final runtime never installs packages; remove base-image installers and vendored payloads.
+RUN PYTHONDONTWRITEBYTECODE=1 /usr/local/bin/python3 -m pip uninstall --yes pip \
+    && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.13 \
+    && rm -rf /usr/local/lib/python3.13/ensurepip
+
 WORKDIR /opt/projetv0-voice
 
 ENV PATH="/opt/projetv0-voice/.venv/bin:$PATH"
