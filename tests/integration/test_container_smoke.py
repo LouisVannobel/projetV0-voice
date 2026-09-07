@@ -371,6 +371,11 @@ def test_container_smoke(tmp_path: Path) -> None:
             "from pipecat.audio.vad.silero import SileroVADAnalyzer;"
             "SileroVADAnalyzer();"
             "assert (os.getuid(),os.getgid())==(10001,10001);"
+            "assert importlib.util.find_spec('pip') is None;"
+            "assert importlib.util.find_spec('ensurepip') is None;"
+            "assert shutil.which('pip') is None;"
+            "assert shutil.which('pip3') is None;"
+            "assert shutil.which('pip3.13') is None;"
             "assert importlib.util.find_spec('pytest') is None;"
             "assert importlib.util.find_spec('mypy') is None;"
             "assert importlib.util.find_spec('ruff') is None;"
@@ -394,6 +399,42 @@ def test_container_smoke(tmp_path: Path) -> None:
             image,
             "-c",
             import_program,
+        )
+
+        global_installer_program = (
+            "import importlib.util,shutil;"
+            "from pathlib import Path;"
+            "site_packages=Path('/usr/local/lib/python3.13/site-packages');"
+            "assert importlib.util.find_spec('pip') is None;"
+            "assert importlib.util.find_spec('ensurepip') is None;"
+            "assert shutil.which('pip') is None;"
+            "assert shutil.which('pip3') is None;"
+            "assert shutil.which('pip3.13') is None;"
+            "assert not tuple(site_packages.glob('pip-*.dist-info'));"
+            "paths=("
+            "'/usr/local/bin/pip',"
+            "'/usr/local/bin/pip3',"
+            "'/usr/local/bin/pip3.13',"
+            "'/usr/local/lib/python3.13/site-packages/pip',"
+            "'/usr/local/lib/python3.13/ensurepip'"
+            ");"
+            "assert all(not Path(path).exists() and not Path(path).is_symlink() for path in paths),"
+            "[path for path in paths if Path(path).exists() or Path(path).is_symlink()]"
+        )
+        _docker(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev",
+            "--entrypoint",
+            "/usr/local/bin/python3",
+            image,
+            "-I",
+            "-c",
+            global_installer_program,
         )
 
         _docker("network", "create", "--internal", network)
