@@ -488,7 +488,7 @@ async def test_atomic_consume_publishes_exact_immutable_claim_time_grant_once() 
         assert grant.telnyx_call_session_id == "session-a"
         assert grant.stream_id == "stream-exact"
         assert grant.started_at == NOW.replace(minute=7)
-        assert grant.retention_until == NOW.replace(minute=7) + timedelta(days=7)
+        assert grant.retention_until == NOW + timedelta(days=7)
         assert repr(grant) == "CallConstructionGrant()"
         assert not hasattr(grant, "__dict__")
         with pytest.raises(dataclasses.FrozenInstanceError):

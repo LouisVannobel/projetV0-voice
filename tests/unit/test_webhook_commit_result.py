@@ -15,7 +15,7 @@ from projetv0_voice.persistence.commands import (
     FatalPersistenceError,
     PersistenceCommand,
 )
-from projetv0_voice.persistence.schema import SCHEMA_SQL, V1_SCHEMA_SQL
+from projetv0_voice.persistence.schema import V1_SCHEMA_SQL
 from projetv0_voice.persistence.writer import PersistenceWriter
 
 KEY = bytes(range(32))
@@ -85,20 +85,13 @@ def _operation(operation_id: int = 1) -> VoiceOperationV1:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_writer_establishes_exact_sqlite_v2_before_readiness(
+async def test_writer_establishes_exact_sqlite_v3_before_readiness(
     tmp_path: Path, legacy: bool
 ) -> None:
     database = tmp_path / "voice.sqlite"
     if legacy:
-        legacy_sql = SCHEMA_SQL.replace(
-            "\nCREATE TABLE qualification_runs (\n"
-            "    run_id TEXT PRIMARY KEY NOT NULL,\n"
-            "    consumed_at TEXT NOT NULL\n"
-            ");\n",
-            "\n",
-        ).replace("PRAGMA user_version = 2;", "PRAGMA user_version = 1;")
         with sqlite3.connect(database) as connection:
-            connection.executescript(legacy_sql)
+            connection.executescript(V1_SCHEMA_SQL)
 
     writer, task = await _start_writer(database)
     await _stop_writer(writer, task)
@@ -113,7 +106,7 @@ async def test_writer_establishes_exact_sqlite_v2_before_readiness(
             )
         }
 
-    assert version == (2,)
+    assert version == (3,)
     assert objects == {
         ("index", "outbox_due_fifo_idx"),
         ("table", "call_leases"),
