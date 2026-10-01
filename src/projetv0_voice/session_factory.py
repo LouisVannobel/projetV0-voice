@@ -265,12 +265,7 @@ class _CallLifecycleOwner:
             handshake = self._handshake
             metric_lease = self._metric_lease
             task = self._task
-            if (
-                grant is None
-                or handshake is None
-                or metric_lease is None
-                or task is None
-            ):
+            if grant is None or handshake is None or metric_lease is None or task is None:
                 return
             self._phase = "constructing"
             await self._factory._construct_and_run(  # noqa: SLF001
@@ -407,6 +402,9 @@ class ProcessSessionFactory:
             raise
         if cancellation is not None:
             raise cancellation
+
+    async def erase_call_by_id(self, call_id: UUID) -> None:
+        await cast(Any, self._registry).stop_call_content(call_id)
 
     async def _live(
         self,

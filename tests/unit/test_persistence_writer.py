@@ -765,7 +765,7 @@ async def test_just_over_64_kib_is_fatal_and_never_inserted(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_schema_has_exact_v3_tables_required_columns_checks_and_delete_journal(
+async def test_schema_has_exact_v4_tables_required_columns_checks_and_delete_journal(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -774,6 +774,7 @@ async def test_schema_has_exact_v3_tables_required_columns_checks_and_delete_jou
         "foreign_keys": 1,
         "journal_mode": "delete",
         "synchronous": 3,
+        "secure_delete": 1,
     }
     await stop_writer(writer, task)
 
@@ -798,6 +799,9 @@ async def test_schema_has_exact_v3_tables_required_columns_checks_and_delete_jou
         "webhook_receipts",
         "outbox",
         "qualification_runs",
+        "sparra_turn_decisions",
+        "sparra_publications",
+        "sparra_content_fences",
     }
     assert "natural_key" not in ddl
     assert "delivered_at" not in ddl
@@ -811,21 +815,22 @@ async def test_schema_has_exact_v3_tables_required_columns_checks_and_delete_jou
     assert "length(semantic_fingerprint_sha256) = 32" in ddl
     assert journal_mode == ("delete",)
     assert "lifecycle_json" in ddl
-    assert user_version == (3,)
+    assert user_version == (4,)
 
 
-@pytest.mark.parametrize("legacy_version", [1, 2])
+@pytest.mark.parametrize("legacy_version", [1, 2, 3])
 @pytest.mark.asyncio
 async def test_forward_lifecycle_migration_preserves_every_legacy_outbox_byte(
     tmp_path, legacy_version
 ):
-    from projetv0_voice.persistence.schema import V1_SCHEMA_SQL, V2_SCHEMA_SQL
+    from projetv0_voice.persistence.schema import V1_SCHEMA_SQL, V2_SCHEMA_SQL, V3_SCHEMA_SQL
 
     legacy = operation()
     prepared = encrypt_operation(legacy, CryptoKeyring({1: KEY}, active_version=1))
     database = tmp_path / f"legacy-{legacy_version}.sqlite"
     with sqlite3.connect(database) as connection:
-        connection.executescript(V1_SCHEMA_SQL if legacy_version == 1 else V2_SCHEMA_SQL)
+        legacy_schema = {1: V1_SCHEMA_SQL, 2: V2_SCHEMA_SQL, 3: V3_SCHEMA_SQL}[legacy_version]
+        connection.executescript(legacy_schema)
         connection.execute(
             "INSERT INTO outbox (op_id,deployment_id,kind,schema_version,call_id,"
             "turn_id,recording_id,crypto_version,key_version,nonce,ciphertext,"
@@ -850,7 +855,7 @@ async def test_forward_lifecycle_migration_preserves_every_legacy_outbox_byte(
     await stop_writer(writer, task)
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT * FROM outbox").fetchall() == before
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         assert "lifecycle_json" in {
             row[1] for row in connection.execute("PRAGMA table_info(call_leases)")
         }

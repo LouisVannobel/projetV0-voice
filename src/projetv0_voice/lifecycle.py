@@ -34,7 +34,7 @@ from projetv0_voice.metrics import (
     RuntimePublishedSnapshot,
 )
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
-from projetv0_voice.persistence.relay import OutboxRelay
+from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
 from projetv0_voice.persistence.writer import (
     PersistenceWriter,
     QualificationRunConsumed,
@@ -763,6 +763,12 @@ class RuntimeSupervisor:
                 )
             if self._sink is not None:
                 await self._startup_await(self._sink.open(), code="operation_sink_open_failed")
+            if self._sparra_enabled:
+                if self._relay is None:
+                    raise RuntimeError("stale_recovery_failed")
+                await self._startup_await(
+                    self._relay.prepare_before_fifo(), code="stale_recovery_failed"
+                )
             await self._recover_stale_leases()
             self._register_fixed_supervisors()
             self.fixed_supervisors.close_registration()
@@ -1366,6 +1372,11 @@ class RuntimeSupervisor:
             raise RuntimeError("stale_recovery_failed") from None
         measured = self._measured_call_control
         for stale in stale_leases:
+            if self._sparra_enabled or stale.lifecycle is not None:
+                lifecycle = await self._startup_await(
+                    self._writer.read_call_lifecycle(stale.call_id), code="stale_recovery_failed"
+                )
+                stale = replace(stale, lifecycle=lifecycle)
             if stale.lifecycle is not None and stale.lifecycle.transfer_fenced:
                 if self._registry is None:
                     raise RuntimeError("transfer_recovery_registry_missing")
@@ -1741,11 +1752,20 @@ async def build_production_runtime(
                 raise RuntimeError("runtime_supervisor_unavailable") from None
             await supervisor_ref.begin_drain()
 
+        async def prepare_sparra_fifo() -> None:
+            await maintain_call_content(
+                writer, cast(Any, sink), session_factory.erase_call_by_id,
+                utcnow=utcnow, timeout_seconds=settings.call_cleanup_phase_timeout_seconds + 20,
+            )
         relay = OutboxRelay(
             writer,
             cast(Any, sink),
             on_degraded=begin_drain,
             drain=begin_drain,
+            before_fifo=prepare_sparra_fifo if manifest.sparra is not None else None,
+            stop_erased_call=(
+                lambda call_id: session_factory.erase_call_by_id(call_id)
+            ) if manifest.sparra is not None else None,
         )
         raw_call_control = factories.call_control_factory(telnyx_api_key)
         inference = factories.inference_factory(

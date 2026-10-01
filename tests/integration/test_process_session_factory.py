@@ -622,7 +622,7 @@ class _Session:
         self.events.append(f"session-drain:{reason}")
 
 
-@pytest.mark.parametrize("clear_behavior", ["stall", "raise", "cancel", "waiter_cancel"])
+@pytest.mark.parametrize("clear_behavior", ["stall", "raise", "cancel", "waiter_cancel", "erase"])
 @pytest.mark.asyncio
 async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
     tmp_path, monkeypatch, clear_behavior
@@ -792,6 +792,19 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
         assert session._controller.state.name == "MARK_PENDING"
         assert await session._controller.accept_mark(session._controller.mark_name)
         await session._controller.join_continuations()
+        if clear_behavior == "erase":
+            await asyncio.wait_for(factory.erase_call_by_id(claim.call_id), timeout=5)
+            await writer.erase_call_content(claim.call_id, now=NOW)
+            await asyncio.wait_for(running, timeout=5)
+            facts = await writer.read_call_lifecycle(claim.call_id)
+            assert facts.content_erased and facts.disclosure_evidence is None
+            assert facts.content_departed_generation == claim.generation
+            assert (await writer.read_retained_call(claim.call_id)).erased
+            assert await writer.oldest_outbox_created_at() is None
+            assert control.hangups == []
+            assert await registry.live_call_count() == 1
+            assert "stt-client-close" in events and "llm-client-close" in events
+            return
         generation = await registry.generation_handle("control-a")
         assert await registry.request_human(generation) == "ringing"
         facts = await writer.read_call_lifecycle(claim.call_id)

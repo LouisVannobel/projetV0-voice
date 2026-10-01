@@ -34,11 +34,14 @@ from projetv0_voice.models import (
     BeginCallSnapshotV1,
     CallUpsertPayloadV1,
     DisclosureEvidenceV1,
+    MessageResultV1,
     RoutingV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
     _e164,
 )
+from projetv0_voice.persistence.business_contract import validate_turn_text
+from projetv0_voice.persistence.business_result import infer_partial_result
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.pipeline import (
     SPARRA_DISCLOSURE,
@@ -272,7 +275,7 @@ MAX_TURN_TEXT_BYTES = 65_520
 
 
 class TurnWriter(Protocol):
-    def try_enqueue_turn(self, operation: VoiceOperationV1) -> bool: ...
+    def try_enqueue_turn(self, operation: VoiceOperationV1, *, truncated: bool = False) -> bool: ...
 
 
 class TurnRecorder:
@@ -332,13 +335,24 @@ class TurnRecorder:
         if not self._accepting or content is None or content == "":
             return
         accepted = False
+        capture_id = None
         try:
-            plaintext = self._bounded_copy(content)
+            if self._identity.routing is not None:
+                self._turn_no += 1
+                capture_id = self._uuid_factory()
+                accepted = True
+            bound = 16384 if self._identity.routing is not None else MAX_TURN_TEXT_BYTES
+            encoded = content.encode("utf-8")
+            plaintext = encoded[:bound].decode("utf-8", errors="ignore").encode("utf-8")
             if not plaintext:
                 return
             accepted = True
-            self._turn_no += 1
-            turn_id = self._uuid_factory()
+            if capture_id is None:
+                self._turn_no += 1
+                capture_id = self._uuid_factory()
+            else:
+                validate_turn_text(plaintext.decode("utf-8"))
+            turn_id = capture_id
             encrypted = self._keyring.encrypt(
                 plaintext,
                 aad=b"turn:" + str(turn_id).encode("ascii"),
@@ -367,10 +381,17 @@ class TurnRecorder:
                 kind="turn.upsert",
                 payload=payload,
             )
-            if not self._writer.try_enqueue_turn(operation):
+            enqueued = (
+                self._writer.try_enqueue_turn(operation, truncated=len(encoded) > bound)
+                if self._identity.routing is not None
+                else self._writer.try_enqueue_turn(operation)
+            )
+            if not enqueued:
                 self._record_turn_lost()
                 self._first_failure.signal("writer_failed")
         except Exception:
+            if self._identity.routing is not None and capture_id is not None:
+                cast(Any, self._writer).try_enqueue_capture_loss(self._identity.call_id, capture_id)
             if accepted:
                 self._record_turn_lost()
             self._first_failure.signal("persistence_failed")
@@ -596,6 +617,9 @@ class CallSession:
         self._recorder: TurnRecorder | None = None
         self._active_runtime: CallRuntime | None = None
         self._terminal_publication: VoiceOperationV1 | None = None
+        self._partial_result: MessageResultV1 | None = None
+        self._result_inference_task: asyncio.Task[MessageResultV1 | None] | None = None
+        self._result_inference_fenced = False
 
     @property
     def no_new_ai(self) -> bool:
@@ -603,10 +627,53 @@ class CallSession:
 
     def stop_new_ai(self) -> None:
         self._no_new_ai = True
+        self.stop_result_inference()
         if self._controller is not None:
             self._controller.stop_input()
         if self._recorder is not None:
             self._recorder.close()
+
+    def stop_result_inference(self) -> None:
+        """A takeover intent irreversibly revokes this call's result request."""
+        self._result_inference_fenced = True
+        self._partial_result = None
+        if self._result_inference_task is not None:
+            self._result_inference_task.cancel()
+
+    async def _prepare_partial_result(self) -> None:
+        if self._identity.routing is None:
+            return
+        frozen = await cast(Any, self._writer).read_frozen_call_publication(self._identity.call_id)
+        if frozen is not None:
+            self._terminal_publication = frozen
+            return
+        retained = await cast(Any, self._writer).read_retained_call(self._identity.call_id)
+        facts = await cast(Any, self._writer).read_call_lifecycle(self._identity.call_id)
+        if (
+            self._no_new_ai
+            or getattr(self, "_result_inference_fenced", False)
+            or retained.erased
+            or (facts is not None and facts.transfer_fenced)
+        ):
+            return
+        task = asyncio.create_task(
+            infer_partial_result(
+                cast(Any, self._services.llm), retained, self._identity.routing.from_e164
+            ),
+            name="call-result-inference-owned",
+        )
+        self._result_inference_task = task
+        try:
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
+                result = await task
+            if not self._no_new_ai and not self._result_inference_fenced:
+                self._partial_result = result
+        except (Exception, asyncio.CancelledError):
+            self._partial_result = None
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _request_human_tool(self, params: FunctionCallParams) -> None:
         if (
@@ -811,6 +878,9 @@ class CallSession:
             # Cancellation is independent of the optional output acknowledgement.
             await runner.cancel(reason="drain")
         finally:
+            if self._result_inference_task is not None and self._no_new_ai:
+                self._result_inference_task.cancel()
+                await asyncio.gather(self._result_inference_task, return_exceptions=True)
             if clear_task is not None:
                 await clear_task
 
@@ -830,6 +900,7 @@ class CallSession:
             "session_construction_failed",
             "telnyx_hangup",
             "qualified_line_connected",
+            "content_erased",
         }:
             raise ValueError("call_drain_reason_invalid") from None
         self._terminal_outcome.request_reason(reason)
@@ -945,9 +1016,7 @@ class CallSession:
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError as error:
-                caller_is_cancelling = (
-                    caller_task is not None and caller_task.cancelling() > 0
-                )
+                caller_is_cancelling = caller_task is not None and caller_task.cancelling() > 0
                 if caller_is_cancelling and cancellation is None:
                     cancellation = error
                     terminal_outcome.note_caller_cancellation()
@@ -1103,13 +1172,19 @@ class CallSession:
             first_failure,
             "recording_cleanup_failed",
         )
-        await self._attempt(self._services.aclose, first_failure, "service_close_failed")
+        await self._attempt(self._prepare_partial_result, first_failure, "persistence_failed")
+        if self._identity.routing is None:
+            await self._attempt(self._services.aclose, first_failure, "service_close_failed")
         self._promote_cleanup_failure(terminal_outcome, first_failure)
-        await self._finish_durable_boundaries(
-            first_failure=first_failure,
-            terminal_outcome=terminal_outcome,
-            disclosure_completed=controller.disclosure_completed,
-        )
+        try:
+            await self._finish_durable_boundaries(
+                first_failure=first_failure,
+                terminal_outcome=terminal_outcome,
+                disclosure_completed=controller.disclosure_completed,
+            )
+        finally:
+            if self._identity.routing is not None:
+                await self._attempt(self._services.aclose, first_failure, "service_close_failed")
 
     @staticmethod
     async def _join_task(task: asyncio.Task[None]) -> None:
@@ -1163,7 +1238,13 @@ class CallSession:
                     ended_at=authority._closed_at,  # noqa: SLF001
                 )
                 if not persisted:
+                    if self._identity.routing is not None:
+                        await self._attempt(
+                            self._services.aclose, first_failure, "service_close_failed"
+                        )
                     return
+            if self._identity.routing is not None:
+                await self._attempt(self._services.aclose, first_failure, "service_close_failed")
             await self._registry_terminalizer.complete(authority)
             return
         frozen = terminal_outcome.freeze()
@@ -1177,6 +1258,8 @@ class CallSession:
                 first_failure,
                 "persistence_failed",
             )
+        if self._identity.routing is not None:
+            await self._attempt(self._services.aclose, first_failure, "service_close_failed")
         await self._attempt(
             lambda: self._lease_terminalizer.terminalize(
                 self._identity,
@@ -1270,6 +1353,16 @@ class CallSession:
             ),
         )
         self._terminal_publication = operation
+        if self._identity.routing is not None:
+            frozen = await cast(Any, self._writer).freeze_call_publication(
+                operation,
+                self._partial_result,
+                provider_callback=self._identity.routing.from_e164,
+                result_permitted=lambda: not self._no_new_ai and not self._result_inference_fenced,
+            )
+            if frozen is not None:
+                self._terminal_publication = frozen
+            return
         await self._writer.commit_control(
             PersistenceCommand("outbox", {"operation": operation}, None)
         )

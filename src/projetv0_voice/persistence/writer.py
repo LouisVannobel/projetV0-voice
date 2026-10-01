@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import errno
 import hashlib
@@ -32,9 +33,16 @@ from projetv0_voice.crypto import (
 from projetv0_voice.models import (
     CallUpsertPayloadV1,
     DisclosureEvidenceV1,
+    MessageResultV1,
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
+)
+from projetv0_voice.persistence.business_contract import encrypt_message_result, validate_turn_text
+from projetv0_voice.persistence.business_result import (
+    RetainedCall,
+    RetainedTurn,
+    validate_result_provenance,
 )
 from projetv0_voice.persistence.commands import (
     CommandConflictError,
@@ -53,8 +61,10 @@ from projetv0_voice.persistence.schema import (
     QUALIFICATION_RUNS_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SPARRA_CONTENT_SQL,
     V1_SCHEMA_SQL,
     V2_SCHEMA_SQL,
+    V3_SCHEMA_SQL,
 )
 
 PERSISTENCE_QUEUE_MAX_ITEMS = 256
@@ -118,6 +128,7 @@ def _expected_schema_objects(schema_sql: str) -> dict[tuple[str, str], str]:
 
 _EXPECTED_V1_SCHEMA_OBJECTS = _expected_schema_objects(V1_SCHEMA_SQL)
 _EXPECTED_V2_SCHEMA_OBJECTS = _expected_schema_objects(V2_SCHEMA_SQL)
+_EXPECTED_V3_SCHEMA_OBJECTS = _expected_schema_objects(V3_SCHEMA_SQL)
 _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
@@ -127,6 +138,9 @@ if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
 } or set(_EXPECTED_SCHEMA_OBJECTS) != {
     *_EXPECTED_V1_SCHEMA_OBJECTS,
     ("table", "qualification_runs"),
+    ("table", "sparra_turn_decisions"),
+    ("table", "sparra_publications"),
+    ("table", "sparra_content_fences"),
 }:
     raise RuntimeError("invalid_expected_sqlite_schema")
 
@@ -143,6 +157,7 @@ class LocalCallAdmissionFacts:
     retention_until: datetime
     telnyx_call_leg_id: str | None
     telnyx_call_session_id: str | None
+    admission_generation: UUID | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -150,6 +165,8 @@ class LocalCallAdmissionFacts:
             or self.admitted_at.utcoffset() is None
             or self.admitted_at.microsecond % 1000
             or self.retention_until != self.admitted_at + timedelta(days=30)
+            or self.admission_generation is not None
+            and not isinstance(self.admission_generation, UUID)
         ):
             raise ValueError("local_admission_facts_invalid")
 
@@ -170,11 +187,15 @@ class LocalCallLifecycleFacts(LocalCallAdmissionFacts):
     transfer_failed_at: datetime | None = None
     transfer_failure_cause: str | None = None
     local_closing_at: datetime | None = None
+    content_erased: bool = False
+    content_departed_generation: UUID | None = None
 
     @property
     def transfer_fenced(self) -> bool:
-        return self.transfer_command_id is not None and (
-            self.transfer_failed_at is None or self.local_closing_at is not None
+        return (
+            self.content_erased
+            or self.transfer_command_id is not None
+            and (self.transfer_failed_at is None or self.local_closing_at is not None)
         )
 
 
@@ -404,7 +425,7 @@ class PersistenceWriter:
                     self._fatal_handler(self.fatal_fault)
         return safe_error
 
-    def try_enqueue_turn(self, operation: VoiceOperationV1) -> bool:
+    def try_enqueue_turn(self, operation: VoiceOperationV1, *, truncated: bool = False) -> bool:
         if operation.kind != "turn.upsert":
             raise ValueError("try_enqueue_turn requires turn.upsert")
         if not self._accepting or self._degraded:
@@ -413,7 +434,7 @@ class PersistenceWriter:
             return False
         command = PersistenceCommand(
             "outbox",
-            {"operation": operation},
+            {"operation": operation, "truncated": truncated},
             None,
             enqueued_at=self._monotonic(),
         )
@@ -776,9 +797,7 @@ class PersistenceWriter:
             raise ValueError("expected_claim_attempt must be a positive exact integer")
         return value
 
-    async def _commit_relay_claim_mutation(
-        self, payload: dict[str, object]
-    ) -> RelayClaimResult:
+    async def _commit_relay_claim_mutation(self, payload: dict[str, object]) -> RelayClaimResult:
         result: asyncio.Future[RelayClaimResult] = asyncio.get_running_loop().create_future()
         try:
             await self.commit_control(
@@ -814,6 +833,464 @@ class PersistenceWriter:
             )
         )
         return cast(LocalCallLifecycleFacts | None, await result)
+
+    async def _content_request(self, action: str, **values: object) -> object:
+        result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "sparra_content", {"action": action, **values, "result": result}, None
+                )
+            )
+        except BaseException:
+            result.add_done_callback(
+                lambda future: None if future.cancelled() else future.exception()
+            )
+            raise
+        return await result
+
+    def try_enqueue_capture_loss(self, call_id: UUID, capture_id: UUID) -> bool:
+        if not self._accepting or self._degraded:
+            return False
+        command = PersistenceCommand(
+            "sparra_content",
+            {
+                "action": "capture_loss",
+                "call_id": call_id,
+                "capture_id": capture_id,
+            },
+            None,
+            enqueued_at=self._monotonic(),
+        )
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull:
+            self._signal_fatal("queue_full")
+            return False
+        self._track_pending(command)
+        return True
+
+    async def read_retained_call(self, call_id: UUID) -> RetainedCall:
+        """Queue behind captures; return only committed, authenticated same-call facts."""
+        return cast(RetainedCall, await self._content_request("read", call_id=call_id))
+
+    async def freeze_call_publication(
+        self,
+        operation: VoiceOperationV1,
+        result: MessageResultV1 | None,
+        *,
+        provider_callback: str | None,
+        result_permitted: Callable[[], bool] | None = None,
+    ) -> VoiceOperationV1 | None:
+        return cast(
+            VoiceOperationV1 | None,
+            await self._content_request(
+                "freeze",
+                operation=operation,
+                call_id=operation.call_id,
+                message_result=result,
+                provider_callback=provider_callback,
+                result_permitted=result_permitted,
+            ),
+        )
+
+    async def read_frozen_call_publication(self, call_id: UUID) -> VoiceOperationV1 | None:
+        return cast(
+            VoiceOperationV1 | None, await self._content_request("frozen_read", call_id=call_id)
+        )
+
+    async def erase_call_content(
+        self,
+        call_id: UUID,
+        *,
+        now: datetime,
+        lease_token: UUID | None = None,
+        expected_item: OutboxItem | None = None,
+        generation: UUID | None = None,
+    ) -> datetime | None:
+        return cast(
+            datetime | None,
+            await self._content_request(
+                "erase",
+                call_id=call_id,
+                now=now,
+                lease_token=lease_token,
+                expected_item=expected_item,
+                generation=generation,
+            ),
+        )
+
+    async def expired_content_calls(self, *, now: datetime) -> tuple[UUID, ...]:
+        return cast(tuple[UUID, ...], await self._content_request("expired", now=now))
+
+    async def pending_erasure_acks(self) -> tuple[tuple[UUID, UUID, datetime], ...]:
+        return cast(
+            tuple[tuple[UUID, UUID, datetime], ...], await self._content_request("pending_acks")
+        )
+
+    async def erased_recording_head(self) -> int | None:
+        return cast(int | None, await self._content_request("recording_head"))
+
+    async def finish_erasure_ack(
+        self, call_id: UUID, lease_token: UUID, *, acknowledged: bool = True
+    ) -> None:
+        await self._content_request(
+            "ack_done", call_id=call_id, lease_token=lease_token, acknowledged=acknowledged
+        )
+
+    async def _content_fenced(self, call_id: UUID) -> bool:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT 1 FROM sparra_content_fences WHERE call_id=?", (str(call_id),)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row is not None
+
+    async def _retained_payloads(
+        self, call_id: UUID
+    ) -> tuple[tuple[TurnUpsertPayloadV1, ...], int]:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT turn_id,op_id,deployment_id,key_version,nonce,ciphertext,lost "
+            "FROM sparra_turn_decisions WHERE call_id=?",
+            (str(call_id),),
+        )
+        rows = list(await cursor.fetchall())
+        await cursor.close()
+        payloads = []
+        for turn_id, op_id, deployment_id, key_version, nonce, ciphertext, _lost in rows:
+            if ciphertext is None:
+                continue
+            aad = operation_aad_from_metadata(
+                dict(
+                    schema_version=1,
+                    kind="turn.upsert",
+                    call_id=str(call_id),
+                    operation_id=op_id,
+                    deployment_id=deployment_id,
+                )
+            )
+            operation = decode_operation(
+                self._keyring.decrypt(EncryptedValue(key_version, nonce, ciphertext), aad=aad)
+            )
+            payload = operation.payload
+            if (
+                operation.call_id != call_id
+                or not isinstance(payload, TurnUpsertPayloadV1)
+                or (str(payload.turn_id) != turn_id)
+            ):
+                raise CommandConflictError("retained_operation_identity_conflict")
+            payloads.append(payload)
+        return tuple(payloads), sum(row[6] for row in rows)
+
+    async def _retained_call(self, call_id: UUID) -> RetainedCall:
+        if await self._content_fenced(call_id):
+            return RetainedCall((), 0, True)
+        payloads, loss_count = await self._retained_payloads(call_id)
+        turns = []
+        for payload in payloads:
+            text = self._keyring.decrypt(
+                EncryptedValue(
+                    payload.key_version,
+                    base64.b64decode(payload.nonce_b64, validate=True),
+                    base64.b64decode(payload.ciphertext_b64, validate=True),
+                ),
+                aad=f"turn:{payload.turn_id}".encode("ascii"),
+            ).decode("utf-8")
+            validate_turn_text(text)
+            turns.append(
+                RetainedTurn(
+                    payload.turn_id, payload.turn_no, payload.role, text, payload.interrupted
+                )
+            )
+        return RetainedCall(
+            tuple(sorted(turns, key=lambda t: (t.turn_no, str(t.turn_id)))),
+            loss_count,
+        )
+
+    async def _retain_turn(self, operation: VoiceOperationV1, *, truncated: bool) -> bool:
+        if await self._read_call_lifecycle(operation.call_id) is None:
+            return True  # Absent Sparra retains the exact legacy queue contract.
+        connection = self._require_owner_connection()
+        payload = cast(TurnUpsertPayloadV1, operation.payload)
+        fingerprint = hashlib.sha256(canonical_operation_bytes(operation)).digest()
+        cursor = await connection.execute(
+            "SELECT fingerprint FROM sparra_turn_decisions WHERE call_id=? AND turn_id=?",
+            (str(operation.call_id), str(payload.turn_id)),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            if existing[0] != fingerprint:
+                raise CommandConflictError("retained_turn_identity_conflict")
+            return False
+        # Authenticate before either retaining or admitting result evidence.
+        text = self._keyring.decrypt(
+            EncryptedValue(
+                payload.key_version,
+                base64.b64decode(payload.nonce_b64, validate=True),
+                base64.b64decode(payload.ciphertext_b64, validate=True),
+            ),
+            aad=f"turn:{payload.turn_id}".encode("ascii"),
+        ).decode("utf-8")
+        validate_turn_text(text)
+        previous, _loss = await self._retained_payloads(operation.call_id)
+        retained_map = {str(p.turn_id): p.model_dump(mode="json") for p in previous}
+        retained_map[str(payload.turn_id)] = payload.model_dump(mode="json")
+        # PostgreSQL JSONB ::text uses comma/colon spaces; keys need no escaping.
+        fits = (
+            len(retained_map) <= 200
+            and len(json.dumps(retained_map, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            <= 524288
+        )
+        encrypted = encrypt_operation(operation, self._keyring).encrypted if fits else None
+        await connection.execute(
+            "INSERT INTO sparra_turn_decisions VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                str(operation.call_id),
+                str(payload.turn_id),
+                str(operation.operation_id),
+                operation.deployment_id,
+                fingerprint,
+                encrypted.key_version if encrypted is not None else None,
+                encrypted.nonce if encrypted is not None else None,
+                encrypted.ciphertext if encrypted is not None else None,
+                int(truncated or not fits),
+            ),
+        )
+        return fits
+
+    async def _frozen_publication(self, call_id: UUID) -> VoiceOperationV1 | None:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT op_id,deployment_id,key_version,nonce,ciphertext "
+            "FROM sparra_publications WHERE call_id=?",
+            (str(call_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        aad = operation_aad_from_metadata(
+            dict(
+                schema_version=1,
+                operation_id=row[0],
+                deployment_id=row[1],
+                call_id=str(call_id),
+                kind="call.upsert",
+            )
+        )
+        return decode_operation(
+            self._keyring.decrypt(EncryptedValue(row[2], row[3], row[4]), aad=aad)
+        )
+
+    async def _apply_content_command(self, values: Mapping[str, object]) -> object:
+        connection = self._require_owner_connection()
+        action = values.get("action")
+        if action == "recording_head":
+            cursor = await connection.execute(
+                "SELECT o.queue_id,o.op_id FROM outbox o "
+                "JOIN sparra_content_fences f ON f.call_id=o.call_id "
+                "WHERE o.kind='recording.upsert' AND o.queue_id=(SELECT min(queue_id) FROM outbox)"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                return None
+            operation = await self._load_operation_by_id(row[1])
+            if (
+                operation is not None
+                and isinstance(operation.payload, RecordingUpsertPayloadV1)
+                and operation.payload.telnyx_recording_id is not None
+            ):
+                return row[0]
+            return None
+        if action == "pending_acks":
+            cursor = await connection.execute(
+                "SELECT call_id,lease_token,lease_cleaned_at FROM sparra_content_fences "
+                "WHERE lease_token IS NOT NULL AND lease_settled=0"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return tuple((UUID(c), UUID(t), _parse_datetime(at)) for c, t, at in rows)
+        if action == "expired":
+            now = self._required_datetime(values, "now")
+            cursor = await connection.execute(
+                "SELECT call_id,lifecycle_json FROM call_leases WHERE lifecycle_json IS NOT NULL"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            expired = []
+            for call, raw in rows:
+                if self._decode_lifecycle(
+                    raw
+                ).retention_until <= now and not await self._content_fenced(UUID(call)):
+                    expired.append(UUID(call))
+            return tuple(expired)
+        call_id = self._required_uuid(values, "call_id")
+        if action == "capture_loss":
+            capture_id = self._required_uuid(values, "capture_id")
+            if not await self._content_fenced(call_id):
+                await connection.execute(
+                    "INSERT OR IGNORE INTO sparra_turn_decisions "
+                    "VALUES (?,?,?,?,?,NULL,NULL,NULL,1)",
+                    (
+                        str(call_id),
+                        str(capture_id),
+                        str(capture_id),
+                        "capture-loss",
+                        hashlib.sha256(capture_id.bytes).digest(),
+                    ),
+                )
+            return True
+        if action == "ack_done":
+            token = self._required_uuid(values, "lease_token")
+            await connection.execute(
+                "UPDATE sparra_content_fences SET lease_acked=?,lease_settled=1 "
+                "WHERE call_id=? AND lease_token=?",
+                (int(values.get("acknowledged") is True), str(call_id), str(token)),
+            )
+            return True
+        if action == "read":
+            return await self._retained_call(call_id)
+        if action == "frozen_read":
+            return (
+                None
+                if await self._content_fenced(call_id)
+                else await self._frozen_publication(call_id)
+            )
+        if action == "freeze":
+            if await self._content_fenced(call_id):
+                return None
+            existing = await self._frozen_publication(call_id)
+            if existing is not None:
+                await self._insert_outbox(existing)
+                return existing
+            operation = require_operation(values)
+            if not isinstance(operation.payload, CallUpsertPayloadV1):
+                raise CommandSerializationError("result_publication_invalid")
+            retained = await self._retained_call(call_id)
+            changes: dict[str, object] = {"transcript_loss_count": retained.loss_count}
+            result = values.get("message_result")
+            facts = await self._read_call_lifecycle(call_id)
+            permitted = values.get("result_permitted")
+            if (
+                isinstance(result, MessageResultV1)
+                and (permitted is None or (callable(permitted) and permitted()))
+                and not (facts is not None and facts.transfer_fenced)
+            ):
+                callback = values.get("provider_callback")
+                validate_result_provenance(
+                    result, retained, callback if isinstance(callback, str) else None
+                )
+                changes["message_result"] = encrypt_message_result(
+                    result,
+                    call_id=call_id,
+                    keyring=self._keyring,
+                    authenticated_turns={t.turn_id: t.role for t in retained.turns},
+                )
+            operation = operation.model_copy(
+                update={"payload": operation.payload.model_copy(update=changes)}
+            )
+            prepared = encrypt_operation(operation, self._keyring)
+            await connection.execute(
+                "INSERT INTO sparra_publications VALUES (?,?,?,?,?,?)",
+                (
+                    str(call_id),
+                    str(operation.operation_id),
+                    operation.deployment_id,
+                    prepared.encrypted.key_version,
+                    prepared.encrypted.nonce,
+                    prepared.encrypted.ciphertext,
+                ),
+            )
+            await self._insert_outbox(operation)
+            return operation
+        if action == "erase":
+            facts = await self._read_call_lifecycle(call_id)
+            generation_value = values.get("generation")
+            durable_generation = (
+                None
+                if facts is None
+                else (
+                    facts.admission_generation
+                    or facts.transfer_generation
+                    or facts.content_departed_generation
+                )
+            )
+            if (
+                isinstance(generation_value, UUID)
+                and durable_generation is not None
+                and (generation_value != durable_generation)
+            ):
+                raise CommandConflictError("content_generation_conflict")
+            generation_value = durable_generation or generation_value
+            cursor = await connection.execute(
+                "SELECT state FROM call_leases WHERE call_id=?", (str(call_id),)
+            )
+            lease_state = await cursor.fetchone()
+            await cursor.close()
+            if (
+                lease_state is not None
+                and lease_state[0] != "terminal"
+                and (facts is None or not isinstance(generation_value, UUID))
+            ):
+                raise FatalPersistenceError("content_recovery_generation_unavailable")
+            expected = values.get("expected_item")
+            if isinstance(expected, OutboxItem):
+                cursor = await connection.execute(
+                    "SELECT call_id,attempts FROM outbox WHERE queue_id=?", (expected.queue_id,)
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row is not None and row != (str(call_id), expected.claim_attempt):
+                    return None
+            now = self._required_datetime(values, "now")
+            lease_token_value = values.get("lease_token")
+            cursor = await connection.execute(
+                "SELECT cleaned_at,lease_token,lease_cleaned_at FROM sparra_content_fences "
+                "WHERE call_id=?",
+                (str(call_id),),
+            )
+            old = await cursor.fetchone()
+            await cursor.close()
+            cleaned = now if old is None else _parse_datetime(old[0])
+            lease_cleaned = (
+                _parse_datetime(old[2])
+                if old is not None and old[1] == str(lease_token_value) and old[2] is not None
+                else now
+            )
+            await connection.execute(
+                "INSERT INTO sparra_content_fences"
+                "(call_id,cleaned_at,lease_token,lease_cleaned_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(call_id) DO UPDATE "
+                "SET lease_token=COALESCE(excluded.lease_token,lease_token),"
+                "lease_cleaned_at=COALESCE(excluded.lease_cleaned_at,lease_cleaned_at),"
+                "lease_acked=0,lease_settled=0",
+                (
+                    str(call_id),
+                    _iso(cleaned),
+                    str(lease_token_value) if isinstance(lease_token_value, UUID) else None,
+                    _iso(lease_cleaned) if isinstance(lease_token_value, UUID) else None,
+                ),
+            )
+            for table in ("sparra_turn_decisions", "sparra_publications"):
+                await connection.execute(f"DELETE FROM {table} WHERE call_id=?", (str(call_id),))
+            # Genuine recording identity remains deliverable into native purge storage.
+            await connection.execute(
+                "DELETE FROM outbox WHERE call_id=? AND kind!='recording.upsert'", (str(call_id),)
+            )
+            if facts is not None:
+                await self._store_lifecycle(
+                    replace(
+                        facts,
+                        disclosure_evidence=None,
+                        content_erased=True,
+                        content_departed_generation=facts.content_departed_generation
+                        or (generation_value if isinstance(generation_value, UUID) else None),
+                        local_closing_at=facts.local_closing_at or now,
+                    )
+                )
+            return lease_cleaned if isinstance(lease_token_value, UUID) else cleaned
+        raise CommandSerializationError("content_action_invalid")
 
     async def assert_sparra_compatible(self) -> None:
         await self.commit_control(PersistenceCommand("sparra_activation", {}, None))
@@ -855,6 +1332,8 @@ class PersistenceWriter:
             "transfer_command_id",
             "transfer_generation",
             "bridge_operation_id",
+            "content_departed_generation",
+            "admission_generation",
         ):
             if values.get(name) is not None:
                 values[name] = UUID(values[name])
@@ -875,6 +1354,8 @@ class PersistenceWriter:
         return LocalCallLifecycleFacts(**values)
 
     async def _store_lifecycle(self, facts: LocalCallLifecycleFacts) -> None:
+        if await self._content_fenced(facts.call_id):
+            facts = replace(facts, disclosure_evidence=None, content_erased=True)
         values: dict[str, object] = {}
         for attribute in fields(facts):
             value = getattr(facts, attribute.name)
@@ -941,6 +1422,11 @@ class PersistenceWriter:
         current = await self._read_call_lifecycle(facts.call_id)
         if current is None or current.admitted_at != facts.admitted_at:
             raise CommandConflictError("transfer_admission_missing")
+        if current.admission_generation is not None and (
+            facts.admission_generation not in {None, current.admission_generation}
+            or facts.transfer_generation not in {None, current.admission_generation}
+        ):
+            raise CommandConflictError("admission_generation_conflict")
         if current.transfer_command_id is not None and (
             current.transfer_command_id != facts.transfer_command_id
             or current.transfer_correlation != facts.transfer_correlation
@@ -964,6 +1450,10 @@ class PersistenceWriter:
                 started_at=current.started_at,
                 disclosure_evidence=current.disclosure_evidence,
                 local_closing_at=current.local_closing_at or facts.local_closing_at,
+                content_erased=current.content_erased or facts.content_erased,
+                admission_generation=current.admission_generation,
+                content_departed_generation=current.content_departed_generation
+                or facts.content_departed_generation,
             )
         )
         operation = payload.get("operation")
@@ -979,9 +1469,7 @@ class PersistenceWriter:
         if not self._run_started or self._closed_event.is_set():
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        command = PersistenceCommand(
-            "shutdown", {}, future, enqueued_at=self._monotonic()
-        )
+        command = PersistenceCommand("shutdown", {}, future, enqueued_at=self._monotonic())
         async with asyncio.timeout(timeout_seconds):
             await self._queue.put(command)
             self._track_pending(command)
@@ -1017,8 +1505,7 @@ class PersistenceWriter:
             while True:
                 wait_timeout = max(
                     0.0,
-                    self._quick_check_interval_seconds
-                    - (self._monotonic() - self._last_check_at),
+                    self._quick_check_interval_seconds - (self._monotonic() - self._last_check_at),
                 )
                 if wait_timeout == 0.0:
                     await self._run_periodic_check_if_due()
@@ -1035,8 +1522,7 @@ class PersistenceWriter:
 
                 if (
                     current_command.kind != "shutdown"
-                    and self._monotonic() - current_command.enqueued_at
-                    > QUEUE_OLDEST_LIMIT_SECONDS
+                    and self._monotonic() - current_command.enqueued_at > QUEUE_OLDEST_LIMIT_SECONDS
                 ):
                     raise FatalPersistenceError("queue_oldest_age_exceeded")
 
@@ -1088,11 +1574,7 @@ class PersistenceWriter:
         try:
             while True:
                 oldest = next(
-                    (
-                        command
-                        for command in self._pending_commands
-                        if command.kind != "shutdown"
-                    ),
+                    (command for command in self._pending_commands if command.kind != "shutdown"),
                     None,
                 )
                 if oldest is None:
@@ -1100,18 +1582,14 @@ class PersistenceWriter:
                     await self._queue_watchdog_wakeup.wait()
                     continue
 
-                remaining = QUEUE_OLDEST_LIMIT_SECONDS - (
-                    self._monotonic() - oldest.enqueued_at
-                )
+                remaining = QUEUE_OLDEST_LIMIT_SECONDS - (self._monotonic() - oldest.enqueued_at)
                 if remaining < 0.0:
                     self._signal_fatal("queue_oldest_age_exceeded")
                     return
 
                 self._queue_watchdog_wakeup.clear()
                 try:
-                    await asyncio.wait_for(
-                        self._queue_watchdog_wakeup.wait(), timeout=remaining
-                    )
+                    await asyncio.wait_for(self._queue_watchdog_wakeup.wait(), timeout=remaining)
                 except TimeoutError:
                     continue
         except asyncio.CancelledError:
@@ -1131,17 +1609,24 @@ class PersistenceWriter:
         await cursor.close()
         await connection.execute("PRAGMA synchronous=EXTRA")
         await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("PRAGMA secure_delete=ON")
         existing_version = self._pragma_int(await self._pragma_scalar("user_version"))
         existing_schema = await self._application_schema_objects()
         if existing_schema:
-            if (existing_version == 1 and existing_schema == _EXPECTED_V1_SCHEMA_OBJECTS) or (
-                existing_version == 2 and existing_schema == _EXPECTED_V2_SCHEMA_OBJECTS
+            if (
+                (existing_version == 1 and existing_schema == _EXPECTED_V1_SCHEMA_OBJECTS)
+                or (existing_version == 2 and existing_schema == _EXPECTED_V2_SCHEMA_OBJECTS)
+                or (existing_version == 3 and existing_schema == _EXPECTED_V3_SCHEMA_OBJECTS)
             ):
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
                     if existing_version == 1:
                         await connection.execute(QUALIFICATION_RUNS_SQL)
-                    await connection.execute(CALL_LIFECYCLE_MIGRATION_SQL)
+                    if existing_version < 3:
+                        await connection.execute(CALL_LIFECYCLE_MIGRATION_SQL)
+                    for statement in SPARRA_CONTENT_SQL.split(";"):
+                        if statement.strip():
+                            await connection.execute(statement)
                     await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     if (
                         self._pragma_int(await self._pragma_scalar("user_version"))
@@ -1173,16 +1658,20 @@ class PersistenceWriter:
                 raise FatalPersistenceError("sqlite_schema_mismatch")
         synchronous = self._pragma_int(await self._pragma_scalar("synchronous"))
         foreign_keys = self._pragma_int(await self._pragma_scalar("foreign_keys"))
+        if await self._pragma_scalar("secure_delete") != 1:
+            raise FatalPersistenceError("sqlite_secure_delete_required")
         journal_mode = str(journal_row[0]).lower() if journal_row else ""
         self.pragma_state = {
             "journal_mode": journal_mode,
             "synchronous": synchronous,
             "foreign_keys": foreign_keys,
+            "secure_delete": 1,
         }
         if self.pragma_state != {
             "journal_mode": "delete",
             "synchronous": 3,
             "foreign_keys": 1,
+            "secure_delete": 1,
         }:
             raise FatalPersistenceError("sqlite_pragma_mismatch")
 
@@ -1201,8 +1690,10 @@ class PersistenceWriter:
         await cursor.close()
         objects: dict[tuple[str, str], str] = {}
         for object_type, name, sql in rows:
-            if not isinstance(object_type, str) or not isinstance(name, str) or not isinstance(
-                sql, str
+            if (
+                not isinstance(object_type, str)
+                or not isinstance(name, str)
+                or not isinstance(sql, str)
             ):
                 raise FatalPersistenceError("sqlite_schema_mismatch")
             objects[(object_type, name)] = _normalize_schema_sql(sql)
@@ -1278,7 +1769,12 @@ class PersistenceWriter:
         try:
             command_result: object | None = None
             if command.kind == "outbox":
-                await self._insert_outbox(require_operation(command.payload))
+                await self._insert_outbox(
+                    require_operation(command.payload),
+                    truncated=command.payload.get("truncated") is True,
+                )
+            elif command.kind == "sparra_content":
+                command_result = await self._apply_content_command(command.payload)
             elif command.kind == "lease":
                 await self._apply_lease(command.payload)
             elif command.kind == "webhook_effect":
@@ -1307,6 +1803,26 @@ class PersistenceWriter:
                 incompatible = await cursor.fetchone()
                 await cursor.close()
                 if missing != (0,) or incompatible != (0,):
+                    raise FatalPersistenceError("sparra_legacy_state_incompatible")
+                cursor = await connection.execute(
+                    "SELECT count(*) FROM call_leases WHERE state!='terminal' "
+                    "AND json_extract(lifecycle_json,'$.admission_generation') IS NULL "
+                    "AND json_extract(lifecycle_json,'$.transfer_generation') IS NULL "
+                    "AND json_extract(lifecycle_json,'$.content_departed_generation') IS NULL"
+                )
+                missing_generation = await cursor.fetchone()
+                await cursor.close()
+                if missing_generation != (0,):
+                    raise FatalPersistenceError("sparra_legacy_generation_incompatible")
+                cursor = await connection.execute(
+                    "SELECT count(*) FROM outbox o JOIN call_leases c ON c.call_id=o.call_id "
+                    "LEFT JOIN sparra_turn_decisions d ON d.call_id=o.call_id "
+                    "AND d.turn_id=o.turn_id WHERE o.kind='turn.upsert' "
+                    "AND c.lifecycle_json IS NOT NULL AND d.turn_id IS NULL"
+                )
+                unqualified_turns = await cursor.fetchone()
+                await cursor.close()
+                if unqualified_turns != (0,):
                     raise FatalPersistenceError("sparra_legacy_state_incompatible")
             elif command.kind in {"transfer_intent", "transfer_observation"}:
                 await self._apply_transfer_facts(command.payload)
@@ -1376,11 +1892,35 @@ class PersistenceWriter:
             return "duplicate"
         return "conflict"
 
-    async def _insert_outbox(self, operation: VoiceOperationV1) -> None:
+    async def _insert_outbox(self, operation: VoiceOperationV1, *, truncated: bool = False) -> None:
         connection = self._require_owner_connection()
         if isinstance(operation.payload, CallUpsertPayloadV1):
             await self._merge_lifecycle_operation(operation)
-        prepared = encrypt_operation(operation, self._keyring)
+        if operation.kind != "recording.upsert" and await self._content_fenced(operation.call_id):
+            return
+        if isinstance(operation.payload, TurnUpsertPayloadV1) and not await self._retain_turn(
+            operation, truncated=truncated
+        ):
+            return
+        cursor = await connection.execute(
+            "SELECT key_version,nonce,ciphertext FROM sparra_publications "
+            "WHERE call_id=? AND op_id=? UNION ALL "
+            "SELECT key_version,nonce,ciphertext FROM sparra_turn_decisions "
+            "WHERE call_id=? AND op_id=? AND ciphertext IS NOT NULL LIMIT 1",
+            (
+                str(operation.call_id),
+                str(operation.operation_id),
+                str(operation.call_id),
+                str(operation.operation_id),
+            ),
+        )
+        frozen = await cursor.fetchone()
+        await cursor.close()
+        encrypted = (
+            EncryptedValue(frozen[0], frozen[1], frozen[2])
+            if frozen is not None
+            else encrypt_operation(operation, self._keyring).encrypted
+        )
         created_at = self._utcnow()
         turn_id: str | None = None
         recording_id: str | None = None
@@ -1406,16 +1946,18 @@ class PersistenceWriter:
                     turn_id,
                     recording_id,
                     CRYPTO_VERSION,
-                    prepared.encrypted.key_version,
-                    prepared.encrypted.nonce,
-                    prepared.encrypted.ciphertext,
+                    encrypted.key_version,
+                    encrypted.nonce,
+                    encrypted.ciphertext,
                     _iso(created_at),
                     _iso(created_at),
                 ),
             )
         except sqlite3.IntegrityError:
             existing = await self._load_operation_by_id(str(operation.operation_id))
-            if existing is None or canonical_operation_bytes(existing) != prepared.plaintext:
+            if existing is None or canonical_operation_bytes(existing) != canonical_operation_bytes(
+                operation
+            ):
                 raise CommandConflictError("operation_identity_conflict") from None
 
     async def _load_operation_by_id(self, operation_id: str) -> VoiceOperationV1 | None:
@@ -1496,12 +2038,14 @@ class PersistenceWriter:
                     admission.retention_until,
                     admission.telnyx_call_leg_id,
                     admission.telnyx_call_session_id,
+                    admission_generation=admission.admission_generation,
                 )
                 if existing is not None and (
                     existing.admitted_at != facts.admitted_at
                     or existing.retention_until != facts.retention_until
                     or existing.telnyx_call_leg_id != facts.telnyx_call_leg_id
                     or existing.telnyx_call_session_id != facts.telnyx_call_session_id
+                    or existing.admission_generation != facts.admission_generation
                 ):
                     raise CommandConflictError("local_admission_identity_conflict")
                 if existing is None:
@@ -2068,15 +2612,13 @@ class PersistenceWriter:
         if (
             isinstance(result, asyncio.Future)
             and not result.done()
-            and (value is not None or command.kind == "call_lifecycle_read")
+            and (value is not None or command.kind in {"call_lifecycle_read", "sparra_content"})
         ):
             result.set_result(value)
         if command.committed is not None and not command.committed.done():
             command.committed.set_result(None)
 
-    def _resolve_failure(
-        self, command: PersistenceCommand, error: FatalPersistenceError
-    ) -> None:
+    def _resolve_failure(self, command: PersistenceCommand, error: FatalPersistenceError) -> None:
         result = command.payload.get("result")
         if isinstance(result, asyncio.Future) and not result.done():
             result.set_exception(error)

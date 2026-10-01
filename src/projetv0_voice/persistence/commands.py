@@ -52,6 +52,7 @@ class PersistenceCommand:
         "sparra_activation",
         "transfer_intent",
         "transfer_observation",
+        "sparra_content",
         "shutdown",
     ]
     payload: Mapping[str, object] = field(repr=False)

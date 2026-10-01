@@ -278,6 +278,7 @@ class _CallEntry:
     answered_at: datetime | None = None
     transfer_facts: LocalCallLifecycleFacts | None = field(default=None, repr=False)
     transfer_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    content_stop_task: asyncio.Task[None] | None = field(default=None, repr=False)
     transfer_future: asyncio.Future[str] | None = field(default=None, repr=False)
     bridge_publication: VoiceOperationV1 | None = field(default=None, repr=False)
     no_new_ai: bool = False
@@ -803,13 +804,7 @@ class _ProcessCallIdAllocator:
         high48 = payload >> 74
         mid12 = (payload >> 62) & ((1 << 12) - 1)
         low62 = payload & ((1 << 62) - 1)
-        uuid_int = (
-            (high48 << 80)
-            | (4 << 76)
-            | (mid12 << 64)
-            | (0b10 << 62)
-            | low62
-        )
+        uuid_int = (high48 << 80) | (4 << 76) | (mid12 << 64) | (0b10 << 62) | low62
         return UUID(int=uuid_int)
 
 
@@ -1197,13 +1192,19 @@ class CallRegistry:
 
     async def restore_transfer_fence(self, stale: Any) -> None:
         facts = stale.lifecycle
-        if facts is None or not facts.transfer_fenced or facts.transfer_generation is None:
+        if (
+            facts is None
+            or not facts.transfer_fenced
+            or (facts.admission_generation is None and facts.transfer_generation is None
+                and facts.content_departed_generation is None)
+        ):
             raise RuntimeError("transfer_recovery_facts_invalid")
         async with self._lock:
             if self._permits_used >= self._capacity:
                 raise RuntimeError("transfer_recovery_capacity_conflict")
             entry = _CallEntry(
-                generation=facts.transfer_generation,
+                generation=(facts.admission_generation or facts.transfer_generation
+                            or facts.content_departed_generation),
                 call_control_id=stale.call_control_id,
                 call_id=stale.call_id,
                 call_leg_id=facts.telnyx_call_leg_id,
@@ -1238,6 +1239,54 @@ class CallRegistry:
                 and self._qualified_destination(entry) is not None
             )
 
+    async def stop_call_content(self, call_id: UUID) -> None:
+        """Revoke AI content while keeping actual telephone capacity/correlation."""
+        async with self._lock:
+            entry = self._by_call_id.get(call_id)
+            if entry is None or entry.lease_state == "terminal":
+                return
+            entry.no_new_ai = True
+            entry.drain_intent = True
+            stop = getattr(entry.session, "stop_new_ai", None)
+            if stop is not None:
+                stop()
+            facts = entry.transfer_facts or LocalCallLifecycleFacts(
+                entry.call_id, entry.initiated_at, entry.initiated_at + timedelta(days=30),
+                entry.call_leg_id, entry.call_session_id,
+            )
+            entry.transfer_facts = replace(
+                facts, content_erased=True, content_departed_generation=entry.generation,
+                local_closing_at=facts.local_closing_at or self._require_aware(self._utcnow()),
+            )
+            if entry.content_stop_task is None:
+                entry.content_stop_task = self._background_owner.start(
+                    self._stop_call_content_owned(entry), name="voice-call-content-stop"
+                )
+                if entry.content_stop_task is None:
+                    raise RuntimeError("content_stop_owner_closed")
+            task = entry.content_stop_task
+        cancellation = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        await task
+        if cancellation is not None:
+            raise cancellation
+
+    async def _stop_call_content_owned(self, entry: _CallEntry) -> None:
+        owner = entry.lifecycle_owner
+        try:
+            await cast(Any, self._writer).erase_call_content(
+                entry.call_id, now=self._require_aware(self._utcnow()), generation=entry.generation
+            )
+        finally:
+            # Even a persistence failure must close the already-revoked AI resources.
+            if owner is not None and self._valid_session_owner(owner):
+                cast(_SessionLifecycleOwner, owner).request_drain("content_erased")
+                await cast(_SessionLifecycleOwner, owner).wait()
+
     async def request_human(self, generation: CallGenerationHandle) -> str:
         async with self._lock:
             entry = self._by_control.get(generation.call_control_id)
@@ -1254,6 +1303,9 @@ class CallRegistry:
             if destination is None:
                 return "unavailable_collect_message"
             if entry.transfer_task is None:
+                stop_result = getattr(entry.session, "stop_result_inference", None)
+                if stop_result is not None:
+                    stop_result()
                 assert entry.routing is not None
                 command_id = uuid4()
                 correlation = base64.b64encode(uuid4().bytes + command_id.bytes).decode("ascii")
@@ -1509,6 +1561,7 @@ class CallRegistry:
                 entry.initiated_at + timedelta(days=30),
                 entry.call_leg_id,
                 entry.call_session_id,
+                admission_generation=entry.generation,
             )
         )
         return WebhookDurableEffect(lease=lease, operation=operation, admission_facts=facts)
@@ -2192,9 +2245,7 @@ class CallRegistry:
             await reservation.confirm(result)
         elif isinstance(reservation, _PlaceholderReservation):
             async with self._lock:
-                linked_abort_identity = (
-                    reservation._placeholder.linked_abort_identity
-                )
+                linked_abort_identity = reservation._placeholder.linked_abort_identity
             linked_abort_target = await reservation.confirm_fail_closed(
                 result,
                 linked_abort_identity=linked_abort_identity,
@@ -2213,18 +2264,18 @@ class CallRegistry:
                     reservation._entry,
                     reservation._generation,
                 )
-        elif (
-            isinstance(reservation, _PlaceholderReservation)
-            and linked_abort_identity is not None
-        ):
+        elif isinstance(reservation, _PlaceholderReservation) and linked_abort_identity is not None:
             identity = linked_abort_identity
-            generation = CallGenerationHandle(
-                identity.call_control_id, identity.generation
-            )
-            if isinstance(result, WebhookCommitResult) and (
-                result.receipt,
-                result.effect,
-            ) == ("first", "applied") and linked_abort_target is not None:
+            generation = CallGenerationHandle(identity.call_control_id, identity.generation)
+            if (
+                isinstance(result, WebhookCommitResult)
+                and (
+                    result.receipt,
+                    result.effect,
+                )
+                == ("first", "applied")
+                and linked_abort_target is not None
+            ):
                 abort_scheduled = self._schedule_abort_target(
                     linked_abort_target,
                     name="voice-fail-closed-lease-abort",
@@ -3232,7 +3283,10 @@ class CallRegistry:
                     authority = TerminalAuthority(
                         status="closing" if fenced else proposed.status,
                         reason=(
-                            "qualified_line_connected"
+                            "content_erased"
+                            if entry.transfer_facts is not None
+                            and entry.transfer_facts.content_erased
+                            else "qualified_line_connected"
                             if entry.no_new_ai
                             else "transfer_outcome_unknown"
                         )
@@ -3611,19 +3665,12 @@ class CallRegistry:
                 self._answered_placeholders.items()
             ):
                 if now >= placeholder.deadline:
-                    if (
-                        self._answered_placeholders.get(call_control_id)
-                        is placeholder
-                    ):
+                    if self._answered_placeholders.get(call_control_id) is placeholder:
                         self._answered_placeholders.pop(call_control_id, None)
                     placeholder.linked_entry = None
                     expired_placeholders += 1
             for entry in tuple(self._by_control.values()):
-                if (
-                    not qualification_expired
-                    and entry.attached
-                    and entry.lease_state == "active"
-                ):
+                if not qualification_expired and entry.attached and entry.lease_state == "active":
                     continue
                 if (
                     not qualification_expired

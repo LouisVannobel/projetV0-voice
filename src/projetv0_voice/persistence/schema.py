@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 V1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS call_leases (
@@ -72,8 +72,44 @@ V2_SCHEMA_SQL = V1_SCHEMA_SQL.replace(
 )
 
 CALL_LIFECYCLE_MIGRATION_SQL = "ALTER TABLE call_leases ADD COLUMN lifecycle_json TEXT"
-SCHEMA_SQL = V2_SCHEMA_SQL.replace(
+V3_SCHEMA_SQL = V2_SCHEMA_SQL.replace(
     "closed_at TEXT,",
     "closed_at TEXT, lifecycle_json TEXT,",
     1,
 ).replace("PRAGMA user_version = 2;", "PRAGMA user_version = 3;")
+
+SPARRA_CONTENT_SQL = """
+CREATE TABLE sparra_turn_decisions (
+    call_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    op_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    key_version INTEGER,
+    nonce BLOB,
+    ciphertext BLOB,
+    lost INTEGER NOT NULL CHECK (lost IN (0, 1)),
+    CHECK ((key_version IS NULL AND nonce IS NULL AND ciphertext IS NULL)
+        OR (key_version > 0 AND length(nonce) = 12 AND length(ciphertext) >= 16)),
+    PRIMARY KEY (call_id, turn_id)
+);
+CREATE TABLE sparra_publications (
+    call_id TEXT PRIMARY KEY NOT NULL,
+    op_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    key_version INTEGER NOT NULL CHECK (key_version > 0),
+    nonce BLOB NOT NULL CHECK (length(nonce) = 12),
+    ciphertext BLOB NOT NULL CHECK (length(ciphertext) >= 16)
+);
+CREATE TABLE sparra_content_fences (
+    call_id TEXT PRIMARY KEY NOT NULL,
+    cleaned_at TEXT NOT NULL,
+    lease_token TEXT,
+    lease_cleaned_at TEXT,
+    lease_acked INTEGER NOT NULL DEFAULT 0 CHECK (lease_acked IN (0,1)),
+    lease_settled INTEGER NOT NULL DEFAULT 0 CHECK (lease_settled IN (0,1))
+);
+"""
+SCHEMA_SQL = V3_SCHEMA_SQL.replace(
+    "PRAGMA user_version = 3;", SPARRA_CONTENT_SQL + "\nPRAGMA user_version = 4;"
+)

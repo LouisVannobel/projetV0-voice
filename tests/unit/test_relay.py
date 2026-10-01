@@ -464,7 +464,7 @@ async def test_batch_size_is_strictly_bounded_before_work(batch_size: Any) -> No
 def test_relay_result_is_frozen_bounded_and_contains_no_sensitive_fields() -> None:
     result = RelayResult(status="delivered", processed=1, acked=1, retried=0)
     assert result == RelayResult(status="delivered", processed=1, acked=1, retried=0)
-    assert result.__slots__ == ("status", "processed", "acked", "retried")
+    assert result.__slots__ == ("status", "processed", "acked", "retried", "discarded")
     with pytest.raises((AttributeError, TypeError)):
         result.processed = 2  # type: ignore[misc]
     with pytest.raises(ValueError):
