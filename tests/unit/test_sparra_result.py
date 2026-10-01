@@ -606,7 +606,9 @@ async def test_content_stop_reserves_phone_fence_before_first_writer_await(tmp_p
         await worker
 
 
-@pytest.mark.parametrize("reason", ["native_erased", "expired", "unavailable", "legacy"])
+@pytest.mark.parametrize(
+    "reason", ["native_erased", "expired", "unavailable", "legacy", "held", "backlog"]
+)
 @pytest.mark.asyncio
 async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_generation(
     tmp_path, reason
@@ -675,7 +677,27 @@ async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_genera
 
     class Sink:
         def __init__(self):
-            self.leases = (lease,) if reason == "native_erased" else ()
+            # Native SQL excludes still-held leases and caps the ordered batch100.
+            self.held_until = clock + timedelta(seconds=20) if reason == "held" else None
+            self.leases = (
+                (lease,)
+                if reason in {"native_erased","held"}
+                else (
+                    tuple(
+                        CallErasureLease(
+                            1,
+                            uuid4(),
+                            uuid4(),
+                            "fixture",
+                            NOW + timedelta(days=30),
+                            clock + timedelta(seconds=30),
+                        )
+                        for _ in range(100)
+                    ) + (lease,)
+                    if reason == "backlog"
+                    else ()
+                )
+            )
 
         async def open(self):
             chronology.append("sink_open")
@@ -689,11 +711,14 @@ async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_genera
 
                 raise OperationSinkTransientError("owned_native_knowledge_unavailable")
             chronology.append("maintenance")
-            result, self.leases = self.leases, ()
+            if self.held_until is not None and clock < self.held_until:
+                return ()
+            # The real function limits100; the actual call is obligation101.
+            result, self.leases = self.leases[:100], self.leases[100:]
             return result
 
         async def ack_call_erasure(self, *args):
-            assert (await writer.read_retained_call(call_id)).erased
+            assert (await writer.read_retained_call(args[0])).erased
 
         async def ingest(self, operation):
             pytest.fail("startup erased content cannot be relayed")
@@ -712,6 +737,9 @@ async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_genera
 
     async def restore(stale):
         chronology.append("recovery")
+        if reason in {"held","backlog"}:
+            assert stale.lifecycle.local_closing_at is not None
+            assert not stale.lifecycle.content_erased
         await original_restore(stale)
 
     registry.restore_transfer_fence = restore
@@ -750,8 +778,15 @@ async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_genera
         assert await registry.live_call_count() == 1
         await committed(registry, writer, event("call.hangup", occurred_at=clock))
         assert await registry.live_call_count() == 0
-        assert (await writer.read_retained_call(call_id)).erased
-        assert await writer.oldest_outbox_created_at() is None
+        retained = await writer.read_retained_call(call_id)
+        if reason in {"held", "backlog"}:
+            facts = await writer.read_call_lifecycle(call_id)
+            if reason=="held":
+                assert not retained.erased and not facts.content_erased
+            assert facts.local_closing_at is not None
+        else:
+            assert retained.erased
+            assert await writer.oldest_outbox_created_at() is None
     finally:
         await supervisor.aclose()
 
@@ -837,5 +872,217 @@ async def test_result_never_calls_api_after_takeover(tmp_path, departure):
         await session._prepare_partial_result()
         assert session._partial_result is None and session._result_inference_task is None
     finally:
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin_started", [False, True])
+async def test_cleanup_ack_has_no_registry_caller_pin_or_completed_future(tmp_path, pin_started):
+    from projetv0_voice.persistence.postgres_sink import CallErasureLease
+    from projetv0_voice.persistence.relay import maintain_call_content
+
+    registry, writer, worker, _ = await start(tmp_path)
+    try:
+        observed = event(from_e164="+33102030407")
+        if pin_started:
+            await committed(registry, writer, observed)
+        else:
+            resolved = await registry.resolve_webhook(observed)
+            effect = resolved.effect
+            ticket = writer.submit_webhook(
+                receipt=dict(
+                    event_id=observed.event_id,
+                    event_type=observed.event_type,
+                    call_control_id=observed.call_control_id,
+                    occurred_at=observed.occurred_at,
+                    received_at=NOW,
+                    semantic_fingerprint_sha256=observed.semantic_fingerprint_sha256,
+                ),
+                lease=effect.lease,
+                operation=effect.operation,
+                admission_facts=effect.admission_facts,
+            )
+            await ticket.wait()
+        entry = registry._by_control["original"]
+        if pin_started:
+            await registry._ensure_begin_snapshot("original")
+            assert entry.begin_future.done() and entry.begin_snapshot is not None
+        generation = entry.generation
+        lease = CallErasureLease(
+            1,
+            entry.call_id,
+            uuid4(),
+            "fixture",
+            NOW + timedelta(days=30),
+            NOW + timedelta(seconds=30),
+        )
+
+        class Sink:
+            async def lease_call_erasures(self, *args):
+                return (lease,)
+
+            async def ack_call_erasure(self, *args):
+                assert entry.routing is None
+                assert entry.begin_snapshot is None and entry.begin_future is None
+                assert entry.begin_task is None and entry.construction_grant is None
+                assert entry.session is None and entry.lifecycle_owner is None
+                assert entry.generation == generation
+                assert await registry.live_call_count() == 1
+
+        await maintain_call_content(
+            writer, Sink(), registry.stop_call_content, utcnow=lambda: NOW, timeout_seconds=2
+        )
+    finally:
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ack_joins_inflight_begin_before_releasing_its_content(tmp_path):
+    from test_sparra_admission import snapshot
+
+    from projetv0_voice.persistence.postgres_sink import CallErasureLease
+    from projetv0_voice.persistence.relay import maintain_call_content
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def begin(deployment, call_id, routing):
+        pin = snapshot(call_id, routing)
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return pin
+
+    registry, writer, worker, _ = await start(tmp_path, begin)
+    admission = asyncio.create_task(committed(registry, writer, event(from_e164="+33102030407")))
+    try:
+        async with asyncio.timeout(2):
+            await entered.wait()
+        entry = registry._by_control["original"]
+        lease = CallErasureLease(
+            1,
+            entry.call_id,
+            uuid4(),
+            "fixture",
+            NOW + timedelta(days=30),
+            NOW + timedelta(seconds=30),
+        )
+
+        class Sink:
+            async def lease_call_erasures(self, *args):
+                return (lease,)
+
+            async def ack_call_erasure(self, *args):
+                assert cancelled.is_set() and admission.done()
+                assert entry.routing is None and entry.begin_snapshot is None
+                assert entry.begin_future is None and entry.begin_task is None
+                assert entry.lifecycle_owner is None and entry.session is None
+                assert (await writer.read_retained_call(entry.call_id)).erased
+
+        await maintain_call_content(
+            writer, Sink(), registry.stop_call_content, utcnow=lambda: NOW, timeout_seconds=2
+        )
+        assert await registry.live_call_count() == 1
+    finally:
+        if not admission.done():
+            admission.cancel()
+        await asyncio.gather(admission, return_exceptions=True)
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_pv301_production_stop_preserves_replaced_claim_without_erasure(tmp_path):
+    from projetv0_voice.persistence.postgres_sink import OperationSinkErasedError
+    from projetv0_voice.persistence.relay import OutboxRelay
+    from projetv0_voice.session_factory import ProcessSessionFactory
+
+    registry, writer, worker, _ = await start(tmp_path)
+    try:
+        await committed(registry, writer, event())
+        entry = registry._by_control["original"]
+        assert writer.try_enqueue_turn(capture(writer, entry.call_id, 1))
+        await writer.read_retained_call(entry.call_id)
+        clock = [writer._utcnow() + timedelta(seconds=1)]
+        factory = ProcessSessionFactory.__new__(ProcessSessionFactory)
+        factory._registry = registry
+        deletions = []
+        original_erase = writer.erase_call_content
+
+        async def guarded_erase(*args, **kwargs):
+            deletions.append(kwargs.get("expected_item"))
+            return await original_erase(*args, **kwargs)
+
+        writer.erase_call_content = guarded_erase
+
+        async def production_stop(call_id):
+            await factory.stop_call_content_by_id(call_id)
+
+        async def fail():
+            pytest.fail("stale claim must not degrade")
+
+        replaced = []
+
+        class Sink:
+            async def ingest(self, operation):
+                clock[0] += timedelta(seconds=11)
+                row = (await writer.read_relay_batch(batch_size=1, now=clock[0], lease_seconds=10))[
+                    0
+                ]
+                replaced.append(row)
+                raise OperationSinkErasedError("owned_rejected_dispatch")
+
+        relay = OutboxRelay(
+            writer,
+            Sink(),
+            utcnow=lambda: clock[0],
+            stop_erased_call=production_stop,
+            on_degraded=fail,
+            drain=fail,
+        )
+        result = await relay.run_once(batch_size=1)
+        assert result.status == "stale_claim" and result.discarded == 0
+        assert len(deletions) == 1 and deletions[0] is not None
+        assert deletions[0].claim_attempt + 1 == replaced[0].claim_attempt
+        assert not (await writer.read_retained_call(entry.call_id)).erased
+        rows = await writer.read_relay_batch(
+            batch_size=1, now=clock[0] + timedelta(seconds=11), lease_seconds=10
+        )
+        assert rows[0].queue_id == replaced[0].queue_id
+    finally:
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_erasure_preserves_pending_phone_transfer_without_inventing_bridge(tmp_path):
+    registry, writer, worker, provider = await start(tmp_path)
+    requested = None
+    try:
+        await committed(registry, writer, event())
+        generation = await registry.generation_handle("original")
+        requested = asyncio.create_task(registry.request_human(generation))
+        async with asyncio.timeout(2):
+            await provider.transfer_entered.wait()
+        entry = registry._by_control["original"]
+        correlation = entry.transfer_facts.transfer_correlation
+        await registry.stop_call_content(entry.call_id)
+        provider.transfer_release.set()
+        result = await requested
+        assert result != "qualified_line_connected"
+        facts = await writer.read_call_lifecycle(entry.call_id)
+        assert facts.qualified_line_bridged_at is None and facts.transfer_correlation == correlation
+        assert facts.transfer_fenced and facts.content_erased
+        assert await registry.live_call_count() == 1
+        assert not any(action[0] == "hangup" for action in provider.actions)
+        await committed(registry, writer, event("call.hangup"))
+        assert await registry.live_call_count() == 0
+    finally:
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.gather(requested, return_exceptions=True)
         await writer.drain(2)
         await worker

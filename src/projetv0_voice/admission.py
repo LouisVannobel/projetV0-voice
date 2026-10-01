@@ -1239,7 +1239,7 @@ class CallRegistry:
                 and self._qualified_destination(entry) is not None
             )
 
-    async def stop_call_content(self, call_id: UUID) -> None:
+    async def stop_call_content(self, call_id: UUID, *, delete_content: bool = True) -> None:
         """Revoke AI content while keeping actual telephone capacity/correlation."""
         async with self._lock:
             entry = self._by_call_id.get(call_id)
@@ -1255,7 +1255,8 @@ class CallRegistry:
                 entry.call_leg_id, entry.call_session_id,
             )
             entry.transfer_facts = replace(
-                facts, content_erased=True, content_departed_generation=entry.generation,
+                facts,
+                content_departed_generation=entry.generation,
                 local_closing_at=facts.local_closing_at or self._require_aware(self._utcnow()),
             )
             if entry.content_stop_task is None:
@@ -1272,20 +1273,57 @@ class CallRegistry:
             except asyncio.CancelledError as error:
                 cancellation = error
         await task
+        if delete_content:
+            await cast(Any, self._writer).erase_call_content(
+                entry.call_id, now=self._require_aware(self._utcnow()), generation=entry.generation
+            )
         if cancellation is not None:
             raise cancellation
 
     async def _stop_call_content_owned(self, entry: _CallEntry) -> None:
-        owner = entry.lifecycle_owner
+        async with self._lock:
+            owner = entry.lifecycle_owner
+            tasks = tuple(
+                dict.fromkeys(
+                    task
+                    for task in (
+                        entry.begin_task,
+                        entry.answer.owner_task,
+                        entry.streaming.owner_task,
+                    )
+                    if task is not None and task is not asyncio.current_task()
+                )
+            )
         try:
-            await cast(Any, self._writer).erase_call_content(
-                entry.call_id, now=self._require_aware(self._utcnow()), generation=entry.generation
+            await cast(Any, self._writer).mark_call_departed(
+                entry.call_id, now=self._require_aware(self._utcnow())
             )
         finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             # Even a persistence failure must close the already-revoked AI resources.
             if owner is not None and self._valid_session_owner(owner):
                 cast(_SessionLifecycleOwner, owner).request_drain("content_erased")
                 await cast(_SessionLifecycleOwner, owner).wait()
+            async with self._lock:
+                self._clear_content_holders_locked(entry)
+
+    @staticmethod
+    def _clear_content_holders_locked(entry: _CallEntry) -> None:
+        entry.begin_snapshot = None
+        entry.routing = None
+        entry.begin_future = None
+        entry.begin_task = None
+        entry.construction_grant = None
+        entry.terminal_capability = None
+        entry.claim = None
+        entry.raw_token = None
+        entry.session = None
+        entry.lifecycle_owner = None
+        entry.lifecycle_owner_task = None
 
     async def request_human(self, generation: CallGenerationHandle) -> str:
         async with self._lock:
@@ -1376,7 +1414,11 @@ class CallRegistry:
             return "outcome_unknown"
         observed = entry.transfer_facts
         if entry.no_new_ai:
-            return "qualified_line_connected"
+            return (
+                "qualified_line_connected"
+                if observed is not None and observed.qualified_line_bridged_at is not None
+                else "outcome_unknown"
+            )
         if observed is not None and observed.transfer_failed_at is not None:
             return f"{observed.transfer_failure_cause or 'target_hangup'}_collect_message"
         return "ringing" if result.outcome == "accepted" else "outcome_unknown"
@@ -2318,7 +2360,12 @@ class CallRegistry:
             if self._qualification_expired():
                 return WebhookDisposition(503)
             entry = self._by_control.get(call_control_id)
-            if entry is None or entry.terminal_event is not None or not entry.durable:
+            if (
+                entry is None
+                or entry.terminal_event is not None
+                or not entry.durable
+                or (self._transfer_fenced(entry))
+            ):
                 return WebhookDisposition(200)
             now = float(self._monotonic())
             if now >= entry.token_deadline and not (
@@ -3287,8 +3334,12 @@ class CallRegistry:
                             if entry.transfer_facts is not None
                             and entry.transfer_facts.content_erased
                             else "qualified_line_connected"
-                            if entry.no_new_ai
+                            if entry.transfer_facts is not None
+                            and entry.transfer_facts.qualified_line_bridged_at is not None
                             else "transfer_outcome_unknown"
+                            if entry.transfer_facts is not None
+                            and entry.transfer_facts.transfer_command_id is not None
+                            else "local_ai_departure"
                         )
                         if fenced
                         else proposed.reason,
@@ -3331,14 +3382,7 @@ class CallRegistry:
                 ):
                     return False
                 closing_entry.resources_released = True
-                closing_entry.begin_snapshot = None
-                closing_entry.routing = None
-                closing_entry.construction_grant = None
-                closing_entry.terminal_capability = None
-                closing_entry.claim = None
-                closing_entry.session = None
-                closing_entry.lifecycle_owner = None
-                closing_entry.lifecycle_owner_task = None
+                self._clear_content_holders_locked(closing_entry)
                 closing_entry.terminal_completion_event.set()
             return True
         cancellation: asyncio.CancelledError | None = None

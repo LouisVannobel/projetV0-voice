@@ -337,10 +337,7 @@ class _RealWriter:
     async def commit_control(self, command: object) -> None:
         self.control_commits.append(command)
         operation = command.payload["operation"]  # type: ignore[union-attr]
-        if (
-            operation.kind == "call.upsert"
-            and operation.payload.status in {"closed", "failed"}
-        ):
+        if operation.kind == "call.upsert" and operation.payload.status in {"closed", "failed"}:
             if self.terminal_started is not None:
                 self.terminal_started.set()
             if self.terminal_release is not None:
@@ -793,8 +790,45 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
         assert await session._controller.accept_mark(session._controller.mark_name)
         await session._controller.join_continuations()
         if clear_behavior == "erase":
-            await asyncio.wait_for(factory.erase_call_by_id(claim.call_id), timeout=5)
-            await writer.erase_call_content(claim.call_id, now=NOW)
+            from projetv0_voice.persistence.postgres_sink import CallErasureLease
+            from projetv0_voice.persistence.relay import maintain_call_content
+
+            before = registry._by_control["control-a"]
+            owner = before.lifecycle_owner
+            assert before.begin_future.done()
+            lease = CallErasureLease(
+                1,
+                claim.call_id,
+                uuid4(),
+                "deployment-a",
+                NOW + timedelta(days=30),
+                NOW + timedelta(seconds=30),
+            )
+
+            class ErasureSink:
+                async def lease_call_erasures(self, *args):
+                    return (lease,)
+
+                async def ack_call_erasure(self, *args):
+                    assert before.routing is None and before.begin_snapshot is None
+                    assert before.begin_future is None and before.begin_task is None
+                    assert before.construction_grant is None and before.session is None
+                    assert before.lifecycle_owner is None and before.lifecycle_owner_task is None
+                    assert (
+                        owner._grant is None and owner._handshake is None and owner._session is None
+                    )
+                    assert "stt-client-close" in events and "llm-client-close" in events
+
+            await asyncio.wait_for(
+                maintain_call_content(
+                    writer,
+                    ErasureSink(),
+                    factory.erase_call_by_id,
+                    utcnow=lambda: NOW,
+                    timeout_seconds=5,
+                ),
+                timeout=5,
+            )
             await asyncio.wait_for(running, timeout=5)
             facts = await writer.read_call_lifecycle(claim.call_id)
             assert facts.content_erased and facts.disclosure_evidence is None
@@ -840,6 +874,7 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
         assert facts.qualified_line_bridged_at == NOW
         assert facts.bridge_operation_id is not None
         assert session._drain_task.done()
+        assert registry._by_control["control-a"].begin_future is None
         items = await writer.read_relay_batch(
             batch_size=100, now=datetime.now(UTC) + timedelta(seconds=1), lease_seconds=60
         )
@@ -936,8 +971,8 @@ async def test_registrar_rejection_closes_candidate_before_claim_or_metric() -> 
     registrar = _Registrar(reject=True)
     metrics = RuntimeMetrics.in_memory(monotonic=lambda: 1.0)
     events: list[str] = []
-    registry.preconsume_probe = lambda: events == [] or pytest.fail(
-        "eager owner crossed closed gate before grant"
+    registry.preconsume_probe = lambda: (
+        events == [] or pytest.fail("eager owner crossed closed gate before grant")
     )
     factory = _factory(
         registry=registry,
@@ -989,8 +1024,8 @@ async def test_eager_registrar_reaches_only_closed_owner_gate_before_grant() -> 
     registrar = _EagerRegistrar()
     metrics = RuntimeMetrics.in_memory(monotonic=iter((1.0, 2.0)).__next__)
     events: list[str] = []
-    registry.preconsume_probe = lambda: events == [] or pytest.fail(
-        "eager owner crossed closed gate before grant"
+    registry.preconsume_probe = lambda: (
+        events == [] or pytest.fail("eager owner crossed closed gate before grant")
     )
     factory = _factory(
         registry=registry,
@@ -1174,8 +1209,9 @@ async def test_post_freeze_construction_persistence_fault_latches_process_failur
 
 
 @pytest.mark.asyncio
-async def test_real_composition_mismatched_handshake_cleans_terminalizes_and_balances_metric(
-) -> None:
+async def test_real_composition_mismatched_handshake_cleans_terminalizes_and_balances_metric() -> (
+    None
+):
     writer = _RealWriter()
     control = _RealControl()
     registry, claim = await _real_claim(writer, control)

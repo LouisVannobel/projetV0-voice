@@ -194,6 +194,7 @@ class LocalCallLifecycleFacts(LocalCallAdmissionFacts):
     def transfer_fenced(self) -> bool:
         return (
             self.content_erased
+            or self.local_closing_at is not None
             or self.transfer_command_id is not None
             and (self.transfer_failed_at is None or self.local_closing_at is not None)
         )
@@ -931,6 +932,11 @@ class PersistenceWriter:
     async def erased_recording_head(self) -> int | None:
         return cast(int | None, await self._content_request("recording_head"))
 
+    async def mark_call_departed(self, call_id: UUID, *, now: datetime) -> LocalCallLifecycleFacts:
+        return cast(
+            LocalCallLifecycleFacts, await self._content_request("depart", call_id=call_id, now=now)
+        )
+
     async def finish_erasure_ack(
         self, call_id: UUID, lease_token: UUID, *, acknowledged: bool = True
     ) -> None:
@@ -1126,6 +1132,20 @@ class PersistenceWriter:
                     expired.append(UUID(call))
             return tuple(expired)
         call_id = self._required_uuid(values, "call_id")
+        if action == "depart":
+            facts = await self._read_call_lifecycle(call_id)
+            if facts is None or not (
+                facts.admission_generation
+                or facts.transfer_generation
+                or facts.content_departed_generation
+            ):
+                raise FatalPersistenceError("call_departure_generation_unavailable")
+            facts = replace(
+                facts,
+                local_closing_at=facts.local_closing_at or self._required_datetime(values, "now"),
+            )
+            await self._store_lifecycle(facts)
+            return facts
         if action == "capture_loss":
             capture_id = self._required_uuid(values, "capture_id")
             if not await self._content_fenced(call_id):

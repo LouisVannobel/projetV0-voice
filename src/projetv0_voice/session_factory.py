@@ -278,6 +278,10 @@ class _CallLifecycleOwner:
         except BaseException:
             return
         finally:
+            self._grant = None
+            self._handshake = None
+            self._session = None
+            self._terminal_capability = None
             self._phase = "done"
             self._closed.set()
 
@@ -405,6 +409,9 @@ class ProcessSessionFactory:
 
     async def erase_call_by_id(self, call_id: UUID) -> None:
         await cast(Any, self._registry).stop_call_content(call_id)
+
+    async def stop_call_content_by_id(self, call_id: UUID) -> None:
+        await cast(Any, self._registry).stop_call_content(call_id, delete_content=False)
 
     async def _live(
         self,

@@ -1377,6 +1377,14 @@ class RuntimeSupervisor:
                     self._writer.read_call_lifecycle(stale.call_id), code="stale_recovery_failed"
                 )
                 stale = replace(stale, lifecycle=lifecycle)
+            if stale.lifecycle is not None and not stale.lifecycle.transfer_fenced:
+                # Leasing is not a negative witness: held leases and later batches
+                # remain invisible. Actual AI departure preserves the original phone.
+                lifecycle = await self._startup_await(
+                    self._writer.mark_call_departed(stale.call_id, now=_aware_utc(self._utcnow())),
+                    code="stale_recovery_failed",
+                )
+                stale = replace(stale, lifecycle=lifecycle)
             if stale.lifecycle is not None and stale.lifecycle.transfer_fenced:
                 if self._registry is None:
                     raise RuntimeError("transfer_recovery_registry_missing")
@@ -1763,9 +1771,9 @@ async def build_production_runtime(
             on_degraded=begin_drain,
             drain=begin_drain,
             before_fifo=prepare_sparra_fifo if manifest.sparra is not None else None,
-            stop_erased_call=(
-                lambda call_id: session_factory.erase_call_by_id(call_id)
-            ) if manifest.sparra is not None else None,
+            stop_erased_call=(lambda call_id: session_factory.stop_call_content_by_id(call_id))
+            if manifest.sparra is not None
+            else None,
         )
         raw_call_control = factories.call_control_factory(telnyx_api_key)
         inference = factories.inference_factory(
