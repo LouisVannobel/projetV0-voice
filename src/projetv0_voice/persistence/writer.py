@@ -7,13 +7,14 @@ import contextlib
 import errno
 import hashlib
 import inspect
+import json
 import math
 import re
 import sqlite3
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
@@ -29,6 +30,8 @@ from projetv0_voice.crypto import (
     UnknownKeyVersionError,
 )
 from projetv0_voice.models import (
+    CallUpsertPayloadV1,
+    DisclosureEvidenceV1,
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
@@ -46,10 +49,12 @@ from projetv0_voice.persistence.commands import (
     require_operation,
 )
 from projetv0_voice.persistence.schema import (
+    CALL_LIFECYCLE_MIGRATION_SQL,
     QUALIFICATION_RUNS_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     V1_SCHEMA_SQL,
+    V2_SCHEMA_SQL,
 )
 
 PERSISTENCE_QUEUE_MAX_ITEMS = 256
@@ -112,6 +117,7 @@ def _expected_schema_objects(schema_sql: str) -> dict[tuple[str, str], str]:
 
 
 _EXPECTED_V1_SCHEMA_OBJECTS = _expected_schema_objects(V1_SCHEMA_SQL)
+_EXPECTED_V2_SCHEMA_OBJECTS = _expected_schema_objects(V2_SCHEMA_SQL)
 _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
@@ -131,6 +137,45 @@ class FatalPersistenceFault:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalCallAdmissionFacts:
+    call_id: UUID
+    admitted_at: datetime
+    retention_until: datetime
+    telnyx_call_leg_id: str | None
+    telnyx_call_session_id: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            self.admitted_at.tzinfo is None
+            or self.admitted_at.utcoffset() is None
+            or self.admitted_at.microsecond % 1000
+            or self.retention_until != self.admitted_at + timedelta(days=30)
+        ):
+            raise ValueError("local_admission_facts_invalid")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class LocalCallLifecycleFacts(LocalCallAdmissionFacts):
+    started_at: datetime | None = None
+    disclosure_evidence: DisclosureEvidenceV1 | None = None
+    transfer_command_id: UUID | None = None
+    transfer_correlation: str | None = None
+    transfer_generation: UUID | None = None
+    transfer_connection_sha256: str | None = None
+    transfer_destination_sha256: str | None = None
+    target_call_control_id: str | None = None
+    target_call_leg_id: str | None = None
+    qualified_line_bridged_at: datetime | None = None
+    bridge_operation_id: UUID | None = None
+    transfer_failed_at: datetime | None = None
+    transfer_failure_cause: str | None = None
+
+    @property
+    def transfer_fenced(self) -> bool:
+        return self.transfer_command_id is not None and self.transfer_failed_at is None
+
+
+@dataclass(frozen=True, slots=True)
 class StaleLease:
     call_control_id: str
     call_id: UUID
@@ -140,6 +185,7 @@ class StaleLease:
     previous_state: Literal["pending", "active"]
     created_at: datetime
     expires_at: datetime
+    lifecycle: LocalCallLifecycleFacts | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +465,7 @@ class PersistenceWriter:
         operation: VoiceOperationV1 | None,
         legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
         qualification_run_id: UUID | None = None,
+        admission_facts: LocalCallAdmissionFacts | None = None,
     ) -> WebhookCommitTicket:
         """Synchronously transfer one webhook transaction to the writer owner."""
 
@@ -439,19 +486,16 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_webhook_receipt")
         if qualification_run_id is not None and not isinstance(qualification_run_id, UUID):
             raise CommandSerializationError("invalid_qualification_run")
-        result: asyncio.Future[WebhookCommitValue] = (
-            asyncio.get_running_loop().create_future()
-        )
+        result: asyncio.Future[WebhookCommitValue] = asyncio.get_running_loop().create_future()
         command = PersistenceCommand(
             "webhook_effect",
             {
                 "receipt": receipt,
                 "lease": lease,
                 "operation": operation,
-                "legacy_v1_semantic_fingerprint_sha256": (
-                    legacy_v1_semantic_fingerprint_sha256
-                ),
+                "legacy_v1_semantic_fingerprint_sha256": (legacy_v1_semantic_fingerprint_sha256),
                 "qualification_run_id": qualification_run_id,
+                "admission_facts": admission_facts,
                 "result": result,
             },
             None,
@@ -757,6 +801,162 @@ class PersistenceWriter:
             raise
         return await result
 
+    async def read_call_lifecycle(self, call_id: UUID) -> LocalCallLifecycleFacts | None:
+        result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        await self.commit_control(
+            PersistenceCommand(
+                "call_lifecycle_read",
+                {"call_id": call_id, "result": result},
+                None,
+            )
+        )
+        return cast(LocalCallLifecycleFacts | None, await result)
+
+    async def assert_sparra_compatible(self) -> None:
+        await self.commit_control(PersistenceCommand("sparra_activation", {}, None))
+
+    async def commit_transfer_intent(self, facts: LocalCallLifecycleFacts) -> None:
+        await self.commit_control(PersistenceCommand("transfer_intent", {"facts": facts}, None))
+
+    async def commit_transfer_observation(
+        self,
+        facts: LocalCallLifecycleFacts,
+        operation: VoiceOperationV1 | None,
+    ) -> None:
+        await self.commit_control(
+            PersistenceCommand(
+                "transfer_observation",
+                {"facts": facts, "operation": operation},
+                None,
+            )
+        )
+
+    async def _read_call_lifecycle(self, call_id: object) -> LocalCallLifecycleFacts | None:
+        if not isinstance(call_id, UUID):
+            raise CommandSerializationError("local_call_id_invalid")
+        cursor = await self._require_owner_connection().execute(
+            "SELECT lifecycle_json FROM call_leases WHERE call_id = ?",
+            (str(call_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None or row[0] is None:
+            return None
+        return self._decode_lifecycle(row[0])
+
+    @staticmethod
+    def _decode_lifecycle(raw: str) -> LocalCallLifecycleFacts:
+        values = json.loads(raw)
+        for name in (
+            "call_id",
+            "transfer_command_id",
+            "transfer_generation",
+            "bridge_operation_id",
+        ):
+            if values.get(name) is not None:
+                values[name] = UUID(values[name])
+        for name in (
+            "admitted_at",
+            "retention_until",
+            "started_at",
+            "qualified_line_bridged_at",
+            "transfer_failed_at",
+        ):
+            if values.get(name) is not None:
+                values[name] = _parse_datetime(values[name])
+        if values.get("disclosure_evidence") is not None:
+            values["disclosure_evidence"] = DisclosureEvidenceV1.model_validate(
+                values["disclosure_evidence"]
+            )
+        return LocalCallLifecycleFacts(**values)
+
+    async def _store_lifecycle(self, facts: LocalCallLifecycleFacts) -> None:
+        values: dict[str, object] = {}
+        for attribute in fields(facts):
+            value = getattr(facts, attribute.name)
+            values[attribute.name] = (
+                value.model_dump(mode="json")
+                if isinstance(value, DisclosureEvidenceV1)
+                else _iso(value)
+                if isinstance(value, datetime)
+                else str(value)
+                if isinstance(value, UUID)
+                else value
+            )
+        await self._require_owner_connection().execute(
+            "UPDATE call_leases SET lifecycle_json = ? WHERE call_id = ?",
+            (json.dumps(values, sort_keys=True, separators=(",", ":")), str(facts.call_id)),
+        )
+
+    async def _merge_lifecycle_operation(self, operation: VoiceOperationV1) -> None:
+        facts = await self._read_call_lifecycle(operation.call_id)
+        if facts is None or not isinstance(operation.payload, CallUpsertPayloadV1):
+            return
+        payload = operation.payload
+        if payload.retention_until != facts.retention_until:
+            raise CommandConflictError("local_retention_conflict")
+        evidence = facts.disclosure_evidence
+        if payload.disclosure_evidence is not None:
+            incoming = payload.disclosure_evidence
+            if evidence is None:
+                evidence = incoming
+            else:
+                evidence = DisclosureEvidenceV1(
+                    schema_version=1,
+                    **{
+                        name: getattr(evidence, name) or getattr(incoming, name)
+                        for name in (
+                            "started_at",
+                            "completed_at",
+                            "failed_at",
+                            "input_gate_opened_at",
+                        )
+                    },
+                )
+        started = facts.started_at
+        if payload.started_at is not None:
+            started = payload.started_at if started is None else min(started, payload.started_at)
+        await self._store_lifecycle(
+            replace(facts, started_at=started, disclosure_evidence=evidence)
+        )
+
+    async def _apply_transfer_facts(self, payload: Mapping[str, object]) -> None:
+        facts = payload.get("facts")
+        if not isinstance(facts, LocalCallLifecycleFacts):
+            raise CommandSerializationError("transfer_facts_invalid")
+        current = await self._read_call_lifecycle(facts.call_id)
+        if current is None or current.admitted_at != facts.admitted_at:
+            raise CommandConflictError("transfer_admission_missing")
+        if current.transfer_command_id is not None and (
+            current.transfer_command_id != facts.transfer_command_id
+            or current.transfer_correlation != facts.transfer_correlation
+            or current.transfer_generation != facts.transfer_generation
+            or current.transfer_connection_sha256 != facts.transfer_connection_sha256
+            or current.transfer_destination_sha256 != facts.transfer_destination_sha256
+        ):
+            raise CommandConflictError("transfer_identity_conflict")
+        for name in (
+            "target_call_control_id",
+            "target_call_leg_id",
+            "qualified_line_bridged_at",
+            "bridge_operation_id",
+        ):
+            old, new = getattr(current, name), getattr(facts, name)
+            if old is not None and new != old:
+                raise CommandConflictError("transfer_observation_conflict")
+        await self._store_lifecycle(
+            replace(
+                facts,
+                started_at=current.started_at,
+                disclosure_evidence=current.disclosure_evidence,
+            )
+        )
+        operation = payload.get("operation")
+        if operation is not None:
+            if not isinstance(operation, VoiceOperationV1) or operation.call_id != facts.call_id:
+                raise CommandSerializationError("transfer_operation_invalid")
+            await self._insert_outbox(operation)
+
     async def drain(self, timeout_seconds: float) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -919,16 +1119,19 @@ class PersistenceWriter:
         existing_version = self._pragma_int(await self._pragma_scalar("user_version"))
         existing_schema = await self._application_schema_objects()
         if existing_schema:
-            if existing_version == 1 and existing_schema == _EXPECTED_V1_SCHEMA_OBJECTS:
+            if (existing_version == 1 and existing_schema == _EXPECTED_V1_SCHEMA_OBJECTS) or (
+                existing_version == 2 and existing_schema == _EXPECTED_V2_SCHEMA_OBJECTS
+            ):
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
-                    await connection.execute(QUALIFICATION_RUNS_SQL)
+                    if existing_version == 1:
+                        await connection.execute(QUALIFICATION_RUNS_SQL)
+                    await connection.execute(CALL_LIFECYCLE_MIGRATION_SQL)
                     await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     if (
                         self._pragma_int(await self._pragma_scalar("user_version"))
                         != SCHEMA_VERSION
-                        or await self._application_schema_objects()
-                        != _EXPECTED_SCHEMA_OBJECTS
+                        or await self._application_schema_objects() != _EXPECTED_SCHEMA_OBJECTS
                     ):
                         raise FatalPersistenceError("sqlite_schema_mismatch")
                     await self._call_failpoint("after_v1_migration_before_commit")
@@ -941,10 +1144,7 @@ class PersistenceWriter:
                     with contextlib.suppress(Exception):
                         await connection.rollback()
                     raise FatalPersistenceError("sqlite_schema_mismatch") from None
-            elif (
-                existing_version != SCHEMA_VERSION
-                or existing_schema != _EXPECTED_SCHEMA_OBJECTS
-            ):
+            elif existing_version != SCHEMA_VERSION or existing_schema != _EXPECTED_SCHEMA_OBJECTS:
                 raise FatalPersistenceError("sqlite_schema_mismatch")
         else:
             if existing_version != 0:
@@ -1076,6 +1276,25 @@ class PersistenceWriter:
                 await self._apply_relay_command(command.payload)
             elif command.kind == "qualification_run_status":
                 command_result = await self._qualification_run_consumed(command.payload)
+            elif command.kind == "call_lifecycle_read":
+                command_result = await self._read_call_lifecycle(command.payload["call_id"])
+            elif command.kind == "sparra_activation":
+                cursor = await connection.execute(
+                    "SELECT count(*) FROM call_leases "
+                    "WHERE state != 'terminal' AND lifecycle_json IS NULL",
+                )
+                missing = await cursor.fetchone()
+                await cursor.close()
+                cursor = await connection.execute(
+                    "SELECT count(*) FROM outbox o LEFT JOIN call_leases c "
+                    "ON c.call_id=o.call_id WHERE c.lifecycle_json IS NULL",
+                )
+                incompatible = await cursor.fetchone()
+                await cursor.close()
+                if missing != (0,) or incompatible != (0,):
+                    raise FatalPersistenceError("sparra_legacy_state_incompatible")
+            elif command.kind in {"transfer_intent", "transfer_observation"}:
+                await self._apply_transfer_facts(command.payload)
             else:
                 raise CommandSerializationError("unknown_persistence_command")
             await self._call_failpoint("after_mutation_before_commit")
@@ -1144,6 +1363,8 @@ class PersistenceWriter:
 
     async def _insert_outbox(self, operation: VoiceOperationV1) -> None:
         connection = self._require_owner_connection()
+        if isinstance(operation.payload, CallUpsertPayloadV1):
+            await self._merge_lifecycle_operation(operation)
         prepared = encrypt_operation(operation, self._keyring)
         created_at = self._utcnow()
         turn_id: str | None = None
@@ -1238,6 +1459,38 @@ class PersistenceWriter:
             if await self._same_identity_is_terminal(lease):
                 return WebhookCommitResult("first", "existing_terminal")
             await self._apply_lease(lease)
+            admission = payload.get("admission_facts")
+            if admission is not None:
+                if not isinstance(
+                    admission, LocalCallAdmissionFacts
+                ) or admission.call_id != lease.get("call_id"):
+                    raise CommandConflictError("local_admission_identity_conflict")
+                if (
+                    not isinstance(operation, VoiceOperationV1)
+                    or not isinstance(operation.payload, CallUpsertPayloadV1)
+                    or operation.call_id != admission.call_id
+                    or operation.payload.retention_until != admission.retention_until
+                    or operation.payload.telnyx_call_leg_id != admission.telnyx_call_leg_id
+                    or operation.payload.telnyx_call_session_id != admission.telnyx_call_session_id
+                ):
+                    raise CommandConflictError("local_admission_identity_conflict")
+                existing = await self._read_call_lifecycle(admission.call_id)
+                facts = LocalCallLifecycleFacts(
+                    admission.call_id,
+                    admission.admitted_at,
+                    admission.retention_until,
+                    admission.telnyx_call_leg_id,
+                    admission.telnyx_call_session_id,
+                )
+                if existing is not None and (
+                    existing.admitted_at != facts.admitted_at
+                    or existing.retention_until != facts.retention_until
+                    or existing.telnyx_call_leg_id != facts.telnyx_call_leg_id
+                    or existing.telnyx_call_session_id != facts.telnyx_call_session_id
+                ):
+                    raise CommandConflictError("local_admission_identity_conflict")
+                if existing is None:
+                    await self._store_lifecycle(facts)
         if operation is not None:
             if not isinstance(operation, VoiceOperationV1):
                 raise CommandSerializationError("invalid_outbox_command")
@@ -1514,7 +1767,7 @@ class PersistenceWriter:
         cursor = await connection.execute(
             """
             SELECT call_control_id, call_id, tenant_id, agent_id, token_hash, state,
-                   created_at, expires_at
+                   created_at, expires_at, lifecycle_json
             FROM call_leases
             WHERE state IN ('pending', 'active')
             ORDER BY created_at, call_control_id
@@ -1532,6 +1785,7 @@ class PersistenceWriter:
                 previous_state=cast(Literal["pending", "active"], row[5]),
                 created_at=_parse_datetime(row[6]),
                 expires_at=_parse_datetime(row[7]),
+                lifecycle=None if row[8] is None else self._decode_lifecycle(row[8]),
             )
             for row in rows
         )
@@ -1657,14 +1911,10 @@ class PersistenceWriter:
             ):
                 raise FatalPersistenceError("runtime_observation_clock_invalid")
             waiting = tuple(
-                command
-                for command in self._pending_commands
-                if command.kind != "shutdown"
+                command for command in self._pending_commands if command.kind != "shutdown"
             )
             oldest_queue_age = (
-                0.0
-                if not waiting
-                else max(0.0, float(monotonic_now) - waiting[0].enqueued_at)
+                0.0 if not waiting else max(0.0, float(monotonic_now) - waiting[0].enqueued_at)
             )
             cursor = await connection.execute(
                 """
@@ -1691,9 +1941,7 @@ class PersistenceWriter:
                 if row[1] is None
                 else max(
                     0.0,
-                    (
-                        utc_now.astimezone(UTC) - _parse_datetime(row[1])
-                    ).total_seconds(),
+                    (utc_now.astimezone(UTC) - _parse_datetime(row[1])).total_seconds(),
                 )
             )
             observation = WriterRuntimeObservation(
@@ -1758,7 +2006,8 @@ class PersistenceWriter:
                 (_iso(now - RECEIPT_RETENTION),),
             )
             leases_cursor = await connection.execute(
-                "DELETE FROM call_leases WHERE state = 'terminal' AND closed_at < ?",
+                "DELETE FROM call_leases WHERE state = 'terminal' AND closed_at < ? "
+                "AND lifecycle_json IS NULL",
                 (_iso(now - CLOSED_LEASE_RETENTION),),
             )
             cleanup = CleanupResult(receipts_cursor.rowcount, leases_cursor.rowcount)
@@ -1801,7 +2050,11 @@ class PersistenceWriter:
 
     def _resolve_success(self, command: PersistenceCommand, value: object | None) -> None:
         result = command.payload.get("result")
-        if isinstance(result, asyncio.Future) and not result.done() and value is not None:
+        if (
+            isinstance(result, asyncio.Future)
+            and not result.done()
+            and (value is not None or command.kind == "call_lifecycle_read")
+        ):
             result.set_result(value)
         if command.committed is not None and not command.committed.done():
             command.committed.set_result(None)

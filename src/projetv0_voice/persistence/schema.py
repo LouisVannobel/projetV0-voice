@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 V1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS call_leases (
@@ -66,7 +66,14 @@ QUALIFICATION_RUNS_SQL = """CREATE TABLE qualification_runs (
     consumed_at TEXT NOT NULL
 )"""
 
-SCHEMA_SQL = V1_SCHEMA_SQL.replace(
+V2_SCHEMA_SQL = V1_SCHEMA_SQL.replace(
     "PRAGMA user_version = 1;",
     f"{QUALIFICATION_RUNS_SQL};\n\nPRAGMA user_version = 2;",
 )
+
+CALL_LIFECYCLE_MIGRATION_SQL = "ALTER TABLE call_leases ADD COLUMN lifecycle_json TEXT"
+SCHEMA_SQL = V2_SCHEMA_SQL.replace(
+    "closed_at TEXT,",
+    "closed_at TEXT, lifecycle_json TEXT,",
+    1,
+).replace("PRAGMA user_version = 2;", "PRAGMA user_version = 3;")

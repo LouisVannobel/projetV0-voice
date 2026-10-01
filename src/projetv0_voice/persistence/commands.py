@@ -48,6 +48,10 @@ class PersistenceCommand:
         "outbox",
         "relay_batch",
         "qualification_run_status",
+        "call_lifecycle_read",
+        "sparra_activation",
+        "transfer_intent",
+        "transfer_observation",
         "shutdown",
     ]
     payload: Mapping[str, object] = field(repr=False)

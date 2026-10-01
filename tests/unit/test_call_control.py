@@ -114,6 +114,41 @@ def ok_response() -> object:
     return SimpleNamespace(data=SimpleNamespace(result="ok"))
 
 
+@pytest.mark.asyncio
+async def test_real_pinned_sdk_qualified_transfer_uses_twenty_seconds_and_same_command(monkeypatch):
+    module = call_control()
+    requests = []
+
+    async def handler(request):
+        requests.append((request.url.path, json.loads(await request.aread())))
+        return httpx.Response(200, json={"data": {"result": "ok"}}, request=request)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(module.telnyx, "DefaultAsyncHttpxClient", lambda **kwargs: http_client)
+    client = module.CallControlClient(api_key=API_KEY)
+    try:
+        assert client.dispatch_available
+        request = module.TransferRequestV1(
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ=="
+        )
+        first = await client.transfer(CALL_CONTROL_ID, request, command_id=COMMAND_ID)
+        second = await client.transfer(CALL_CONTROL_ID, request, command_id=COMMAND_ID)
+        assert first.outcome == second.outcome == "accepted"
+        expected = (
+            f"/v2/calls/{CALL_CONTROL_ID}/actions/transfer",
+            {
+                "to": "+33102030406",
+                "command_id": str(COMMAND_ID),
+                "target_leg_client_state": "Zml4dHVyZQ==",
+                "timeout_secs": 20,
+            },
+        )
+        assert requests == [expected, expected]
+    finally:
+        await client.aclose()
+    assert not client.dispatch_available
+
+
 def malformed_response(result: str | None = None) -> object:
     return SimpleNamespace(data=None if result is None else SimpleNamespace(result=result))
 

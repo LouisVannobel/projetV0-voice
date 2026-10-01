@@ -243,6 +243,8 @@ class _RuntimeSink(Protocol):
 
     async def close(self) -> None: ...
 
+    async def begin_call(self, deployment_id: str, call_id: UUID, routing: Any) -> Any: ...
+
 
 class _CloseableGate(Protocol):
     def close(self) -> None: ...
@@ -625,6 +627,7 @@ class RuntimeSupervisor:
         candidate_run_id: UUID | None = None,
         deployment_id: str = "projetv0-voice",
         retention_days: int = 7,
+        sparra_enabled: bool = False,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         loop_interval_seconds: float = 0.25,
         startup_phase_timeout_seconds: float = 5.0,
@@ -694,6 +697,7 @@ class RuntimeSupervisor:
         self._candidate_run_id = candidate_run_id
         self._deployment_id = deployment_id
         self._retention_days = retention_days
+        self._sparra_enabled = sparra_enabled
         self._utcnow = utcnow
         self._loop_interval_seconds = float(loop_interval_seconds)
         self._startup_phase_timeout_seconds = float(startup_phase_timeout_seconds)
@@ -753,10 +757,12 @@ class RuntimeSupervisor:
             ):
                 raise RuntimeError("qualification_run_consumed")
             self._qualification_valid = True
-            if self._sink is not None:
+            if self._sparra_enabled:
                 await self._startup_await(
-                    self._sink.open(), code="operation_sink_open_failed"
+                    self._writer.assert_sparra_compatible(), code="writer_startup_failed"
                 )
+            if self._sink is not None:
+                await self._startup_await(self._sink.open(), code="operation_sink_open_failed")
             await self._recover_stale_leases()
             self._register_fixed_supervisors()
             self.fixed_supervisors.close_registration()
@@ -768,9 +774,7 @@ class RuntimeSupervisor:
             )
             self._publish_current()
             if self._writer_health_breached():
-                await self._startup_await(
-                    self.begin_drain(), code="runtime_begin_drain_failed"
-                )
+                await self._startup_await(self.begin_drain(), code="runtime_begin_drain_failed")
         except asyncio.CancelledError as error:
             cancellation = error
         except BaseException as error:
@@ -1026,15 +1030,16 @@ class RuntimeSupervisor:
                     "call_control_id": event.call_control_id,
                     "occurred_at": event.occurred_at,
                     "received_at": _aware_utc(self._utcnow()),
-                    "semantic_fingerprint_sha256": (
-                        event.semantic_fingerprint_sha256
-                    ),
+                    "semantic_fingerprint_sha256": (event.semantic_fingerprint_sha256),
                 },
                 lease=None if effect is None else effect.lease,
                 operation=None if effect is None else effect.operation,
-                legacy_v1_semantic_fingerprint_sha256=(
-                    event.legacy_v1_semantic_fingerprint_sha256
+                **(
+                    {"admission_facts": effect.admission_facts}
+                    if effect is not None and effect.admission_facts is not None
+                    else {}
                 ),
+                legacy_v1_semantic_fingerprint_sha256=(event.legacy_v1_semantic_fingerprint_sha256),
                 qualification_run_id=(
                     self._candidate_run_id
                     if receipt == "first"
@@ -1056,9 +1061,7 @@ class RuntimeSupervisor:
         timed_out = False
         try:
             try:
-                async with asyncio.timeout(
-                    self._writer.control_commit_timeout_seconds
-                ):
+                async with asyncio.timeout(self._writer.control_commit_timeout_seconds):
                     result = await ticket.wait()
             except TimeoutError:
                 timed_out = True
@@ -1083,9 +1086,7 @@ class RuntimeSupervisor:
         if timed_out:
             if self._registry is not None:
                 with contextlib.suppress(Exception):
-                    await self._registry.confirm_late_after_fail_closed(
-                        event, resolution, result
-                    )
+                    await self._registry.confirm_late_after_fail_closed(event, resolution, result)
             return
 
         disposition = WebhookDisposition(
@@ -1096,9 +1097,7 @@ class RuntimeSupervisor:
         )
         if self._registry is not None:
             try:
-                disposition = await self._registry.reconcile_after_commit(
-                    event, resolution, result
-                )
+                disposition = await self._registry.reconcile_after_commit(event, resolution, result)
             except BaseException:
                 disposition = WebhookDisposition(500)
         if isinstance(result, WebhookCommitResult) and self._metrics is not None:
@@ -1107,9 +1106,7 @@ class RuntimeSupervisor:
                 self._metrics.record_recording(transition)
         if self._recording_after_commit is not None:
             try:
-                recording_disposition = await self._recording_after_commit(
-                    event, resolution.effect
-                )
+                recording_disposition = await self._recording_after_commit(event, resolution.effect)
             except asyncio.CancelledError:
                 raise
             except BaseException:
@@ -1369,6 +1366,11 @@ class RuntimeSupervisor:
             raise RuntimeError("stale_recovery_failed") from None
         measured = self._measured_call_control
         for stale in stale_leases:
+            if stale.lifecycle is not None and stale.lifecycle.transfer_fenced:
+                if self._registry is None:
+                    raise RuntimeError("transfer_recovery_registry_missing")
+                await cast(Any, self._registry).restore_transfer_fence(stale)
+                continue
             command_id = _stale_cleanup_id(stale.call_id)
             try:
                 result = (
@@ -1700,14 +1702,11 @@ async def build_production_runtime(
         _validate_profile_selection(settings, manifest, selection, now=now)
 
         telnyx_api_key = factories.read_secret(settings.telnyx_api_key_file)
-        webhook_public_key = factories.read_secret(
-            settings.telnyx_webhook_public_key_file
-        )
+        webhook_public_key = factories.read_secret(settings.telnyx_webhook_public_key_file)
         openrouter_api_key = factories.read_secret(settings.openrouter_api_key_file)
         postgres_dsn = factories.read_secret(settings.postgres_dsn_file)
         if not all(
-            isinstance(value, SecretStr)
-            and bool(value.get_secret_value())
+            isinstance(value, SecretStr) and bool(value.get_secret_value())
             for value in (
                 telnyx_api_key,
                 webhook_public_key,
@@ -1719,9 +1718,7 @@ async def build_production_runtime(
         api_key_sha256 = hashlib.sha256(
             telnyx_api_key.get_secret_value().encode("utf-8")
         ).hexdigest()
-        if not hmac.compare_digest(
-            selection.profile.telnyx_api_key_sha256, api_key_sha256
-        ):
+        if not hmac.compare_digest(selection.profile.telnyx_api_key_sha256, api_key_sha256):
             raise RuntimeError("runtime_profile_api_key_mismatch")
 
         keyring = factories.load_keyring(settings)
@@ -1770,6 +1767,7 @@ async def build_production_runtime(
             candidate_run_id=candidate_run_id,
             deployment_id=settings.deployment_id,
             retention_days=manifest.transcript_retention_days,
+            sparra_enabled=manifest.sparra is not None,
             utcnow=utcnow,
             loop_interval_seconds=0.25,
             startup_phase_timeout_seconds=float(startup_phase_timeout_seconds),
@@ -1807,6 +1805,9 @@ async def build_production_runtime(
             candidate_run_id=candidate_run_id,
             admission_expires_at=admission_expires_at,
             qualification_observer=supervisor.observe_qualification_state,
+            sparra=manifest.sparra,
+            called_did=manifest.dids[0],
+            begin_call=getattr(sink, "begin_call", None),
         )
         lease_authority = ProcessLeaseAuthority(registry)
         gate = SynchronousUnauthenticatedGate(capacity)
@@ -1817,8 +1818,7 @@ async def build_production_runtime(
             timeout_seconds=settings.handshake_timeout_seconds,
         )
         recording_retention_days = (
-            manifest.recording_retention_days
-            or manifest.transcript_retention_days
+            manifest.recording_retention_days or manifest.transcript_retention_days
         )
 
         def recording_factory(identity: CallIdentity) -> RecordingBoundary:
@@ -1847,9 +1847,7 @@ async def build_production_runtime(
             recording_factory=recording_factory,
             recording_call_control_identity=measured_call_control,
             idle_timeout_seconds=settings.call_idle_timeout_seconds,
-            cleanup_phase_timeout_seconds=(
-                settings.call_cleanup_phase_timeout_seconds
-            ),
+            cleanup_phase_timeout_seconds=(settings.call_cleanup_phase_timeout_seconds),
         )
         verifier = TelnyxWebhookVerifier(
             public_key=webhook_public_key.get_secret_value(),
@@ -2125,6 +2123,9 @@ def _stale_terminal_operation(
     operation_digest = hashlib.sha256(
         b"projetv0.voice.stale-terminal.v1\x00" + stale.call_id.bytes
     ).digest()
+    facts = stale.lifecycle
+    if facts is not None and facts.transfer_fenced:
+        raise RuntimeError("transfer_fence_cannot_stale_terminalize")
     return VoiceOperationV1(
         schema_version=1,
         operation_id=UUID(bytes=operation_digest[:16], version=4),
@@ -2134,14 +2135,30 @@ def _stale_terminal_operation(
         kind="call.upsert",
         payload=CallUpsertPayloadV1(
             telnyx_call_control_id=stale.call_control_id,
-            telnyx_call_leg_id=None,
-            telnyx_call_session_id=None,
+            telnyx_call_leg_id=None if facts is None else facts.telnyx_call_leg_id,
+            telnyx_call_session_id=None if facts is None else facts.telnyx_call_session_id,
             status="failed",
-            disclosure_state="failed",
-            started_at=None,
+            disclosure_state="completed"
+            if facts is not None
+            and facts.disclosure_evidence is not None
+            and facts.disclosure_evidence.completed_at is not None
+            else "failed",
+            started_at=None if facts is None else facts.started_at,
             ended_at=ended_at,
             end_reason="stale_process_recovery",
-            retention_until=ended_at + timedelta(days=retention_days),
+            retention_until=ended_at + timedelta(days=retention_days)
+            if facts is None
+            else facts.retention_until,
+            **(
+                cast(
+                    Any,
+                    (
+                        {"disclosure_evidence": facts.disclosure_evidence}
+                        if facts is not None and facts.disclosure_evidence is not None
+                        else {}
+                    ),
+                )
+            ),
         ),
     )
 

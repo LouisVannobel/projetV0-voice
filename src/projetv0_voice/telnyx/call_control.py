@@ -143,6 +143,19 @@ class RecordingStartV1(_RedactedFrozenModel):
     )
 
 
+class TransferRequestV1(_RedactedFrozenModel):
+    to_e164: str = Field(repr=False)
+    target_leg_client_state: str = Field(min_length=1, max_length=4096, repr=False)
+    timeout_secs: Literal[20] = 20
+
+    @field_validator("to_e164")
+    @classmethod
+    def destination(cls, value: str) -> str:
+        from projetv0_voice.models import _e164
+
+        return _e164(value)
+
+
 class RecordingStopV1(_RedactedFrozenModel):
     client_state: SecretStr = Field(
         min_length=1,
@@ -351,6 +364,10 @@ class CallControlClient:
             raise CallControlInputError("call_control_input_invalid")
         return cast(str, call_control_id), str(command_id)
 
+    @property
+    def dispatch_available(self) -> bool:
+        return not self._closing and not self._closed
+
     async def answer(self, call_control_id: str, *, command_id: UUID) -> CallControlResult:
         control_id, canonical_command = self._validated_ids(call_control_id, command_id)
 
@@ -358,6 +375,29 @@ class CallControlClient:
             return await self._client.calls.actions.answer(
                 control_id,
                 command_id=canonical_command,
+                timeout=self._timeout,
+            )
+
+        return await self._execute(action)
+
+    async def transfer(
+        self,
+        call_control_id: str,
+        request: TransferRequestV1,
+        *,
+        command_id: UUID,
+    ) -> CallControlResult:
+        control_id, canonical_command = self._validated_ids(call_control_id, command_id)
+        if not isinstance(request, TransferRequestV1):
+            raise CallControlInputError("call_control_input_invalid")
+
+        async def action() -> object:
+            return await self._client.calls.actions.transfer(
+                control_id,
+                to=request.to_e164,
+                command_id=canonical_command,
+                target_leg_client_state=request.target_leg_client_state,
+                timeout_secs=20,
                 timeout=self._timeout,
             )
 
