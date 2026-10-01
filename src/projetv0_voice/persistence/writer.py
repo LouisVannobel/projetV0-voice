@@ -169,10 +169,13 @@ class LocalCallLifecycleFacts(LocalCallAdmissionFacts):
     bridge_operation_id: UUID | None = None
     transfer_failed_at: datetime | None = None
     transfer_failure_cause: str | None = None
+    local_closing_at: datetime | None = None
 
     @property
     def transfer_fenced(self) -> bool:
-        return self.transfer_command_id is not None and self.transfer_failed_at is None
+        return self.transfer_command_id is not None and (
+            self.transfer_failed_at is None or self.local_closing_at is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -861,6 +864,7 @@ class PersistenceWriter:
             "started_at",
             "qualified_line_bridged_at",
             "transfer_failed_at",
+            "local_closing_at",
         ):
             if values.get(name) is not None:
                 values[name] = _parse_datetime(values[name])
@@ -917,7 +921,17 @@ class PersistenceWriter:
         if payload.started_at is not None:
             started = payload.started_at if started is None else min(started, payload.started_at)
         await self._store_lifecycle(
-            replace(facts, started_at=started, disclosure_evidence=evidence)
+            replace(
+                facts,
+                started_at=started,
+                disclosure_evidence=evidence,
+                local_closing_at=facts.local_closing_at
+                or (
+                    operation.occurred_at
+                    if payload.status == "closing" and facts.transfer_command_id is not None
+                    else None
+                ),
+            )
         )
 
     async def _apply_transfer_facts(self, payload: Mapping[str, object]) -> None:
@@ -949,6 +963,7 @@ class PersistenceWriter:
                 facts,
                 started_at=current.started_at,
                 disclosure_evidence=current.disclosure_evidence,
+                local_closing_at=current.local_closing_at or facts.local_closing_at,
             )
         )
         operation = payload.get("operation")

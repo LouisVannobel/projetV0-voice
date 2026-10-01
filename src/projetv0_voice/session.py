@@ -588,6 +588,7 @@ class CallSession:
         self._active_runner: WorkerRunner | None = None
         self._drain_requested = False
         self._drain_claimed = False
+        self._drain_task: asyncio.Task[None] | None = None
         self._drain_lock = asyncio.Lock()
         self._terminal_outcome = _TerminalOutcome("closed")
         self._no_new_ai = False
@@ -782,16 +783,43 @@ class CallSession:
         if reason is not None:
             self._latch_drain_reason(reason)
 
-        runner: WorkerRunner | None = None
         async with self._drain_lock:
             self._drain_requested = True
             if self._active_runner is not None and not self._drain_claimed:
                 self._drain_claimed = True
-                runner = self._active_runner
-        if runner is not None:
-            if self._no_new_ai and self._active_runtime is not None:
-                await self._active_runtime.request_clear()
+                self._drain_task = asyncio.create_task(
+                    self._drain_runner_owned(self._active_runner),
+                    name="call-drain-owned",
+                )
+            task = self._drain_task
+        if task is not None:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # A cancelled waiter cannot revoke the call-owned departure.
+                    continue
+            await task
+
+    async def _drain_runner_owned(self, runner: WorkerRunner) -> None:
+        clear_task = None
+        if self._no_new_ai and self._active_runtime is not None:
+            clear_task = asyncio.create_task(
+                self._clear_takeover_owned(self._active_runtime), name="call-takeover-clear"
+            )
+        try:
+            # Cancellation is independent of the optional output acknowledgement.
             await runner.cancel(reason="drain")
+        finally:
+            if clear_task is not None:
+                await clear_task
+
+    async def _clear_takeover_owned(self, runtime: CallRuntime) -> None:
+        try:
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
+                await runtime.request_clear()
+        except (Exception, asyncio.CancelledError):
+            return
 
     def _latch_drain_reason(self, reason: str) -> None:
         if type(reason) is not str or reason not in {
@@ -843,17 +871,10 @@ class CallSession:
         )
 
     async def _replay_pending_drain(self) -> None:
-        runner: WorkerRunner | None = None
         async with self._drain_lock:
-            if (
-                self._drain_requested
-                and not self._drain_claimed
-                and self._active_runner is not None
-            ):
-                self._drain_claimed = True
-                runner = self._active_runner
-        if runner is not None:
-            await runner.cancel(reason="drain")
+            requested = self._drain_requested
+        if requested:
+            await self.request_drain()
 
     @staticmethod
     def _default_task_factory(

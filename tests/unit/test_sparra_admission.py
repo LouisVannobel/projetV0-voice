@@ -536,3 +536,100 @@ async def test_begin_return_after_original_admission_deadline_cannot_answer(tmp_
         await registry.wait_background()
         await writer.drain(2)
         await worker
+
+
+@pytest.mark.parametrize("cause", ["user_busy", "no_answer"])
+@pytest.mark.asyncio
+async def test_departed_owner_target_failure_preserves_actual_original_hangup(tmp_path, cause):
+    from types import SimpleNamespace
+
+    from pydantic import SecretStr
+
+    from projetv0_voice.admission import TerminalProposal
+
+    registry, writer, worker, provider = await start(tmp_path)
+    await committed(registry, writer, event())
+    await committed(registry, writer, event("call.answered"))
+    snapshot_entry = await registry.snapshot("original")
+    claim = await registry.claim_once(
+        call_control_id="original",
+        token_digest=snapshot_entry.token_digest,
+        abort_target_publisher=lambda target: True,
+        abort_target_clearer=lambda target: None,
+    )
+
+    async def wait():
+        pass
+
+    owner = SimpleNamespace(
+        _task=asyncio.current_task(),
+        _phase="constructing",
+        _session=None,
+        _terminal_capability=None,
+        request_drain=lambda cause: None,
+        wait=wait,
+    )
+    grant = await registry.consume_claim_for_construction(claim, "stream", owner, owner._task)
+    requested = asyncio.create_task(registry.request_human(grant.generation))
+    await provider.transfer_entered.wait()
+    try:
+        authority = await registry.reserve_or_read_terminal(
+            grant,
+            owner._terminal_capability,
+            TerminalProposal(
+                status="failed",
+                reason="pipeline_failed",
+                metric_class="failed",
+                cleanup_hangup=True,
+            ),
+        )
+        assert authority.status == "closing"
+        await registry._persist_authority_call(authority)
+        await registry.complete_reserved_terminal(authority)
+        await registry.close_session_owner_registration()
+        facts = await writer.read_call_lifecycle(grant.call_id)
+        target = dict(
+            call_control_id="target",
+            call_leg_id="target-leg",
+            to_e164=TARGET,
+            client_state=SecretStr(facts.transfer_correlation),
+            direction="outgoing",
+            call_state=None,
+        )
+        await committed(registry, writer, event(**target))
+        failure = event("call.hangup", **{**target, "direction": None, "hangup_cause": cause})
+        await committed(registry, writer, failure)
+        await committed(registry, writer, failure)
+        retained = await writer.read_call_lifecycle(grant.call_id)
+        assert retained.transfer_failed_at == failure.occurred_at
+        assert retained.local_closing_at == authority._closed_at
+        assert retained.transfer_fenced
+        assert await registry.live_call_count() == 1
+        assert not any(action[0] == "hangup" for action in provider.actions)
+        original = event("call.hangup", occurred_at=NOW + timedelta(seconds=10))
+        await committed(registry, writer, original)
+        await committed(registry, writer, original)
+        assert await registry.live_call_count() == 0
+        items = await writer.read_relay_batch(
+            batch_size=100, now=datetime.now(UTC) + timedelta(seconds=1), lease_seconds=60
+        )
+        terminal = [
+            item.operation.payload
+            for item in items
+            if item.operation.kind == "call.upsert" and item.operation.payload.ended_at is not None
+        ]
+        assert len(terminal) == 1 and terminal[0].ended_at == original.occurred_at
+        import sqlite3
+
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            state, closed_at = connection.execute(
+                "SELECT state,closed_at FROM call_leases WHERE call_id=?", (str(grant.call_id),)
+            ).fetchone()
+        assert state == "terminal"
+        assert datetime.fromisoformat(closed_at.replace("Z", "+00:00")) == original.occurred_at
+    finally:
+        provider.transfer_release.set()
+        await asyncio.gather(requested, return_exceptions=True)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker

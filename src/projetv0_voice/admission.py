@@ -1399,6 +1399,13 @@ class CallRegistry:
                     facts = replace(
                         facts, transfer_failed_at=event.occurred_at, transfer_failure_cause=cause
                     )
+                    if (
+                        candidate.terminal_authority is not None
+                        and candidate.terminal_authority.status == "closing"
+                    ):
+                        facts = replace(
+                            facts, local_closing_at=candidate.terminal_authority._closed_at
+                        )
                 candidate.transfer_facts = facts
                 entry = candidate
                 break
