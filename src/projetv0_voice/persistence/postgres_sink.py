@@ -12,12 +12,22 @@ from uuid import UUID
 
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
+from pydantic import ValidationError
 
-from projetv0_voice.models import VoiceOperationV1, is_valid_provider_recording_id
+from projetv0_voice.models import (
+    BeginCallSnapshotV1,
+    RoutingV1,
+    VoiceOperationV1,
+    is_valid_provider_recording_id,
+    validate_deployment_id,
+)
 
 INGEST_SQL = "SELECT voice.ingest_operation_v1(%s::jsonb)"
 LEASE_PURGES_SQL = "SELECT * FROM voice.lease_recording_purge_v1(%s,%s,%s)"
 ACK_PURGE_SQL = "SELECT voice.ack_recording_purge_v1(%s,%s,%s,%s)"
+BEGIN_CALL_SQL = "SELECT voice.begin_call_v1(%s,%s,%s::jsonb)"
+LEASE_CALL_ERASURES_SQL = "SELECT * FROM voice.lease_call_erasure_v1(%s,%s,%s)"
+ACK_CALL_ERASURE_SQL = "SELECT voice.ack_call_erasure_v1(%s,%s,%s)"
 
 POOL_ACQUIRE_TIMEOUT_SECONDS = 2.0
 SQL_TRANSACTION_TIMEOUT_SECONDS = 5.0
@@ -59,6 +69,10 @@ class OperationSinkStaleLeaseError(OperationSinkError):
     """The purge lease token no longer owns the recording transition."""
 
 
+class OperationSinkErasedError(OperationSinkError):
+    """PV301 confirms terminal discard of erased or expired call content."""
+
+
 @dataclass(frozen=True, slots=True)
 class RecordingPurgeLease:
     schema_version: int
@@ -69,8 +83,30 @@ class RecordingPurgeLease:
     lease_expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class CallErasureLease:
+    schema_version: int
+    call_id: UUID = field(repr=False)
+    lease_token: UUID = field(repr=False)
+    deployment_id: str = field(repr=False)
+    original_retention_until: datetime
+    lease_expires_at: datetime
+
+
 class PostgresOperationSink(Protocol):
+    async def begin_call(
+        self, deployment_id: str, call_id: UUID, routing: RoutingV1
+    ) -> BeginCallSnapshotV1: ...
+
     async def ingest(self, operation: VoiceOperationV1) -> None: ...
+
+    async def lease_call_erasures(
+        self, worker_id: str, lease_seconds: int, batch_size: int
+    ) -> Sequence[CallErasureLease]: ...
+
+    async def ack_call_erasure(
+        self, call_id: UUID, lease_token: UUID, occurred_at: datetime
+    ) -> None: ...
 
     async def lease_recording_purges(
         self, worker_id: str, lease_seconds: int, batch_size: int
@@ -94,6 +130,7 @@ _FailureKind = Literal[
     "contract",
     "conflict",
     "stale",
+    "erased",
 ]
 
 
@@ -126,6 +163,18 @@ class _LeaseCallResult:
     failure: _SafeFailure | None
 
 
+@dataclass(frozen=True, slots=True)
+class _BeginCallResult:
+    snapshot: BeginCallSnapshotV1 | None = field(repr=False)
+    failure: _SafeFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ErasureLeaseResult:
+    leases: tuple[CallErasureLease, ...] = field(repr=False)
+    failure: _SafeFailure | None
+
+
 def _raise_safe_failure(failure: _SafeFailure) -> None:
     exception_type: type[OperationSinkError]
     if failure.kind == "transient":
@@ -138,6 +187,8 @@ def _raise_safe_failure(failure: _SafeFailure) -> None:
         exception_type = OperationConflictError
     elif failure.kind == "stale":
         exception_type = OperationSinkStaleLeaseError
+    elif failure.kind == "erased":
+        exception_type = OperationSinkErasedError
     else:
         exception_type = OperationSinkPermanentError
     raise exception_type(failure.code)
@@ -168,6 +219,8 @@ def _safe_failure_from_exception(error: OperationSinkError) -> _SafeFailure:
         kind = "contract"
     elif isinstance(error, OperationSinkStaleLeaseError):
         kind = "stale"
+    elif isinstance(error, OperationSinkErasedError):
+        kind = "erased"
     elif isinstance(error, OperationSinkCommitAmbiguousError):
         kind = "ambiguous"
     elif isinstance(error, OperationSinkTransientError):
@@ -182,13 +235,19 @@ def _failure_from_raw_exception(
     *,
     dispatched: bool,
     map_purge_ack_sqlstates: bool,
+    map_erased_sqlstate: bool = False,
+    map_contract_sqlstate: bool = False,
 ) -> _SafeFailure:
+    sqlstate = getattr(error, "sqlstate", None)
+    if map_erased_sqlstate and sqlstate == "PV301":
+        return _SafeFailure("erased", "operation_call_erased")
     if map_purge_ack_sqlstates:
-        sqlstate = getattr(error, "sqlstate", None)
         if sqlstate == "PV201":
             return _SafeFailure("stale", "purge_stale_lease")
         if sqlstate == "PV202":
             return _SafeFailure("permanent", "purge_contract_failure")
+    if map_contract_sqlstate and sqlstate == "PV202":
+        return _SafeFailure("permanent", "operation_contract_failure")
     if dispatched:
         return _SafeFailure("ambiguous", "operation_commit_ambiguous")
     return _SafeFailure("transient", "operation_pre_dispatch_failed")
@@ -270,6 +329,137 @@ class PsycopgOperationSink:
         if failure is not None:
             del self, operation
             _raise_safe_failure(failure)
+
+    async def begin_call(
+        self, deployment_id: str, call_id: UUID, routing: RoutingV1
+    ) -> BeginCallSnapshotV1:
+        validate_deployment_id(deployment_id)
+        if not isinstance(call_id, UUID) or not isinstance(routing, RoutingV1):
+            raise ValueError("call identity and routing must be typed")
+        result = await self._begin_call_result(deployment_id, call_id, routing)
+        if result.failure is not None:
+            failure = result.failure
+            del result, self, deployment_id, call_id, routing
+            _raise_safe_failure(failure)
+        if result.snapshot is None:
+            raise OperationSinkContractError("begin_call_result_invalid")
+        return result.snapshot
+
+    async def _begin_call_result(
+        self, deployment_id: str, call_id: UUID, routing: RoutingV1
+    ) -> _BeginCallResult:
+        snapshots: list[BeginCallSnapshotV1] = []
+
+        def validate(rows: Sequence[tuple[object, ...]]) -> None:
+            raw = _one_json_object(rows, "begin_call_result_invalid")
+            try:
+                snapshot = BeginCallSnapshotV1.model_validate(raw)
+            except (ValidationError, ValueError):
+                raise OperationSinkContractError("begin_call_result_invalid") from None
+            if snapshot.call_id != call_id or snapshot.retention_until != (
+                routing.admitted_at + timedelta(seconds=2_592_000)
+            ):
+                raise OperationSinkContractError("begin_call_result_invalid")
+            snapshots.append(snapshot)
+
+        failure = await self._execute_result(
+            BEGIN_CALL_SQL,
+            (deployment_id, call_id, Jsonb(routing.model_dump(mode="json"))),
+            validate,
+            map_purge_ack_sqlstates=False,
+        )
+        return _BeginCallResult(
+            snapshot=None if failure is not None else snapshots[0], failure=failure
+        )
+
+    async def lease_call_erasures(
+        self, worker_id: str, lease_seconds: int, batch_size: int
+    ) -> Sequence[CallErasureLease]:
+        if not isinstance(worker_id, str) or _WORKER_ID.fullmatch(worker_id) is None:
+            raise ValueError("worker_id is outside the supported range")
+        _exact_bounded_int(lease_seconds, 1, 300, "lease_seconds")
+        _exact_bounded_int(batch_size, 1, 100, "batch_size")
+        result = await self._lease_call_erasures_result(worker_id, lease_seconds, batch_size)
+        if result.failure is not None:
+            failure = result.failure
+            del result, self, worker_id, lease_seconds, batch_size
+            _raise_safe_failure(failure)
+        return result.leases
+
+    async def _lease_call_erasures_result(
+        self, worker_id: str, lease_seconds: int, batch_size: int
+    ) -> _ErasureLeaseResult:
+        leases: list[CallErasureLease] = []
+
+        def validate(rows: Sequence[tuple[object, ...]]) -> None:
+            code = "call_erasure_lease_result_invalid"
+            if len(rows) > batch_size:
+                raise OperationSinkContractError(code)
+            call_ids: set[UUID] = set()
+            tokens: set[UUID] = set()
+            for row in rows:
+                value = _row_json_object(row, code)
+                if set(value) != {
+                    "schema_version",
+                    "call_id",
+                    "lease_token",
+                    "deployment_id",
+                    "original_retention_until",
+                    "lease_expires_at",
+                }:
+                    raise OperationSinkContractError(code)
+                if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+                    raise OperationSinkContractError(code)
+                call_id = _strict_uuid(value["call_id"], code)
+                token = _strict_uuid(value["lease_token"], code)
+                try:
+                    deployment_id = validate_deployment_id(value["deployment_id"])
+                except ValueError:
+                    raise OperationSinkContractError(code) from None
+                retention = _strict_aware_datetime(value["original_retention_until"], code)
+                expires = _strict_aware_datetime(value["lease_expires_at"], code)
+                if call_id in call_ids or token in tokens:
+                    raise OperationSinkContractError(code)
+                call_ids.add(call_id)
+                tokens.add(token)
+                leases.append(
+                    CallErasureLease(1, call_id, token, deployment_id, retention, expires)
+                )
+
+        failure = await self._execute_result(
+            LEASE_CALL_ERASURES_SQL,
+            (worker_id, lease_seconds, batch_size),
+            validate,
+            map_purge_ack_sqlstates=False,
+        )
+        return _ErasureLeaseResult(
+            leases=() if failure is not None else tuple(leases), failure=failure
+        )
+
+    async def ack_call_erasure(
+        self, call_id: UUID, lease_token: UUID, occurred_at: datetime
+    ) -> None:
+        if not isinstance(call_id, UUID) or not isinstance(lease_token, UUID):
+            raise ValueError("call and lease IDs must be UUIDs")
+        normalized_time = _input_aware_datetime(occurred_at)
+        failure = await self._ack_call_erasure_result(call_id, lease_token, normalized_time)
+        if failure is not None:
+            del self, call_id, lease_token, occurred_at, normalized_time
+            _raise_safe_failure(failure)
+
+    async def _ack_call_erasure_result(
+        self, call_id: UUID, lease_token: UUID, occurred_at: datetime
+    ) -> _SafeFailure | None:
+        def validate(rows: Sequence[tuple[object, ...]]) -> None:
+            if len(rows) != 1 or len(rows[0]) != 1 or rows[0][0] is not None:
+                raise OperationSinkContractError("call_erasure_ack_result_invalid")
+
+        return await self._execute_result(
+            ACK_CALL_ERASURE_SQL,
+            (call_id, lease_token, occurred_at),
+            validate,
+            map_purge_ack_sqlstates=True,
+        )
 
     async def _ingest_result(self, operation: VoiceOperationV1) -> _SafeFailure | None:
         expected_id = operation.operation_id
@@ -461,6 +651,8 @@ class PsycopgOperationSink:
                             raw_error,
                             dispatched=dispatched,
                             map_purge_ack_sqlstates=map_purge_ack_sqlstates,
+                            map_erased_sqlstate=sql == INGEST_SQL,
+                            map_contract_sqlstate=sql in {BEGIN_CALL_SQL, LEASE_CALL_ERASURES_SQL},
                         )
                     if rollback is not None:
                         raise _RollbackBoundary(rollback.kind, rollback.code)
@@ -480,6 +672,8 @@ class PsycopgOperationSink:
                     raw_error,
                     dispatched=dispatched,
                     map_purge_ack_sqlstates=map_purge_ack_sqlstates,
+                    map_erased_sqlstate=sql == INGEST_SQL,
+                    map_contract_sqlstate=sql in {BEGIN_CALL_SQL, LEASE_CALL_ERASURES_SQL},
                 )
         finally:
             await self._leave_call()
