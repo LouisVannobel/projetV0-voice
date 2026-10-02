@@ -418,7 +418,7 @@ async def test_paused_committed_intent_fences_real_terminal_authority_and_delaye
         assert await registry.complete_reserved_terminal(authority)
         await registry.begin_drain()
         release.set()
-        await provider.transfer_entered.wait()
+        await asyncio.wait_for(provider.transfer_entered.wait(), 2)
         assert not any(item[0] == "hangup" for item in provider.actions)
         assert await registry.live_call_count() == 1
         facts = await writer.read_call_lifecycle(grant.call_id)

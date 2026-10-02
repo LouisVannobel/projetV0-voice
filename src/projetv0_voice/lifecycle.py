@@ -1038,6 +1038,14 @@ class RuntimeSupervisor:
                     "occurred_at": event.occurred_at,
                     "received_at": _aware_utc(self._utcnow()),
                     "semantic_fingerprint_sha256": (event.semantic_fingerprint_sha256),
+                    **(
+                        {
+                            "call_leg_id": event.call_leg_id,
+                            "call_session_id": event.call_session_id,
+                        }
+                        if self._sparra_enabled and event.event_type == "call.hangup"
+                        else {}
+                    ),
                 },
                 lease=None if effect is None else effect.lease,
                 operation=None if effect is None else effect.operation,

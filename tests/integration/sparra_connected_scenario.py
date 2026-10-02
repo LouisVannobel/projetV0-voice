@@ -604,6 +604,16 @@ class Scenario:
                 assert entry.lifecycle_owner is None and entry.session is None, (
                     "native_owner_scrub_before_ack"
                 )
+                self.evidence["bridge_cache_ack_boundary"] = {
+                    "cache_absent": entry.bridge_publication is None,
+                    "disclosure_absent": entry.bridge_publication is None or (
+                        entry.bridge_publication.payload.disclosure_evidence is None
+                    ),
+                }
+                assert entry.bridge_publication is None, "native_bridge_cache_scrub_before_ack"
+                assert entry.transfer_facts is None or (
+                    entry.transfer_facts.disclosure_evidence is None
+                ), "native_bridge_facts_scrub_before_ack"
                 self.holder_checks += 1
             assert (await self.graph.writer.read_retained_call(call_id)).erased, (
                 "native_content_removed_before_ack"
@@ -656,13 +666,18 @@ class Scenario:
                 await asyncio.to_thread((self.directory / (self.recovery_case + ".json")).read_text)
             )
             self.call_id = UUID(self.case_state["call_id"])
+            if self.recovery_case == "final-fix":
+                self.evidence.update(self.case_state["evidence"])
             original_restore = self.graph.registry.restore_transfer_fence
 
             async def observed_restore(stale):
                 if stale.call_id == self.call_id:
-                    assert not stale.lifecycle.content_erased, (
-                        "native_unknown_lease_not_fake_erased"
-                    )
+                    if self.recovery_case == "final-fix":
+                        assert stale.lifecycle.content_erased, "native_live_bridge_erasure_restored"
+                    else:
+                        assert not stale.lifecycle.content_erased, (
+                            "native_unknown_lease_not_fake_erased"
+                        )
                     assert stale.lifecycle.local_closing_at is not None, (
                         "native_unknown_lease_minimal_departure"
                     )
@@ -1244,6 +1259,8 @@ class Scenario:
         self.delivery_release = asyncio.Event()
         entered = asyncio.Event()
         original_prepare = self.graph.relay._before_fifo
+        if not hasattr(self, "final_fix_native_prepare"):
+            self.final_fix_native_prepare = original_prepare
 
         async def pause():
             entered.set()
@@ -1510,6 +1527,453 @@ class Scenario:
             "no_hangup": True,
         }
 
+    async def final_fix_recording(self):
+        await self.pause_delivery()
+        facts = await self.graph.writer.read_call_lifecycle(self.human_call_id)
+        assert facts.disclosure_evidence.completed_at is not None, (
+            "native_actual_completed_disclosure"
+        )
+        self.final_fix_eligible = self.human_call_id
+        self.final_fix_late = next(c for c in self.captures if c.call_id == self.human_call_id)
+        self.final_fix_retention = facts.retention_until
+        self.final_fix_generation = self.graph.registry._by_call_id[self.human_call_id].generation
+        correlation = encode_recording_correlation(
+            build_recording_correlation(self.session._identity, retention_days=30, required=False)
+        ).get_secret_value()
+        self.peers.recordings["owned-final-fix-recording"] = b"owned synthetic recording"
+        await self.event(
+            "call.recording.saved",
+            "human-original",
+            recording_id="owned-final-fix-recording",
+            client_state=correlation,
+            recording_started_at=now().isoformat(),
+            recording_ended_at=now().isoformat(),
+            channels="dual",
+        )
+        return {}
+
+    async def final_fix_bridge_erased(self):
+        try:
+            await self.final_fix_native_prepare()
+        finally:
+            self.delivery_release.set()
+        await eventually(
+            lambda: self.human_call_id in self.local_acks, "native_bridge_real_local_ack", 20
+        )
+        await eventually(lambda: self.remote_acks, "native_bridge_real_recording_ack", 20)
+        entry = self.graph.registry._by_call_id[self.human_call_id]
+        assert entry.bridge_publication is None, "native_bridge_cache_absent_after_ack"
+        assert entry.transfer_facts.disclosure_evidence is None, (
+            "native_bridge_evidence_absent_after_ack"
+        )
+        assert entry.generation == self.final_fix_generation, (
+            "native_bridge_original_generation_preserved"
+        )
+        facts = await self.graph.writer.read_call_lifecycle(self.human_call_id)
+        assert facts.content_erased and facts.bridge_operation_id is not None, (
+            "native_bridge_durable_minimal_fact"
+        )
+        assert await self.graph.registry.live_call_count() == 1, "native_live_bridge_capacity_held"
+        requests = self.peers.inferences
+        fields = dict(
+            to="+33102030406",
+            call_session_id="human-original-session",
+            client_state=self.peers.transfer["target_leg_client_state"],
+        )
+        await self.event("call.bridged", "human-target", **fields)
+        body, headers = self.last_event
+        assert (
+            await self.http.post("/telnyx/events", content=body, headers=headers)
+        ).status_code == 200
+        self.session._recorder.record_user("Late erased content", now().isoformat())
+        await self.session._prepare_partial_result()
+        assert self.peers.inferences == requests, "native_erased_bridge_no_new_ai"
+        assert (await self.graph.writer.read_retained_call(self.human_call_id)).erased
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_erased_bridge_no_hangup"
+        )
+        self.evidence["checks"].extend(
+            [
+                "bridge-real-owner-erasure-real-acks",
+                "bridge-cache-disclosure-absent-before-ack",
+                "duplicate-target-no-content-no-ai",
+            ]
+        )
+        return {"cleaned": True, "recording_ack": True, "no_hangup": True}
+
+    async def final_fix_original_end(self):
+        original_observer = self.graph.writer._record_original_end
+
+        async def historical_missing_observer(*args):
+            # Model only the pre-field metadata gap. The real signed event,
+            # receipt, original terminal transition and reconciliation commit.
+            return None
+
+        self.graph.writer._record_original_end = historical_missing_observer
+        try:
+            await self.event("call.hangup", "human-original")
+        finally:
+            self.graph.writer._record_original_end = original_observer
+        assert await self.graph.registry.live_call_count() == 0, (
+            "native_signed_original_end_releases_capacity"
+        )
+        assert (
+            await self.graph.writer.read_call_lifecycle(self.final_fix_eligible)
+        ).original_ended_at is None, "native_historical_end_fact_missing"
+        return {}
+
+    async def final_fix_original_end_observer(self):
+        call_id = self.final_fix_eligible
+        await self.graph.writer.cleanup_local_state(
+            now=self.final_fix_retention + timedelta(seconds=901)
+        )
+        assert await self.graph.writer.read_call_lifecycle(call_id) is not None, (
+            "native_unknown_terminal_end_not_collected"
+        )
+        await self.event("call.hangup", "human-original", call_leg_id="wrong-original-leg")
+        await self.event("call.hangup", "human-target", call_session_id="human-original-session")
+        assert (await self.graph.writer.read_call_lifecycle(call_id)).original_ended_at is None, (
+            "native_ignored_hangups_do_not_mint_original_end"
+        )
+        await self.event("call.hangup", "human-original")
+        body, headers = self.last_event
+        occurred_at = datetime.fromisoformat(json.loads(body)["data"]["occurred_at"])
+        assert (await self.graph.writer.read_call_lifecycle(call_id)).original_ended_at == (
+            occurred_at
+        ), "native_existing_terminal_original_end_fact"
+        assert (
+            await self.http.post("/telnyx/events", content=body, headers=headers)
+        ).status_code == 200
+        assert (
+            await self.graph.writer.read_call_lifecycle(call_id)
+        ).original_ended_at == occurred_at
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_end_observer_never_dispatches_hangup"
+        )
+        self.evidence["checks"].extend(
+            [
+                "actual-terminal-with-historical-missing-end-fact-preserved",
+                "signed-wrong-leg-target-cannot-stamp-original-end",
+                "signed-matching-existing-terminal-and-duplicate-end-observed",
+            ]
+        )
+        return {"stable": True}
+    async def final_fix_prepare_unsettled(self):
+        await self.open_call("unsettled-original")
+        await self.captured("Une demande avec nettoyage natif encore en attente.")
+        self.final_fix_unsettled_call = self.call_id
+        self.final_fix_unsettled_retention = (
+            await self.graph.writer.read_call_lifecycle(self.call_id)
+        ).retention_until
+        await self.pause_delivery()
+        correlation = encode_recording_correlation(
+            build_recording_correlation(self.session._identity, retention_days=30, required=False)
+        ).get_secret_value()
+        self.peers.recordings["owned-unsettled-recording"] = b"owned synthetic recording"
+        await self.event(
+            "call.recording.saved",
+            self.control,
+            recording_id="owned-unsettled-recording",
+            client_state=correlation,
+            recording_started_at=now().isoformat(),
+            recording_ended_at=now().isoformat(),
+            channels="dual",
+        )
+        await self.event("call.hangup", self.control)
+        await self.media.close()
+        await self.open_call("unrelated-final-fix")
+        await self.captured("Une capture indépendante reste dans sa propre file.")
+        self.final_fix_unrelated = self.call_id
+        self.final_fix_unrelated_turn = self.captures[-1]
+        assert await self.queued_operation(self.final_fix_unrelated_turn) is not None
+        return {"call_id": str(self.final_fix_unsettled_call)}
+
+    async def final_fix_unsettled(self):
+        call_id = self.final_fix_unsettled_call
+        facts = await self.graph.writer.read_call_lifecycle(call_id)
+        clock = facts.retention_until + timedelta(seconds=901)
+        ack_entered, ack_release = asyncio.Event(), asyncio.Event()
+        recording_entered, recording_release = asyncio.Event(), asyncio.Event()
+        original_finish = self.graph.writer.finish_erasure_ack
+        original_ingest = self.graph.sink.ingest
+        maintenance = None
+
+        async def finish(call, *args, **kwargs):
+            if call == call_id:
+                ack_entered.set()
+                await ack_release.wait()
+            return await original_finish(call, *args, **kwargs)
+
+        async def ingest(operation):
+            if operation.call_id == call_id and operation.kind == "recording.upsert":
+                recording_entered.set()
+                await recording_release.wait()
+            return await original_ingest(operation)
+
+        self.graph.writer.finish_erasure_ack = finish
+        self.graph.sink.ingest = ingest
+        try:
+            maintenance = asyncio.create_task(self.final_fix_native_prepare())
+            await asyncio.wait_for(ack_entered.wait(), 10)
+            assert call_id in self.local_acks, "native_unsettled_actual_remote_ack_received"
+            await self.graph.writer.cleanup_local_state(now=clock)
+            assert await self.graph.writer.read_call_lifecycle(call_id) is not None, (
+                "native_gc_preserves_unsettled_ack"
+            )
+            queued = await self.queued_operation(self.final_fix_unrelated_turn)
+            assert queued is not None, "native_gc_preserves_unrelated_queued_capture"
+            ack_release.set()
+            await asyncio.wait_for(recording_entered.wait(), 10)
+            await self.graph.writer.cleanup_local_state(now=clock)
+            assert await self.graph.writer.read_call_lifecycle(call_id) is not None, (
+                "native_gc_preserves_claimed_recording_handoff"
+            )
+            assert await self.queued_operation(self.final_fix_unrelated_turn) == queued, (
+                "native_gc_unrelated_bytes_unchanged"
+            )
+            recording_release.set()
+            await maintenance
+        finally:
+            ack_release.set()
+            recording_release.set()
+            self.delivery_release.set()
+            if maintenance is not None:
+                await maintenance
+            self.graph.writer.finish_erasure_ack = original_finish
+            self.graph.sink.ingest = original_ingest
+            self.delivery_release.set()
+        await eventually(
+            lambda: "owned-unsettled-recording" not in self.peers.recordings,
+            "native_unsettled_real_recording_purge",
+            20,
+        )
+        await self.event("call.hangup", "unrelated-final-fix")
+        await self.media.close()
+        self.evidence["checks"].extend(
+            [
+                "real-ack-awaiting-local-settlement-preserved",
+                "real-claimed-recording-awaiting-handoff-preserved",
+                "unrelated-queued-capture-bytes-preserved",
+            ]
+        )
+        return {"stable": True}
+
+    async def final_fix_prepare_bridge_race(self):
+        await self.open_call("human-race-original")
+        await self.captured("Une demande observée avant le pont et l'effacement.")
+        self.peers.transfer = None
+        generation = await self.graph.registry.generation_handle(self.control)
+        self.final_fix_transfer = asyncio.create_task(self.graph.registry.request_human(generation))
+        await eventually(lambda: self.peers.transfer, "native_race_real_transfer")
+        fields = dict(
+            to="+33102030406",
+            call_session_id="human-race-original-session",
+            client_state=self.peers.transfer["target_leg_client_state"],
+        )
+        await self.event("call.initiated", "human-race-target", direction="outgoing", **fields)
+        await self.event("call.answered", "human-race-target", **fields)
+        self.final_fix_read_entered, self.final_fix_read_release = asyncio.Event(), asyncio.Event()
+        original_read = self.graph.writer.read_call_lifecycle
+
+        async def read(call_id):
+            result = await original_read(call_id)
+            if call_id == self.call_id and not self.final_fix_read_entered.is_set():
+                assert result.disclosure_evidence.completed_at is not None, (
+                    "native_race_actual_disclosure"
+                )
+                self.final_fix_read_entered.set()
+                await self.final_fix_read_release.wait()
+            return result
+
+        self.graph.writer.read_call_lifecycle = read
+        self.final_fix_bridge = asyncio.create_task(
+            self.event("call.bridged", "human-race-target", **fields)
+        )
+        await asyncio.wait_for(self.final_fix_read_entered.wait(), 10)
+        return {"call_id": str(self.call_id)}
+
+    async def final_fix_intent_departure(self):
+        await self.open_call("intent-departure-original")
+        entry = self.graph.registry._by_call_id[self.call_id]
+        observed = await self.graph.writer.read_call_lifecycle(self.call_id)
+        assert observed.disclosure_evidence.completed_at is not None
+        original_transfer = self.graph.registry._transfer_owned
+        original_commit = self.graph.writer.commit_transfer_intent
+        entered, release = asyncio.Event(), asyncio.Event()
+        requested = None
+        self.peers.transfer = None
+
+        async def holder_variant(owner, destination):
+            # Fresh production intent facts have no evidence. This supported
+            # holder-shape compatibility regression copies ONLY actual native
+            # dated evidence before the dispatcher captures its reservation.
+            owner.transfer_facts = replace(
+                owner.transfer_facts, disclosure_evidence=observed.disclosure_evidence
+            )
+            return await original_transfer(owner, destination)
+
+        async def committed_intent(facts):
+            await original_commit(facts)
+            entered.set()
+            await release.wait()
+
+        self.graph.registry._transfer_owned = holder_variant
+        self.graph.writer.commit_transfer_intent = committed_intent
+        try:
+            requested = asyncio.create_task(
+                self.graph.registry.request_human(
+                    await self.graph.registry.generation_handle(self.control)
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 10)
+            await self.media.close()
+            await eventually(
+                lambda: entry.lifecycle_owner is None and entry.session is None,
+                "native_intent_normal_ai_departure",
+                20,
+            )
+            release.set()
+            await requested
+            assert self.peers.transfer is not None, (
+                "native_completed_disclosure_intent_dispatches_after_normal_departure"
+            )
+            assert not any(path.endswith("/hangup") for path in self.peers.actions)
+            assert await self.graph.registry.live_call_count() == 1
+        finally:
+            release.set()
+            if requested is not None:
+                await requested
+            self.graph.registry._transfer_owned = original_transfer
+            self.graph.writer.commit_transfer_intent = original_commit
+        await self.event("call.hangup", self.control)
+        assert await self.graph.registry.live_call_count() == 0
+        self.evidence["checks"].append(
+            "actual-disclosure-holder-shape-committed-intent-normal-departure-sdk-dispatch"
+        )
+        return {"stable": True, "no_hangup": True}
+    async def final_fix_finish_bridge_race(self):
+        await eventually(
+            lambda: self.call_id in self.local_acks, "native_inflight_bridge_actual_ack", 20
+        )
+        self.final_fix_read_release.set()
+        await self.final_fix_bridge
+        await self.final_fix_transfer
+        await self.media.close()
+        entry = self.graph.registry._by_call_id[self.call_id]
+        assert entry.bridge_publication is None, "native_inflight_bridge_does_not_repopulate_cache"
+        assert entry.transfer_facts.disclosure_evidence is None, (
+            "native_inflight_bridge_no_disclosure_holder"
+        )
+        assert await self.graph.writer.read_frozen_call_publication(self.call_id) is None
+        facts = await self.graph.writer.read_call_lifecycle(self.call_id)
+        assert facts.content_erased and facts.qualified_line_bridged_at is not None
+        assert facts.content_departed_generation == entry.generation, (
+            "native_inflight_bridge_preserves_departure"
+        )
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_inflight_bridge_keeps_live_phone"
+        )
+        self.final_fix_live = self.call_id
+        state = dict(
+            call_id=str(entry.call_id),
+            generation=str(entry.generation),
+            eligible_call_id=str(self.final_fix_eligible),
+            retention=max(
+                self.final_fix_retention, self.final_fix_unsettled_retention
+            ).isoformat(),
+            late=self.final_fix_late.model_dump(mode="json"),
+            additional_eligible=str(self.final_fix_unsettled_call),
+            unrelated=str(self.final_fix_unrelated),
+            evidence=self.evidence,
+        )
+        await asyncio.to_thread((self.directory / "final-fix.json").write_text, json.dumps(state))
+        self.evidence["checks"].append("actual-bridge-read-crosses-real-owner-ack-no-resurrection")
+        return {"cleaned": True, "no_hangup": True}
+
+    async def final_fix_gc_before(self):
+        await self.graph.writer.cleanup_local_state(
+            now=self.final_fix_retention + timedelta(seconds=899)
+        )
+        assert await self.graph.writer.read_call_lifecycle(self.final_fix_eligible) is not None
+        self.evidence["checks"].append("original-retention-plus-899-not-collected")
+        return {"stable": True}
+
+    async def final_fix_gc_after(self):
+        eligible = UUID(self.case_state["eligible_call_id"])
+        clock = datetime.fromisoformat(self.case_state["retention"]) + timedelta(seconds=901)
+        from projetv0_voice.persistence.relay import maintain_call_content
+
+        await maintain_call_content(
+            self.graph.writer,
+            self.graph.sink,
+            self.graph.registry.stop_call_content,
+            utcnow=lambda: clock,
+            timeout_seconds=10,
+        )
+        assert await self.graph.writer.read_call_lifecycle(eligible) is None, (
+            "native_terminal_metadata_finite_gc"
+        )
+        assert (
+            await self.graph.writer.read_call_lifecycle(
+                UUID(self.case_state["additional_eligible"])
+            )
+            is None
+        ), "native_settled_recording_metadata_finite_gc"
+        assert (
+            await self.graph.writer.read_call_lifecycle(UUID(self.case_state["unrelated"]))
+            is not None
+        ), "native_gc_preserves_unknown_remote_ack"
+
+        def inspect():
+            uri = "file:" + (self.directory / "voice.sqlite").as_posix() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as connection:
+                return {
+                    table: connection.execute(
+                        "SELECT count(*) FROM " + table + " WHERE call_id=?", (str(eligible),)
+                    ).fetchone()[0]
+                    for table in (
+                        "call_leases",
+                        "sparra_content_fences",
+                        "sparra_turn_decisions",
+                        "sparra_publications",
+                        "outbox",
+                    )
+                }
+
+        counts = await asyncio.to_thread(inspect)
+        assert all(value == 0 for value in counts.values()), (
+            "native_gc_no_identifying_local_lifecycle"
+        )
+        late = VoiceOperationV1.model_validate(self.case_state["late"])
+        for _ in range(2):
+            assert self.graph.writer.try_enqueue_turn(late)
+            assert self.graph.writer.try_enqueue_capture_loss(eligible, late.payload.turn_id)
+            retained = await self.graph.writer.read_retained_call(eligible)
+            assert retained.erased and not retained.turns and retained.loss_count == 0, (
+                "native_gc_late_capture_fail_closed"
+            )
+        assert await self.graph.writer.oldest_outbox_created_at() is None
+        entry = self.graph.registry._by_call_id[self.call_id]
+        assert entry.generation == UUID(self.case_state["generation"])
+        assert entry.bridge_publication is None and entry.no_new_ai
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_gc_keeps_live_human_phone_fence"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_gc_never_infers_original_end"
+        )
+        self.evidence["terminal_gc"] = {
+            "counts": counts,
+            "boundary_seconds": 901,
+            "live_bridge_preserved": True,
+            "late_duplicate_denied": True,
+        }
+        self.evidence["checks"].append(
+            "restart-original-retention-plus-900-real-ack-recording-handoff-gc"
+        )
+        await self.event("call.hangup", "human-race-original")
+        assert await self.graph.registry.live_call_count() == 0
+        return {"cleaned": True, "stable": True, "no_hangup": True}
     async def human_hangup(self):
         await self.event("call.hangup", "human-original")
         return {}
@@ -1616,6 +2080,10 @@ class Scenario:
         return {"cleaned": True, "no_hangup": True}
 
     async def close(self):
+        if hasattr(self, "final_fix_read_release"):
+            self.final_fix_read_release.set()
+        if hasattr(self, "final_fix_bridge"):
+            await asyncio.gather(self.final_fix_bridge, return_exceptions=True)
         if self.media is not None:
             await self.media.close()
         if self.server is not None:
@@ -1653,6 +2121,25 @@ async def connected(request):
             emit(result)
     except Exception as error:
         # Never serialize exception arguments/requests/credentials; source location only.
+        if scenario.graph is not None:
+            entry = scenario.graph.registry._by_call_id.get(scenario.call_id)
+            scenario.evidence["failure_state"] = {
+                "writer_fault": None
+                if scenario.graph.writer.fatal_fault is None
+                else scenario.graph.writer.fatal_fault.code,
+                "registry_draining": scenario.graph.registry._draining,
+                "relay_degraded": scenario.graph.relay._degraded,
+                "entry_present": entry is not None,
+                "content_stop_started": entry is not None and entry.content_stop_task is not None,
+                "content_stop_done": entry is not None
+                and entry.content_stop_task is not None
+                and entry.content_stop_task.done(),
+                "cache_present": entry is not None and entry.bridge_publication is not None,
+            }
+        await asyncio.to_thread(
+            Path(request["evidence_path"], "native.json").write_text,
+            json.dumps(scenario.evidence, indent=2), encoding="utf-8",
+        )
         frame = traceback.extract_tb(error.__traceback__)[-1]
         label = (
             error.args[0]

@@ -1309,10 +1309,19 @@ class CallRegistry:
                 cast(_SessionLifecycleOwner, owner).request_drain("content_erased")
                 await cast(_SessionLifecycleOwner, owner).wait()
             async with self._lock:
-                self._clear_content_holders_locked(entry)
+                self._clear_content_holders_locked(entry, clear_cached_content=True)
 
     @staticmethod
-    def _clear_content_holders_locked(entry: _CallEntry) -> None:
+    def _clear_content_holders_locked(
+        entry: _CallEntry, *, clear_cached_content: bool = False
+    ) -> None:
+        if clear_cached_content:
+            entry.bridge_publication = None
+            if (
+                entry.transfer_facts is not None
+                and entry.transfer_facts.disclosure_evidence is not None
+            ):
+                entry.transfer_facts = replace(entry.transfer_facts, disclosure_evidence=None)
         entry.begin_snapshot = None
         entry.routing = None
         entry.begin_future = None
@@ -1512,51 +1521,69 @@ class CallRegistry:
         if session is not None:
             await cast(Any, session).request_drain("qualified_line_connected")
         if facts.qualified_line_bridged_at is not None:
+            bridged_at = facts.qualified_line_bridged_at
             lifecycle = await cast(Any, self._writer).read_call_lifecycle(entry.call_id)
-            started = lifecycle.started_at if lifecycle is not None else None
-            started = started or entry.answered_at or entry.claimed_at
-            if started is None:
-                raise CallAdmissionRejected("call_identity_conflict")
-            if lifecycle is not None and lifecycle.bridge_operation_id is None:
-                operation = entry.bridge_publication or VoiceOperationV1(
-                    schema_version=1,
-                    operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
-                    deployment_id=self._deployment_id,
-                    call_id=entry.call_id,
-                    occurred_at=facts.qualified_line_bridged_at,
-                    kind="call.upsert",
-                    payload=CallUpsertPayloadV1(
-                        telnyx_call_control_id=entry.call_control_id,
-                        telnyx_call_leg_id=entry.call_leg_id,
-                        telnyx_call_session_id=entry.call_session_id,
-                        status="closing",
-                        disclosure_state="completed"
-                        if lifecycle is not None
-                        and lifecycle.disclosure_evidence is not None
-                        and lifecycle.disclosure_evidence.completed_at is not None
-                        else "pending",
-                        started_at=started,
-                        ended_at=None,
-                        end_reason="qualified_line_connected",
-                        retention_until=entry.initiated_at + timedelta(days=30),
-                        **(
-                            cast(
-                                Any,
-                                (
-                                    {"disclosure_evidence": lifecycle.disclosure_evidence}
-                                    if lifecycle is not None
-                                    and lifecycle.disclosure_evidence is not None
-                                    else {}
-                                ),
-                            )
-                        ),
-                    ),
+            async with self._lock:
+                started = lifecycle.started_at if lifecycle is not None else None
+                started = started or entry.answered_at or entry.claimed_at
+                if started is None:
+                    raise CallAdmissionRejected("call_identity_conflict")
+                # A writer read/drain can cross explicit content stop. Recheck the
+                # registered entry under its lock before retaining any payload.
+                facts = entry.transfer_facts or facts
+                content_stopped = (
+                    entry.content_stop_task is not None
+                    or facts.content_erased
+                    or lifecycle is not None and lifecycle.content_erased
                 )
-                entry.bridge_publication = operation
-                facts = replace(facts, bridge_operation_id=operation.operation_id)
-            elif lifecycle is not None:
-                facts = replace(facts, bridge_operation_id=lifecycle.bridge_operation_id)
-            entry.transfer_facts = facts
+                if content_stopped:
+                    entry.bridge_publication = None
+                    facts = replace(facts, disclosure_evidence=None)
+                if (
+                    not content_stopped
+                    and lifecycle is not None
+                    and lifecycle.bridge_operation_id is None
+                    and facts.bridge_operation_id is None
+                ):
+                    operation = entry.bridge_publication or VoiceOperationV1(
+                        schema_version=1,
+                        operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
+                        deployment_id=self._deployment_id,
+                        call_id=entry.call_id,
+                        occurred_at=bridged_at,
+                        kind="call.upsert",
+                        payload=CallUpsertPayloadV1(
+                            telnyx_call_control_id=entry.call_control_id,
+                            telnyx_call_leg_id=entry.call_leg_id,
+                            telnyx_call_session_id=entry.call_session_id,
+                            status="closing",
+                            disclosure_state="completed"
+                            if lifecycle is not None
+                            and lifecycle.disclosure_evidence is not None
+                            and lifecycle.disclosure_evidence.completed_at is not None
+                            else "pending",
+                            started_at=started,
+                            ended_at=None,
+                            end_reason="qualified_line_connected",
+                            retention_until=entry.initiated_at + timedelta(days=30),
+                            **(
+                                cast(
+                                    Any,
+                                    (
+                                        {"disclosure_evidence": lifecycle.disclosure_evidence}
+                                        if lifecycle is not None
+                                        and lifecycle.disclosure_evidence is not None
+                                        else {}
+                                    ),
+                                )
+                            ),
+                        ),
+                    )
+                    entry.bridge_publication = operation
+                    facts = replace(facts, bridge_operation_id=operation.operation_id)
+                elif lifecycle is not None and lifecycle.bridge_operation_id is not None:
+                    facts = replace(facts, bridge_operation_id=lifecycle.bridge_operation_id)
+                entry.transfer_facts = facts
         await cast(Any, self._writer).commit_transfer_observation(facts, operation)
         return ResolvedWebhook(None)
 

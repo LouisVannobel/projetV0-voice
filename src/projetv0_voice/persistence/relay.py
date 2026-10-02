@@ -156,6 +156,7 @@ async def maintain_call_content(
         else:
             if await writer.erased_recording_head() is not None:
                 raise OperationSinkTransientError("erased_recording_handoff_pending")
+        await writer.cleanup_local_state(now=_aware_utc(utcnow()))
 
 
 class OutboxRelay:
