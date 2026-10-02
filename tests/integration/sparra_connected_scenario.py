@@ -96,6 +96,79 @@ def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
+def observe_native_startup(supervisor, patches, diagnostic):
+    """Test-only observation; the original owns scheduling, budgets and exceptions."""
+    original = supervisor._startup_await
+    phases = {
+        "writer_startup_failed", "writer_quick_check_failed", "qualification_status_failed",
+        "operation_sink_open_failed", "stale_recovery_failed", "runtime_publication_failed",
+        "runtime_begin_drain_failed",
+    }
+
+    async def observed(awaitable, *, code):
+        diagnostic["last_phase"] = (
+            code if type(code) is str and code in phases else "other_safe_failure"
+        )
+        diagnostic["outcome"] = "other"
+        try:
+            return await original(awaitable, code=code)
+        except BaseException:
+            diagnostic["outcome"] = (
+                "native_timeout" if supervisor._startup_phase_timed_out is True
+                else "native_exception"
+            )
+            raise
+
+    patches.enter_context(patch.object(supervisor, "_startup_await", observed))
+
+
+def safe_startup_diagnostic(error, diagnostic, recovery_case):
+    """Closed public fields only: never stringify exceptions, locals or source lines."""
+    terminal_codes = {
+        "runtime_startup_invalid", "stale_recovery_failed", "qualification_run_consumed",
+        "writer_startup_failed", "writer_quick_check_failed", "owned_task_registration_failed",
+        "runtime_startup_failed",
+    }
+    phases = {
+        "writer_startup_failed", "writer_quick_check_failed", "qualification_status_failed",
+        "operation_sink_open_failed", "stale_recovery_failed", "runtime_publication_failed",
+        "runtime_begin_drain_failed",
+    }
+    terminal_code = "other_safe_failure"
+    if type(error) is RuntimeError and len(error.args) == 1:
+        argument = error.args[0]
+        if type(argument) is str and argument in terminal_codes:
+            terminal_code = argument
+    phase = diagnostic.get("last_phase")
+    outcome = diagnostic.get("outcome")
+    classes = {RuntimeError: "RuntimeError", AssertionError: "AssertionError",
+               TimeoutError: "TimeoutError", asyncio.CancelledError: "CancelledError"}
+    frame_names = {
+        "setup", "startup", "_startup_await", "_recover_stale_leases", "prepare_before_fifo",
+        "maintain_call_content", "observed_restore", "restore_transfer_fence",
+        "_finish_startup_unwind",
+    }
+    frames = []
+    current = error.__traceback__
+    for _ in range(64):
+        if current is None:
+            break
+        name = current.tb_frame.f_code.co_name
+        if name in frame_names:
+            frames.append(name)
+        current = current.tb_next
+    return {
+        "terminal_code": terminal_code,
+        "last_phase": phase if type(phase) is str and phase in phases else "other_safe_failure",
+        "outcome": outcome if type(outcome) is str
+        and outcome in {"native_timeout", "native_exception"} else "other",
+        "recovery_case": recovery_case if type(recovery_case) is str
+        and recovery_case in {"held", "backlog", "final-fix", "replay"} else "other",
+        "error_class": classes.get(type(error), "OtherException"),
+        "frames": frames[-8:],
+    }
+
+
 async def eventually(predicate, label, seconds=12):
     try:
         async with asyncio.timeout(seconds):
@@ -336,6 +409,7 @@ class Scenario:
         self.app = None
         self.phase = "setup"
         self.patches = ExitStack()
+        self.startup_diagnostic = {}
         self.lifespan = None
         self.server = None
         self.server_task = None
@@ -551,6 +625,7 @@ class Scenario:
         )
 
         self.graph = await build_production_runtime(self.settings, factories=factories)
+        observe_native_startup(self.graph.supervisor, self.patches, self.startup_diagnostic)
         self.captures = []
         native_enqueue = self.graph.writer.try_enqueue_turn
 
@@ -2121,6 +2196,9 @@ async def connected(request):
             emit(result)
     except Exception as error:
         # Never serialize exception arguments/requests/credentials; source location only.
+        scenario.evidence["startup_diagnostic"] = safe_startup_diagnostic(
+            error, scenario.startup_diagnostic, scenario.request.get("recovery_case")
+        )
         if scenario.graph is not None:
             entry = scenario.graph.registry._by_call_id.get(scenario.call_id)
             scenario.evidence["failure_state"] = {
