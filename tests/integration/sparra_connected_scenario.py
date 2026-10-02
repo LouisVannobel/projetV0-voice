@@ -39,6 +39,7 @@ from websockets.asyncio.client import connect
 from projetv0_voice.admission import CallAdmissionRejected
 from projetv0_voice.app import create_app
 from projetv0_voice.config import AgentManifestV1
+from projetv0_voice.crypto import EncryptedValue
 from projetv0_voice.inference import services as native_services
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.lifecycle import (
@@ -49,6 +50,11 @@ from projetv0_voice.lifecycle import (
 )
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import RoutingV1, VoiceOperationV1
+from projetv0_voice.persistence.commands import (
+    canonical_operation_bytes,
+    decode_operation,
+    operation_aad_from_metadata,
+)
 from projetv0_voice.persistence.postgres_sink import PsycopgOperationSink
 from projetv0_voice.production_wiring import _decode_keyring_value
 from projetv0_voice.qualified_profile import (
@@ -602,6 +608,16 @@ class Scenario:
             assert (await self.graph.writer.read_retained_call(call_id)).erased, (
                 "native_content_removed_before_ack"
             )
+            if getattr(self, "erasure_turn", None) is not None and (
+                call_id == self.erasure_turn.call_id
+            ):
+                assert await self.queued_operation(self.erasure_turn) is None, (
+                    "native_erasure_queued_turn_absent_before_ack"
+                )
+                assert await self.graph.writer.read_frozen_call_publication(call_id) is None, (
+                    "native_erasure_frozen_publication_absent_before_ack"
+                )
+                self.evidence["erasure_queue"]["removed_before_ack"] = True
             await original_call_ack(call_id, token, occurred_at)
             async with await psycopg.AsyncConnection.connect(
                 self.request["url"], prepare_threshold=None
@@ -1063,24 +1079,96 @@ class Scenario:
         await self.graph.writer.read_retained_call(self.call_id)
         return await asyncio.to_thread(inspect_owned_read_only)
 
+    async def queued_operation(self, operation):
+        def inspect_owned_read_only():
+            uri = "file:" + (self.directory / "voice.sqlite").as_posix() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as inspection:
+                row = inspection.execute(
+                    "SELECT schema_version,op_id,deployment_id,call_id,kind,"
+                    "key_version,nonce,ciphertext FROM outbox WHERE op_id=?",
+                    (str(operation.operation_id),),
+                ).fetchone()
+            if row is None:
+                return None
+            metadata = dict(
+                zip(
+                    ("schema_version", "operation_id", "deployment_id", "call_id", "kind"),
+                    row[:5],
+                    strict=True,
+                )
+            )
+            plaintext = self.graph.keyring.decrypt(
+                EncryptedValue(row[5], row[6], row[7]),
+                aad=operation_aad_from_metadata(metadata),
+            )
+            queued_bytes = canonical_operation_bytes(decode_operation(plaintext))
+            assert queued_bytes == canonical_operation_bytes(operation), (
+                "native_queued_operation_bytes_immutable"
+            )
+            return {
+                "operation_sha256": hashlib.sha256(queued_bytes).hexdigest(),
+                "ciphertext_sha256": hashlib.sha256(row[6] + row[7]).hexdigest(),
+            }
+
+        return await asyncio.to_thread(inspect_owned_read_only)
+
     async def queue_erasure_race(self):
-        self.delivery_release = asyncio.Event()
-        entered = asyncio.Event()
-        original_prepare = self.graph.relay._before_fifo
+        # The replayed original stays finalized. A distinct admitted owner produces this turn.
+        await self.event("call.hangup", "connected-original")
 
-        async def prepare():
-            entered.set()
-            await self.delivery_release.wait()
-            await original_prepare()
+        async def released():
+            return await self.graph.registry.live_call_count() == 0
 
-        self.graph.relay._before_fifo = prepare
-        await asyncio.wait_for(entered.wait(), 2)
-        assert self.graph.writer.try_enqueue_turn(self.captures[0])
+        await eventually(released, "native_replayed_original_capacity_released")
+        await self.open_call("erasure-original")
+
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_new_erasure_admission_delivered")
+        await self.pause_delivery()
+        await self.captured("Une nouvelle demande capturée sera effacée avec son enregistrement.")
+        self.erasure_turn = self.captures[-1]
+        assert self.erasure_turn.call_id == self.call_id, "native_new_erasure_call_identity"
+        assert self.erasure_turn.operation_id != self.captures[0].operation_id, (
+            "native_erasure_turn_is_new_capture"
+        )
         await self.graph.writer.read_retained_call(self.call_id)
-        self.peers.recordings["owned-connected-recording"] = b"owned synthetic recording"
+        queued = await self.queued_operation(self.erasure_turn)
+        assert queued is not None, "native_erasure_turn_actual_outbox_exists"
+        self.recording_state = encode_recording_correlation(
+            build_recording_correlation(self.session._identity, retention_days=30, required=False)
+        ).get_secret_value()
+        await self.event("call.hangup", "erasure-original")
+        await self.media.close()
+
+        async def frozen():
+            return await self.graph.writer.read_frozen_call_publication(self.call_id)
+
+        publication = await eventually(frozen, "native_erasure_call_finalizer_frozen", 20)
+        assert publication.payload.message_result is not None, (
+            "native_erasure_actual_partial_result"
+        )
+        assert await self.queued_operation(self.erasure_turn) == queued, (
+            "native_erasure_queued_turn_immutable_through_finalization"
+        )
+        assert await self.queued_operation(publication) is not None, (
+            "native_erasure_actual_frozen_publication_queued"
+        )
+        self.evidence["erasure_queue"] = {
+            **queued,
+            "call_id": str(self.call_id),
+            "operation_id": str(self.erasure_turn.operation_id),
+            "finalizer_operation_sha256": hashlib.sha256(
+                canonical_operation_bytes(publication)
+            ).hexdigest(),
+            "removed_before_ack": False,
+        }
+        self.peers.recordings["owned-erasure-recording"] = b"owned synthetic recording"
         await self.event(
             "call.recording.saved",
-            recording_id="owned-connected-recording",
+            "erasure-original",
+            recording_id="owned-erasure-recording",
             client_state=self.recording_state,
             recording_started_at=now().isoformat(),
             recording_ended_at=now().isoformat(),
@@ -1091,6 +1179,7 @@ class Scenario:
         assert duplicate.status_code == 200, "native_duplicate_recording_callback"
         await self.event(
             "call.recording.saved",
+            "erasure-original",
             expected_status=500,
             recording_id="owned-wrong-correlation",
             client_state=self.recording_state,
@@ -1099,8 +1188,12 @@ class Scenario:
             recording_ended_at=now().isoformat(),
             channels="dual",
         )
+        await eventually(released, "native_new_erasure_signed_hangup_capacity_released")
         await self.event("call.initiated", "unrelated-next")
         self.next_call_id = (await self.graph.registry.snapshot("unrelated-next")).call_id
+        assert await self.queued_operation(self.erasure_turn) == queued, (
+            "native_erasure_turn_present_before_owner_erase"
+        )
         self.evidence["checks"].extend(
             [
                 "signed-recording-first-duplicate",
@@ -1108,7 +1201,7 @@ class Scenario:
                 "genuine-recording-identity-queued-with-erased-turn",
             ]
         )
-        return {"call_id": str(self.next_call_id)}
+        return {"call_id": str(self.call_id), "queue_witness": self.evidence["erasure_queue"]}
 
     async def cleanup(self):
         async def erased():
@@ -1133,7 +1226,7 @@ class Scenario:
         from projetv0_voice.persistence.postgres_sink import OperationSinkErasedError
 
         try:
-            await self.graph.sink.ingest(self.captures[0])
+            await self.graph.sink.ingest(self.erasure_turn)
         except OperationSinkErasedError:
             self.evidence["checks"].append("native-late-pv301-refusal")
         else:
@@ -1144,6 +1237,7 @@ class Scenario:
             "recording_ack": bool(self.remote_acks),
             "no_hangup": True,
             "ack_before_scrub": False,
+            "queue_witness": self.evidence["erasure_queue"],
         }
 
     async def pause_delivery(self):
