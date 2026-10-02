@@ -11,11 +11,15 @@ import tempfile
 import traceback
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from pydantic import SecretStr
 
-from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
+from projetv0_voice.qualified_profile import (
+    QualificationCandidateProfileV1,
+    QualifiedDeploymentProfileV1,
+)
 from projetv0_voice.runtime_config import RuntimeSettingsV1
 
 KEYRING_PATH = PurePosixPath("/run/secrets/aead_keyring_v1.json")
@@ -380,6 +384,43 @@ def test_ancestor_authority_rejects_reverse_name_or_stat_mutation(
         verify((authority,))
 
 
+def test_qualified_and_candidate_profile_select_eu(monkeypatch: pytest.MonkeyPatch) -> None:
+    import projetv0_voice.production_wiring as wiring
+
+    qualified = QualifiedDeploymentProfileV1.model_validate_json(
+        Path("tests/fixtures/qualified-deployment-profile-v1.json").read_text(encoding="utf-8")
+    )
+    candidate = QualificationCandidateProfileV1.model_validate({
+        **qualified.model_dump(exclude={"telnyx_data_locality", "qualified_at"}),
+        "run_id": UUID("00000000-0000-4000-8000-000000000001"),
+        "expires_at": qualified.qualified_at,
+        "benchmark_did_hash": "b" * 64,
+        "max_concurrent_calls": 1,
+        "call_lease_ttl_seconds": 30,
+        "disclosure_mark_timeout_ms": 10000,
+    })
+    constructions = []
+    monkeypatch.setattr(wiring, "CallControlClient", lambda **kwargs: constructions.append(kwargs))
+    factories = wiring.build_production_factories(_settings())
+    assert constructions == []
+    for profile in (qualified, candidate):
+        factories.call_control_factory(SecretStr("synthetic-telnyx"), profile)
+    assert constructions == [
+        {"api_key": "synthetic-telnyx", "api_region": "EU"},
+        {"api_key": "synthetic-telnyx", "api_region": "EU"},
+    ]
+    for key, profile in (
+        (SecretStr("synthetic-telnyx"), object()),
+        (SecretStr("synthetic-telnyx"),
+         qualified.model_copy(update={"telnyx_data_locality": "US"})),
+        ("synthetic-telnyx", qualified),
+        (SecretStr(""), qualified),
+    ):
+        with pytest.raises(RuntimeError, match="^runtime_call_control_invalid$"):
+            factories.call_control_factory(key, profile)
+    assert len(constructions) == 2
+
+
 def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -425,7 +466,9 @@ def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
     monkeypatch.setattr(
         wiring,
         "CallControlClient",
-        lambda *, api_key: events.append(("control", api_key)) or object(),
+        lambda *, api_key, api_region: (
+            events.append(("control", (api_key, api_region))) or object()
+        ),
     )
 
     factories = wiring.build_production_factories(_settings())
@@ -444,7 +487,7 @@ def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
     assert first_llm is not second_llm
     assert first_tts is not second_tts
     factories.sink_factory(SecretStr("postgres"))
-    factories.call_control_factory(SecretStr("telnyx"))
+    factories.call_control_factory(SecretStr("telnyx"), profile)
 
     assert [name for name, _ in events] == [
         "http",

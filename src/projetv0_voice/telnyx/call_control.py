@@ -327,14 +327,19 @@ class CallControlClient:
 
     __slots__ = ("_client", "_close_lock", "_closed", "_closing", "_timeout")
 
-    def __init__(self, *, api_key: str) -> None:
-        if not _valid_api_key(api_key):
+    def __init__(self, *, api_key: str, api_region: Literal["global", "EU"] = "global") -> None:
+        if (
+            not _valid_api_key(api_key)
+            or type(api_region) not in (str,)
+            or api_region not in {"global", "EU"}
+        ):
             raise CallControlConfigurationError("call_control_config_invalid")
         sdk_client: telnyx.AsyncTelnyx | None = None
         construction_failed = False
         try:
             sdk_client = telnyx.AsyncTelnyx(
                 api_key=api_key,
+                base_url="https://api.telnyx.eu/v2" if api_region == "EU" else "https://api.telnyx.com/v2",
                 max_retries=0,
                 http_client=telnyx.DefaultAsyncHttpxClient(trust_env=False),
             )

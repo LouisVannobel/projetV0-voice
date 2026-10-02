@@ -611,6 +611,23 @@ def _load_profile(
     return RuntimeProfileSelection(profile, override)
 
 
+def _call_control_factory(
+    api_key: SecretStr,
+    deployment_profile: RuntimeDeploymentProfileV1,
+) -> CallControlClient:
+    if (
+        not isinstance(api_key, SecretStr)
+        or not api_key.get_secret_value()
+        or not isinstance(
+            deployment_profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
+        )
+        or isinstance(deployment_profile, QualifiedDeploymentProfileV1)
+        and deployment_profile.telnyx_data_locality != "EU"
+    ):
+        raise RuntimeError("runtime_call_control_invalid") from None
+    return CallControlClient(api_key=api_key.get_secret_value(), api_region="EU")
+
+
 def _inference_factories(
     api_key: SecretStr,
     deployment_profile: RuntimeDeploymentProfileV1,
@@ -703,9 +720,7 @@ def build_production_factories(
         read_secret=read_runtime_secret,
         load_keyring=load_keyring,
         sink_factory=lambda dsn: PsycopgOperationSink(dsn.get_secret_value()),
-        call_control_factory=lambda key: CallControlClient(
-            api_key=key.get_secret_value()
-        ),
+        call_control_factory=_call_control_factory,
         inference_factory=_inference_factories,
     )
 

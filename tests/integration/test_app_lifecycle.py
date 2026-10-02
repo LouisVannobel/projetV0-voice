@@ -1248,6 +1248,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     from projetv0_voice.qualified_profile import (
         InferenceProfileV1,
+        QualificationCandidateProfileV1,
         QualificationOverrideV1,
         QualifiedDeploymentProfileV1,
         canonical_inference_profile_sha256,
@@ -1412,6 +1413,13 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
 
     monkeypatch.setattr(RuntimeMetrics, "production", classmethod(build_metrics))
 
+    selected_profiles = []
+
+    def build_control(_key, selected_profile):
+        selected_profiles.append(selected_profile)
+        order.append("call-control")
+        return Control()
+
     factories = RuntimeProductionFactories(
         validate_artifacts=lambda received: order.append(
             "artifacts" if received is settings else "wrong-settings"
@@ -1433,7 +1441,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
             or CryptoKeyring({1: KEY}, active_version=1)
         ),
         sink_factory=lambda _dsn: order.append("sink") or Sink(),
-        call_control_factory=lambda _key: order.append("call-control") or Control(),
+        call_control_factory=build_control,
         inference_factory=lambda _key, _profile, language: (
             order.append(f"inference:{language}")
             or RuntimeInferenceFactories(
@@ -1467,6 +1475,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         "call-control",
         "inference:fr",
     ]
+    assert len(selected_profiles) == 1 and selected_profiles[0] is profile
     assert graph.raw_call_control is not graph.measured_call_control
     assert graph.supervisor.call_control_facade is graph.measured_call_control
     assert graph.registry.call_control_identity is graph.measured_call_control
@@ -1478,6 +1487,54 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     assert isinstance(graph.handshake, AuthenticatedTelnyxHandshakeService)
     assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
     await graph.supervisor.aclose()
+
+    candidate = QualificationCandidateProfileV1.model_validate({
+        **profile.model_dump(exclude={"telnyx_data_locality", "qualified_at"}),
+        "run_id": UUID("00000000-0000-4000-8000-000000000001"),
+        "expires_at": NOW + timedelta(hours=1),
+        "benchmark_did_hash": "b" * 64,
+        "max_concurrent_calls": 1,
+        "call_lease_ttl_seconds": 30,
+        "disclosure_mark_timeout_ms": 10000,
+    })
+    for invalid_profile in (
+        candidate,
+        profile.model_copy(update={"image_digest": f"ghcr.io/example/voice@sha256:{'0' * 64}"}),
+        profile.model_copy(update={"telnyx_api_key_sha256": "0" * 64}),
+    ):
+        invalid_factories = replace(
+            factories,
+            load_profile=lambda *_args, selected=invalid_profile: (
+                RuntimeProfileSelection(selected, None)
+            ),
+        )
+        with pytest.raises(RuntimeError, match="^runtime_production_composition_failed$"):
+            await build_production_runtime(
+                settings, factories=invalid_factories, utcnow=lambda: NOW
+            )
+        assert len(selected_profiles) == 1
+
+    candidate_settings = replace(
+        settings, runtime_mode="qualification_candidate", qualification_run_id=candidate.run_id,
+        benchmark_did_sha256=candidate.benchmark_did_hash, deployment_max_calls=1,
+    )
+    object.__setattr__(candidate_settings, "_observability_token", settings.observability_token())
+    candidate_manifest = manifest.model_copy(update={
+        "recording_mode": "off", "recording_retention_days": None, "max_concurrent_calls": 1,
+    })
+    candidate_factories = replace(
+        factories,
+        load_manifest=lambda _settings: candidate_manifest,
+        load_profile=lambda *_args: RuntimeProfileSelection(candidate, None),
+    )
+    candidate_graph = await build_production_runtime(
+        candidate_settings, factories=candidate_factories, utcnow=lambda: NOW,
+        monotonic=lambda: 10.0, startup_phase_timeout_seconds=2.0,
+    )
+    try:
+        assert len(selected_profiles) == 2 and selected_profiles[-1] is candidate
+    finally:
+        await candidate_graph.supervisor.aclose()
 
     from projetv0_voice.admission import CallAdmissionRejected
 
@@ -1517,6 +1574,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         )
         reservations: list[ResolvedWebhook] = []
         try:
+            assert selected_profiles[-1] is profile
             assert override_graph.registry.candidate_run_id is None
             assert override_graph.supervisor._candidate_run_id is None  # noqa: SLF001
             assert override_graph.registry._capacity == capacity  # noqa: SLF001

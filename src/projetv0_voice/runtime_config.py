@@ -66,7 +66,7 @@ _DIRECT_SECRET_NAMES = frozenset(
         "VOICE_POSTGRES_DSN",
     }
 )
-_FORBIDDEN_EXACT = _DIRECT_SECRET_NAMES | {"TELNYX_LOG", "OPENAI_LOG"}
+_FORBIDDEN_EXACT = _DIRECT_SECRET_NAMES | {"TELNYX_LOG", "OPENAI_LOG", "TELNYX_BASE_URL"}
 _MISSING = object()
 _ASCII_WHITESPACE = frozenset(" \t\n\v\f\r")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")

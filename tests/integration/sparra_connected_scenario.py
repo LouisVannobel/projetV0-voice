@@ -126,7 +126,7 @@ class Peers:
 
     async def http(self, request):
         path = request.url.path
-        if request.url.host == "api.telnyx.com":
+        if request.url.host == "api.telnyx.eu":
             if path.endswith("/actions/streaming_start"):
                 self.stream = json.loads(request.content)
             if path.endswith("/actions/transfer"):
@@ -529,8 +529,8 @@ class Scenario:
             read_secret=lambda path: material[str(path)],
             load_keyring=lambda _settings: keyring,
             sink_factory=native_sink,
-            call_control_factory=lambda secret: native_control.CallControlClient(
-                api_key=secret.get_secret_value()
+            call_control_factory=lambda secret, _profile: native_control.CallControlClient(
+                api_key=secret.get_secret_value(), api_region="EU"
             ),
             inference_factory=lambda secret, _profile, language: RuntimeInferenceFactories(
                 stt_http_client_factory=lambda: DefaultAsyncHttpxClient(

@@ -175,6 +175,7 @@ class _FailingAllowedValueMapping(Mapping[str, object]):
         "OTEL_EXPORTER_OTLP_HEADERS",
         "LOGURU_DIAGNOSE",
         "TELNYX_LOG",
+        "TELNYX_BASE_URL",
         "OPENAI_LOG",
     ],
 )
@@ -188,6 +189,15 @@ def test_hostile_environment_key_is_rejected_without_reading_its_value(key: obje
     assert mapping.reads == {}
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("value", ["", "https://hostile.invalid/v2"])
+def test_ambient_base_url_forbidden_before_capture(value: str) -> None:
+    runtime_config = _runtime_config()
+    mapping = _CountingMapping({**valid_environment(), "TELNYX_BASE_URL": value})
+    with pytest.raises(RuntimeError, match="^runtime_environment_forbidden$"):
+        runtime_config.capture_runtime_environment(mapping)
+    assert mapping.reads == {}
 
 
 def test_capture_reads_every_allowed_value_exactly_once_and_no_unknown_value() -> None:

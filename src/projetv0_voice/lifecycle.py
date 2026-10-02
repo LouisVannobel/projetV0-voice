@@ -302,7 +302,7 @@ class RuntimeProductionFactories:
     read_secret: Callable[[PurePosixPath], SecretStr]
     load_keyring: Callable[[RuntimeSettingsV1], CryptoKeyring]
     sink_factory: Callable[[SecretStr], _RuntimeSink]
-    call_control_factory: Callable[[SecretStr], _ProcessCallControl]
+    call_control_factory: Callable[[SecretStr, RuntimeDeploymentProfileV1], _ProcessCallControl]
     inference_factory: Callable[
         [SecretStr, RuntimeDeploymentProfileV1, str], RuntimeInferenceFactories
     ]
@@ -1784,7 +1784,7 @@ async def build_production_runtime(
             if manifest.sparra is not None
             else None,
         )
-        raw_call_control = factories.call_control_factory(telnyx_api_key)
+        raw_call_control = factories.call_control_factory(telnyx_api_key, selection.profile)
         inference = factories.inference_factory(
             openrouter_api_key,
             selection.profile,
