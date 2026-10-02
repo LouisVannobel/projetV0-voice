@@ -67,6 +67,7 @@ from projetv0_voice.telnyx.recordings import (
     after_recording_webhook_commit,
     purge_recordings_once,
     recording_metric_transition,
+    resolve_recording_webhook,
 )
 from projetv0_voice.telnyx.webhooks import (
     ResolvedWebhook,
@@ -1887,10 +1888,20 @@ async def build_production_runtime(
                 "call.recording.error",
             ),
         )
+        async def resolve_webhook(event: VerifiedWebhook) -> ResolvedWebhook:
+            if event.event_type in {"call.recording.saved", "call.recording.error"}:
+                return ResolvedWebhook(resolve_recording_webhook(event))
+            return await registry.resolve_webhook(event)
+
+        async def resolve_duplicate_webhook(event: VerifiedWebhook) -> ResolvedWebhook:
+            if event.event_type in {"call.recording.saved", "call.recording.error"}:
+                return ResolvedWebhook(resolve_recording_webhook(event))
+            return await registry.resolve_duplicate_webhook(event)
+
         webhook_processor = TelnyxWebhookProcessor(
             verifier=verifier,
-            resolver=registry.resolve_webhook,
-            duplicate_resolver=registry.resolve_duplicate_webhook,
+            resolver=resolve_webhook,
+            duplicate_resolver=resolve_duplicate_webhook,
             finalizer_owner=supervisor,
         )
 

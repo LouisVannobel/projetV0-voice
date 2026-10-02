@@ -132,8 +132,12 @@ async def start(tmp_path, begin=None):
     return registry, writer, worker, provider
 
 
-async def committed(registry, writer, observed):
-    resolved = await registry.resolve_webhook(observed)
+async def committed(registry, writer, observed, *, duplicate=False):
+    resolved = await (
+        registry.resolve_duplicate_webhook(observed)
+        if duplicate
+        else registry.resolve_webhook(observed)
+    )
     effect = resolved.effect
     ticket = writer.submit_webhook(
         receipt=dict(
@@ -150,6 +154,52 @@ async def committed(registry, writer, observed):
     )
     result = await ticket.wait()
     return await registry.reconcile_after_commit(observed, resolved, result)
+
+
+@pytest.mark.asyncio
+async def test_committed_transfer_target_is_acknowledged_without_original_admission(tmp_path):
+    from pydantic import SecretStr
+
+    begins = []
+
+    async def begin(deployment, call_id, routing):
+        begins.append((call_id, routing.telnyx_call_control_id))
+        return snapshot(call_id, routing)
+
+    registry, writer, worker, provider = await start(tmp_path, begin)
+    requested = None
+    try:
+        assert (await committed(registry, writer, event())).status_code == 200
+        assert (await committed(registry, writer, event("call.answered"))).status_code == 200
+        generation = await registry.generation_handle("original")
+        requested = asyncio.create_task(registry.request_human(generation))
+        await provider.transfer_entered.wait()
+        facts = await writer.read_call_lifecycle((await registry.snapshot("original")).call_id)
+        target = event(
+            call_control_id="target",
+            call_leg_id="target-leg",
+            to_e164=TARGET,
+            client_state=SecretStr(facts.transfer_correlation),
+            direction="outgoing",
+            call_state=None,
+        )
+        assert (await committed(registry, writer, target)).status_code == 200
+        assert (await committed(registry, writer, target, duplicate=True)).status_code == 200
+        assert [control for _, control in begins] == ["original"]
+        assert not any(action[1] == "target" for action in provider.actions)
+        assert await registry.snapshot("target") is None
+        assert await registry.live_call_count() == 1
+        assert registry._permits_used == 1
+        assert (await committed(registry, writer, event("call.hangup"))).status_code == 200
+        assert await registry.live_call_count() == 0
+        assert registry._permits_used == 0
+    finally:
+        provider.transfer_release.set()
+        if requested is not None:
+            await requested
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
 
 
 @pytest.mark.parametrize(

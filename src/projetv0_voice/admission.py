@@ -2249,6 +2249,9 @@ class CallRegistry:
             return WebhookDisposition(200)
         if event.event_type != "call.initiated":
             return WebhookDisposition(200)
+        if not isinstance(reservation, CallReservation):
+            # A committed transfer-target observation owns no original AI admission.
+            return WebhookDisposition(200)
         async with self._lock:
             entry = self._by_control.get(event.call_control_id)
             answered_early = entry is not None and entry.answer_evidence
