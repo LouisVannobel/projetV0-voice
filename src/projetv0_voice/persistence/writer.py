@@ -975,7 +975,7 @@ class PersistenceWriter:
             "WHERE c.state='terminal' AND f.lease_acked=1 AND f.lease_settled=1 "
             "AND f.lease_token IS NOT NULL "
             "AND json_extract(c.lifecycle_json,'$.original_ended_at') IS NOT NULL "
-            "AND json_extract(c.lifecycle_json,'$.retention_until') < ? "
+            "AND julianday(json_extract(c.lifecycle_json,'$.retention_until')) <= julianday(?) "
             "AND NOT EXISTS(SELECT 1 FROM outbox o WHERE o.call_id=c.call_id) "
             "AND NOT EXISTS(SELECT 1 FROM sparra_turn_decisions d WHERE d.call_id=c.call_id) "
             "AND NOT EXISTS(SELECT 1 FROM sparra_publications p WHERE p.call_id=c.call_id) "
@@ -1169,10 +1169,12 @@ class PersistenceWriter:
             return tuple((UUID(c), UUID(t), _parse_datetime(at)) for c, t, at in rows)
         if action == "expired":
             now = self._required_datetime(values, "now")
+            # ISO fractions vary in persisted legacy facts. SQLite's temporal
+            # prefilter is inclusive; the decoded datetime below remains exact.
             cursor = await connection.execute(
                 "SELECT c.call_id,c.lifecycle_json FROM call_leases c "
                 "WHERE c.lifecycle_json IS NOT NULL "
-                "AND json_extract(c.lifecycle_json,'$.retention_until') <= ? "
+                "AND julianday(json_extract(c.lifecycle_json,'$.retention_until')) <= julianday(?) "
                 "AND NOT EXISTS(SELECT 1 FROM sparra_content_fences f WHERE f.call_id=c.call_id) "
                 "ORDER BY c.created_at LIMIT 100", (_iso(now),)
             )

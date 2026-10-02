@@ -39,6 +39,83 @@ def capture(writer, call_id, number, text="Pouvez-vous me rappeler ?"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cutoff_microsecond", [0, 1, 1000, 123456])
+async def test_zero_fraction_expiry_is_consumed_before_aged_fifo(tmp_path, cutoff_microsecond):
+    import sqlite3
+
+    from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
+    from projetv0_voice.persistence.writer import PersistenceWriter
+
+    registry, original, worker, _ = await start(tmp_path)
+    original._utcnow = lambda: NOW
+    await committed(registry, original, event())
+    call_id = (await registry.snapshot("original")).call_id
+    await committed(registry, original, event("call.hangup"))
+    await original.drain(2)
+    await worker
+    deadline = (NOW + timedelta(days=30)).replace(microsecond=0)
+    with sqlite3.connect(original._database_path) as db:
+        raw = db.execute("SELECT lifecycle_json FROM call_leases WHERE call_id=?",
+                         (str(call_id),)).fetchone()[0]
+        facts = json.loads(raw)
+        facts["admitted_at"] = NOW.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        facts["retention_until"] = deadline.isoformat().replace("+00:00", "Z")
+        db.execute("UPDATE call_leases SET lifecycle_json=? WHERE call_id=?",
+                   (json.dumps(facts), str(call_id)))
+    clock = [deadline.replace(microsecond=cutoff_microsecond)]
+    writer = PersistenceWriter(original._database_path, original._keyring, utcnow=lambda: clock[0])
+    task = asyncio.create_task(writer.run())
+    assert await writer.wait_ready()
+    await writer.assert_sparra_compatible()
+    stopped = []
+
+    class Sink:
+        async def lease_call_erasures(self, *args):
+            return ()
+
+        async def ingest(self, operation):
+            pytest.fail("expired content cannot reach native ingest")
+
+    async def stop(call):
+        stopped.append(call)
+
+    async def fail():
+        pytest.fail("expired local content must not degrade the aged FIFO")
+
+    async def maintain():
+        await maintain_call_content(
+            writer, Sink(), stop, utcnow=lambda: clock[0], timeout_seconds=2
+        )
+
+    try:
+        relay = OutboxRelay(writer, Sink(), utcnow=lambda: clock[0], before_fifo=maintain,
+                            on_degraded=fail, drain=fail)
+        assert (await relay.run_once()).status == "empty"
+        assert stopped == [call_id]
+        assert (await writer.read_retained_call(call_id)).erased
+        assert await writer.oldest_outbox_created_at() is None
+        assert not writer.is_degraded
+        # Native settled erasure permits GC only beyond the exact replay window.
+        token = uuid4()
+        await writer.erase_call_content(call_id, now=clock[0], lease_token=token)
+        await writer.finish_erasure_ack(call_id, token, acknowledged=True)
+        clock[0] = deadline + timedelta(seconds=900)
+        await writer.cleanup_local_state(now=clock[0])
+        assert await writer.read_call_lifecycle(call_id) is not None
+        clock[0] += timedelta(microseconds=max(1, cutoff_microsecond))
+        await writer.cleanup_local_state(now=clock[0])
+        assert await writer.read_call_lifecycle(call_id) is None
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    finally:
+        if not task.done():
+            await writer.drain(2)
+        await task
+
+
+@pytest.mark.asyncio
 async def test_retained_dialogue_survives_ack_and_duplicate_capture(tmp_path):
     registry, writer, worker, _ = await start(tmp_path)
     try:
