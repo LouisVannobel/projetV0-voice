@@ -26,7 +26,7 @@ from projetv0_voice.models import (
     RoutingV1,
     VoiceOperationV1,
 )
-from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.persistence.commands import PersistenceCommand, PersistenceError
 from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguousError
 from projetv0_voice.persistence.writer import (
     LocalCallAdmissionFacts,
@@ -1143,9 +1143,27 @@ class CallRegistry:
             or snapshot.retention_until != entry.initiated_at + timedelta(days=30)
         ):
             raise CallAdmissionRejected("call_identity_conflict")
+        try:
+            await cast(Any, self._writer).bind_recording_policy(
+                snapshot, generation=entry.generation
+            )
+        except PersistenceError:
+            raise CallAdmissionRejected("call_identity_conflict") from None
         # Company preference is pinned; native audio activation stays closed
         # until disclosure, recording and retention qualification are complete.
         if snapshot.recording_enabled:
+            # Exercise actual owned capacity/readiness before the immutable
+            # capability gate. A rejected ON admission must not retain copy authority.
+            try:
+                await cast(Any, self._writer).reserve_recording_audio(
+                    entry.call_id, generation=entry.generation
+                )
+            except PersistenceError:
+                pass
+            finally:
+                await cast(Any, self._writer).release_recording_audio(
+                    entry.call_id, generation=entry.generation
+                )
             raise CallAdmissionRejected("sparra_recording_unqualified")
         async with self._lock:
             if (

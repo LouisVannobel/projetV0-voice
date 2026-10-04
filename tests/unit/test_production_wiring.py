@@ -9,6 +9,8 @@ import sys
 import tarfile
 import tempfile
 import traceback
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from uuid import UUID
@@ -95,6 +97,42 @@ def _settings(
         bind_host="127.0.0.1",
         bind_port=8080,
     )
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_recording_archive_factory_keeps_off_without_unverified_descriptor(
+    tmp_path, monkeypatch, configured
+):
+    from projetv0_voice import production_wiring as wiring
+    from projetv0_voice.crypto import CryptoKeyring
+    from projetv0_voice.persistence.writer import PersistenceWriter
+
+    settings = replace(
+        _settings(),
+        recording_archive_directory=(
+            PurePosixPath("/var/lib/projetv0/audio") if configured else None
+        ),
+        recording_download_origins=("https://recordings.example.invalid",) if configured else (),
+    )
+    observations = []
+
+    def invalid_parent(path):
+        observations.append(path)
+        raise wiring._WiringInvalid
+
+    def forbidden_consumer(**_kwargs):
+        pytest.fail("unverified storage constructed a media consumer")
+
+    monkeypatch.setattr(wiring, "_open_parent", invalid_parent)
+    monkeypatch.setattr(wiring, "RecordingArchive", forbidden_consumer)
+    factories = wiring.build_production_factories(settings)
+    assert callable(factories.archive_factory)
+    keyring = CryptoKeyring({1: bytes(range(32))}, active_version=1)
+    writer = PersistenceWriter(tmp_path / "factory.sqlite", keyring)
+    assert factories.archive_factory(
+        settings, writer, keyring, object(), lambda: datetime(2026, 10, 4, tzinfo=UTC)
+    ) is None
+    assert observations == ([settings.recording_archive_directory] if configured else [])
 
 
 def _keyring_json() -> str:

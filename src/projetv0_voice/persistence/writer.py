@@ -18,10 +18,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, cast
-from uuid import UUID
+from typing import TYPE_CHECKING, Literal, cast
+from uuid import UUID, uuid5
 
 import aiosqlite
+
+if TYPE_CHECKING:
+    from projetv0_voice.telnyx.recordings import RecordingCorrelationV1
 
 from projetv0_voice.crypto import (
     CRYPTO_VERSION,
@@ -31,9 +34,11 @@ from projetv0_voice.crypto import (
     UnknownKeyVersionError,
 )
 from projetv0_voice.models import (
+    BeginCallSnapshotV1,
     CallUpsertPayloadV1,
     DisclosureEvidenceV1,
     MessageResultV1,
+    RecordingArchiveReceiptV1,
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
@@ -59,12 +64,14 @@ from projetv0_voice.persistence.commands import (
 from projetv0_voice.persistence.schema import (
     CALL_LIFECYCLE_MIGRATION_SQL,
     QUALIFICATION_RUNS_SQL,
+    RECORDING_ARCHIVE_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     SPARRA_CONTENT_SQL,
     V1_SCHEMA_SQL,
     V2_SCHEMA_SQL,
     V3_SCHEMA_SQL,
+    V4_SCHEMA_SQL,
 )
 
 PERSISTENCE_QUEUE_MAX_ITEMS = 256
@@ -130,6 +137,7 @@ def _expected_schema_objects(schema_sql: str) -> dict[tuple[str, str], str]:
 _EXPECTED_V1_SCHEMA_OBJECTS = _expected_schema_objects(V1_SCHEMA_SQL)
 _EXPECTED_V2_SCHEMA_OBJECTS = _expected_schema_objects(V2_SCHEMA_SQL)
 _EXPECTED_V3_SCHEMA_OBJECTS = _expected_schema_objects(V3_SCHEMA_SQL)
+_EXPECTED_V4_SCHEMA_OBJECTS = _expected_schema_objects(V4_SCHEMA_SQL)
 _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
@@ -142,6 +150,7 @@ if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "sparra_turn_decisions"),
     ("table", "sparra_publications"),
     ("table", "sparra_content_fences"),
+    ("table", "recording_archives"),
 }:
     raise RuntimeError("invalid_expected_sqlite_schema")
 
@@ -191,6 +200,27 @@ class LocalCallLifecycleFacts(LocalCallAdmissionFacts):
     content_erased: bool = False
     content_departed_generation: UUID | None = None
     original_ended_at: datetime | None = None
+    recording_policy_revision: int | None = None
+    recording_enabled: bool = False
+    audio_reserved_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        LocalCallAdmissionFacts.__post_init__(self)
+        if (
+            type(self.recording_enabled) is not bool
+            or self.recording_policy_revision is not None
+            and (
+                type(self.recording_policy_revision) is not int
+                or not 1 <= self.recording_policy_revision <= 2_147_483_647
+            )
+            or type(self.audio_reserved_bytes) is not int
+            or not 0 <= self.audio_reserved_bytes <= 33_554_448
+            or self.recording_policy_revision is None
+            and (self.recording_enabled or self.audio_reserved_bytes)
+            or not self.recording_enabled
+            and self.audio_reserved_bytes
+        ):
+            raise ValueError("recording_policy_facts_invalid")
 
     @property
     def transfer_fenced(self) -> bool:
@@ -335,6 +365,28 @@ def _parse_datetime(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class AudioErasurePlan:
+    recording_ids: tuple[UUID, ...]
+    cleaned_at: datetime
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RecordingArchiveJob:
+    operation: VoiceOperationV1
+    correlation: RecordingCorrelationV1
+    state: Literal["pending", "archived", "acknowledged", "unavailable", "expired", "erased"]
+    observed_at: datetime
+    retention_until: datetime
+    receipt: RecordingArchiveReceiptV1 | None
+    nonce: bytes | None
+    fenced: bool = False
+    policy_bound: bool = False
+    recording_enabled: bool = False
+    reserved_bytes: int = 0
+    input_gate_opened: bool = False
+
+
 class PersistenceWriter:
     """Own one queue, one coroutine, and one aiosqlite connection."""
 
@@ -364,6 +416,9 @@ class PersistenceWriter:
         self._monotonic = monotonic
         self._utcnow = utcnow
         self._sparra_active = False
+        self._audio_cleanup: Callable[[UUID, tuple[UUID, ...]], Awaitable[None]] | None = None
+        self._audio_free_bytes: Callable[[], int] | None = None
+        self._audio_erase_lock = asyncio.Lock()
         self.control_commit_timeout_seconds = control_commit_timeout_seconds
         self._quick_check_interval_seconds = quick_check_interval_seconds
         self._quick_check_observer = quick_check_observer
@@ -853,6 +908,549 @@ class PersistenceWriter:
             raise
         return await result
 
+    def bind_recording_audio_cleanup(
+        self,
+        cleanup: Callable[[UUID, tuple[UUID, ...]], Awaitable[None]],
+        *,
+        free_bytes: Callable[[], int],
+    ) -> None:
+        if self._audio_cleanup is not None:
+            raise RuntimeError("recording_archive_already_bound")
+        self._audio_cleanup = cleanup
+        self._audio_free_bytes = free_bytes
+
+    def unbind_recording_audio_cleanup(
+        self, cleanup: Callable[[UUID, tuple[UUID, ...]], Awaitable[None]]
+    ) -> None:
+        if self._audio_cleanup == cleanup:
+            self._audio_cleanup = None
+            self._audio_free_bytes = None
+
+    async def read_recording_archive(self, recording_id: UUID) -> RecordingArchiveJob | None:
+        return cast(
+            RecordingArchiveJob | None,
+            await self._archive_request("read", recording_id=recording_id),
+        )
+
+    async def fail_recording_archive(
+        self, recording_id: UUID, *, expired: bool, now: datetime
+    ) -> None:
+        await self._archive_request("fail", recording_id=recording_id, expired=expired, now=now)
+
+    async def bind_recording_archive_provider(
+        self, recording_id: UUID, provider_recording_id: str, *, now: datetime
+    ) -> RecordingArchiveJob | None:
+        return cast(RecordingArchiveJob | None, await self._archive_request(
+            "provider", recording_id=recording_id, provider_recording_id=provider_recording_id,
+            now=now,
+        ))
+
+    async def pending_recording_archives(self) -> tuple[UUID, ...]:
+        return cast(tuple[UUID, ...], await self._archive_request("pending"))
+
+    async def recording_audio_cleanup_calls(self, *, now: datetime) -> tuple[UUID, ...]:
+        return cast(tuple[UUID, ...], await self._archive_request("cleanup_calls", now=now))
+
+    async def bind_recording_policy(
+        self, snapshot: BeginCallSnapshotV1, *, generation: UUID
+    ) -> LocalCallLifecycleFacts:
+        if not isinstance(snapshot, BeginCallSnapshotV1) or not isinstance(generation, UUID):
+            raise PersistenceError("recording_policy_unavailable")
+        result = await self._archive_request(
+            "policy_bind", snapshot=snapshot, generation=generation
+        )
+        if isinstance(result, str):
+            raise PersistenceError(result)
+        if not isinstance(result, LocalCallLifecycleFacts):
+            raise PersistenceError("recording_policy_unavailable")
+        return result
+
+    async def reserve_recording_audio(self, call_id: UUID, *, generation: UUID) -> None:
+        if (
+            await self._archive_request("reserve", call_id=call_id, generation=generation)
+            is not True
+        ):
+            raise PersistenceError("recording_archive_unavailable")
+
+    async def release_recording_audio(self, call_id: UUID, *, generation: UUID) -> None:
+        await self._archive_request("release", call_id=call_id, generation=generation)
+
+    def submit_recording_archive_finish(
+        self,
+        recording_id: UUID,
+        receipt: RecordingArchiveReceiptV1,
+        nonce: bytes,
+        *,
+        now: datetime,
+        publication_deadline: float,
+    ) -> asyncio.Future[object]:
+        """Transfer receipt ownership synchronously; the result is the real COMMIT outcome."""
+        if not self._accepting or self._degraded:
+            raise self._new_safe_error(
+                self.fatal_fault.code if self.fatal_fault else "persistence_degraded"
+            )
+        result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        command = PersistenceCommand(
+            "recording_archive",
+            {
+                "action": "finish",
+                "recording_id": recording_id,
+                "receipt": receipt,
+                "nonce": nonce,
+                "now": now,
+                "publication_deadline": publication_deadline,
+                "result": result,
+            },
+            None,
+            enqueued_at=self._monotonic(),
+        )
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull as error:
+            raise self._signal_fatal("queue_full", source=error) from None
+        self._track_pending(command)
+        return result
+
+    async def _archive_request(self, action: str, **values: object) -> object:
+        result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "recording_archive", {"action": action, **values, "result": result}, None
+                )
+            )
+        except BaseException:
+            result.add_done_callback(
+                lambda future: None if future.cancelled() else future.exception()
+            )
+            raise
+        return await result
+
+    async def _read_recording_archive(self, recording_id: UUID) -> RecordingArchiveJob | None:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT call_id,deployment_id,state,observed_at,retention_until,context_key_version,"
+            "context_nonce,context_ciphertext,receipt_json,audio_nonce FROM recording_archives "
+            "WHERE recording_id=?",
+            (str(recording_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        from pydantic import SecretStr
+
+        from projetv0_voice.telnyx.recordings import decode_recording_correlation
+
+        call_id = UUID(row[0])
+        context = json.loads(
+            self._keyring.decrypt(
+                EncryptedValue(row[5], row[6], row[7]),
+                aad=f"recording-job:{call_id}:{recording_id}".encode("ascii"),
+            )
+        )
+        operation = VoiceOperationV1.model_validate(context["operation"])
+        correlation = decode_recording_correlation(SecretStr(context["correlation"]))
+        if (
+            operation.call_id != call_id
+            or operation.deployment_id != row[1]
+            or not isinstance(operation.payload, RecordingUpsertPayloadV1)
+            or operation.payload.recording_id != recording_id
+            or correlation.call_id != call_id
+            or correlation.recording_id != recording_id
+            or correlation.deployment_id != row[1]
+            or correlation.admission_retention_until != _parse_datetime(row[4])
+        ):
+            raise CommandConflictError("recording_archive_identity_conflict")
+        receipt = None if row[8] is None else RecordingArchiveReceiptV1.model_validate_json(row[8])
+        facts = await self._read_call_lifecycle(call_id)
+        return RecordingArchiveJob(
+            operation,
+            correlation,
+            row[2],
+            _parse_datetime(row[3]),
+            _parse_datetime(row[4]),
+            receipt,
+            row[9],
+            await self._content_fenced(call_id),
+            facts is not None and facts.recording_policy_revision is not None,
+            facts.recording_enabled if facts is not None else False,
+            facts.audio_reserved_bytes if facts is not None else 0,
+            facts is not None
+            and facts.started_at is not None
+            and facts.disclosure_evidence is not None
+            and facts.disclosure_evidence.input_gate_opened_at is not None,
+        )
+
+    async def _apply_archive_command(self, values: Mapping[str, object]) -> object:
+        connection = self._require_owner_connection()
+        action = values.get("action")
+        if action in {"policy_bind", "reserve", "release"}:
+            snapshot = values.get("snapshot")
+            call_id = (
+                snapshot.call_id
+                if isinstance(snapshot, BeginCallSnapshotV1)
+                else (self._required_uuid(values, "call_id"))
+            )
+            generation = self._required_uuid(values, "generation")
+            facts = await self._read_call_lifecycle(call_id)
+            if (
+                facts is None
+                or facts.admission_generation != generation
+                or await self._content_fenced(call_id)
+                or facts.content_erased
+                or facts.retention_until <= self._utcnow()
+            ):
+                return "recording_policy_unavailable" if action == "policy_bind" else False
+            if action == "policy_bind":
+                if (
+                    not isinstance(snapshot, BeginCallSnapshotV1)
+                    or snapshot.retention_until != facts.retention_until
+                ):
+                    return "recording_policy_unavailable"
+                if facts.recording_policy_revision is not None:
+                    return (
+                        facts
+                        if (
+                            facts.recording_policy_revision == snapshot.configuration_revision
+                            and facts.recording_enabled is snapshot.recording_enabled
+                        )
+                        else "recording_policy_conflict"
+                    )
+                facts = replace(
+                    facts,
+                    recording_policy_revision=snapshot.configuration_revision,
+                    recording_enabled=snapshot.recording_enabled,
+                )
+                await self._store_lifecycle(facts)
+                return facts
+            if action == "release":
+                await self._store_lifecycle(replace(facts, audio_reserved_bytes=0))
+                return True
+            if (
+                not facts.recording_enabled
+                or facts.recording_policy_revision is None
+                or facts.local_closing_at is not None
+                or not await self._recording_resources_ready()
+            ):
+                return False
+            cursor = await connection.execute(
+                "SELECT 1 FROM recording_archives WHERE call_id=? AND receipt_json IS NOT NULL "
+                "AND state IN ('archived','acknowledged')",
+                (str(call_id),),
+            )
+            committed_file = await cursor.fetchone()
+            await cursor.close()
+            if committed_file is not None:
+                return True  # The real file is already charged to filesystem free space.
+            cursor = await connection.execute(
+                "SELECT COALESCE(sum(json_extract(lifecycle_json,'$.audio_reserved_bytes')),0) "
+                "FROM call_leases WHERE call_id!=?",
+                (str(call_id),),
+            )
+            reserved = await cursor.fetchone()
+            await cursor.close()
+            try:
+                free = self._audio_free_bytes() if self._audio_free_bytes is not None else 0
+            except Exception:
+                return False
+            if type(free) is not int or free < (reserved[0] if reserved else 0) + 33_554_448:
+                return False
+            if facts.audio_reserved_bytes == 0:
+                await self._store_lifecycle(replace(facts, audio_reserved_bytes=33_554_448))
+            return True
+        if action == "cleanup_calls":
+            now = self._required_datetime(values, "now")
+            cursor = await connection.execute(
+                "SELECT DISTINCT a.call_id FROM recording_archives a "
+                "LEFT JOIN sparra_content_fences f ON f.call_id=a.call_id "
+                "WHERE f.call_id IS NOT NULL OR julianday(a.retention_until)<=julianday(?) "
+                "ORDER BY a.call_id LIMIT 100",
+                (_iso(now),),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return tuple(UUID(row[0]) for row in rows)
+        if action == "pending":
+            cursor = await connection.execute(
+                "SELECT recording_id FROM recording_archives "
+                "WHERE state='pending' ORDER BY observed_at,recording_id LIMIT 1"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return tuple(UUID(row[0]) for row in rows)
+        if action == "queue":
+            from projetv0_voice.telnyx.recordings import (
+                RecordingCorrelationV1,
+                encode_recording_correlation,
+            )
+
+            operation = values.get("operation")
+            correlation = values.get("correlation")
+            now = self._required_datetime(values, "now")
+            if (
+                not isinstance(operation, VoiceOperationV1)
+                or not isinstance(operation.payload, RecordingUpsertPayloadV1)
+                or not isinstance(correlation, RecordingCorrelationV1)
+                or operation.call_id != correlation.call_id
+                or operation.deployment_id != correlation.deployment_id
+                or operation.payload.recording_id != correlation.recording_id
+                or correlation.admission_retention_until is None
+            ):
+                raise CommandSerializationError("recording_archive_queue_invalid")
+            if operation.payload.status != "saved":
+                return None
+            facts = await self._read_call_lifecycle(operation.call_id)
+            if (
+                facts is None
+                or facts.retention_until != correlation.admission_retention_until
+                or facts.telnyx_call_leg_id != correlation.call_leg_id
+                or facts.telnyx_call_session_id != correlation.call_session_id
+                or operation.payload.retention_until != facts.retention_until
+            ):
+                raise CommandConflictError("recording_archive_admission_conflict")
+            cursor = await connection.execute(
+                "SELECT call_control_id FROM call_leases WHERE call_id=?", (str(operation.call_id),)
+            )
+            bound = await cursor.fetchone()
+            await cursor.close()
+            if bound != (correlation.call_control_id,):
+                raise CommandConflictError("recording_archive_admission_conflict")
+            # Retain the genuine provider purge identity even when an already
+            # fenced/expired callback must not create private archive metadata.
+            await self._insert_outbox(operation)
+            if await self._content_fenced(operation.call_id) or facts.retention_until <= now:
+                return None
+            if (
+                facts.recording_policy_revision is None
+                or not facts.recording_enabled
+                or facts.audio_reserved_bytes != 33_554_448
+                or facts.started_at is None
+                or facts.disclosure_evidence is None
+                or facts.disclosure_evidence.input_gate_opened_at is None
+            ):
+                return None
+            recording_id = correlation.recording_id
+            context = json.dumps(
+                {
+                    "operation": operation.model_dump(mode="json"),
+                    "correlation": encode_recording_correlation(correlation).get_secret_value(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            if len(context) > 65536:
+                raise CommandSerializationError("recording_archive_context_too_large")
+            fingerprint = hashlib.sha256(context).digest()
+            existing = await self._read_recording_archive(recording_id)
+            if existing is not None:
+                cursor = await connection.execute(
+                    "SELECT fingerprint FROM recording_archives WHERE recording_id=?",
+                    (str(recording_id),),
+                )
+                original = await cursor.fetchone()
+                await cursor.close()
+                if original != (fingerprint,):
+                    raise CommandConflictError("recording_archive_identity_conflict")
+                return existing
+            state = (
+                "erased"
+                if await self._content_fenced(operation.call_id)
+                else ("expired" if facts.retention_until <= now else "pending")
+            )
+            observed_at = min(now, facts.original_ended_at) if facts.original_ended_at else now
+            encrypted = self._keyring.encrypt(
+                context, aad=f"recording-job:{operation.call_id}:{recording_id}".encode("ascii")
+            )
+            await connection.execute(
+                "INSERT INTO recording_archives "
+                "(recording_id,call_id,deployment_id,fingerprint,state,observed_at,retention_until,"
+                "context_key_version,context_nonce,context_ciphertext) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(recording_id),
+                    str(operation.call_id),
+                    operation.deployment_id,
+                    fingerprint,
+                    state,
+                    _iso(observed_at),
+                    _iso(facts.retention_until),
+                    encrypted.key_version,
+                    encrypted.nonce,
+                    encrypted.ciphertext,
+                ),
+            )
+            return await self._read_recording_archive(recording_id)
+        recording_id = self._required_uuid(values, "recording_id")
+        job = await self._read_recording_archive(recording_id)
+        if action == "read" or job is None:
+            return job
+        now = self._required_datetime(values, "now")
+        if action == "provider":
+            return await self._bind_archive_provider(job, values.get("provider_recording_id"), now)
+        if action == "fail":
+            if job.state not in {"erased", "expired"}:
+                await connection.execute(
+                    "UPDATE recording_archives SET state=? WHERE recording_id=?",
+                    (
+                        "expired" if values.get("expired") is True else "unavailable",
+                        str(recording_id),
+                    ),
+                )
+                facts = await self._read_call_lifecycle(job.operation.call_id)
+                if facts is not None:
+                    await self._store_lifecycle(replace(facts, audio_reserved_bytes=0))
+            return None
+        if action != "finish":
+            raise CommandSerializationError("recording_archive_action_invalid")
+        if (
+            await self._content_fenced(job.operation.call_id)
+            or job.retention_until <= self._utcnow()
+            or job.state != "pending"
+            or not job.policy_bound
+            or not job.recording_enabled
+            or job.reserved_bytes != 33_554_448
+            or not job.input_gate_opened
+            or not self._archive_publication_budget(values, job)
+        ):
+            return None
+        receipt, nonce = values.get("receipt"), values.get("nonce")
+        if (
+            not isinstance(receipt, RecordingArchiveReceiptV1)
+            or receipt.recording_id != recording_id
+            or receipt.retention_until != job.retention_until
+            or type(nonce) is not bytes
+            or len(nonce) != 12
+        ):
+            raise CommandSerializationError("recording_archive_receipt_invalid")
+        receipt_operation = job.operation.model_copy(
+            update={
+                "operation_id": uuid5(recording_id, "archive-receipt-v1"),
+                "occurred_at": max(now, job.operation.occurred_at),
+                "payload": job.operation.payload.model_copy(update={"archive_receipt": receipt}),
+            }
+        )
+        await self._insert_outbox(receipt_operation)
+        await connection.execute(
+            "UPDATE recording_archives SET state='archived',receipt_json=?,"
+            "audio_nonce=?,receipt_op_id=? WHERE recording_id=?",
+            (
+                receipt.model_dump_json(),
+                nonce,
+                str(receipt_operation.operation_id),
+                str(recording_id),
+            ),
+        )
+        facts = await self._read_call_lifecycle(job.operation.call_id)
+        if facts is not None:
+            await self._store_lifecycle(replace(facts, audio_reserved_bytes=0))
+        return await self._read_recording_archive(recording_id)
+
+    async def _bind_archive_provider(
+        self,
+        job: RecordingArchiveJob,
+        provider_id: object,
+        now: datetime,
+    ) -> RecordingArchiveJob | None:
+        from projetv0_voice.models import is_valid_provider_recording_id
+
+        payload = job.operation.payload
+        if (
+            not is_valid_provider_recording_id(provider_id)
+            or not isinstance(payload, RecordingUpsertPayloadV1)
+            or job.fenced
+            or job.state != "pending"
+            or job.retention_until <= self._utcnow()
+            or now >= job.observed_at + timedelta(seconds=120)
+            or self._utcnow() >= job.observed_at + timedelta(seconds=120)
+            or not job.policy_bound
+            or not job.recording_enabled
+            or not job.input_gate_opened
+            or job.reserved_bytes != 33_554_448
+        ):
+            return None
+        if payload.telnyx_recording_id is not None:
+            return job if payload.telnyx_recording_id == provider_id else None
+        operation = job.operation.model_copy(
+            update={
+                "operation_id": uuid5(payload.recording_id, "archive-provider-id-v1"),
+                "payload": payload.model_copy(update={"telnyx_recording_id": provider_id}),
+            }
+        )
+        from projetv0_voice.telnyx.recordings import encode_recording_correlation
+
+        context = json.dumps(
+            {
+                "operation": operation.model_dump(mode="json"),
+                "correlation": encode_recording_correlation(job.correlation).get_secret_value(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(context) > 65536:
+            raise CommandSerializationError("recording_archive_context_too_large")
+        encrypted = self._keyring.encrypt(
+            context, aad=f"recording-job:{operation.call_id}:{payload.recording_id}".encode("ascii")
+        )
+        await self._insert_outbox(operation)
+        # Keep the original callback fingerprint and observation for immutable replay/budget.
+        await self._require_owner_connection().execute(
+            "UPDATE recording_archives SET context_key_version=?,context_nonce=?,"
+            "context_ciphertext=? WHERE recording_id=?",
+            (
+                encrypted.key_version,
+                encrypted.nonce,
+                encrypted.ciphertext,
+                str(payload.recording_id),
+            ),
+        )
+        return await self._read_recording_archive(payload.recording_id)
+
+    async def _recording_resources_ready(self) -> bool:
+        if self._audio_cleanup is None or self._audio_free_bytes is None:
+            return False
+        cursor = await self._require_owner_connection().execute(
+            "SELECT state,observed_at FROM recording_archives "
+            "WHERE state NOT IN ('acknowledged','erased','expired')"
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        now = self._utcnow()
+        if any(
+            state == "unavailable" or _parse_datetime(observed) + timedelta(seconds=120) <= now
+            for state, observed in rows
+        ):
+            return False
+        cursor = await self._require_owner_connection().execute(
+            "SELECT lifecycle_json FROM call_leases WHERE lifecycle_json IS NOT NULL "
+            "AND json_extract(lifecycle_json,'$.audio_reserved_bytes')>0"
+        )
+        held = await cursor.fetchall()
+        await cursor.close()
+        return not any(
+            (facts := self._decode_lifecycle(row[0])).original_ended_at is not None
+            and facts.original_ended_at + timedelta(seconds=120) <= now
+            for row in held
+        )
+
+    def _archive_publication_budget(
+        self, values: Mapping[str, object], job: RecordingArchiveJob
+    ) -> bool:
+        deadline = values.get("publication_deadline")
+        if (
+            not isinstance(deadline, int | float)
+            or type(deadline) not in {float, int}
+            or not math.isfinite(deadline)
+        ):
+            raise CommandSerializationError("recording_archive_deadline_invalid")
+        current = self._utcnow()
+        return (
+            self._monotonic() < float(deadline)
+            and current < job.retention_until
+            and current < job.observed_at + timedelta(seconds=120)
+        )
+
     def try_enqueue_capture_loss(self, call_id: UUID, capture_id: UUID) -> bool:
         if not self._accepting or self._degraded:
             return False
@@ -912,17 +1510,45 @@ class PersistenceWriter:
         expected_item: OutboxItem | None = None,
         generation: UUID | None = None,
     ) -> datetime | None:
-        return cast(
-            datetime | None,
-            await self._content_request(
-                "erase",
-                call_id=call_id,
-                now=now,
-                lease_token=lease_token,
-                expected_item=expected_item,
-                generation=generation,
-            ),
-        )
+        async def erase_owned() -> datetime | None:
+            async with self._audio_erase_lock:
+                plan = await self._content_request(
+                    "erase",
+                    call_id=call_id,
+                    now=now,
+                    lease_token=lease_token,
+                    expected_item=expected_item,
+                    generation=generation,
+                )
+                if not isinstance(plan, AudioErasurePlan):
+                    return cast(datetime | None, plan)
+                if self._audio_cleanup is None:
+                    raise PersistenceError("recording_archive_cleanup_unavailable")
+                # The durable fence precedes this join; the SQLite owner remains
+                # free to settle any receipt that the audio task already queued.
+                await self._audio_cleanup(call_id, plan.recording_ids)
+                return cast(
+                    datetime,
+                    await self._content_request(
+                        "audio_erase_complete",
+                        call_id=call_id,
+                        now=now,
+                        lease_token=lease_token,
+                        cleaned_at=max(plan.cleaned_at, self._utcnow()),
+                    ),
+                )
+
+        owner = asyncio.create_task(erase_owned(), name="voice-audio-erasure")
+        cancellation: asyncio.CancelledError | None = None
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        result = owner.result()
+        if cancellation is not None:
+            raise cancellation
+        return result
 
     async def expired_content_calls(self, *, now: datetime) -> tuple[UUID, ...]:
         return cast(tuple[UUID, ...], await self._content_request("expired", now=now))
@@ -1162,7 +1788,7 @@ class PersistenceWriter:
         if action == "pending_acks":
             cursor = await connection.execute(
                 "SELECT call_id,lease_token,lease_cleaned_at FROM sparra_content_fences "
-                "WHERE lease_token IS NOT NULL AND lease_settled=0"
+                "WHERE lease_token IS NOT NULL AND lease_cleaned_at IS NOT NULL AND lease_settled=0"
             )
             rows = await cursor.fetchall()
             await cursor.close()
@@ -1176,18 +1802,41 @@ class PersistenceWriter:
                 "WHERE c.lifecycle_json IS NOT NULL "
                 "AND julianday(json_extract(c.lifecycle_json,'$.retention_until')) <= julianday(?) "
                 "AND NOT EXISTS(SELECT 1 FROM sparra_content_fences f WHERE f.call_id=c.call_id) "
-                "ORDER BY c.created_at LIMIT 100", (_iso(now),)
+                "ORDER BY c.created_at LIMIT 100",
+                (_iso(now),),
             )
             rows = await cursor.fetchall()
             await cursor.close()
             expired = []
             for call, raw in rows:
-                if self._decode_lifecycle(
-                    raw
-                ).retention_until <= now:
+                if self._decode_lifecycle(raw).retention_until <= now:
                     expired.append(UUID(call))
             return tuple(expired)
         call_id = self._required_uuid(values, "call_id")
+        if action == "audio_erase_complete":
+            if not await self._content_fenced(call_id):
+                raise CommandConflictError("recording_audio_erasure_fence_missing")
+            await connection.execute(
+                "DELETE FROM recording_archives WHERE call_id=?", (str(call_id),)
+            )
+            facts = await self._read_call_lifecycle(call_id)
+            if facts is not None:
+                await self._store_lifecycle(replace(facts, audio_reserved_bytes=0))
+            cleaned = self._required_datetime(values, "cleaned_at")
+            token = values.get("lease_token")
+            if isinstance(token, UUID):
+                await connection.execute(
+                    "UPDATE sparra_content_fences SET lease_cleaned_at=? "
+                    "WHERE call_id=? AND lease_token=?",
+                    (_iso(cleaned), str(call_id), str(token)),
+                )
+            else:
+                await connection.execute(
+                    "UPDATE sparra_content_fences SET lease_cleaned_at=? "
+                    "WHERE call_id=? AND lease_token IS NOT NULL AND lease_settled=0",
+                    (_iso(cleaned), str(call_id)),
+                )
+            return cleaned
         if action == "depart":
             facts = await self._read_call_lifecycle(call_id)
             if facts is None or not (
@@ -1322,6 +1971,13 @@ class PersistenceWriter:
             now = self._required_datetime(values, "now")
             lease_token_value = values.get("lease_token")
             cursor = await connection.execute(
+                "SELECT recording_id FROM recording_archives WHERE call_id=? ORDER BY recording_id",
+                (str(call_id),),
+            )
+            audio_rows = await cursor.fetchall()
+            await cursor.close()
+            recording_ids = tuple(UUID(row[0]) for row in audio_rows)
+            cursor = await connection.execute(
                 "SELECT cleaned_at,lease_token,lease_cleaned_at FROM sparra_content_fences "
                 "WHERE call_id=?",
                 (str(call_id),),
@@ -1334,18 +1990,25 @@ class PersistenceWriter:
                 if old is not None and old[1] == str(lease_token_value) and old[2] is not None
                 else now
             )
+            cleanup_update = (
+                "lease_cleaned_at=NULL,"
+                if recording_ids
+                else "lease_cleaned_at=COALESCE(excluded.lease_cleaned_at,lease_cleaned_at),"
+            )
             await connection.execute(
                 "INSERT INTO sparra_content_fences"
                 "(call_id,cleaned_at,lease_token,lease_cleaned_at) "
                 "VALUES (?,?,?,?) ON CONFLICT(call_id) DO UPDATE "
                 "SET lease_token=COALESCE(excluded.lease_token,lease_token),"
-                "lease_cleaned_at=COALESCE(excluded.lease_cleaned_at,lease_cleaned_at),"
-                "lease_acked=0,lease_settled=0",
+                + cleanup_update
+                + "lease_acked=0,lease_settled=0",
                 (
                     str(call_id),
                     _iso(cleaned),
                     str(lease_token_value) if isinstance(lease_token_value, UUID) else None,
-                    _iso(lease_cleaned) if isinstance(lease_token_value, UUID) else None,
+                    _iso(lease_cleaned)
+                    if isinstance(lease_token_value, UUID) and not recording_ids
+                    else None,
                 ),
             )
             for table in ("sparra_turn_decisions", "sparra_publications"):
@@ -1360,11 +2023,14 @@ class PersistenceWriter:
                         facts,
                         disclosure_evidence=None,
                         content_erased=True,
+                        audio_reserved_bytes=facts.audio_reserved_bytes if recording_ids else 0,
                         content_departed_generation=facts.content_departed_generation
                         or (generation_value if isinstance(generation_value, UUID) else None),
                         local_closing_at=facts.local_closing_at or now,
                     )
                 )
+            if recording_ids:
+                return AudioErasurePlan(recording_ids, lease_cleaned)
             return lease_cleaned if isinstance(lease_token_value, UUID) else cleaned
         raise CommandSerializationError("content_action_invalid")
 
@@ -1533,6 +2199,9 @@ class PersistenceWriter:
                 content_erased=current.content_erased or facts.content_erased,
                 admission_generation=current.admission_generation,
                 original_ended_at=current.original_ended_at,
+                recording_policy_revision=current.recording_policy_revision,
+                recording_enabled=current.recording_enabled,
+                audio_reserved_bytes=current.audio_reserved_bytes,
                 content_departed_generation=current.content_departed_generation
                 or facts.content_departed_generation,
             )
@@ -1698,6 +2367,7 @@ class PersistenceWriter:
                 (existing_version == 1 and existing_schema == _EXPECTED_V1_SCHEMA_OBJECTS)
                 or (existing_version == 2 and existing_schema == _EXPECTED_V2_SCHEMA_OBJECTS)
                 or (existing_version == 3 and existing_schema == _EXPECTED_V3_SCHEMA_OBJECTS)
+                or (existing_version == 4 and existing_schema == _EXPECTED_V4_SCHEMA_OBJECTS)
             ):
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -1705,7 +2375,11 @@ class PersistenceWriter:
                         await connection.execute(QUALIFICATION_RUNS_SQL)
                     if existing_version < 3:
                         await connection.execute(CALL_LIFECYCLE_MIGRATION_SQL)
-                    for statement in SPARRA_CONTENT_SQL.split(";"):
+                    if existing_version < 4:
+                        for statement in SPARRA_CONTENT_SQL.split(";"):
+                            if statement.strip():
+                                await connection.execute(statement)
+                    for statement in RECORDING_ARCHIVE_SQL.split(";"):
                         if statement.strip():
                             await connection.execute(statement)
                     await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -1856,6 +2530,8 @@ class PersistenceWriter:
                 )
             elif command.kind == "sparra_content":
                 command_result = await self._apply_content_command(command.payload)
+            elif command.kind == "recording_archive":
+                command_result = await self._apply_archive_command(command.payload)
             elif command.kind == "lease":
                 await self._apply_lease(command.payload)
             elif command.kind == "webhook_effect":
@@ -1911,11 +2587,40 @@ class PersistenceWriter:
             else:
                 raise CommandSerializationError("unknown_persistence_command")
             await self._call_failpoint("after_mutation_before_commit")
+            if (
+                command.kind == "recording_archive"
+                and command.payload.get("action") == "finish"
+                and isinstance(command_result, RecordingArchiveJob)
+                and not self._archive_publication_budget(command.payload, command_result)
+            ):
+                await connection.rollback()
+                return False, None
             self._check_storage_limit()
             await connection.commit()
         except BaseException:
-            with contextlib.suppress(Exception):
+            rolled_back = False
+            try:
                 await connection.rollback()
+                rolled_back = True
+            except BaseException:
+                pass
+            if command.kind == "recording_archive" and command.payload.get("action") == "finish":
+                # An exception from COMMIT can follow a successful native commit.
+                # Only a successful rollback plus an authoritative receipt-less
+                # same-owner read proves the receipt transaction did not commit.
+                definitely_uncommitted = False
+                if rolled_back:
+                    try:
+                        recording_id = self._required_uuid(command.payload, "recording_id")
+                        stored = await self._read_recording_archive(recording_id)
+                        definitely_uncommitted = stored is not None and stored.receipt is None
+                    except BaseException:
+                        pass
+                raise FatalPersistenceError(
+                    "recording_archive_rolled_back"
+                    if definitely_uncommitted
+                    else "recording_archive_commit_unknown"
+                ) from None
             raise
         return False, command_result
 
@@ -2358,6 +3063,20 @@ class PersistenceWriter:
         elif bound_fingerprint != enrichment_fingerprint:
             raise CommandConflictError("webhook_enrichment_conflict")
         await self._insert_outbox(operation)
+        if isinstance(operation.payload, RecordingUpsertPayloadV1):
+            job = await self._read_recording_archive(operation.payload.recording_id)
+            if job is not None and isinstance(job.operation.payload, RecordingUpsertPayloadV1):
+                expected = job.operation.payload.model_copy(
+                    update={"telnyx_recording_id": operation.payload.telnyx_recording_id}
+                )
+                if (
+                    operation.call_id == job.operation.call_id
+                    and operation.deployment_id == job.operation.deployment_id
+                    and expected == operation.payload
+                ):
+                    await self._bind_archive_provider(
+                        job, operation.payload.telnyx_recording_id, self._utcnow()
+                    )
 
     async def _apply_lease(self, payload: Mapping[str, object]) -> None:
         if payload.get("action") == "stale_terminal":
@@ -2645,11 +3364,29 @@ class PersistenceWriter:
             if not isinstance(result, asyncio.Future):
                 raise CommandSerializationError("invalid_relay_ack")
             cursor = await connection.execute(
+                "SELECT op_id FROM outbox WHERE queue_id=? AND attempts=?",
+                (queue_id, expected_claim),
+            )
+            delivered = await cursor.fetchone()
+            await cursor.close()
+            cursor = await connection.execute(
                 "DELETE FROM outbox WHERE queue_id = ? AND attempts = ?",
                 (queue_id, expected_claim),
             )
             applied = cursor.rowcount == 1
             await cursor.close()
+            if applied and delivered is not None:
+                # This exact claim is ACKed only after the relay's native sink
+                # ingest returned a known success. Local archive COMMIT alone
+                # never reaches this path, and ambiguous native COMMIT does not ACK.
+                await connection.execute(
+                    "UPDATE recording_archives SET state='acknowledged' "
+                    "WHERE receipt_op_id=? AND state='archived' "
+                    "AND julianday(retention_until)>julianday(?) "
+                    "AND NOT EXISTS(SELECT 1 FROM sparra_content_fences f "
+                    "WHERE f.call_id=recording_archives.call_id)",
+                    (delivered[0], _iso(self._utcnow())),
+                )
             if not result.done():
                 result.set_result(RelayClaimResult(applied=applied))
         elif action == "retry":
@@ -2739,7 +3476,10 @@ class PersistenceWriter:
         if (
             isinstance(result, asyncio.Future)
             and not result.done()
-            and (value is not None or command.kind in {"call_lifecycle_read", "sparra_content"})
+            and (
+                value is not None
+                or command.kind in {"call_lifecycle_read", "sparra_content", "recording_archive"}
+            )
         ):
             result.set_result(value)
         if command.committed is not None and not command.committed.done():

@@ -161,7 +161,9 @@ async def committed(registry, writer, observed, *, duplicate=False):
 async def test_pinned_policy_requires_qualified_audio_before_answer(
     tmp_path, enabled, expected_status
 ):
+    begins = []
     async def begin(deployment, call_id, routing):
+        begins.append(call_id)
         return BeginCallSnapshotV1.model_validate(
             {**snapshot(call_id, routing).model_dump(), "recording_enabled": enabled}
         )
@@ -171,6 +173,10 @@ async def test_pinned_policy_requires_qualified_audio_before_answer(
         result = await committed(registry, writer, event())
         assert result.status_code == expected_status
         assert any(action[0] == "answer" for action in provider.actions) is (not enabled)
+        facts = await writer.read_call_lifecycle(begins[0])
+        assert getattr(facts, "recording_policy_revision", None) == 1
+        assert getattr(facts, "recording_enabled", None) is enabled
+        assert getattr(facts, "audio_reserved_bytes", None) == 0
         if enabled:
             assert not any(action[0] == "streaming" for action in provider.actions)
     finally:

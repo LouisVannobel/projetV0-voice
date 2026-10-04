@@ -85,7 +85,7 @@ def _operation(operation_id: int = 1) -> VoiceOperationV1:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_writer_establishes_exact_sqlite_v4_before_readiness(
+async def test_writer_establishes_exact_sqlite_v5_before_readiness(
     tmp_path: Path, legacy: bool
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -106,7 +106,7 @@ async def test_writer_establishes_exact_sqlite_v4_before_readiness(
             )
         }
 
-    assert version == (4,)
+    assert version == (5,)
     assert objects == {
         ("index", "outbox_due_fifo_idx"),
         ("table", "call_leases"),
@@ -116,6 +116,7 @@ async def test_writer_establishes_exact_sqlite_v4_before_readiness(
         ("table", "sparra_turn_decisions"),
         ("table", "sparra_content_fences"),
         ("table", "sparra_publications"),
+        ("table", "recording_archives"),
     }
 
 

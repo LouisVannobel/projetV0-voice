@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 V1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS call_leases (
@@ -110,6 +110,30 @@ CREATE TABLE sparra_content_fences (
     lease_settled INTEGER NOT NULL DEFAULT 0 CHECK (lease_settled IN (0,1))
 );
 """
-SCHEMA_SQL = V3_SCHEMA_SQL.replace(
+V4_SCHEMA_SQL = V3_SCHEMA_SQL.replace(
     "PRAGMA user_version = 3;", SPARRA_CONTENT_SQL + "\nPRAGMA user_version = 4;"
+)
+
+RECORDING_ARCHIVE_SQL = """
+CREATE TABLE recording_archives (
+    recording_id TEXT PRIMARY KEY NOT NULL,
+    call_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    state TEXT NOT NULL CHECK (state IN
+        ('pending','archived','acknowledged','unavailable','expired','erased')),
+    observed_at TEXT NOT NULL,
+    retention_until TEXT NOT NULL,
+    context_key_version INTEGER NOT NULL CHECK (context_key_version > 0),
+    context_nonce BLOB NOT NULL CHECK (length(context_nonce) = 12),
+    context_ciphertext BLOB NOT NULL CHECK (length(context_ciphertext) >= 16),
+    receipt_json TEXT,
+    audio_nonce BLOB CHECK (audio_nonce IS NULL OR length(audio_nonce) = 12),
+    receipt_op_id TEXT,
+    CHECK ((receipt_json IS NULL AND audio_nonce IS NULL AND receipt_op_id IS NULL)
+        OR (receipt_json IS NOT NULL AND audio_nonce IS NOT NULL AND receipt_op_id IS NOT NULL))
+);
+"""
+SCHEMA_SQL = V4_SCHEMA_SQL.replace(
+    "PRAGMA user_version = 4;", RECORDING_ARCHIVE_SQL + "\nPRAGMA user_version = 5;"
 )

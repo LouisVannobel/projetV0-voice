@@ -77,6 +77,7 @@ class FakeSDK:
         self.max_retries = constructor_kwargs["max_retries"]
         self.actions = FakeActions(observations)
         self.calls = SimpleNamespace(actions=self.actions)
+        self.recordings = SimpleNamespace()
         self.close_count = 0
         self._close_impl = close_impl
 

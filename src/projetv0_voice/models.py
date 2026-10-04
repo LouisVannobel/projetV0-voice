@@ -492,6 +492,38 @@ class TurnUpsertPayloadV1(_StrictFrozenModel):
         return self
 
 
+class RecordingArchiveReceiptV1(_StrictFrozenModel):
+    """Bounded metadata for durable ciphertext; contains no access scope or bytes."""
+
+    recording_id: CanonicalUUID
+    ciphertext_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    encrypted_bytes: Annotated[
+        int, Field(ge=17, le=33_554_448), BeforeValidator(_require_exact_int)
+    ]
+    key_version: Annotated[PositiveInt, Field(le=9_007_199_254_740_991)]
+    retention_until: BusinessInstant
+
+    @field_validator("retention_until", mode="before")
+    @classmethod
+    def strict_deadline(cls, value: object) -> object:
+        if isinstance(value, str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", value
+        ) is None:
+            raise ValueError("archive deadline must be canonical UTC milliseconds")
+        if isinstance(value, datetime) and (
+            value.tzinfo is None or value.utcoffset() != UTC.utcoffset(None)
+            or value.microsecond % 1000
+        ):
+            raise ValueError("archive deadline must be canonical UTC milliseconds")
+        return value
+
+    _retention = field_validator("retention_until")(_business_utc)
+
+    @field_serializer("retention_until")
+    def serialize_deadline(self, value: datetime) -> str:
+        return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 class RecordingUpsertPayloadV1(_StrictFrozenModel):
     recording_id: UUID
     status: Literal["off", "pending", "active", "saved", "failed", "purged"]
@@ -501,6 +533,23 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
     started_at: datetime | None
     ended_at: datetime | None
     retention_until: datetime | None
+    archive_receipt: RecordingArchiveReceiptV1 | None = None
+
+    @field_validator("archive_receipt", mode="before")
+    @classmethod
+    def reject_null_receipt(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("present archive receipt must not be null")
+        return value
+
+    @model_serializer(mode="wrap")
+    def serialize_archive_extension(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        serialized: dict[str, object] = handler(self)
+        if "archive_receipt" not in self.model_fields_set:
+            serialized.pop("archive_receipt", None)
+        return serialized
 
     _validate_datetime_inputs = field_validator(
         "started_at", "ended_at", "retention_until", mode="before"
@@ -518,6 +567,13 @@ class RecordingUpsertPayloadV1(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def validate_recording(self) -> Self:
+        if self.archive_receipt is not None and (
+            self.status not in {"saved", "purged"}
+            or self.telnyx_recording_id is None
+            or self.archive_receipt.recording_id != self.recording_id
+            or self.archive_receipt.retention_until != self.retention_until
+        ):
+            raise ValueError("archive receipt must match saved recording identity and deadline")
         metadata = (
             self.telnyx_recording_id,
             self.channels,

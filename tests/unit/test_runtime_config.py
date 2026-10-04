@@ -25,6 +25,8 @@ ALLOWED_NAMES = (
     "VOICE_QUALIFICATION_OVERRIDE_PATH",
     "VOICE_KEYRING_PATH",
     "VOICE_SQLITE_PATH",
+    "VOICE_RECORDING_ARCHIVE_DIRECTORY",
+    "VOICE_RECORDING_DOWNLOAD_ORIGINS",
     "VOICE_RUNTIME_CONTRACT_SHA256",
     "VOICE_IMAGE_DIGEST",
     "VOICE_AGENT_BUNDLE_SHA256",
@@ -48,6 +50,50 @@ ALLOWED_NAMES = (
     "VOICE_BIND_PORT",
 )
 HEX_A = "a" * 64
+
+
+def test_archive_settings_are_explicit_optional_and_consume_exact_https_origins():
+    module = _runtime_config()
+    values = valid_environment()
+    values.update(
+        {
+            "VOICE_RECORDING_ARCHIVE_DIRECTORY": "/var/lib/projetv0/audio",
+            "VOICE_RECORDING_DOWNLOAD_ORIGINS": "https://recordings.example.invalid",
+        }
+    )
+    settings = module.parse_runtime_settings(
+        module.capture_runtime_environment(values), geteuid=lambda: 10001, getegid=lambda: 10001
+    )
+    assert getattr(settings, "recording_archive_directory", None) == PurePosixPath(
+        "/var/lib/projetv0/audio"
+    )
+    assert getattr(settings, "recording_download_origins", None) == (
+        "https://recordings.example.invalid",
+    )
+
+
+@pytest.mark.parametrize(
+    "directory,origins",
+    [
+        ("/var/lib/projetv0/audio", None),
+        (None, "https://recordings.example.invalid"),
+        ("/var/lib/projetv0/audio", "http://recordings.example.invalid"),
+        ("/var/lib/projetv0/audio", "https://recordings.example.invalid/private?token=sentinel"),
+    ],
+)
+def test_archive_settings_fail_closed_for_partial_or_noncanonical_scope(directory, origins):
+    module = _runtime_config()
+    values = valid_environment()
+    if directory is not None:
+        values["VOICE_RECORDING_ARCHIVE_DIRECTORY"] = directory
+    if origins is not None:
+        values["VOICE_RECORDING_DOWNLOAD_ORIGINS"] = origins
+    with pytest.raises(RuntimeError, match="runtime_settings_invalid"):
+        module.parse_runtime_settings(
+            module.capture_runtime_environment(values), geteuid=lambda: 10001, getegid=lambda: 10001
+        )
+
+
 HEX_B = "b" * 64
 HEX_C = "c" * 64
 IMAGE = f"ghcr.io/louisvannobel/projetv0-voice@sha256:{'d' * 64}"
@@ -270,9 +316,7 @@ def test_parse_once_builds_frozen_typed_settings_for_each_mode(
     )
 
     assert settings.runtime_mode == mode
-    assert settings.runtime_contract_path == PurePosixPath(
-        "/srv/projetv0/runtime-contract.json"
-    )
+    assert settings.runtime_contract_path == PurePosixPath("/srv/projetv0/runtime-contract.json")
     assert getattr(settings, expected_profile_field) is not None
     assert settings.bind_port == 8080
     assert settings.otlp_http_endpoint == ENDPOINT
@@ -495,9 +539,7 @@ def test_direct_and_replaced_settings_have_no_production_token_or_provenance_fie
 def test_endpoint_only_capture_cannot_create_settings_or_access_an_issuer() -> None:
     runtime_config = _runtime_config()
     bootstrap = importlib.import_module("projetv0_voice.observability_bootstrap")
-    capture = runtime_config.capture_runtime_environment(
-        {"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT}
-    )
+    capture = runtime_config.capture_runtime_environment({"VOICE_OTLP_HTTP_ENDPOINT": ENDPOINT})
 
     with pytest.raises(RuntimeError, match="^runtime_settings_invalid$"):
         runtime_config.parse_runtime_settings(

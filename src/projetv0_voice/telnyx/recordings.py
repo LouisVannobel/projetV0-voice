@@ -245,25 +245,7 @@ class ProviderRecordingPageV1:
         return "ProviderRecordingPageV1()"
 
 
-class TelnyxRecordingApi(Protocol):
-    """Project testing seam over the one process-owned Telnyx client."""
-
-    async def start_recording(
-        self,
-        call_control_id: str,
-        request: RecordingStartV1,
-        *,
-        command_id: UUID,
-    ) -> CallControlResult: ...
-
-    async def stop_recording(
-        self,
-        call_control_id: str,
-        request: RecordingStopV1,
-        *,
-        command_id: UUID,
-    ) -> CallControlResult: ...
-
+class RecordingCatalogApi(Protocol):
     async def list_recordings_one_page(
         self,
         *,
@@ -283,6 +265,18 @@ class TelnyxRecordingApi(Protocol):
         *,
         timeout_seconds: float,
     ) -> ProviderRecordingV1: ...
+
+
+class TelnyxRecordingApi(RecordingCatalogApi, Protocol):
+    """Project testing seam over the one process-owned Telnyx client."""
+
+    async def start_recording(
+        self, call_control_id: str, request: RecordingStartV1, *, command_id: UUID,
+    ) -> CallControlResult: ...
+
+    async def stop_recording(
+        self, call_control_id: str, request: RecordingStopV1, *, command_id: UUID,
+    ) -> CallControlResult: ...
 
     async def delete_recording(
         self,
@@ -404,6 +398,7 @@ class RecordingCorrelationV1:
     call_session_id: str | None = field(repr=False)
     retention_days: int
     required: bool
+    admission_retention_until: datetime | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -422,6 +417,13 @@ class RecordingCorrelationV1:
             or type(self.retention_days) is not int
             or not 1 <= self.retention_days <= MAX_RETENTION_DAYS
             or type(self.required) is not bool
+            or self.admission_retention_until is not None and (
+                not isinstance(self.admission_retention_until, datetime)
+                or self.admission_retention_until.tzinfo is None
+                or self.admission_retention_until.utcoffset() != timedelta(0)
+                or self.admission_retention_until.microsecond % 1000
+                or self.retention_days != 30
+            )
         ):
             raise ValueError("recording_correlation_invalid") from None
 
@@ -449,14 +451,15 @@ def build_recording_correlation(
         call_session_id=identity.telnyx_call_session_id,
         retention_days=retention_days,
         required=required,
+        admission_retention_until=identity.retention_until
+        if identity.begin_snapshot is not None else None,
     )
 
 
 def encode_recording_correlation(correlation: RecordingCorrelationV1) -> SecretStr:
     if not isinstance(correlation, RecordingCorrelationV1):
         raise ValueError("recording_correlation_invalid")
-    raw = _canonical_json_bytes(
-        {
+    values: dict[str, object] = {
             "v": 1,
             "deployment_id": correlation.deployment_id,
             "call_id": str(correlation.call_id),
@@ -467,7 +470,11 @@ def encode_recording_correlation(correlation: RecordingCorrelationV1) -> SecretS
             "retention_days": correlation.retention_days,
             "required": correlation.required,
         }
-    )
+    if correlation.admission_retention_until is not None:
+        values["admission_retention_until"] = correlation.admission_retention_until.isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+    raw = _canonical_json_bytes(values)
     if len(raw) > MAX_CLIENT_STATE_JSON_BYTES:
         raise RecordingCapsuleError("recording_capsule_invalid") from None
     encoded = base64.b64encode(raw).decode("ascii")
@@ -493,7 +500,9 @@ def decode_recording_correlation(client_state: SecretStr) -> RecordingCorrelatio
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
         )
-        if not isinstance(parsed, dict) or set(parsed) != _CAPSULE_KEYS:
+        if not isinstance(parsed, dict) or set(parsed) not in (
+            _CAPSULE_KEYS, _CAPSULE_KEYS | {"admission_retention_until"}
+        ):
             _raise_capsule_error()
         if _canonical_json_bytes(parsed) != raw:
             _raise_capsule_error()
@@ -507,6 +516,17 @@ def decode_recording_correlation(client_state: SecretStr) -> RecordingCorrelatio
         session_id = parsed.get("call_session_id")
         retention_days = parsed.get("retention_days")
         required = parsed.get("required")
+        admission_deadline = None
+        if "admission_retention_until" in parsed:
+            raw_deadline = parsed["admission_retention_until"]
+            if not isinstance(raw_deadline, str):
+                _raise_capsule_error()
+            admission_deadline = datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
+            if (admission_deadline.tzinfo is None or admission_deadline.utcoffset() != timedelta(0)
+                or admission_deadline.microsecond % 1000
+                or admission_deadline.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                != raw_deadline):
+                _raise_capsule_error()
         if (
             not _valid_deployment_id(deployment_id)
             or call_id is None
@@ -530,6 +550,7 @@ def decode_recording_correlation(client_state: SecretStr) -> RecordingCorrelatio
             call_session_id=cast(str | None, session_id),
             retention_days=retention_days,
             required=required,
+            admission_retention_until=admission_deadline,
         )
     except RecordingCapsuleError:
         raise
@@ -800,6 +821,7 @@ def resolve_recording_webhook(
         return None
     try:
         correlation = _recording_correlation_from_event(event)
+        retention_until: datetime | None
         started_at = event.recording_started_at
         ended_at = event.recording_ended_at
         if (started_at is None) != (ended_at is None):
@@ -814,7 +836,11 @@ def resolve_recording_webhook(
             ):
                 raise ValueError("saved_fields")
             status: Literal["saved", "failed"] = "saved"
-            retention_until = ended_at + timedelta(days=correlation.retention_days)
+            retention_until = correlation.admission_retention_until or (
+                ended_at + timedelta(days=correlation.retention_days))
+            if retention_until <= ended_at:
+                status = "failed"
+                retention_until = None
         else:
             status = "failed"
             retention_until = None
@@ -904,6 +930,17 @@ def _catalog_match(
     correlation: RecordingCorrelationV1,
     event: VerifiedWebhook,
 ) -> Literal["valid", "missing", "mismatch", "missing_id"]:
+    return _catalog_match_facts(
+        item, correlation, event.recording_started_at, event.recording_ended_at
+    )
+
+
+def _catalog_match_facts(
+    item: ProviderRecordingV1,
+    correlation: RecordingCorrelationV1,
+    started_at: datetime | None,
+    ended_at: datetime | None,
+) -> Literal["valid", "missing", "mismatch", "missing_id"]:
     if item.recording_id is None:
         return "missing_id"
     required_values: tuple[tuple[object, object], ...] = (
@@ -912,8 +949,8 @@ def _catalog_match(
         (item.status, "completed"),
         (item.source, "call"),
         (item.initiated_by, "StartCallRecordingAPI"),
-        (item.recording_started_at, event.recording_started_at),
-        (item.recording_ended_at, event.recording_ended_at),
+        (item.recording_started_at, started_at),
+        (item.recording_ended_at, ended_at),
     )
     if correlation.call_leg_id is not None:
         required_values += ((item.call_leg_id, correlation.call_leg_id),)
@@ -960,6 +997,69 @@ def _enrichment_operation(
             ),
         }
     )
+
+
+async def reconcile_archive_provider_recording(
+    operation: VoiceOperationV1,
+    *,
+    correlation: RecordingCorrelationV1,
+    telnyx: RecordingCatalogApi,
+    monotonic: Callable[[], float],
+    deadline: float,
+) -> str:
+    """Use authenticated catalogue identity without reconstructing a webhook receipt."""
+    payload = operation.payload
+    if (
+        not isinstance(payload, RecordingUpsertPayloadV1)
+        or payload.status != "saved"
+        or payload.started_at is None
+        or payload.ended_at is None
+        or operation.call_id != correlation.call_id
+        or payload.recording_id != correlation.recording_id
+    ):
+        raise RecordingWebhookError("recording_webhook_invalid")
+    slop = timedelta(seconds=RECONCILE_TIMESTAMP_SLOP_SECONDS)
+    page = await _await_with_deadline(
+        telnyx.list_recordings_one_page(
+            call_control_id=correlation.call_control_id,
+            call_leg_id=correlation.call_leg_id,
+            call_session_id=correlation.call_session_id,
+            start_gte_iso=_utc_iso(payload.started_at - slop),
+            start_lte_iso=_utc_iso(payload.started_at + slop),
+            end_gte_iso=_utc_iso(payload.ended_at - slop),
+            end_lte_iso=_utc_iso(payload.ended_at + slop),
+            timeout_seconds=_bounded_remaining(
+                monotonic=monotonic, deadline=deadline, maximum=RECORDING_LIST_DEADLINE_SECONDS
+            ),
+        ),
+        monotonic=monotonic,
+        deadline=deadline,
+    )
+    if (
+        not isinstance(page, ProviderRecordingPageV1)
+        or page.page_number != 1
+        or page.total_pages != 1
+        or len(page.items) != 1
+    ):
+        raise RecordingWebhookError("recording_webhook_invalid")
+    item = page.items[0]
+    match = _catalog_match_facts(item, correlation, payload.started_at, payload.ended_at)
+    if match == "missing" and item.recording_id is not None:
+        candidate_id = item.recording_id
+        retrieved = await telnyx.retrieve_recording(
+            candidate_id,
+            timeout_seconds=_bounded_remaining(
+                monotonic=monotonic, deadline=deadline, maximum=RECORDING_RETRIEVE_DEADLINE_SECONDS
+            ),
+        )
+        if not isinstance(retrieved, ProviderRecordingV1) or retrieved.recording_id != candidate_id:
+            raise RecordingWebhookError("recording_webhook_invalid")
+        item = retrieved
+        match = _catalog_match_facts(item, correlation, payload.started_at, payload.ended_at)
+    if match != "valid" or not is_valid_provider_recording_id(item.recording_id):
+        raise RecordingWebhookError("recording_webhook_invalid")
+    assert item.recording_id is not None
+    return item.recording_id
 
 
 async def _reconcile_provider_recording(
@@ -1047,9 +1147,7 @@ async def _reconcile_provider_recording(
     assert item.recording_id is not None
     try:
         operation = _enrichment_operation(event, effect, item.recording_id)
-        enrichment_fingerprint = hashlib.sha256(
-            canonical_operation_bytes(operation)
-        ).digest()
+        enrichment_fingerprint = hashlib.sha256(canonical_operation_bytes(operation)).digest()
         await writer.commit_control(
             PersistenceCommand(
                 "webhook_enrichment",
@@ -1087,6 +1185,7 @@ async def after_recording_webhook_commit(
     local_drain: Callable[[UUID, str], Awaitable[None]],
     monotonic: Callable[[], float],
     timeout_seconds: float,
+    utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> WebhookDisposition | None:
     if not isinstance(event, VerifiedWebhook) or event.event_type not in {
         "call.recording.saved",
@@ -1110,6 +1209,24 @@ async def after_recording_webhook_commit(
     except Exception:
         return WebhookDisposition(500)
     if event.event_type == "call.recording.saved":
+        if correlation.admission_retention_until is not None:
+            try:
+                await writer.commit_control(
+                    PersistenceCommand(
+                        "recording_archive",
+                        {
+                            "action": "queue",
+                            "operation": effect.operation,
+                            "correlation": correlation,
+                            "now": utcnow(),
+                        },
+                        None,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return WebhookDisposition(503)
         if event.recording_id is not None:
             return WebhookDisposition(200)
         return await _reconcile_provider_recording(
@@ -1138,18 +1255,14 @@ async def after_recording_webhook_commit(
     except Exception:
         drain_failed = True
 
-    hangup_result, hangup_cancellation, hangup_failed = (
-        await _join_owned_with_deadline(
-            telnyx.hangup(
-                correlation.call_control_id,
-                command_id=derive_recording_action_id(
-                    correlation.recording_id, "hangup"
-                ),
-                client_state=event.client_state,
-            ),
-            monotonic=monotonic,
-            deadline=deadline,
-        )
+    hangup_result, hangup_cancellation, hangup_failed = await _join_owned_with_deadline(
+        telnyx.hangup(
+            correlation.call_control_id,
+            command_id=derive_recording_action_id(correlation.recording_id, "hangup"),
+            client_state=event.client_state,
+        ),
+        monotonic=monotonic,
+        deadline=deadline,
     )
     if first_cancellation is None and hangup_cancellation is not None:
         first_cancellation = hangup_cancellation
@@ -1191,9 +1304,7 @@ async def purge_recordings_once(
     ):
         raise RecordingPurgeError("recording_purge_input_invalid")
     try:
-        leased_result = await sink.lease_recording_purges(
-            worker_id, lease_seconds, batch_size
-        )
+        leased_result = await sink.lease_recording_purges(worker_id, lease_seconds, batch_size)
         leases = tuple(leased_result)
     except asyncio.CancelledError:
         raise
