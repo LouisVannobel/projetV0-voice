@@ -229,13 +229,20 @@ def snapshot(**updates):
 def test_begin_snapshot_is_exact_strict_reply():
     assert (
         model("BeginCallSnapshotV1").model_validate(snapshot()).model_dump(mode="json")
-        == snapshot()
+        == {**snapshot(), "recording_enabled": False}
     )
+    for enabled in (False, True):
+        value = snapshot(recording_enabled=enabled)
+        assert model("BeginCallSnapshotV1").model_validate(value).model_dump(mode="json") == value
     for updates in [
         {"configuration_revision": True},
         {"workspace_id": str(CALL_ID)},
         {"transfer_destination": "123"},
         {"retention_until": "2026-02-30T00:00:00Z"},
+        {"recording_enabled": "true"},
+        {"recording_enabled": 1},
+        {"recording_enabled": 0},
+        {"recording_enabled": None},
     ]:
         with pytest.raises(ValidationError):
             model("BeginCallSnapshotV1").model_validate(snapshot(**updates))
