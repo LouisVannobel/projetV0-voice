@@ -88,6 +88,7 @@ class CallAdmissionRejected(RuntimeError):
             "qualification_run_consumed",
             "qualification_window_expired",
             "call_draining",
+            "sparra_recording_unqualified",
         }
     )
     _EVENT_CODES = frozenset({"call_event_invalid", "call_identity_conflict"})
@@ -1142,6 +1143,10 @@ class CallRegistry:
             or snapshot.retention_until != entry.initiated_at + timedelta(days=30)
         ):
             raise CallAdmissionRejected("call_identity_conflict")
+        # Company preference is pinned; native audio activation stays closed
+        # until disclosure, recording and retention qualification are complete.
+        if snapshot.recording_enabled:
+            raise CallAdmissionRejected("sparra_recording_unqualified")
         async with self._lock:
             if (
                 self._by_control.get(entry.call_control_id) is not entry

@@ -71,11 +71,29 @@ async def test_begin_uses_owned_transaction_and_exact_reply():
     admitted = routing()
     value = await sink.begin_call("agent-a", UUID(int=2), admitted)
     assert value.call_id == UUID(int=2)
+    assert value.recording_enabled is False
     sql, params, prepare = connection.calls[0]
     assert sql == "SELECT voice.begin_call_v1(%s,%s,%s::jsonb)"
     assert params[:2] == ("agent-a", UUID(int=2))
     assert params[2].obj == admitted.model_dump(mode="json")
     assert prepare is False and connection.transaction_commits == 1 and pool.active == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_begin_consumes_the_explicit_pinned_company_recording_policy(enabled):
+    sink, _, _, _ = sink_with_rows([({**snapshot(), "recording_enabled": enabled},)])
+    value = await sink.begin_call("agent-a", UUID(int=2), routing())
+    assert value.recording_enabled is enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [None, "true", "false", 0, 1])
+async def test_begin_rejects_malformed_company_recording_policy(enabled):
+    sink, _, connection, _ = sink_with_rows([({**snapshot(), "recording_enabled": enabled},)])
+    with pytest.raises(OperationSinkContractError):
+        await sink.begin_call("agent-a", UUID(int=2), routing())
+    assert connection.transaction_rollbacks == 1
 
 
 @pytest.mark.asyncio

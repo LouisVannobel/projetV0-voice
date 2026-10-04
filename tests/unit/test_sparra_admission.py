@@ -157,6 +157,29 @@ async def committed(registry, writer, observed, *, duplicate=False):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled, expected_status", [(False, 200), (True, 503)])
+async def test_pinned_policy_requires_qualified_audio_before_answer(
+    tmp_path, enabled, expected_status
+):
+    async def begin(deployment, call_id, routing):
+        return BeginCallSnapshotV1.model_validate(
+            {**snapshot(call_id, routing).model_dump(), "recording_enabled": enabled}
+        )
+
+    registry, writer, worker, provider = await start(tmp_path, begin)
+    try:
+        result = await committed(registry, writer, event())
+        assert result.status_code == expected_status
+        assert any(action[0] == "answer" for action in provider.actions) is (not enabled)
+        if enabled:
+            assert not any(action[0] == "streaming" for action in provider.actions)
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
 async def test_committed_transfer_target_is_acknowledged_without_original_admission(tmp_path):
     from pydantic import SecretStr
 

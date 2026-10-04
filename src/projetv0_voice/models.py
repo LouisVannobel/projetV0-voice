@@ -244,6 +244,7 @@ class BeginCallSnapshotV1(_StrictFrozenModel):
     knowledge: BusinessKnowledgeV1
     transfer_destination: StrictStr | None
     retention_until: BusinessInstant
+    recording_enabled: StrictBool = False
 
     _retention = field_validator("retention_until")(_canonical_milliseconds)
 
