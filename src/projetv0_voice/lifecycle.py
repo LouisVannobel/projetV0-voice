@@ -1859,13 +1859,19 @@ async def build_production_runtime(
         )
 
         def recording_factory(identity: CallIdentity) -> RecordingBoundary:
-            del identity
+            snapshot = identity.begin_snapshot
+            if snapshot is not None and snapshot.recording_enabled and (
+                settings.runtime_mode != "strict"
+            ):
+                raise ValueError("sparra_recording_unqualified") from None
             return TelnyxRecordingBoundary(
                 telnyx=cast(Any, measured_call_control),
                 writer=writer,
-                retention_days=recording_retention_days,
-                required=manifest.recording_required,
-                play_beep=manifest.recording_play_beep,
+                retention_days=30 if snapshot is not None else recording_retention_days,
+                required=snapshot.recording_enabled
+                if snapshot is not None else manifest.recording_required,
+                play_beep=snapshot.recording_enabled
+                if snapshot is not None else manifest.recording_play_beep,
                 utcnow=utcnow,
             )
 

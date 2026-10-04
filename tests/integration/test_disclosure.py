@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from uuid import UUID
@@ -19,6 +20,7 @@ from starlette.websockets import WebSocket, WebSocketState
 
 from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.metrics import RuntimeMetrics
+from projetv0_voice.models import BeginCallSnapshotV1, RoutingV1
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
@@ -127,6 +129,7 @@ def _controller(
     recording_required: bool = False,
     timeout: float = 0.05,
     call_int: int = 1,
+    identity: object | None = None,
 ) -> tuple[object, _Writer, _Recording, object]:
     selected_writer = writer or _Writer()
     selected_recording = recording or _Recording(
@@ -136,7 +139,7 @@ def _controller(
     )
     failure = pipeline_module.FirstFailure()
     controller = session_module.DisclosureController(
-        identity=_identity(call_int),
+        identity=identity or _identity(call_int),
         writer=selected_writer,
         first_failure=failure,
         recording=selected_recording,
@@ -148,6 +151,78 @@ def _controller(
         uuid_factory=_uuids(100 + call_int * 10),
     )
     return controller, selected_writer, selected_recording, failure
+
+
+def _pinned_identity(enabled: bool):
+    snapshot = BeginCallSnapshotV1.model_validate({
+        "schema_version": 1, "call_id": str(UUID(int=1)), "configuration_revision": 7,
+        "knowledge": {"business_name": "Garage", "sector": "garage", "opening_hours": "",
+                      "services": "", "prices": "", "faq": "", "instructions": ""},
+        "transfer_destination": None, "retention_until": "2026-09-27T18:00:00.000Z",
+        "recording_enabled": enabled,
+    })
+    routing = RoutingV1(
+        schema_version=1, direction="incoming", connection_id="fixture",
+        to_e164="+33102030405", from_e164=None, telnyx_call_control_id="call-control-1",
+        telnyx_call_leg_id="call-leg-1", telnyx_call_session_id="call-session-1",
+        admitted_at=NOW,
+    )
+    return replace(_identity(), begin_snapshot=snapshot, retention_until=snapshot.retention_until,
+                   routing=routing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_company_controller_pin_overrides_legacy_flags_and_waits_for_durable_disclosure(
+    enabled,
+):
+    writer = _Writer(block=True)
+    recording = _Recording(session_module.RecordingStartResult(
+        session_module.RecordingStartState.STARTED))
+    controller, _, _, failure = _controller(
+        writer=writer, recording=recording, identity=_pinned_identity(enabled),
+        recording_enabled=not enabled, recording_required=not enabled,
+    )
+    await controller.note_disclosure_audio()
+    await controller.arm_expected_mark()
+    await controller.mark_forwarded()
+    assert await controller.accept_mark(controller.mark_name)
+    await writer.started.wait()
+    assert recording.starts == 0 and not controller.is_active()
+    operations = [command.payload["operation"] for command in writer.commands]
+    assert operations[0].payload.retention_until == NOW + timedelta(days=30)
+    writer.release.set()
+    await controller.join_continuations()
+    assert recording.starts == int(enabled)
+    assert controller.is_active() and failure.code is None
+    assert controller.evidence.input_gate_opened_at == NOW + timedelta(seconds=1)
+    assert len(writer.commands) == 2
+    operations = [command.payload["operation"] for command in writer.commands]
+    assert operations[0].payload.disclosure_evidence.input_gate_opened_at is None
+    assert operations[1].payload.disclosure_evidence.input_gate_opened_at == (
+        NOW + timedelta(seconds=1)
+    )
+    assert not await controller.accept_mark(controller.mark_name)
+    await controller.terminalize_and_join(cancel_continuations=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["DEFINITELY_NOT_STARTED", "INDETERMINATE"])
+async def test_company_on_pin_requires_recording_even_when_legacy_flags_are_off(state):
+    recording = _Recording(session_module.RecordingStartResult(
+        getattr(session_module.RecordingStartState, state),
+        gate_may_open=state == "INDETERMINATE"))
+    controller, _, _, failure = _controller(
+        recording=recording, identity=_pinned_identity(True))
+    await controller.note_disclosure_audio()
+    await controller.arm_expected_mark()
+    await controller.mark_forwarded()
+    await controller.accept_mark(controller.mark_name)
+    await controller.join_continuations()
+    assert recording.starts == 1
+    assert not controller.is_active() and failure.code == "recording_failed"
+    assert controller.evidence.input_gate_opened_at is None
+    await controller.terminalize_and_join(cancel_continuations=True)
 
 
 @pytest.mark.asyncio
@@ -417,7 +492,10 @@ async def test_recording_policy_matrix(
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_recording_provider_acceptance_keeps_cleanup_ownership() -> None:
+@pytest.mark.parametrize("company_pin", [False, True])
+async def test_cancel_after_recording_provider_acceptance_keeps_cleanup_ownership(
+    company_pin,
+) -> None:
     recording = _Recording(
         session_module.RecordingStartResult(session_module.RecordingStartState.STARTED),
         block_after_accept=True,
@@ -426,6 +504,7 @@ async def test_cancel_after_recording_provider_acceptance_keeps_cleanup_ownershi
         recording=recording,
         recording_enabled=True,
         recording_required=True,
+        identity=_pinned_identity(True) if company_pin else None,
     )
     await controller.note_disclosure_audio()
     assert await controller.arm_expected_mark() is True

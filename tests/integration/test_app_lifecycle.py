@@ -1229,9 +1229,11 @@ async def test_shutdown_deadline_bounds_each_dependency_close(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("company_case", ["on", "candidate", "override"])
 async def test_production_composition_builds_ordered_graph_with_one_measured_control(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    company_case: str,
 ) -> None:
     import base64
     import hashlib
@@ -1358,6 +1360,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         qualified_at=NOW - timedelta(days=1),
     )
     order: list[str] = []
+    recording_requests = []
 
     class Sink:
         async def open(self) -> None:
@@ -1385,6 +1388,10 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
 
         async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
             return CallControlResult("accepted")
+
+        async def start_recording(self, control_id, request, *, command_id):
+            recording_requests.append((control_id, request, command_id))
+            return CallControlResult("outcome_unknown")
 
         async def aclose(self) -> None:
             order.append("call-control-close")
@@ -1453,6 +1460,9 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         ),
     )
 
+    token = settings.observability_token()
+    settings = replace(settings, sqlite_path=tmp_path / "company-recording.sqlite")
+    object.__setattr__(settings, "_observability_token", token)
     graph = await build_production_runtime(
         settings,
         factories=factories,
@@ -1486,6 +1496,51 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     assert graph.recording_call_control_identity is graph.measured_call_control
     assert isinstance(graph.handshake, AuthenticatedTelnyxHandshakeService)
     assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
+    from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
+    from projetv0_voice.models import BeginCallSnapshotV1
+    from projetv0_voice.session import CallIdentity, RecordingStartState
+    from projetv0_voice.telnyx.recordings import decode_recording_correlation
+
+    def recording_identity(enabled):
+        call_id = UUID("12345678-1234-4234-8234-1234567890ab")
+        generation = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        snapshot = BeginCallSnapshotV1(
+            schema_version=1, call_id=call_id, configuration_revision=7,
+            knowledge=dict(business_name="Garage", sector="garage", opening_hours="",
+                           services="", prices="", faq="", instructions=""),
+            transfer_destination=None, retention_until=NOW + timedelta(days=30),
+            recording_enabled=enabled,
+        )
+        return CallIdentity(
+            call_id=call_id, generation=CallGenerationHandle("fixture-control", generation),
+            lease_claim=ProcessLeaseClaim(call_control_id="fixture-control", call_id=call_id,
+                generation=generation, token_digest=b"x" * 32, claimed_at=NOW),
+            deployment_id=settings.deployment_id, telnyx_call_control_id="fixture-control",
+            telnyx_call_leg_id="fixture-leg", telnyx_call_session_id="fixture-session",
+            stream_id="fixture-stream", started_at=NOW,
+            retention_until=NOW + timedelta(days=30), begin_snapshot=snapshot,
+        )
+
+    # Only the OS path is controlled; the production factory, writer and boundary remain real.
+    if company_case == "on":
+        writer_task = asyncio.create_task(graph.writer.run())
+        assert await graph.writer.wait_ready()
+        try:
+            on_identity = recording_identity(True)
+            result = await graph.recording_factory(on_identity).start(on_identity)
+            assert result.state is RecordingStartState.INDETERMINATE
+            assert result.gate_may_open is False
+            request = recording_requests[-1][1]
+            assert request.play_beep is True
+            correlation = decode_recording_correlation(request.client_state)
+            assert correlation.required is True and correlation.retention_days == 30
+            legacy_identity = replace(on_identity, begin_snapshot=None)
+            legacy_result = await graph.recording_factory(legacy_identity).start(legacy_identity)
+            assert legacy_result.gate_may_open is True
+            assert recording_requests[-1][1].play_beep is False
+        finally:
+            await graph.writer.drain(2)
+            await writer_task
     await graph.supervisor.aclose()
 
     candidate = QualificationCandidateProfileV1.model_validate({
@@ -1533,6 +1588,9 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     try:
         assert len(selected_profiles) == 2 and selected_profiles[-1] is candidate
+        if company_case == "candidate":
+            with pytest.raises(ValueError, match="^sparra_recording_unqualified$"):
+                candidate_graph.recording_factory(recording_identity(True))
     finally:
         await candidate_graph.supervisor.aclose()
 
@@ -1575,6 +1633,9 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         reservations: list[ResolvedWebhook] = []
         try:
             assert selected_profiles[-1] is profile
+            if company_case == "override":
+                with pytest.raises(ValueError, match="^sparra_recording_unqualified$"):
+                    override_graph.recording_factory(recording_identity(True))
             assert override_graph.registry.candidate_run_id is None
             assert override_graph.supervisor._candidate_run_id is None  # noqa: SLF001
             assert override_graph.registry._capacity == capacity  # noqa: SLF001

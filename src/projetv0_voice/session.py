@@ -45,6 +45,7 @@ from projetv0_voice.persistence.business_result import infer_partial_result
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.pipeline import (
     SPARRA_DISCLOSURE,
+    SPARRA_RECORDING_DISCLOSURE,
     CallRuntime,
     FirstFailure,
     ObservedPipeline,
@@ -702,8 +703,12 @@ class CallSession:
             writer=self._writer,
             first_failure=first_failure,
             recording=self._recording,
-            recording_enabled=self._manifest.recording_mode != "off",
-            recording_required=self._manifest.recording_required,
+            recording_enabled=self._identity.begin_snapshot.recording_enabled
+            if self._identity.begin_snapshot is not None
+            else self._manifest.recording_mode != "off",
+            recording_required=self._identity.begin_snapshot.recording_enabled
+            if self._identity.begin_snapshot is not None
+            else self._manifest.recording_required,
             mark_timeout_seconds=self._profile.disclosure_mark_timeout_ms / 1000,
             runtime_metrics=self._runtime_metrics,
             utcnow=self._utcnow,
@@ -752,7 +757,11 @@ class CallSession:
             runtime = build_runtime(
                 pipeline=pipeline,
                 first_failure=first_failure,
-                greeting=SPARRA_DISCLOSURE
+                greeting=(
+                    SPARRA_RECORDING_DISCLOSURE
+                    if self._identity.begin_snapshot.recording_enabled
+                    else SPARRA_DISCLOSURE
+                )
                 if self._identity.begin_snapshot is not None
                 else self._manifest.greeting,
                 mark_name=controller.mark_name,
@@ -1428,6 +1437,9 @@ class DisclosureController:
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
+        if identity.begin_snapshot is not None:
+            recording_enabled = identity.begin_snapshot.recording_enabled
+            recording_required = recording_enabled
         if (
             type(recording_enabled) is not bool
             or type(recording_required) is not bool
@@ -1808,6 +1820,13 @@ class DisclosureController:
                 failed = True
         if failed:
             self._first_failure.signal("recording_failed")
+        elif self._identity.begin_snapshot is not None:
+            async with self._lock:
+                if not self.is_active():
+                    return
+                self._input_gate_opened_at = self._utcnow().astimezone(UTC)
+            if self._identity.routing is not None:
+                await self._publish_gate_evidence()
 
     async def _publish_gate_evidence(self) -> None:
         assert self._input_gate_opened_at is not None
