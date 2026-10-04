@@ -765,7 +765,7 @@ async def test_just_over_64_kib_is_fatal_and_never_inserted(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_schema_has_exact_v2_tables_required_columns_checks_and_delete_journal(
+async def test_schema_has_exact_v5_tables_required_columns_checks_and_delete_journal(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -774,6 +774,7 @@ async def test_schema_has_exact_v2_tables_required_columns_checks_and_delete_jou
         "foreign_keys": 1,
         "journal_mode": "delete",
         "synchronous": 3,
+        "secure_delete": 1,
     }
     await stop_writer(writer, task)
 
@@ -798,6 +799,10 @@ async def test_schema_has_exact_v2_tables_required_columns_checks_and_delete_jou
         "webhook_receipts",
         "outbox",
         "qualification_runs",
+        "sparra_turn_decisions",
+        "sparra_publications",
+        "sparra_content_fences",
+        "recording_archives",
     }
     assert "natural_key" not in ddl
     assert "delivered_at" not in ddl
@@ -810,7 +815,95 @@ async def test_schema_has_exact_v2_tables_required_columns_checks_and_delete_jou
     assert "provider_enrichment_fingerprint_sha256" in ddl
     assert "length(semantic_fingerprint_sha256) = 32" in ddl
     assert journal_mode == ("delete",)
-    assert user_version == (2,)
+    assert "lifecycle_json" in ddl
+    assert user_version == (5,)
+
+
+@pytest.mark.parametrize("legacy_version", [1, 2, 3, 4])
+@pytest.mark.asyncio
+async def test_forward_lifecycle_migration_preserves_every_legacy_outbox_byte(
+    tmp_path, legacy_version
+):
+    from projetv0_voice.persistence.schema import (
+        V1_SCHEMA_SQL,
+        V2_SCHEMA_SQL,
+        V3_SCHEMA_SQL,
+        V4_SCHEMA_SQL,
+    )
+
+    legacy = operation()
+    prepared = encrypt_operation(legacy, CryptoKeyring({1: KEY}, active_version=1))
+    database = tmp_path / f"legacy-{legacy_version}.sqlite"
+    with sqlite3.connect(database) as connection:
+        legacy_schema = {
+            1: V1_SCHEMA_SQL, 2: V2_SCHEMA_SQL, 3: V3_SCHEMA_SQL, 4: V4_SCHEMA_SQL,
+        }[legacy_version]
+        connection.executescript(legacy_schema)
+        connection.execute(
+            "INSERT INTO outbox (op_id,deployment_id,kind,schema_version,call_id,"
+            "turn_id,recording_id,crypto_version,key_version,nonce,ciphertext,"
+            "created_at,attempts,next_attempt_at,last_error_code) "
+            "VALUES (?,?,?,?,?,NULL,NULL,1,?,?,?, ?,0,?,NULL)",
+            (
+                str(legacy.operation_id),
+                legacy.deployment_id,
+                legacy.kind,
+                1,
+                str(legacy.call_id),
+                prepared.encrypted.key_version,
+                prepared.encrypted.nonce,
+                prepared.encrypted.ciphertext,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        before = connection.execute("SELECT * FROM outbox").fetchall()
+    writer, task = await start_writer(database)
+    assert await writer.read_call_lifecycle(legacy.call_id) is None
+    await stop_writer(writer, task)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT * FROM outbox").fetchall() == before
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert "lifecycle_json" in {
+            row[1] for row in connection.execute("PRAGMA table_info(call_leases)")
+        }
+    writer, task = await start_writer(database)
+    replay = await writer.read_relay_batch(batch_size=1, now=NOW, lease_seconds=30)
+    assert len(replay) == 1
+    assert canonical_operation_bytes(replay[0].operation) == canonical_operation_bytes(legacy)
+    await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_original_admission_metadata_receipt_lease_and_outbox_roll_back_together(tmp_path):
+    from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
+
+    database = tmp_path / "atomic-admission.sqlite"
+
+    async def failpoint(name):
+        if name == "after_mutation_before_commit":
+            raise sqlite3.OperationalError("owned fixture failpoint")
+
+    writer, task = await start_writer(database, failpoint=failpoint)
+    original = operation(call_control_id="control-1")
+    original = original.model_copy(
+        update={
+            "payload": original.payload.model_copy(
+                update={"retention_until": NOW + timedelta(days=30)}
+            )
+        }
+    )
+    lease = {**lease_payload(), "call_id": original.call_id}
+    facts = LocalCallAdmissionFacts(original.call_id, NOW, NOW + timedelta(days=30), None, None)
+    ticket = writer.submit_webhook(
+        receipt=receipt_payload(), lease=lease, operation=original, admission_facts=facts
+    )
+    with pytest.raises(FatalPersistenceError):
+        await ticket.wait()
+    await task
+    with sqlite3.connect(database) as connection:
+        for table in ("call_leases", "webhook_receipts", "outbox"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
 
 
 @pytest.mark.asyncio

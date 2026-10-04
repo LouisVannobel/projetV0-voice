@@ -77,6 +77,7 @@ class FakeSDK:
         self.max_retries = constructor_kwargs["max_retries"]
         self.actions = FakeActions(observations)
         self.calls = SimpleNamespace(actions=self.actions)
+        self.recordings = SimpleNamespace()
         self.close_count = 0
         self._close_impl = close_impl
 
@@ -112,6 +113,117 @@ def install_fake(
 
 def ok_response() -> object:
     return SimpleNamespace(data=SimpleNamespace(result="ok"))
+
+
+@pytest.mark.parametrize("region", ["", "eu", "GLOBAL", " EU", "unknown", None, 1, True])
+def test_invalid_api_region_never_constructs_client(monkeypatch, region):
+    module = call_control()
+    constructions = []
+
+    def forbidden_factory(**kwargs):
+        constructions.append(kwargs)
+        raise AssertionError("invalid region reached a client constructor")
+
+    monkeypatch.setattr(module.telnyx, "AsyncTelnyx", forbidden_factory)
+    monkeypatch.setattr(module.telnyx, "DefaultAsyncHttpxClient", forbidden_factory)
+    with pytest.raises(module.CallControlConfigurationError, match="^call_control_config_invalid$"):
+        module.CallControlClient(api_key=API_KEY, api_region=region)
+    assert constructions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("region", "host"),
+    [(None, "api.telnyx.com"), ("global", "api.telnyx.com"), ("EU", "api.telnyx.eu")],
+)
+async def test_pinned_sdk_explicit_region_requests_use_exact_host_and_paths(
+    monkeypatch, region, host
+):
+    module = call_control()
+    monkeypatch.setenv("TELNYX_BASE_URL", "https://hostile.invalid/override")
+    requests = []
+    closes = []
+
+    async def handler(request):
+        body = json.loads(await request.aread()) if request.method == "POST" else {}
+        requests.append((request.method, request.url.scheme, request.url.host, request.url.path,
+                         body.get("command_id")))
+        if len(requests) == 1:
+            return httpx.Response(500, json={"errors": []}, request=request)
+        data = {"id": "recording_Ab-12"} if request.method == "DELETE" else {"result": "ok"}
+        return httpx.Response(200, json={"data": data}, request=request)
+
+    class ObservedClient(httpx.AsyncClient):
+        async def aclose(self):
+            closes.append(True)
+            await super().aclose()
+
+    http_client = ObservedClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(module.telnyx, "DefaultAsyncHttpxClient", lambda **_kwargs: http_client)
+    client = None
+    try:
+        options = {} if region is None else {"api_region": region}
+        client = module.CallControlClient(api_key=API_KEY, **options)
+        assert (await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID)).outcome == "accepted"
+        assert (await client.hangup(CALL_CONTROL_ID, command_id=COMMAND_ID)).outcome == "accepted"
+        transfer = module.TransferRequestV1(
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ=="
+        )
+        transferred = await client.transfer(CALL_CONTROL_ID, transfer, command_id=COMMAND_ID)
+        assert transferred.outcome == "accepted"
+        deleted = await client.delete_recording("recording_Ab-12", timeout_seconds=0.75)
+        assert deleted.outcome == "deleted"
+        command = str(COMMAND_ID)
+        assert requests == [
+            ("POST", "https", host, f"/v2/calls/{CALL_CONTROL_ID}/actions/answer", command),
+            ("POST", "https", host, f"/v2/calls/{CALL_CONTROL_ID}/actions/answer", command),
+            ("POST", "https", host, f"/v2/calls/{CALL_CONTROL_ID}/actions/hangup", command),
+            ("POST", "https", host, f"/v2/calls/{CALL_CONTROL_ID}/actions/transfer", command),
+            ("DELETE", "https", host, "/v2/recordings/recording_Ab-12", None),
+        ]
+        await client.aclose()
+        await client.aclose()
+        assert closes == [True]
+    finally:
+        if client is not None:
+            await client.aclose()
+        elif not http_client.is_closed:
+            await http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_pinned_sdk_qualified_transfer_uses_twenty_seconds_and_same_command(monkeypatch):
+    module = call_control()
+    requests = []
+
+    async def handler(request):
+        requests.append((request.url.path, json.loads(await request.aread())))
+        return httpx.Response(200, json={"data": {"result": "ok"}}, request=request)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(module.telnyx, "DefaultAsyncHttpxClient", lambda **kwargs: http_client)
+    client = module.CallControlClient(api_key=API_KEY)
+    try:
+        assert client.dispatch_available
+        request = module.TransferRequestV1(
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ=="
+        )
+        first = await client.transfer(CALL_CONTROL_ID, request, command_id=COMMAND_ID)
+        second = await client.transfer(CALL_CONTROL_ID, request, command_id=COMMAND_ID)
+        assert first.outcome == second.outcome == "accepted"
+        expected = (
+            f"/v2/calls/{CALL_CONTROL_ID}/actions/transfer",
+            {
+                "to": "+33102030406",
+                "command_id": str(COMMAND_ID),
+                "target_leg_client_state": "Zml4dHVyZQ==",
+                "timeout_secs": 20,
+            },
+        )
+        assert requests == [expected, expected]
+    finally:
+        await client.aclose()
+    assert not client.dispatch_available
 
 
 def malformed_response(result: str | None = None) -> object:

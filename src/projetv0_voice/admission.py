@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -11,17 +12,25 @@ import secrets
 import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
 
-from projetv0_voice.config import AgentManifestV1
-from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
-from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.config import AgentManifestV1, SparraManifestV1
+from projetv0_voice.models import (
+    BeginCallSnapshotV1,
+    CallUpsertPayloadV1,
+    RoutingV1,
+    VoiceOperationV1,
+)
+from projetv0_voice.persistence.commands import PersistenceCommand, PersistenceError
+from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguousError
 from projetv0_voice.persistence.writer import (
+    LocalCallAdmissionFacts,
+    LocalCallLifecycleFacts,
     QualificationRunConsumed,
     WebhookCommitResult,
     WebhookCommitValue,
@@ -36,6 +45,7 @@ from projetv0_voice.qualified_profile import (
 from projetv0_voice.telnyx.call_control import (
     CallControlResult,
     StreamingStartV1,
+    TransferRequestV1,
 )
 
 if TYPE_CHECKING:
@@ -78,6 +88,7 @@ class CallAdmissionRejected(RuntimeError):
             "qualification_run_consumed",
             "qualification_window_expired",
             "call_draining",
+            "sparra_recording_unqualified",
         }
     )
     _EVENT_CODES = frozenset({"call_event_invalid", "call_identity_conflict"})
@@ -237,9 +248,9 @@ class _CallEntry:
     lifecycle_owner: object | None = field(default=None, repr=False)
     lifecycle_owner_task: asyncio.Task[None] | None = field(default=None, repr=False)
     terminal_capability: _TerminalCapability | None = field(default=None, repr=False)
-    terminal_state: Literal[
-        "open", "external_pending", "reserved", "completing", "removed"
-    ] = "open"
+    terminal_state: Literal["open", "external_pending", "reserved", "completing", "removed"] = (
+        "open"
+    )
     terminal_authority: TerminalAuthority | None = field(default=None, repr=False)
     terminal_completion_owner: asyncio.Task[object] | None = field(
         default=None,
@@ -261,9 +272,20 @@ class _CallEntry:
     drain_intent: bool = False
     session: object | None = field(default=None, repr=False)
     resources_released: bool = False
-    abort_target_clearers: list[
-        tuple[_AbortTarget, Callable[[_AbortTarget], None]]
-    ] = field(default_factory=list, repr=False)
+    routing: RoutingV1 | None = None
+    begin_snapshot: BeginCallSnapshotV1 | None = None
+    begin_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    begin_future: asyncio.Future[BeginCallSnapshotV1] | None = field(default=None, repr=False)
+    answered_at: datetime | None = None
+    transfer_facts: LocalCallLifecycleFacts | None = field(default=None, repr=False)
+    transfer_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    content_stop_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    transfer_future: asyncio.Future[str] | None = field(default=None, repr=False)
+    bridge_publication: VoiceOperationV1 | None = field(default=None, repr=False)
+    no_new_ai: bool = False
+    abort_target_clearers: list[tuple[_AbortTarget, Callable[[_AbortTarget], None]]] = field(
+        default_factory=list, repr=False
+    )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -283,12 +305,11 @@ class _AnsweredPlaceholder:
     call_session_id: str | None
     first_seen: float
     deadline: float
+    answered_at: datetime | None = None
     precommit_refcount: int = 1
     durable: bool = False
     linked_entry: _CallEntry | None = field(default=None, repr=False)
-    linked_abort_identity: _LinkedAbortIdentity | None = field(
-        default=None, repr=False
-    )
+    linked_abort_identity: _LinkedAbortIdentity | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -567,6 +588,8 @@ class CallConstructionGrant:
     stream_id: str = field(repr=False)
     started_at: datetime = field(repr=False)
     retention_until: datetime = field(repr=False)
+    routing: RoutingV1 | None = field(default=None, repr=False)
+    begin_snapshot: BeginCallSnapshotV1 | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -651,14 +674,14 @@ class _TerminalCapability:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class TerminalProposal:
-    status: Literal["closed", "failed"]
+    status: Literal["closing", "closed", "failed"]
     reason: str
     metric_class: Literal["closed", "failed", "drained"]
     cleanup_hangup: bool
 
     def __post_init__(self) -> None:
         if (
-            self.status not in {"closed", "failed"}
+            self.status not in {"closing", "closed", "failed"}
             or type(self.reason) is not str
             or not self.reason
             or self.metric_class not in {"closed", "failed", "drained"}
@@ -672,7 +695,7 @@ class TerminalProposal:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class TerminalAuthority:
-    status: Literal["closed", "failed"]
+    status: Literal["closing", "closed", "failed"]
     reason: str
     metric_class: Literal["closed", "failed", "drained"]
     cleanup_hangup: bool
@@ -755,9 +778,7 @@ class SynchronousUnauthenticatedGate:
                 self._in_use -= 1
 
 
-BackgroundTaskFactory = Callable[
-    [Coroutine[object, object, None], str], asyncio.Task[None]
-]
+BackgroundTaskFactory = Callable[[Coroutine[object, object, None], str], asyncio.Task[None]]
 
 
 class _ProcessCallIdAllocator:
@@ -784,13 +805,7 @@ class _ProcessCallIdAllocator:
         high48 = payload >> 74
         mid12 = (payload >> 62) & ((1 << 12) - 1)
         low62 = payload & ((1 << 62) - 1)
-        uuid_int = (
-            (high48 << 80)
-            | (4 << 76)
-            | (mid12 << 64)
-            | (0b10 << 62)
-            | low62
-        )
+        uuid_int = (high48 << 80) | (4 << 76) | (mid12 << 64) | (0b10 << 62) | low62
         return UUID(int=uuid_int)
 
 
@@ -881,11 +896,12 @@ class CallRegistry:
         candidate_run_id: UUID | None = None,
         candidate_consumed: bool = False,
         admission_expires_at: datetime | None = None,
-        qualification_observer: Callable[
-            [Literal["valid", "consumed", "expired"]], None
-        ]
+        qualification_observer: Callable[[Literal["valid", "consumed", "expired"]], None]
         | None = None,
         background_task_factory: BackgroundTaskFactory = _default_background_task_factory,
+        sparra: SparraManifestV1 | None = None,
+        called_did: str | None = None,
+        begin_call: Callable[[str, UUID, RoutingV1], Awaitable[BeginCallSnapshotV1]] | None = None,
     ) -> None:
         if (
             type(capacity) is not int
@@ -895,8 +911,7 @@ class CallRegistry:
             or type(retention_days) is not int
             or retention_days <= 0
             or not all(
-                isinstance(value, str) and value
-                for value in (tenant_id, agent_id, deployment_id)
+                isinstance(value, str) and value for value in (tenant_id, agent_id, deployment_id)
             )
             or not isinstance(stream_url, str)
             or not stream_url.startswith("wss://")
@@ -918,6 +933,13 @@ class CallRegistry:
         ):
             raise ValueError("call_registry_config_invalid")
         self._writer = writer
+        if sparra is not None and (
+            capacity != 1 or retention_days != 30 or called_did is None or begin_call is None
+        ):
+            raise ValueError("sparra_admission_config_invalid")
+        self._sparra = sparra
+        self._called_did = called_did
+        self._begin_call = begin_call
         self._call_control = call_control
         self._tenant_id = tenant_id
         self._agent_id = agent_id
@@ -930,16 +952,12 @@ class CallRegistry:
         self._utcnow = utcnow
         self._monotonic = monotonic
         self._token_factory = token_factory
-        self._call_id_allocator = _ProcessCallIdAllocator(
-            prefix_factory=prefix_factory
-        )
+        self._call_id_allocator = _ProcessCallIdAllocator(prefix_factory=prefix_factory)
         self._uuid_factory = uuid_factory
         self._candidate_run_id = candidate_run_id
         self._candidate_consumed = candidate_consumed
         self._admission_expires_at = (
-            None
-            if admission_expires_at is None
-            else admission_expires_at.astimezone(UTC)
+            None if admission_expires_at is None else admission_expires_at.astimezone(UTC)
         )
         self._qualification_observer = qualification_observer
         self._lock = asyncio.Lock()
@@ -999,7 +1017,7 @@ class CallRegistry:
         return value.astimezone(UTC)
 
     def _new_entry(
-        self, event: VerifiedWebhook, *, minted_monotonic: float
+        self, event: VerifiedWebhook, *, minted_monotonic: float, routing: RoutingV1 | None = None
     ) -> _CallEntry:
         if event.call_control_id is None:
             raise CallAdmissionRejected("call_event_invalid")
@@ -1024,7 +1042,9 @@ class CallRegistry:
             call_id=call_id,
             call_leg_id=event.call_leg_id,
             call_session_id=event.call_session_id,
-            initiated_at=self._require_aware(event.occurred_at),
+            initiated_at=routing.admitted_at
+            if routing is not None
+            else self._require_aware(event.occurred_at),
             created_at=created_at,
             expires_at=expires_at,
             token_deadline=float(minted_monotonic) + self._lease_ttl_seconds,
@@ -1034,7 +1054,561 @@ class CallRegistry:
             streaming=_ActionSlot(streaming_id),
             hangup_command_id=hangup_id,
             precommit_refcount=1,
+            routing=routing,
         )
+
+    def _validate_sparra_routing(self, event: VerifiedWebhook) -> RoutingV1:
+        try:
+            routing = RoutingV1(
+                schema_version=1,
+                direction="incoming",
+                connection_id=cast(str, event.connection_id),
+                to_e164=cast(str, event.to_e164),
+                from_e164=event.from_e164,
+                telnyx_call_control_id=cast(str, event.call_control_id),
+                telnyx_call_leg_id=event.call_leg_id,
+                telnyx_call_session_id=event.call_session_id,
+                admitted_at=event.occurred_at,
+            )
+        except ValueError:
+            raise CallAdmissionRejected("call_event_invalid") from None
+        if (
+            self._sparra is None
+            or event.connection_id != self._sparra.connection_id
+            or event.to_e164 != self._called_did
+            or event.direction != "incoming"
+            or not -30
+            <= (self._require_aware(self._utcnow()) - routing.admitted_at).total_seconds()
+            <= 300
+        ):
+            raise CallAdmissionRejected("call_event_invalid")
+        return routing
+
+    async def _ensure_begin_snapshot(self, control_id: str) -> BeginCallSnapshotV1:
+        async with self._lock:
+            entry = self._by_control.get(control_id)
+            if (
+                entry is None
+                or entry.routing is None
+                or entry.terminal_event is not None
+                or entry.drain_intent
+                or self._draining
+                or self._qualification_expired()
+                or float(self._monotonic()) >= entry.token_deadline
+                or not self._admission_fresh(entry)
+                or self._transfer_fenced(entry)
+            ):
+                raise CallAdmissionRejected("call_event_invalid")
+            if entry.begin_snapshot is not None:
+                return entry.begin_snapshot
+            if entry.begin_task is None:
+                entry.begin_future = asyncio.get_running_loop().create_future()
+                task = self._background_owner.start(
+                    self._begin_future_owned(entry, entry.begin_future), name="voice-begin-call"
+                )
+                if task is None:
+                    raise CallAdmissionRejected("owner_registration_failed")
+                entry.begin_task = task
+            begin_future = entry.begin_future
+        assert begin_future is not None
+        return await asyncio.shield(begin_future)
+
+    async def _begin_future_owned(
+        self, entry: _CallEntry, future: asyncio.Future[BeginCallSnapshotV1]
+    ) -> None:
+        try:
+            result = await self._begin_owned(entry)
+        except BaseException as error:
+            if not future.done():
+                future.set_exception(error)
+                future.exception()
+        else:
+            if not future.done():
+                future.set_result(result)
+
+    async def _begin_owned(self, entry: _CallEntry) -> BeginCallSnapshotV1:
+        assert self._begin_call is not None and entry.routing is not None
+        remaining = min(
+            entry.token_deadline - float(self._monotonic()),
+            300 - (self._require_aware(self._utcnow()) - entry.initiated_at).total_seconds(),
+        )
+        async with asyncio.timeout(max(0.0, remaining)):
+            try:
+                snapshot = await self._begin_call(self._deployment_id, entry.call_id, entry.routing)
+            except OperationSinkCommitAmbiguousError:
+                snapshot = await self._begin_call(self._deployment_id, entry.call_id, entry.routing)
+        if (
+            not isinstance(snapshot, BeginCallSnapshotV1)
+            or snapshot.call_id != entry.call_id
+            or snapshot.retention_until != entry.initiated_at + timedelta(days=30)
+        ):
+            raise CallAdmissionRejected("call_identity_conflict")
+        try:
+            await cast(Any, self._writer).bind_recording_policy(
+                snapshot, generation=entry.generation
+            )
+        except PersistenceError:
+            raise CallAdmissionRejected("call_identity_conflict") from None
+        # Company preference is pinned; native audio activation stays closed
+        # until disclosure, recording and retention qualification are complete.
+        if snapshot.recording_enabled:
+            # Exercise actual owned capacity/readiness before the immutable
+            # capability gate. A rejected ON admission must not retain copy authority.
+            try:
+                await cast(Any, self._writer).reserve_recording_audio(
+                    entry.call_id, generation=entry.generation
+                )
+            except PersistenceError:
+                pass
+            finally:
+                await cast(Any, self._writer).release_recording_audio(
+                    entry.call_id, generation=entry.generation
+                )
+            raise CallAdmissionRejected("sparra_recording_unqualified")
+        async with self._lock:
+            if (
+                self._by_control.get(entry.call_control_id) is not entry
+                or entry.terminal_event is not None
+                or entry.drain_intent
+                or self._draining
+                or self._qualification_expired()
+                or float(self._monotonic()) >= entry.token_deadline
+                or not self._admission_fresh(entry)
+            ):
+                raise CallAdmissionRejected("call_event_invalid")
+            entry.begin_snapshot = snapshot
+        return snapshot
+
+    def _admission_fresh(self, entry: _CallEntry) -> bool:
+        return (
+            -30 <= (self._require_aware(self._utcnow()) - entry.initiated_at).total_seconds() <= 300
+        )
+
+    def _qualified_destination(self, entry: _CallEntry) -> str | None:
+        if self._sparra is None or entry.begin_snapshot is None:
+            return None
+        if entry.call_session_id is None:
+            return None
+        destination = entry.begin_snapshot.transfer_destination
+        if (
+            destination is None
+            or destination != self._sparra.qualified_transfer_destination_e164
+            or destination in {self._called_did, self._sparra.original_forward_line_e164}
+        ):
+            return None
+        return destination
+
+    @staticmethod
+    def _transfer_fenced(entry: _CallEntry) -> bool:
+        return entry.transfer_facts is not None and entry.transfer_facts.transfer_fenced
+
+    async def _hangup_unfenced(self, control_id: str, *, command_id: UUID) -> CallControlResult:
+        if self._sparra is None:
+            return await self._call_control.hangup(control_id, command_id=command_id)
+        async with self._lock:
+            entry = self._by_control.get(control_id)
+            if entry is not None:
+                if self._transfer_fenced(entry):
+                    return CallControlResult("accepted")
+                entry.cleanup_hangup_started = True
+        return await self._call_control.hangup(control_id, command_id=command_id)
+
+    async def restore_transfer_fence(self, stale: Any) -> None:
+        facts = stale.lifecycle
+        if (
+            facts is None
+            or not facts.transfer_fenced
+            or (facts.admission_generation is None and facts.transfer_generation is None
+                and facts.content_departed_generation is None)
+        ):
+            raise RuntimeError("transfer_recovery_facts_invalid")
+        async with self._lock:
+            if self._permits_used >= self._capacity:
+                raise RuntimeError("transfer_recovery_capacity_conflict")
+            entry = _CallEntry(
+                generation=(facts.admission_generation or facts.transfer_generation
+                            or facts.content_departed_generation),
+                call_control_id=stale.call_control_id,
+                call_id=stale.call_id,
+                call_leg_id=facts.telnyx_call_leg_id,
+                call_session_id=facts.telnyx_call_session_id,
+                initiated_at=facts.admitted_at,
+                created_at=stale.created_at,
+                expires_at=stale.expires_at,
+                token_deadline=0.0,
+                token_digest=stale.token_hash,
+                raw_token=None,
+                answer=_ActionSlot(uuid4()),
+                streaming=_ActionSlot(uuid4()),
+                hangup_command_id=uuid4(),
+                durable=True,
+                lease_state="active",
+                answered_at=facts.started_at,
+                transfer_facts=facts,
+                answer_evidence=facts.started_at is not None,
+                no_new_ai=True,
+                attached=True,
+            )
+            self._by_control[entry.call_control_id] = entry
+            self._by_call_id[entry.call_id] = entry
+            self._permits_used += 1
+
+    async def human_tool_available(self, generation: CallGenerationHandle) -> bool:
+        async with self._lock:
+            entry = self._by_control.get(generation.call_control_id)
+            return (
+                entry is not None
+                and entry.generation == generation.generation
+                and self._qualified_destination(entry) is not None
+            )
+
+    async def stop_call_content(self, call_id: UUID, *, delete_content: bool = True) -> None:
+        """Revoke AI content while keeping actual telephone capacity/correlation."""
+        async with self._lock:
+            entry = self._by_call_id.get(call_id)
+            if entry is None or entry.lease_state == "terminal":
+                return
+            entry.no_new_ai = True
+            entry.drain_intent = True
+            stop = getattr(entry.session, "stop_new_ai", None)
+            if stop is not None:
+                stop()
+            facts = entry.transfer_facts or LocalCallLifecycleFacts(
+                entry.call_id, entry.initiated_at, entry.initiated_at + timedelta(days=30),
+                entry.call_leg_id, entry.call_session_id,
+            )
+            entry.transfer_facts = replace(
+                facts,
+                content_departed_generation=entry.generation,
+                local_closing_at=facts.local_closing_at or self._require_aware(self._utcnow()),
+            )
+            if entry.content_stop_task is None:
+                entry.content_stop_task = self._background_owner.start(
+                    self._stop_call_content_owned(entry), name="voice-call-content-stop"
+                )
+                if entry.content_stop_task is None:
+                    raise RuntimeError("content_stop_owner_closed")
+            task = entry.content_stop_task
+        cancellation = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        await task
+        if delete_content:
+            await cast(Any, self._writer).erase_call_content(
+                entry.call_id, now=self._require_aware(self._utcnow()), generation=entry.generation
+            )
+        if cancellation is not None:
+            raise cancellation
+
+    async def _stop_call_content_owned(self, entry: _CallEntry) -> None:
+        async with self._lock:
+            owner = entry.lifecycle_owner
+            tasks = tuple(
+                dict.fromkeys(
+                    task
+                    for task in (
+                        entry.begin_task,
+                        entry.answer.owner_task,
+                        entry.streaming.owner_task,
+                    )
+                    if task is not None and task is not asyncio.current_task()
+                )
+            )
+        try:
+            await cast(Any, self._writer).mark_call_departed(
+                entry.call_id, now=self._require_aware(self._utcnow())
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Even a persistence failure must close the already-revoked AI resources.
+            if owner is not None and self._valid_session_owner(owner):
+                cast(_SessionLifecycleOwner, owner).request_drain("content_erased")
+                await cast(_SessionLifecycleOwner, owner).wait()
+            async with self._lock:
+                self._clear_content_holders_locked(entry, clear_cached_content=True)
+
+    @staticmethod
+    def _clear_content_holders_locked(
+        entry: _CallEntry, *, clear_cached_content: bool = False
+    ) -> None:
+        if clear_cached_content:
+            entry.bridge_publication = None
+            if (
+                entry.transfer_facts is not None
+                and entry.transfer_facts.disclosure_evidence is not None
+            ):
+                entry.transfer_facts = replace(entry.transfer_facts, disclosure_evidence=None)
+        entry.begin_snapshot = None
+        entry.routing = None
+        entry.begin_future = None
+        entry.begin_task = None
+        entry.construction_grant = None
+        entry.terminal_capability = None
+        entry.claim = None
+        entry.raw_token = None
+        entry.session = None
+        entry.lifecycle_owner = None
+        entry.lifecycle_owner_task = None
+
+    async def request_human(self, generation: CallGenerationHandle) -> str:
+        async with self._lock:
+            entry = self._by_control.get(generation.call_control_id)
+            if (
+                entry is None
+                or entry.generation != generation.generation
+                or entry.cleanup_hangup_started
+                or entry.terminal_authority is not None
+                or entry.terminal_event is not None
+                or self._draining
+            ):
+                return "unavailable_collect_message"
+            destination = self._qualified_destination(entry)
+            if destination is None:
+                return "unavailable_collect_message"
+            if entry.transfer_task is None:
+                stop_result = getattr(entry.session, "stop_result_inference", None)
+                if stop_result is not None:
+                    stop_result()
+                assert entry.routing is not None
+                command_id = uuid4()
+                correlation = base64.b64encode(uuid4().bytes + command_id.bytes).decode("ascii")
+                # Reservation precedes the first writer await; terminal cleanup observes this fence.
+                entry.transfer_facts = LocalCallLifecycleFacts(
+                    entry.call_id,
+                    entry.initiated_at,
+                    entry.initiated_at + timedelta(days=30),
+                    entry.call_leg_id,
+                    entry.call_session_id,
+                    transfer_command_id=command_id,
+                    transfer_correlation=correlation,
+                    transfer_generation=entry.generation,
+                    transfer_connection_sha256=hashlib.sha256(
+                        entry.routing.connection_id.encode()
+                    ).hexdigest(),
+                    transfer_destination_sha256=hashlib.sha256(destination.encode()).hexdigest(),
+                )
+                entry.transfer_future = asyncio.get_running_loop().create_future()
+                task = self._background_owner.start(
+                    self._transfer_future_owned(entry, destination, entry.transfer_future),
+                    name="voice-qualified-transfer",
+                )
+                if task is None:
+                    entry.transfer_facts = None
+                    return "unavailable_collect_message"
+                entry.transfer_task = task
+            transfer_future = entry.transfer_future
+        assert transfer_future is not None
+        return await asyncio.shield(transfer_future)
+
+    async def _transfer_future_owned(
+        self, entry: _CallEntry, destination: str, future: asyncio.Future[str]
+    ) -> None:
+        try:
+            result = await self._transfer_owned(entry, destination)
+        except BaseException as error:
+            if not future.done():
+                future.set_exception(error)
+                future.exception()
+        else:
+            if not future.done():
+                future.set_result(result)
+
+    async def _transfer_owned(self, entry: _CallEntry, destination: str) -> str:
+        facts = entry.transfer_facts
+        assert facts is not None and facts.transfer_command_id is not None
+        assert facts.transfer_correlation is not None
+        await cast(Any, self._writer).commit_transfer_intent(facts)
+        async with self._lock:
+            if (
+                self._by_control.get(entry.call_control_id) is not entry
+                or entry.transfer_facts is not facts
+                or entry.terminal_event == "call.hangup"
+                or not getattr(self._call_control, "dispatch_available", True)
+            ):
+                return "unavailable_collect_message"
+        # A durable pending intent fences cleanup even after local failure/drain.
+        try:
+            result = await cast(Any, self._call_control).transfer(
+                entry.call_control_id,
+                TransferRequestV1(
+                    to_e164=destination, target_leg_client_state=facts.transfer_correlation
+                ),
+                command_id=facts.transfer_command_id,
+            )
+        except Exception:
+            return "outcome_unknown"
+        observed = entry.transfer_facts
+        if entry.no_new_ai:
+            return (
+                "qualified_line_connected"
+                if observed is not None and observed.qualified_line_bridged_at is not None
+                else "outcome_unknown"
+            )
+        if observed is not None and observed.transfer_failed_at is not None:
+            return f"{observed.transfer_failure_cause or 'target_hangup'}_collect_message"
+        return "ringing" if result.outcome == "accepted" else "outcome_unknown"
+
+    async def _resolve_transfer_event(self, event: VerifiedWebhook) -> ResolvedWebhook | None:
+        from projetv0_voice.telnyx.webhooks import ResolvedWebhook
+
+        if self._sparra is None or event.event_type not in {
+            "call.initiated",
+            "call.answered",
+            "call.bridged",
+            "call.hangup",
+        }:
+            return None
+        entry: _CallEntry | None = None
+        session: object | None = None
+        async with self._lock:
+            for candidate in self._by_control.values():
+                facts = candidate.transfer_facts
+                if (
+                    facts is None
+                    or not facts.transfer_fenced
+                    or event.call_control_id == candidate.call_control_id
+                ):
+                    continue
+                token = (
+                    None if event.client_state is None else event.client_state.get_secret_value()
+                )
+                if (
+                    token != facts.transfer_correlation
+                    or event.call_session_id != candidate.call_session_id
+                    or event.connection_id is None
+                    or event.to_e164 is None
+                    or hashlib.sha256(event.connection_id.encode()).hexdigest()
+                    != facts.transfer_connection_sha256
+                    or hashlib.sha256(event.to_e164.encode()).hexdigest()
+                    != facts.transfer_destination_sha256
+                ):
+                    continue
+                if facts.target_call_control_id is None:
+                    if (
+                        event.event_type != "call.initiated"
+                        or event.direction != "outgoing"
+                        or event.call_leg_id is None
+                    ):
+                        return ResolvedWebhook(None)
+                    facts = replace(
+                        facts,
+                        target_call_control_id=event.call_control_id,
+                        target_call_leg_id=event.call_leg_id,
+                    )
+                elif (
+                    event.call_control_id != facts.target_call_control_id
+                    or event.call_leg_id != facts.target_call_leg_id
+                ):
+                    return ResolvedWebhook(None)
+                if event.event_type == "call.bridged":
+                    if facts.qualified_line_bridged_at is None:
+                        facts = replace(facts, qualified_line_bridged_at=event.occurred_at)
+                    candidate.no_new_ai = True
+                    session = candidate.session
+                    stop = getattr(session, "stop_new_ai", None)
+                    if callable(stop):
+                        stop()
+                elif event.event_type == "call.hangup" and facts.qualified_line_bridged_at is None:
+                    cause = (
+                        event.hangup_cause
+                        if event.hangup_cause
+                        in {"user_busy", "no_answer", "timeout", "call_rejected"}
+                        else "target_hangup"
+                    )
+                    facts = replace(
+                        facts, transfer_failed_at=event.occurred_at, transfer_failure_cause=cause
+                    )
+                    if (
+                        candidate.terminal_authority is not None
+                        and candidate.terminal_authority.status == "closing"
+                    ):
+                        facts = replace(
+                            facts, local_closing_at=candidate.terminal_authority._closed_at
+                        )
+                candidate.transfer_facts = facts
+                entry = candidate
+                break
+        if entry is None:
+            if event.direction == "outgoing" or event.event_type == "call.bridged":
+                return ResolvedWebhook(None)
+            return None
+        operation = None
+        assert facts is not None
+        if session is not None:
+            await cast(Any, session).request_drain("qualified_line_connected")
+        if facts.qualified_line_bridged_at is not None:
+            bridged_at = facts.qualified_line_bridged_at
+            lifecycle = await cast(Any, self._writer).read_call_lifecycle(entry.call_id)
+            async with self._lock:
+                started = lifecycle.started_at if lifecycle is not None else None
+                started = started or entry.answered_at or entry.claimed_at
+                if started is None:
+                    raise CallAdmissionRejected("call_identity_conflict")
+                # A writer read/drain can cross explicit content stop. Recheck the
+                # registered entry under its lock before retaining any payload.
+                facts = entry.transfer_facts or facts
+                content_stopped = (
+                    entry.content_stop_task is not None
+                    or facts.content_erased
+                    or lifecycle is not None and lifecycle.content_erased
+                )
+                if content_stopped:
+                    entry.bridge_publication = None
+                    facts = replace(facts, disclosure_evidence=None)
+                if (
+                    not content_stopped
+                    and lifecycle is not None
+                    and lifecycle.bridge_operation_id is None
+                    and facts.bridge_operation_id is None
+                ):
+                    operation = entry.bridge_publication or VoiceOperationV1(
+                        schema_version=1,
+                        operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
+                        deployment_id=self._deployment_id,
+                        call_id=entry.call_id,
+                        occurred_at=bridged_at,
+                        kind="call.upsert",
+                        payload=CallUpsertPayloadV1(
+                            telnyx_call_control_id=entry.call_control_id,
+                            telnyx_call_leg_id=entry.call_leg_id,
+                            telnyx_call_session_id=entry.call_session_id,
+                            status="closing",
+                            disclosure_state="completed"
+                            if lifecycle is not None
+                            and lifecycle.disclosure_evidence is not None
+                            and lifecycle.disclosure_evidence.completed_at is not None
+                            else "pending",
+                            started_at=started,
+                            ended_at=None,
+                            end_reason="qualified_line_connected",
+                            retention_until=entry.initiated_at + timedelta(days=30),
+                            **(
+                                cast(
+                                    Any,
+                                    (
+                                        {"disclosure_evidence": lifecycle.disclosure_evidence}
+                                        if lifecycle is not None
+                                        and lifecycle.disclosure_evidence is not None
+                                        else {}
+                                    ),
+                                )
+                            ),
+                        ),
+                    )
+                    entry.bridge_publication = operation
+                    facts = replace(facts, bridge_operation_id=operation.operation_id)
+                elif lifecycle is not None and lifecycle.bridge_operation_id is not None:
+                    facts = replace(facts, bridge_operation_id=lifecycle.bridge_operation_id)
+                entry.transfer_facts = facts
+        await cast(Any, self._writer).commit_transfer_observation(facts, operation)
+        return ResolvedWebhook(None)
 
     def _pending_effect(self, entry: _CallEntry) -> WebhookDurableEffect:
         from projetv0_voice.telnyx.webhooks import WebhookDurableEffect
@@ -1070,11 +1644,21 @@ class CallRegistry:
                 retention_until=entry.initiated_at + timedelta(days=self._retention_days),
             ),
         )
-        return WebhookDurableEffect(lease=lease, operation=operation)
+        facts = (
+            None
+            if entry.routing is None
+            else LocalCallAdmissionFacts(
+                entry.call_id,
+                entry.initiated_at,
+                entry.initiated_at + timedelta(days=30),
+                entry.call_leg_id,
+                entry.call_session_id,
+                admission_generation=entry.generation,
+            )
+        )
+        return WebhookDurableEffect(lease=lease, operation=operation, admission_facts=facts)
 
-    def _terminal_effect(
-        self, entry: _CallEntry, event: VerifiedWebhook
-    ) -> WebhookDurableEffect:
+    def _terminal_effect(self, entry: _CallEntry, event: VerifiedWebhook) -> WebhookDurableEffect:
         from projetv0_voice.telnyx.webhooks import WebhookDurableEffect
 
         closed_at = self._require_aware(event.occurred_at)
@@ -1090,7 +1674,12 @@ class CallRegistry:
             "expires_at": entry.expires_at,
             "closed_at": closed_at,
         }
-        answered = entry.answer_evidence
+        if (
+            entry.routing is not None or entry.transfer_facts is not None
+        ) and closed_at >= entry.initiated_at + self._retention_delta:
+            return WebhookDurableEffect(lease=lease)
+        actual_start = entry.answered_at or entry.claimed_at
+        answered = actual_start is not None
         operation = VoiceOperationV1(
             schema_version=1,
             operation_id=uuid5(entry.call_id, event.event_id),
@@ -1104,10 +1693,10 @@ class CallRegistry:
                 telnyx_call_session_id=entry.call_session_id,
                 status="closed" if answered else "failed",
                 disclosure_state="failed",
-                started_at=entry.initiated_at if answered else None,
+                started_at=actual_start,
                 ended_at=closed_at,
                 end_reason="telnyx_hangup",
-                retention_until=closed_at + timedelta(days=self._retention_days),
+                retention_until=entry.initiated_at + timedelta(days=self._retention_days),
             ),
         )
         return WebhookDurableEffect(lease=lease, operation=operation)
@@ -1115,7 +1704,15 @@ class CallRegistry:
     async def resolve_webhook(self, event: VerifiedWebhook) -> ResolvedWebhook:
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
 
-        if event.event_type in {"call.initiated", "call.answered", "call.hangup"}:
+        target = await self._resolve_transfer_event(event)
+        if target is not None:
+            return target
+        routing = (
+            self._validate_sparra_routing(event)
+            if event.event_type == "call.initiated" and self._sparra is not None
+            else None
+        )
+        if event.event_type in {"call.initiated", "call.answered"}:
             async with self._lock:
                 if self._draining:
                     raise CallAdmissionRejected("call_draining")
@@ -1137,9 +1734,21 @@ class CallRegistry:
             if existing is not None:
                 if (
                     existing.terminal_event is not None
+                    or self._transfer_fenced(existing)
                     or existing.call_leg_id != event.call_leg_id
                     or existing.call_session_id != event.call_session_id
-                    or existing.initiated_at != event.occurred_at.astimezone(UTC)
+                    or existing.initiated_at
+                    != (
+                        routing.admitted_at
+                        if routing is not None
+                        else event.occurred_at.astimezone(UTC)
+                    )
+                    or existing.routing is not None
+                    and (
+                        existing.routing.connection_id != event.connection_id
+                        or existing.routing.to_e164 != event.to_e164
+                        or existing.routing.from_e164 != event.from_e164
+                    )
                 ):
                     raise CallAdmissionRejected("call_identity_conflict")
                 existing.precommit_refcount += 1
@@ -1166,10 +1775,11 @@ class CallRegistry:
                         self._answered_placeholders.pop(event.call_control_id, None)
                     placeholder.linked_entry = None
                     placeholder = None
-                entry = self._new_entry(event, minted_monotonic=now)
+                entry = self._new_entry(event, minted_monotonic=now, routing=routing)
                 if placeholder is not None:
                     if placeholder.durable:
                         entry.answer_evidence = True
+                        entry.answered_at = placeholder.answered_at
                         entry.answer.state = "accepted"
                         if placeholder.precommit_refcount == 0:
                             self._answered_placeholders.pop(event.call_control_id, None)
@@ -1191,6 +1801,10 @@ class CallRegistry:
 
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
 
+        transfer = await self._resolve_transfer_event(event)
+        if transfer is not None:
+            return transfer
+
         async with self._lock:
             if self._draining:
                 raise CallAdmissionRejected("call_draining")
@@ -1205,10 +1819,7 @@ class CallRegistry:
         async with self._lock:
             entry = self._by_control.get(event.call_control_id)
             if entry is not None:
-                if (
-                    event.event_type == "call.hangup"
-                    and not self._session_owner_registration_open
-                ):
+                if event.event_type == "call.hangup" and not self._session_owner_registration_open:
                     return ResolvedWebhook(None)
                 if (
                     entry.call_leg_id != event.call_leg_id
@@ -1247,16 +1858,12 @@ class CallRegistry:
                     entry,
                     event.event_type,
                     terminal_occurred_at=(
-                        event.occurred_at
-                        if event.event_type == "call.hangup"
-                        else None
+                        event.occurred_at if event.event_type == "call.hangup" else None
                     ),
                 ),
             )
         if placeholder is not None:
-            return ResolvedWebhook(
-                None, await self._register_placeholder_reservation(placeholder)
-            )
+            return ResolvedWebhook(None, await self._register_placeholder_reservation(placeholder))
         return ResolvedWebhook(None)
 
     async def _resolve_answered(self, event: VerifiedWebhook) -> ResolvedWebhook:
@@ -1299,6 +1906,7 @@ class CallRegistry:
                     call_session_id=event.call_session_id,
                     first_seen=first_seen,
                     deadline=first_seen + self._lease_ttl_seconds,
+                    answered_at=event.occurred_at.astimezone(UTC),
                 )
                 self._answered_placeholders[event.call_control_id] = placeholder
         if call_entry is not None:
@@ -1307,9 +1915,7 @@ class CallRegistry:
             )
         if placeholder is None:
             raise RuntimeError("placeholder_resolution_failed")
-        return ResolvedWebhook(
-            None, await self._register_placeholder_reservation(placeholder)
-        )
+        return ResolvedWebhook(None, await self._register_placeholder_reservation(placeholder))
 
     async def _resolve_hangup(self, event: VerifiedWebhook) -> ResolvedWebhook:
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
@@ -1318,13 +1924,13 @@ class CallRegistry:
             raise CallAdmissionRejected("call_event_invalid")
         entry: _CallEntry | None
         async with self._lock:
-            if self._qualification_expired():
-                raise CallAdmissionRejected("qualification_window_expired")
             entry = self._by_control.get(event.call_control_id)
             if (
                 entry is None
                 or entry.terminal_event is not None
+                and not self._transfer_fenced(entry)
                 or not self._session_owner_registration_open
+                and not self._transfer_fenced(entry)
             ):
                 return ResolvedWebhook(None)
             if (
@@ -1341,7 +1947,37 @@ class CallRegistry:
             event.event_type,
             terminal_occurred_at=event.occurred_at,
         )
-        return ResolvedWebhook(self._terminal_effect(entry, event), reservation)
+        effect = self._terminal_effect(entry, event)
+        if entry.routing is not None or entry.transfer_facts is not None:
+            facts = await cast(Any, self._writer).read_call_lifecycle(entry.call_id)
+            if facts is not None and effect.operation is not None:
+                payload = cast(CallUpsertPayloadV1, effect.operation.payload)
+                starts = [
+                    value
+                    for value in (facts.started_at, entry.answered_at, entry.claimed_at)
+                    if value is not None
+                ]
+                started = min(starts) if starts else None
+                payload = payload.model_copy(
+                    update={
+                        "started_at": started,
+                        "status": "closed" if started is not None else "failed",
+                        "disclosure_state": "completed"
+                        if facts.disclosure_evidence is not None
+                        and facts.disclosure_evidence.completed_at is not None
+                        else "failed",
+                        **(
+                            {"disclosure_evidence": facts.disclosure_evidence}
+                            if facts.disclosure_evidence is not None
+                            else {}
+                        ),
+                    }
+                )
+                effect = effect.__class__(
+                    lease=effect.lease,
+                    operation=effect.operation.model_copy(update={"payload": payload}),
+                )
+        return ResolvedWebhook(effect, reservation)
 
     async def _register_call_reservation(
         self,
@@ -1434,9 +2070,11 @@ class CallRegistry:
                     entry.terminal_pending_count -= 1
                 if (
                     isinstance(result, WebhookCommitResult)
-                    and result.effect
-                    in {"applied", "duplicate", "existing_terminal"}
-                    and entry.terminal_authority is None
+                    and result.effect in {"applied", "duplicate", "existing_terminal"}
+                    and (
+                        entry.terminal_authority is None
+                        or entry.terminal_authority.status == "closing"
+                    )
                 ):
                     completion_owner = asyncio.current_task()
                     if completion_owner is None:
@@ -1447,24 +2085,18 @@ class CallRegistry:
                     authority = TerminalAuthority(
                         status="closed" if entry.answer_evidence else "failed",
                         reason="telnyx_hangup",
-                        metric_class=(
-                            "closed" if entry.answer_evidence else "failed"
-                        ),
+                        metric_class=("closed" if entry.answer_evidence else "failed"),
                         cleanup_hangup=False,
                         persist_call=False,
                         persist_lease=False,
                         completion_token=self._uuid_factory(),
                         _entry=entry,
                         _generation=entry.generation,
-                        _completion_owner=cast(
-                            asyncio.Task[object], completion_owner
-                        ),
+                        _completion_owner=cast(asyncio.Task[object], completion_owner),
                         _closed_at=closed_at,
                     )
                     entry.terminal_authority = authority
-                    entry.terminal_completion_owner = cast(
-                        asyncio.Task[object], completion_owner
-                    )
+                    entry.terminal_completion_owner = cast(asyncio.Task[object], completion_owner)
                     entry.terminal_state = "reserved"
                     entry.terminal_event = "call.hangup"
                     entry.lease_state = "terminal"
@@ -1481,25 +2113,23 @@ class CallRegistry:
                             slot.state = "unknown"
                             slot.disposition = 200
                         if slot.completion is not None and not slot.completion.done():
-                            slot.completion.set_result(
-                                WebhookDisposition(slot.disposition)
-                            )
-                        if (
-                            slot.owner_task is not None
-                            and slot.owner_task is not current_task
-                        ):
+                            slot.completion.set_result(WebhookDisposition(slot.disposition))
+                        if slot.owner_task is not None and slot.owner_task is not current_task:
                             action_owners.append(slot.owner_task)
                     terminal_action_owners = tuple(dict.fromkeys(action_owners))
                 if entry.terminal_pending_count == 0:
                     if entry.terminal_authority is None:
                         entry.terminal_state = "open"
                     entry.terminal_settled_event.set()
-            if reservation._event_type == "call.initiated" and isinstance(
-                result, WebhookCommitResult
-            ) and (
-                result.receipt,
-                result.effect,
-            ) == ("first", "applied"):
+            if (
+                reservation._event_type == "call.initiated"
+                and isinstance(result, WebhookCommitResult)
+                and (
+                    result.receipt,
+                    result.effect,
+                )
+                == ("first", "applied")
+            ):
                 entry.durable = True
                 entry.lease_state = "pending"
                 if self._candidate_run_id is not None and not self._candidate_consumed:
@@ -1538,9 +2168,7 @@ class CallRegistry:
             if reservation._registry_applied:
                 return None
             placeholder = reservation._placeholder
-            mapped_placeholder = self._answered_placeholders.get(
-                placeholder.call_control_id
-            )
+            mapped_placeholder = self._answered_placeholders.get(placeholder.call_control_id)
             is_live_placeholder = mapped_placeholder is placeholder
             if placeholder.precommit_refcount > 0:
                 placeholder.precommit_refcount -= 1
@@ -1550,10 +2178,7 @@ class CallRegistry:
             ) == ("first", "applied"):
                 now = float(self._monotonic())
                 if is_live_placeholder and now >= placeholder.deadline:
-                    if (
-                        self._answered_placeholders.get(placeholder.call_control_id)
-                        is placeholder
-                    ):
+                    if self._answered_placeholders.get(placeholder.call_control_id) is placeholder:
                         self._answered_placeholders.pop(placeholder.call_control_id, None)
                     placeholder.linked_entry = None
                     is_live_placeholder = False
@@ -1568,6 +2193,7 @@ class CallRegistry:
                         and linked.terminal_event is None
                     ):
                         linked.answer_evidence = True
+                        linked.answered_at = placeholder.answered_at
                         linked.answer.state = "accepted"
                         linked.answer.disposition = 200
                         completion = linked.answer.completion
@@ -1577,13 +2203,8 @@ class CallRegistry:
                     or placeholder.linked_entry is not None
                     or not is_live_placeholder
                 ):
-                    if (
-                        self._answered_placeholders.get(placeholder.call_control_id)
-                        is placeholder
-                    ):
-                        self._answered_placeholders.pop(
-                            placeholder.call_control_id, None
-                        )
+                    if self._answered_placeholders.get(placeholder.call_control_id) is placeholder:
+                        self._answered_placeholders.pop(placeholder.call_control_id, None)
                     placeholder.linked_entry = None
                 placeholder.linked_abort_identity = None
             if (
@@ -1591,13 +2212,10 @@ class CallRegistry:
                 and isinstance(result, WebhookCommitResult)
                 and (result.receipt, result.effect) == ("first", "applied")
             ):
-                current = self._by_control.get(
-                    linked_abort_identity.call_control_id
-                )
+                current = self._by_control.get(linked_abort_identity.call_control_id)
                 if (
                     current is not None
-                    and current.call_control_id
-                    == linked_abort_identity.call_control_id
+                    and current.call_control_id == linked_abort_identity.call_control_id
                     and current.generation == linked_abort_identity.generation
                     and current.terminal_event is None
                     and hmac.compare_digest(
@@ -1663,6 +2281,7 @@ class CallRegistry:
                 ):
                     return WebhookDisposition(200)
                 entry.answer_evidence = True
+                entry.answered_at = event.occurred_at.astimezone(UTC)
                 entry.answer.state = "accepted"
                 entry.answer.disposition = 200
                 completion = entry.answer.completion
@@ -1679,6 +2298,9 @@ class CallRegistry:
             )
             return WebhookDisposition(200)
         if event.event_type != "call.initiated":
+            return WebhookDisposition(200)
+        if not isinstance(reservation, CallReservation):
+            # A committed transfer-target observation owns no original AI admission.
             return WebhookDisposition(200)
         async with self._lock:
             entry = self._by_control.get(event.call_control_id)
@@ -1718,9 +2340,7 @@ class CallRegistry:
             await reservation.confirm(result)
         elif isinstance(reservation, _PlaceholderReservation):
             async with self._lock:
-                linked_abort_identity = (
-                    reservation._placeholder.linked_abort_identity
-                )
+                linked_abort_identity = reservation._placeholder.linked_abort_identity
             linked_abort_target = await reservation.confirm_fail_closed(
                 result,
                 linked_abort_identity=linked_abort_identity,
@@ -1739,18 +2359,18 @@ class CallRegistry:
                     reservation._entry,
                     reservation._generation,
                 )
-        elif (
-            isinstance(reservation, _PlaceholderReservation)
-            and linked_abort_identity is not None
-        ):
+        elif isinstance(reservation, _PlaceholderReservation) and linked_abort_identity is not None:
             identity = linked_abort_identity
-            generation = CallGenerationHandle(
-                identity.call_control_id, identity.generation
-            )
-            if isinstance(result, WebhookCommitResult) and (
-                result.receipt,
-                result.effect,
-            ) == ("first", "applied") and linked_abort_target is not None:
+            generation = CallGenerationHandle(identity.call_control_id, identity.generation)
+            if (
+                isinstance(result, WebhookCommitResult)
+                and (
+                    result.receipt,
+                    result.effect,
+                )
+                == ("first", "applied")
+                and linked_abort_target is not None
+            ):
                 abort_scheduled = self._schedule_abort_target(
                     linked_abort_target,
                     name="voice-fail-closed-lease-abort",
@@ -1771,6 +2391,14 @@ class CallRegistry:
     ) -> WebhookDisposition:
         from projetv0_voice.telnyx.webhooks import WebhookDisposition
 
+        if self._sparra is not None:
+            try:
+                await self._ensure_begin_snapshot(call_control_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return WebhookDisposition(503, admission_rejection="invalid")
+
         owner = False
         completion: asyncio.Future[WebhookDisposition] | None = None
         command_id: UUID | None = None
@@ -1785,7 +2413,12 @@ class CallRegistry:
             if self._qualification_expired():
                 return WebhookDisposition(503)
             entry = self._by_control.get(call_control_id)
-            if entry is None or entry.terminal_event is not None or not entry.durable:
+            if (
+                entry is None
+                or entry.terminal_event is not None
+                or not entry.durable
+                or (self._transfer_fenced(entry))
+            ):
                 return WebhookDisposition(200)
             now = float(self._monotonic())
             if now >= entry.token_deadline and not (
@@ -1880,9 +2513,7 @@ class CallRegistry:
                 if slot.owner_task is asyncio.current_task():
                     slot.owner_task = None
                 positive_evidence = (
-                    current.answer_evidence
-                    if action == "answer"
-                    else current.streaming_evidence
+                    current.answer_evidence if action == "answer" else current.streaming_evidence
                 )
                 now = float(self._monotonic())
                 if current.terminal_event is not None:
@@ -1965,7 +2596,7 @@ class CallRegistry:
     ) -> _TerminalWork | None:
         from projetv0_voice.telnyx.webhooks import WebhookDisposition
 
-        if entry.terminal_event is not None:
+        if self._transfer_fenced(entry) or entry.terminal_event is not None:
             return None
         entry.terminal_event = reason
         entry.lease_state = "terminal"
@@ -2045,7 +2676,7 @@ class CallRegistry:
         if work.cleanup_hangup:
             while True:
                 try:
-                    await self._call_control.hangup(
+                    await self._hangup_unfenced(
                         entry.call_control_id,
                         command_id=entry.hangup_command_id,
                     )
@@ -2064,15 +2695,15 @@ class CallRegistry:
                 continue
 
     async def complete_terminal_cleanup(self, generation: CallGenerationHandle) -> bool:
-        abort_target_clearers: tuple[
-            tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...
-        ] = ()
+        abort_target_clearers: tuple[tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...] = ()
         async with self._lock:
             entry = self._by_control.get(generation.call_control_id)
             if (
                 entry is None
                 or entry.generation != generation.generation
                 or entry.terminal_event is None
+                or self._transfer_fenced(entry)
+                and entry.terminal_event != "call.hangup"
             ):
                 return False
             if not entry.capacity_released:
@@ -2319,9 +2950,7 @@ class CallRegistry:
 
     async def _close_session_owner_registration_core(self) -> None:
         authorities: list[TerminalAuthority] = []
-        provider_authorities: list[
-            tuple[TerminalAuthority, _CallEntry, UUID, asyncio.Event]
-        ] = []
+        provider_authorities: list[tuple[TerminalAuthority, _CallEntry, UUID, asyncio.Event]] = []
         owners: list[tuple[_SessionLifecycleOwner, str]] = []
         cancellation: asyncio.CancelledError | None = None
         failure: BaseException | None = None
@@ -2352,6 +2981,8 @@ class CallRegistry:
                     if completion_owner is None:
                         raise RuntimeError("terminal_owner_unavailable") from None
                     for entry in tuple(self._by_control.values()):
+                        if self._transfer_fenced(entry):
+                            continue
                         authority = entry.terminal_authority
                         if (
                             authority is not None
@@ -2371,9 +3002,8 @@ class CallRegistry:
                                     entry.terminal_completion_event,
                                 )
                             )
-                            if (
-                                entry.lifecycle_owner is not None
-                                and self._valid_session_owner(entry.lifecycle_owner)
+                            if entry.lifecycle_owner is not None and self._valid_session_owner(
+                                entry.lifecycle_owner
                             ):
                                 entry.drain_intent = True
                                 owners.append(
@@ -2403,9 +3033,7 @@ class CallRegistry:
                                 completion_token=self._uuid_factory(),
                                 _entry=entry,
                                 _generation=entry.generation,
-                                _completion_owner=cast(
-                                    asyncio.Task[object], completion_owner
-                                ),
+                                _completion_owner=cast(asyncio.Task[object], completion_owner),
                                 _closed_at=self._require_aware(self._utcnow()),
                             )
                             entry.terminal_authority = authority
@@ -2421,9 +3049,8 @@ class CallRegistry:
                             entry.terminal_settled_event.set()
                             authorities.append(authority)
                             continue
-                        if (
-                            entry.lifecycle_owner is not None
-                            and self._valid_session_owner(entry.lifecycle_owner)
+                        if entry.lifecycle_owner is not None and self._valid_session_owner(
+                            entry.lifecycle_owner
                         ):
                             entry.drain_intent = True
                             owners.append(
@@ -2476,9 +3103,7 @@ class CallRegistry:
                             cancellation = error
         for authority in authorities:
             try:
-                persistence_cancellation = await self._persist_authority_call(
-                    authority
-                )
+                persistence_cancellation = await self._persist_authority_call(authority)
                 if cancellation is None and persistence_cancellation is not None:
                     cancellation = persistence_cancellation
             except asyncio.CancelledError as error:
@@ -2507,7 +3132,13 @@ class CallRegistry:
         authority: TerminalAuthority,
     ) -> asyncio.CancelledError | None:
         entry = authority._entry
-        started_at = entry.claimed_at or entry.created_at
+        if authority._closed_at >= entry.initiated_at + self._retention_delta:
+            return None
+        started_at = entry.claimed_at or entry.answered_at
+        read_facts = getattr(self._writer, "read_call_lifecycle", None)
+        facts = await read_facts(entry.call_id) if callable(read_facts) else None
+        if facts is not None:
+            started_at = facts.started_at or started_at
         operation = VoiceOperationV1(
             schema_version=1,
             operation_id=authority.completion_token,
@@ -2519,12 +3150,28 @@ class CallRegistry:
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
-                status=authority.status,
-                disclosure_state="failed",
+                status="failed"
+                if authority.status == "closed" and started_at is None
+                else authority.status,
+                disclosure_state="completed"
+                if facts is not None
+                and facts.disclosure_evidence is not None
+                and facts.disclosure_evidence.completed_at is not None
+                else "failed",
                 started_at=started_at,
-                ended_at=authority._closed_at,
+                ended_at=None if authority.status == "closing" else authority._closed_at,
                 end_reason=authority.reason,
-                retention_until=started_at + self._retention_delta,
+                retention_until=entry.initiated_at + self._retention_delta,
+                **(
+                    cast(
+                        Any,
+                        (
+                            {"disclosure_evidence": facts.disclosure_evidence}
+                            if facts is not None and facts.disclosure_evidence is not None
+                            else {}
+                        ),
+                    )
+                ),
             ),
         )
         commit_control = getattr(self._writer, "commit_control", None)
@@ -2534,9 +3181,7 @@ class CallRegistry:
         cancellation: asyncio.CancelledError | None = None
         while True:
             try:
-                await commit_control(
-                    PersistenceCommand("outbox", {"operation": operation}, None)
-                )
+                await commit_control(PersistenceCommand("outbox", {"operation": operation}, None))
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error
@@ -2588,6 +3233,8 @@ class CallRegistry:
                 or now >= entry.token_deadline
                 or owner_task.done()
                 or owner_task.cancelling() != 0
+                or self._sparra is not None
+                and (entry.routing is None or entry.begin_snapshot is None)
             ):
                 return None
             generation = CallGenerationHandle(entry.call_control_id, entry.generation)
@@ -2601,8 +3248,9 @@ class CallRegistry:
                 telnyx_call_session_id=entry.call_session_id,
                 stream_id=stream_id,
                 started_at=claim.claimed_at,
-                retention_until=claim.claimed_at
-                + timedelta(days=self._retention_days),
+                retention_until=entry.initiated_at + timedelta(days=self._retention_days),
+                routing=entry.routing,
+                begin_snapshot=entry.begin_snapshot,
             )
             entry.construction_grant = grant
             entry.lifecycle_owner = owner
@@ -2725,37 +3373,44 @@ class CallRegistry:
                     raise RuntimeError("terminal_authority_unavailable") from None
                 if entry.terminal_authority is not None:
                     return entry.terminal_authority
-                if (
-                    entry.terminal_state == "external_pending"
-                    and entry.terminal_pending_count > 0
-                ):
+                if entry.terminal_state == "external_pending" and entry.terminal_pending_count > 0:
                     pending_event = entry.terminal_settled_event
                 else:
+                    fenced = self._transfer_fenced(entry)
                     completion_owner = asyncio.current_task()
                     if completion_owner is None:
                         raise RuntimeError("terminal_owner_unavailable") from None
                     authority = TerminalAuthority(
-                        status=proposed.status,
-                        reason=proposed.reason,
+                        status="closing" if fenced else proposed.status,
+                        reason=(
+                            "content_erased"
+                            if entry.transfer_facts is not None
+                            and entry.transfer_facts.content_erased
+                            else "qualified_line_connected"
+                            if entry.transfer_facts is not None
+                            and entry.transfer_facts.qualified_line_bridged_at is not None
+                            else "transfer_outcome_unknown"
+                            if entry.transfer_facts is not None
+                            and entry.transfer_facts.transfer_command_id is not None
+                            else "local_ai_departure"
+                        )
+                        if fenced
+                        else proposed.reason,
                         metric_class=proposed.metric_class,
-                        cleanup_hangup=proposed.cleanup_hangup,
+                        cleanup_hangup=False if fenced else proposed.cleanup_hangup,
                         persist_call=True,
-                        persist_lease=True,
+                        persist_lease=not fenced,
                         completion_token=self._uuid_factory(),
                         _entry=entry,
                         _generation=entry.generation,
-                        _completion_owner=cast(
-                            asyncio.Task[object], completion_owner
-                        ),
+                        _completion_owner=cast(asyncio.Task[object], completion_owner),
                         _closed_at=self._require_aware(self._utcnow()),
                     )
                     entry.terminal_authority = authority
-                    entry.terminal_completion_owner = cast(
-                        asyncio.Task[object], completion_owner
-                    )
+                    entry.terminal_completion_owner = cast(asyncio.Task[object], completion_owner)
                     entry.terminal_state = "reserved"
                     entry.terminal_event = proposed.reason
-                    entry.lease_state = "terminal"
+                    entry.lease_state = "active" if fenced else "terminal"
                     entry.session_phase = "terminal"
                     entry.raw_token = None
                     entry.drain_intent = True
@@ -2771,6 +3426,18 @@ class CallRegistry:
     async def complete_reserved_terminal(self, authority: object) -> bool:
         if not isinstance(authority, TerminalAuthority):
             return False
+        if authority.status == "closing":
+            async with self._lock:
+                closing_entry = self._by_control.get(authority._entry.call_control_id)
+                if (
+                    closing_entry is not authority._entry
+                    or closing_entry.terminal_authority is not authority
+                ):
+                    return False
+                closing_entry.resources_released = True
+                self._clear_content_holders_locked(closing_entry)
+                closing_entry.terminal_completion_event.set()
+            return True
         cancellation: asyncio.CancelledError | None = None
         entry: _CallEntry
         while True:
@@ -2803,9 +3470,7 @@ class CallRegistry:
                         )
                         if not provider_takeover:
                             return False
-                        entry.terminal_completion_owner = cast(
-                            asyncio.Task[object], current_task
-                        )
+                        entry.terminal_completion_owner = cast(asyncio.Task[object], current_task)
                     entry.terminal_state = "completing"
                 break
             except asyncio.CancelledError as error:
@@ -2836,14 +3501,11 @@ class CallRegistry:
         if authority.cleanup_hangup:
             while True:
                 try:
-                    result = await self._call_control.hangup(
+                    result = await self._hangup_unfenced(
                         entry.call_control_id,
                         command_id=entry.hangup_command_id,
                     )
-                    if (
-                        not isinstance(result, CallControlResult)
-                        or result.outcome != "accepted"
-                    ):
+                    if not isinstance(result, CallControlResult) or result.outcome != "accepted":
                         self._note_terminal_failure("terminal_hangup_failed")
                 except asyncio.CancelledError as error:
                     if cancellation is None:
@@ -2852,9 +3514,7 @@ class CallRegistry:
                 except BaseException:
                     self._set_internal_failure("terminal_hangup_failed")
                 break
-        abort_target_clearers: tuple[
-            tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...
-        ] = ()
+        abort_target_clearers: tuple[tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...] = ()
         while True:
             try:
                 async with self._lock:
@@ -3102,19 +3762,12 @@ class CallRegistry:
                 self._answered_placeholders.items()
             ):
                 if now >= placeholder.deadline:
-                    if (
-                        self._answered_placeholders.get(call_control_id)
-                        is placeholder
-                    ):
+                    if self._answered_placeholders.get(call_control_id) is placeholder:
                         self._answered_placeholders.pop(call_control_id, None)
                     placeholder.linked_entry = None
                     expired_placeholders += 1
             for entry in tuple(self._by_control.values()):
-                if (
-                    not qualification_expired
-                    and entry.attached
-                    and entry.lease_state == "active"
-                ):
+                if not qualification_expired and entry.attached and entry.lease_state == "active":
                     continue
                 if (
                     not qualification_expired

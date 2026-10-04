@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from importlib.metadata import version
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from pipecat.processors.frame_processor import FrameProcessor
@@ -126,6 +126,14 @@ class _RegistryTerminalizer:
 
     async def complete(self, authority: TerminalAuthority) -> bool:
         return await self._registry.complete_reserved_terminal(authority)
+
+    async def request_human(self) -> str:
+        return cast(str, await cast(Any, self._registry).request_human(self._grant.generation))
+
+    async def human_tool_available(self) -> bool:
+        return cast(
+            bool, await cast(Any, self._registry).human_tool_available(self._grant.generation)
+        )
 
     def note_failure(self, code: str) -> None:
         self._registry._note_terminal_failure(code)
@@ -257,12 +265,7 @@ class _CallLifecycleOwner:
             handshake = self._handshake
             metric_lease = self._metric_lease
             task = self._task
-            if (
-                grant is None
-                or handshake is None
-                or metric_lease is None
-                or task is None
-            ):
+            if grant is None or handshake is None or metric_lease is None or task is None:
                 return
             self._phase = "constructing"
             await self._factory._construct_and_run(  # noqa: SLF001
@@ -275,6 +278,10 @@ class _CallLifecycleOwner:
         except BaseException:
             return
         finally:
+            self._grant = None
+            self._handshake = None
+            self._session = None
+            self._terminal_capability = None
             self._phase = "done"
             self._closed.set()
 
@@ -400,6 +407,12 @@ class ProcessSessionFactory:
         if cancellation is not None:
             raise cancellation
 
+    async def erase_call_by_id(self, call_id: UUID) -> None:
+        await cast(Any, self._registry).stop_call_content(call_id)
+
+    async def stop_call_content_by_id(self, call_id: UUID) -> None:
+        await cast(Any, self._registry).stop_call_content(call_id, delete_content=False)
+
     async def _live(
         self,
         grant: CallConstructionGrant,
@@ -440,6 +453,8 @@ class ProcessSessionFactory:
                 stream_id=grant.stream_id,
                 started_at=grant.started_at,
                 retention_until=grant.retention_until,
+                routing=grant.routing,
+                begin_snapshot=grant.begin_snapshot,
             )
             if not await self._live(grant, owner, owner_task):
                 return
@@ -594,8 +609,7 @@ class ProcessSessionFactory:
         terminalizer = _RegistryTerminalizer(self._registry, grant, owner)
         authority = await terminalizer.reserve_or_read(proposed)
         metric_lease.finish(authority.metric_class)
-        if authority.persist_call:
-            await self._persist_terminal_call(grant, authority)
+        await self._persist_terminal_call(grant, authority)
         await terminalizer.complete(authority)
 
     async def _persist_terminal_call(
@@ -603,6 +617,8 @@ class ProcessSessionFactory:
         grant: CallConstructionGrant,
         authority: TerminalAuthority,
     ) -> None:
+        read_facts = getattr(self._writer, "read_call_lifecycle", None)
+        facts = await read_facts(grant.call_id) if callable(read_facts) else None
         operation = VoiceOperationV1(
             schema_version=1,
             operation_id=authority.completion_token,
@@ -615,11 +631,25 @@ class ProcessSessionFactory:
                 telnyx_call_leg_id=grant.telnyx_call_leg_id,
                 telnyx_call_session_id=grant.telnyx_call_session_id,
                 status=authority.status,
-                disclosure_state="failed",
+                disclosure_state="completed"
+                if facts is not None
+                and facts.disclosure_evidence is not None
+                and facts.disclosure_evidence.completed_at is not None
+                else "failed",
                 started_at=grant.started_at,
-                ended_at=authority._closed_at,  # noqa: SLF001
+                ended_at=None if authority.status == "closing" else authority._closed_at,  # noqa: SLF001
                 end_reason=authority.reason,
                 retention_until=grant.retention_until,
+                **(
+                    cast(
+                        Any,
+                        (
+                            {"disclosure_evidence": facts.disclosure_evidence}
+                            if facts is not None and facts.disclosure_evidence is not None
+                            else {}
+                        ),
+                    )
+                ),
             ),
         )
         while True:
@@ -630,9 +660,7 @@ class ProcessSessionFactory:
             except asyncio.CancelledError:
                 continue
             except BaseException:
-                self._registry._note_terminal_failure(
-                    "terminal_persistence_failed"
-                )
+                self._registry._note_terminal_failure("terminal_persistence_failed")
                 return
             return
 
@@ -641,7 +669,11 @@ class ProcessSessionFactory:
         authority: TerminalAuthority,
     ) -> tuple[bool, asyncio.CancelledError | None]:
         entry = authority._entry  # noqa: SLF001
-        started_at = entry.claimed_at or entry.created_at
+        read_facts = getattr(self._writer, "read_call_lifecycle", None)
+        facts = await read_facts(entry.call_id) if callable(read_facts) else None
+        started_at = entry.claimed_at or entry.answered_at
+        if facts is not None:
+            started_at = facts.started_at or started_at
         operation = VoiceOperationV1(
             schema_version=1,
             operation_id=authority.completion_token,
@@ -653,13 +685,28 @@ class ProcessSessionFactory:
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
-                status=authority.status,
-                disclosure_state="failed",
+                status="failed"
+                if authority.status == "closed" and started_at is None
+                else authority.status,
+                disclosure_state="completed"
+                if facts is not None
+                and facts.disclosure_evidence is not None
+                and facts.disclosure_evidence.completed_at is not None
+                else "failed",
                 started_at=started_at,
-                ended_at=authority._closed_at,  # noqa: SLF001
+                ended_at=None if authority.status == "closing" else authority._closed_at,  # noqa: SLF001
                 end_reason=authority.reason,
-                retention_until=started_at
-                + self._registry._retention_delta,  # type: ignore[attr-defined]  # noqa: SLF001
+                retention_until=entry.initiated_at + self._registry._retention_delta,  # type: ignore[attr-defined]  # noqa: SLF001
+                **(
+                    cast(
+                        Any,
+                        (
+                            {"disclosure_evidence": facts.disclosure_evidence}
+                            if facts is not None and facts.disclosure_evidence is not None
+                            else {}
+                        ),
+                    )
+                ),
             ),
         )
         cancellation: asyncio.CancelledError | None = None
@@ -673,9 +720,7 @@ class ProcessSessionFactory:
                     cancellation = error
                 continue
             except BaseException:
-                self._registry._note_terminal_failure(
-                    "terminal_persistence_failed"
-                )
+                self._registry._note_terminal_failure("terminal_persistence_failed")
                 return False, cancellation
             return True, cancellation
 

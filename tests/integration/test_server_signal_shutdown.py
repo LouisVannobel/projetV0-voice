@@ -2134,6 +2134,7 @@ def _asgi_inert_signed_event(
     event_type: str,
 ) -> tuple[bytes, dict[str, str]]:
     import base64
+    from datetime import UTC, datetime
 
     timestamp = 1_777_118_400
     payload: dict[str, object] = {
@@ -2152,7 +2153,7 @@ def _asgi_inert_signed_event(
                     f"event-{runtime.state.boundary}-{runtime.state.side}-{event_type}"
                 ),
                 "event_type": event_type,
-                "occurred_at": "2026-08-29T10:00:00Z",
+                "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "payload": payload,
             }
         },

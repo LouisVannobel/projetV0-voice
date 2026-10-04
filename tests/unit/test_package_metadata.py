@@ -487,7 +487,7 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
     assert linux["steps"] == [
         {
             "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-            "with": {"persist-credentials": "false"},
+            "with": {"persist-credentials": "false", "fetch-depth": "0"},
         },
         {
             "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",

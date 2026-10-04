@@ -20,6 +20,7 @@ from projetv0_voice.models import (
 )
 
 if TYPE_CHECKING:
+    from projetv0_voice.recording_archive import ProviderRecordingDownloadV1
     from projetv0_voice.telnyx.recordings import (
         ProviderDeleteResultV1,
         ProviderRecordingPageV1,
@@ -141,6 +142,19 @@ class RecordingStartV1(_RedactedFrozenModel):
         exclude=True,
         repr=False,
     )
+
+
+class TransferRequestV1(_RedactedFrozenModel):
+    to_e164: str = Field(repr=False)
+    target_leg_client_state: str = Field(min_length=1, max_length=4096, repr=False)
+    timeout_secs: Literal[20] = 20
+
+    @field_validator("to_e164")
+    @classmethod
+    def destination(cls, value: str) -> str:
+        from projetv0_voice.models import _e164
+
+        return _e164(value)
 
 
 class RecordingStopV1(_RedactedFrozenModel):
@@ -312,19 +326,34 @@ def _valid_catalog_filter_time(value: object) -> bool:
 class CallControlClient:
     """Own exactly one long-lived Telnyx SDK client and one immediate retry."""
 
-    __slots__ = ("_client", "_close_lock", "_closed", "_closing", "_timeout")
+    __slots__ = ("_client", "_close_lock", "_closed", "_closing", "_timeout", "_utcnow")
 
-    def __init__(self, *, api_key: str) -> None:
-        if not _valid_api_key(api_key):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_region: Literal["global", "EU"] = "global",
+        utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if (
+            not _valid_api_key(api_key)
+            or type(api_region) not in (str,)
+            or api_region not in {"global", "EU"}
+        ):
             raise CallControlConfigurationError("call_control_config_invalid")
         sdk_client: telnyx.AsyncTelnyx | None = None
         construction_failed = False
         try:
             sdk_client = telnyx.AsyncTelnyx(
                 api_key=api_key,
+                base_url="https://api.telnyx.eu/v2"
+                if api_region == "EU"
+                else "https://api.telnyx.com/v2",
                 max_retries=0,
                 http_client=telnyx.DefaultAsyncHttpxClient(trust_env=False),
             )
+            # The public SDK property imports its generated resources before any request.
+            _ = sdk_client.recordings
         except Exception:
             construction_failed = True
         if construction_failed or sdk_client is None:
@@ -340,6 +369,7 @@ class CallControlClient:
         self._close_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
+        self._utcnow = utcnow
 
     def __repr__(self) -> str:
         return "CallControlClient()"
@@ -351,6 +381,10 @@ class CallControlClient:
             raise CallControlInputError("call_control_input_invalid")
         return cast(str, call_control_id), str(command_id)
 
+    @property
+    def dispatch_available(self) -> bool:
+        return not self._closing and not self._closed
+
     async def answer(self, call_control_id: str, *, command_id: UUID) -> CallControlResult:
         control_id, canonical_command = self._validated_ids(call_control_id, command_id)
 
@@ -358,6 +392,29 @@ class CallControlClient:
             return await self._client.calls.actions.answer(
                 control_id,
                 command_id=canonical_command,
+                timeout=self._timeout,
+            )
+
+        return await self._execute(action)
+
+    async def transfer(
+        self,
+        call_control_id: str,
+        request: TransferRequestV1,
+        *,
+        command_id: UUID,
+    ) -> CallControlResult:
+        control_id, canonical_command = self._validated_ids(call_control_id, command_id)
+        if not isinstance(request, TransferRequestV1):
+            raise CallControlInputError("call_control_input_invalid")
+
+        async def action() -> object:
+            return await self._client.calls.actions.transfer(
+                control_id,
+                to=request.to_e164,
+                command_id=canonical_command,
+                target_leg_client_state=request.target_leg_client_state,
+                timeout_secs=20,
                 timeout=self._timeout,
             )
 
@@ -588,6 +645,55 @@ class CallControlClient:
             _raise_recording_catalog_failure("invalid")
         return result
 
+    async def retrieve_recording_download(
+        self, recording_id: str, *, timeout_seconds: float
+    ) -> ProviderRecordingDownloadV1:
+        from projetv0_voice.recording_archive import ProviderRecordingDownloadV1
+
+        if self._closing or self._closed:
+            raise CallControlClosedError("call_control_client_closed")
+        if (
+            not is_valid_provider_recording_id(recording_id)
+            or type(timeout_seconds) not in {float, int}
+            or not 0 < timeout_seconds <= 1
+        ):
+            raise CallControlInputError("call_control_input_invalid")
+        failure: CatalogFailureKind | None = None
+        result = None
+        try:
+            async with asyncio.timeout(float(timeout_seconds)):
+                response = await self._client.recordings.retrieve(
+                    recording_id, timeout=float(timeout_seconds)
+                )
+            data = getattr(response, "data", None)
+            recording = _catalog_item(data)
+            url = getattr(getattr(data, "download_urls", None), "wav", None)
+            if (
+                recording.recording_id != recording_id
+                or type(url) is not str
+                or not 0 < len(url) <= 4096
+            ):
+                raise _RecordingCatalogInvalid
+            parsed = urlsplit(url)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
+                raise _RecordingCatalogInvalid
+            result = ProviderRecordingDownloadV1(recording, SecretStr(url), self._utcnow())
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            failure = _recording_catalog_failure_kind(error, not_found_transient=True)
+        if failure is not None:
+            _raise_recording_catalog_failure(failure)
+        if result is None:
+            _raise_recording_catalog_failure("invalid")
+        return result
+
     async def delete_recording(
         self,
         recording_id: str,
@@ -610,9 +716,7 @@ class CallControlClient:
                     recording_id,
                     timeout=float(timeout_seconds),
                 )
-            returned_id = _strict_catalog_text(
-                getattr(getattr(response, "data", None), "id", None)
-            )
+            returned_id = _strict_catalog_text(getattr(getattr(response, "data", None), "id", None))
             if returned_id is None:
                 return ProviderDeleteResultV1("retry")
             return ProviderDeleteResultV1("deleted", returned_id)

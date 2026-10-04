@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +29,7 @@ from projetv0_voice.lifecycle import (
     RuntimeProfileSelection,
 )
 from projetv0_voice.persistence.postgres_sink import PsycopgOperationSink
+from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.qualified_profile import (
     QualificationCandidateProfileV1,
     QualifiedDeploymentProfileV1,
@@ -37,6 +38,11 @@ from projetv0_voice.qualified_profile import (
     load_qualification_candidate_profile,
     load_qualification_override,
     load_qualified_deployment_profile,
+)
+from projetv0_voice.recording_archive import (
+    RecordingArchive,
+    RecordingArchiveError,
+    RecordingDownloadApi,
 )
 from projetv0_voice.runtime_config import (
     RuntimeSettingsV1,
@@ -611,6 +617,23 @@ def _load_profile(
     return RuntimeProfileSelection(profile, override)
 
 
+def _call_control_factory(
+    api_key: SecretStr,
+    deployment_profile: RuntimeDeploymentProfileV1,
+) -> CallControlClient:
+    if (
+        not isinstance(api_key, SecretStr)
+        or not api_key.get_secret_value()
+        or not isinstance(
+            deployment_profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
+        )
+        or isinstance(deployment_profile, QualifiedDeploymentProfileV1)
+        and deployment_profile.telnyx_data_locality != "EU"
+    ):
+        raise RuntimeError("runtime_call_control_invalid") from None
+    return CallControlClient(api_key=api_key.get_secret_value(), api_region="EU")
+
+
 def _inference_factories(
     api_key: SecretStr,
     deployment_profile: RuntimeDeploymentProfileV1,
@@ -645,6 +668,43 @@ def _inference_factories(
         llm_factory=lambda: build_llm(profile, api_key),
         tts_factory=lambda: OpenRouterTTSService(profile=profile, api_key=api_key),
     )
+
+
+def _archive_factory(
+    settings: RuntimeSettingsV1, writer: PersistenceWriter, keyring: CryptoKeyring,
+    control: Any, utcnow: Callable[[], datetime],
+) -> RecordingArchive | None:
+    directory = settings.recording_archive_directory
+    if directory is None:
+        return None
+    descriptors: list[int] = []
+    try:
+        descriptors, parent, leaf, authorities, expected = _open_parent(directory)
+        descriptor = os.open(leaf, _linux_flags(directory=True), dir_fd=parent)
+        descriptors.append(descriptor)
+        opened = os.fstat(descriptor)
+        if (
+            _directory_stat(opened) != expected
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != getattr(os, "geteuid", lambda: -1)()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise _WiringInvalid
+        _verify_ancestor_authorities(authorities)
+        return RecordingArchive(
+            directory=Path(str(directory)),
+            directory_descriptor=descriptor,
+            writer=writer,
+            keyring=keyring,
+            telnyx=cast(RecordingDownloadApi, control),
+            allowed_origins=settings.recording_download_origins,
+            utcnow=utcnow,
+        )
+    except (_WiringInvalid, OSError, RecordingArchiveError):
+        # Missing or unsafe storage cannot grant copy capacity; OFF remains independent.
+        return None
+    finally:
+        _close_all(descriptors)
 
 
 def build_production_factories(
@@ -703,10 +763,9 @@ def build_production_factories(
         read_secret=read_runtime_secret,
         load_keyring=load_keyring,
         sink_factory=lambda dsn: PsycopgOperationSink(dsn.get_secret_value()),
-        call_control_factory=lambda key: CallControlClient(
-            api_key=key.get_secret_value()
-        ),
+        call_control_factory=_call_control_factory,
         inference_factory=_inference_factories,
+        archive_factory=_archive_factory,
     )
 
 

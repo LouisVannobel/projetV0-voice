@@ -34,7 +34,7 @@ from projetv0_voice.metrics import (
     RuntimePublishedSnapshot,
 )
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
-from projetv0_voice.persistence.relay import OutboxRelay
+from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
 from projetv0_voice.persistence.writer import (
     PersistenceWriter,
     QualificationRunConsumed,
@@ -51,6 +51,7 @@ from projetv0_voice.qualified_profile import (
     canonical_inference_profile_sha256,
     canonical_qualified_profile_sha256,
 )
+from projetv0_voice.recording_archive import RecordingArchive, RecordingArchiveError
 from projetv0_voice.runtime_config import RuntimeSettingsV1
 from projetv0_voice.session import (
     CallIdentity,
@@ -67,6 +68,7 @@ from projetv0_voice.telnyx.recordings import (
     after_recording_webhook_commit,
     purge_recordings_once,
     recording_metric_transition,
+    resolve_recording_webhook,
 )
 from projetv0_voice.telnyx.webhooks import (
     ResolvedWebhook,
@@ -243,6 +245,8 @@ class _RuntimeSink(Protocol):
 
     async def close(self) -> None: ...
 
+    async def begin_call(self, deployment_id: str, call_id: UUID, routing: Any) -> Any: ...
+
 
 class _CloseableGate(Protocol):
     def close(self) -> None: ...
@@ -299,23 +303,40 @@ class RuntimeProductionFactories:
     read_secret: Callable[[PurePosixPath], SecretStr]
     load_keyring: Callable[[RuntimeSettingsV1], CryptoKeyring]
     sink_factory: Callable[[SecretStr], _RuntimeSink]
-    call_control_factory: Callable[[SecretStr], _ProcessCallControl]
+    call_control_factory: Callable[[SecretStr, RuntimeDeploymentProfileV1], _ProcessCallControl]
     inference_factory: Callable[
         [SecretStr, RuntimeDeploymentProfileV1, str], RuntimeInferenceFactories
     ]
+    archive_factory: (
+        Callable[
+            [
+                RuntimeSettingsV1,
+                PersistenceWriter,
+                CryptoKeyring,
+                _ProcessCallControl,
+                Callable[[], datetime],
+            ],
+            RecordingArchive | None,
+        ]
+        | None
+    ) = None
 
     def __post_init__(self) -> None:
-        if not all(
-            callable(value)
-            for value in (
-                self.validate_artifacts,
-                self.load_manifest,
-                self.load_profile,
-                self.read_secret,
-                self.load_keyring,
-                self.sink_factory,
-                self.call_control_factory,
-                self.inference_factory,
+        if (
+            self.archive_factory is not None
+            and not callable(self.archive_factory)
+            or not all(
+                callable(value)
+                for value in (
+                    self.validate_artifacts,
+                    self.load_manifest,
+                    self.load_profile,
+                    self.read_secret,
+                    self.load_keyring,
+                    self.sink_factory,
+                    self.call_control_factory,
+                    self.inference_factory,
+                )
             )
         ):
             raise ValueError("runtime_production_factories_invalid") from None
@@ -333,9 +354,7 @@ class _MeasuredCallControl:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._control, name)
 
-    async def answer(
-        self, call_control_id: str, *, command_id: UUID
-    ) -> CallControlResult:
+    async def answer(self, call_control_id: str, *, command_id: UUID) -> CallControlResult:
         return await self._invoke(
             "answer",
             self._control.answer(call_control_id, command_id=command_id),
@@ -414,6 +433,7 @@ class RuntimeProductionGraph:
     webhook_processor: TelnyxWebhookProcessor
     recording_factory: Callable[[CallIdentity], RecordingBoundary]
     recording_call_control_identity: object
+    archive: RecordingArchive | None = None
 
     def __repr__(self) -> str:
         return "RuntimeProductionGraph()"
@@ -476,17 +496,13 @@ def publish_runtime_readiness(
         outbox_oldest_age=writer.outbox_oldest_age,
         outbox_bytes=writer.outbox_bytes,
         storage_bytes=writer.storage_bytes,
-        startup_profile_and_stale_recovery_complete=(
-            startup_profile_and_stale_recovery_complete
-        ),
+        startup_profile_and_stale_recovery_complete=(startup_profile_and_stale_recovery_complete),
         admission_open=admission_open,
         qualification_state_valid=qualification_state_valid,
         writer_owner_alive_and_ready=writer_owner_alive_and_ready,
         no_writer_fatal_or_degradation=no_writer_fatal_or_degradation,
         relay_supervisor_alive=relay_supervisor_alive,
-        no_permanent_relay_or_sink_degradation=(
-            no_permanent_relay_or_sink_degradation
-        ),
+        no_permanent_relay_or_sink_degradation=(no_permanent_relay_or_sink_degradation),
     )
     publication.publish(snapshot)
     return snapshot
@@ -622,9 +638,11 @@ class RuntimeSupervisor:
             Awaitable[WebhookDisposition | None],
         ]
         | None = None,
+        archive: RecordingArchive | None = None,
         candidate_run_id: UUID | None = None,
         deployment_id: str = "projetv0-voice",
         retention_days: int = 7,
+        sparra_enabled: bool = False,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         loop_interval_seconds: float = 0.25,
         startup_phase_timeout_seconds: float = 5.0,
@@ -691,9 +709,11 @@ class RuntimeSupervisor:
         self._unauthenticated_gate = unauthenticated_gate
         self._purge_once = purge_once
         self._recording_after_commit = recording_after_commit
+        self._archive = archive
         self._candidate_run_id = candidate_run_id
         self._deployment_id = deployment_id
         self._retention_days = retention_days
+        self._sparra_enabled = sparra_enabled
         self._utcnow = utcnow
         self._loop_interval_seconds = float(loop_interval_seconds)
         self._startup_phase_timeout_seconds = float(startup_phase_timeout_seconds)
@@ -747,15 +767,32 @@ class RuntimeSupervisor:
                 self._writer.quick_check(), code="writer_quick_check_failed"
             ):
                 raise RuntimeError("writer_quick_check_failed")
+            if self._archive is not None:
+                archive = self._archive
+
+                async def prepare_archive() -> None:
+                    # Handle only the consumer's latched unavailability inside the owned phase.
+                    with contextlib.suppress(RecordingArchiveError):
+                        await archive.prepare()
+
+                await self._startup_await(prepare_archive(), code="writer_startup_failed")
             if self._candidate_run_id is not None and await self._startup_await(
                 self._writer.qualification_run_consumed(self._candidate_run_id),
                 code="qualification_status_failed",
             ):
                 raise RuntimeError("qualification_run_consumed")
             self._qualification_valid = True
-            if self._sink is not None:
+            if self._sparra_enabled:
                 await self._startup_await(
-                    self._sink.open(), code="operation_sink_open_failed"
+                    self._writer.assert_sparra_compatible(), code="writer_startup_failed"
+                )
+            if self._sink is not None:
+                await self._startup_await(self._sink.open(), code="operation_sink_open_failed")
+            if self._sparra_enabled:
+                if self._relay is None:
+                    raise RuntimeError("stale_recovery_failed")
+                await self._startup_await(
+                    self._relay.prepare_before_fifo(), code="stale_recovery_failed"
                 )
             await self._recover_stale_leases()
             self._register_fixed_supervisors()
@@ -768,9 +805,7 @@ class RuntimeSupervisor:
             )
             self._publish_current()
             if self._writer_health_breached():
-                await self._startup_await(
-                    self.begin_drain(), code="runtime_begin_drain_failed"
-                )
+                await self._startup_await(self.begin_drain(), code="runtime_begin_drain_failed")
         except asyncio.CancelledError as error:
             cancellation = error
         except BaseException as error:
@@ -840,9 +875,7 @@ class RuntimeSupervisor:
         parent_cancellation: asyncio.CancelledError | None = None
         done: set[asyncio.Task[ResultT]] = set()
         try:
-            completed, _pending = await asyncio.wait(
-                (task,), timeout=timeout_seconds
-            )
+            completed, _pending = await asyncio.wait((task,), timeout=timeout_seconds)
             done.update(completed)
         except asyncio.CancelledError as error:
             parent_cancellation = error
@@ -955,9 +988,7 @@ class RuntimeSupervisor:
     def readiness_snapshot(self) -> RuntimePublishedSnapshot:
         return self._publication.snapshot()
 
-    def observe_qualification_state(
-        self, state: Literal["valid", "consumed", "expired"]
-    ) -> None:
+    def observe_qualification_state(self, state: Literal["valid", "consumed", "expired"]) -> None:
         """Consume the registry's synchronous post-COMMIT state notification."""
 
         if state == "valid":
@@ -977,9 +1008,7 @@ class RuntimeSupervisor:
         return await self._writer.classify_webhook_receipt(
             event_id=event.event_id,
             semantic_fingerprint_sha256=event.semantic_fingerprint_sha256,
-            legacy_v1_semantic_fingerprint_sha256=(
-                event.legacy_v1_semantic_fingerprint_sha256
-            ),
+            legacy_v1_semantic_fingerprint_sha256=(event.legacy_v1_semantic_fingerprint_sha256),
         )
 
     def start_webhook_finalization(
@@ -995,9 +1024,7 @@ class RuntimeSupervisor:
             or receipt not in {"first", "duplicate"}
         ):
             raise RuntimeError("webhook_finalizer_invalid") from None
-        completion: asyncio.Future[WebhookDisposition] = (
-            asyncio.get_running_loop().create_future()
-        )
+        completion: asyncio.Future[WebhookDisposition] = asyncio.get_running_loop().create_future()
         task = self.webhook_finalizers.try_start(
             self._finalize_webhook(event, resolution, receipt, completion),
             name="voice-webhook-finalizer",
@@ -1026,15 +1053,24 @@ class RuntimeSupervisor:
                     "call_control_id": event.call_control_id,
                     "occurred_at": event.occurred_at,
                     "received_at": _aware_utc(self._utcnow()),
-                    "semantic_fingerprint_sha256": (
-                        event.semantic_fingerprint_sha256
+                    "semantic_fingerprint_sha256": (event.semantic_fingerprint_sha256),
+                    **(
+                        {
+                            "call_leg_id": event.call_leg_id,
+                            "call_session_id": event.call_session_id,
+                        }
+                        if self._sparra_enabled and event.event_type == "call.hangup"
+                        else {}
                     ),
                 },
                 lease=None if effect is None else effect.lease,
                 operation=None if effect is None else effect.operation,
-                legacy_v1_semantic_fingerprint_sha256=(
-                    event.legacy_v1_semantic_fingerprint_sha256
+                **(
+                    {"admission_facts": effect.admission_facts}
+                    if effect is not None and effect.admission_facts is not None
+                    else {}
                 ),
+                legacy_v1_semantic_fingerprint_sha256=(event.legacy_v1_semantic_fingerprint_sha256),
                 qualification_run_id=(
                     self._candidate_run_id
                     if receipt == "first"
@@ -1056,9 +1092,7 @@ class RuntimeSupervisor:
         timed_out = False
         try:
             try:
-                async with asyncio.timeout(
-                    self._writer.control_commit_timeout_seconds
-                ):
+                async with asyncio.timeout(self._writer.control_commit_timeout_seconds):
                     result = await ticket.wait()
             except TimeoutError:
                 timed_out = True
@@ -1083,9 +1117,7 @@ class RuntimeSupervisor:
         if timed_out:
             if self._registry is not None:
                 with contextlib.suppress(Exception):
-                    await self._registry.confirm_late_after_fail_closed(
-                        event, resolution, result
-                    )
+                    await self._registry.confirm_late_after_fail_closed(event, resolution, result)
             return
 
         disposition = WebhookDisposition(
@@ -1096,9 +1128,7 @@ class RuntimeSupervisor:
         )
         if self._registry is not None:
             try:
-                disposition = await self._registry.reconcile_after_commit(
-                    event, resolution, result
-                )
+                disposition = await self._registry.reconcile_after_commit(event, resolution, result)
             except BaseException:
                 disposition = WebhookDisposition(500)
         if isinstance(result, WebhookCommitResult) and self._metrics is not None:
@@ -1107,9 +1137,7 @@ class RuntimeSupervisor:
                 self._metrics.record_recording(transition)
         if self._recording_after_commit is not None:
             try:
-                recording_disposition = await self._recording_after_commit(
-                    event, resolution.effect
-                )
+                recording_disposition = await self._recording_after_commit(event, resolution.effect)
             except asyncio.CancelledError:
                 raise
             except BaseException:
@@ -1125,9 +1153,7 @@ class RuntimeSupervisor:
             if self._closed:
                 return
         if self._close_task is None:
-            self._close_task = asyncio.create_task(
-                self._aclose_core(), name="voice-runtime-close"
-            )
+            self._close_task = asyncio.create_task(self._aclose_core(), name="voice-runtime-close")
         await asyncio.shield(self._close_task)
 
     async def _aclose_core(self) -> None:
@@ -1152,18 +1178,15 @@ class RuntimeSupervisor:
                 self._registry.close_session_owner_registration(), deadline
             )
         self.call_lifecycle_owners.close_registration()
-        await join_or_remember(
-            self.call_lifecycle_owners.join_until_empty(deadline)
-        )
+        await join_or_remember(self.call_lifecycle_owners.join_until_empty(deadline))
 
         self._state_stop.set()
+        await self._close_archive(deadline)
         if await self._join_state_supervisors(deadline):
             terminal_owner_failed = True
         if self._registry is not None:
             self._registry.close_registration()
-            await self._await_shutdown_deadline(
-                self._registry.join_until_empty(), deadline
-            )
+            await self._await_shutdown_deadline(self._registry.join_until_empty(), deadline)
 
         self._relay_stop.set()
         await join_or_remember(self._join_task("relay", deadline))
@@ -1177,25 +1200,20 @@ class RuntimeSupervisor:
         deadline = asyncio.get_running_loop().time() + self._shutdown_timeout_seconds
         await self._await_shutdown_deadline(self.begin_drain(), deadline)
         await self._join_startup_phase_tasks(deadline)
-        await self._join_empty_owner_for_unwind(
-            self.webhook_finalizers, deadline
-        )
+        await self._join_empty_owner_for_unwind(self.webhook_finalizers, deadline)
         if self._registry is not None:
             await self._await_shutdown_deadline(
                 self._registry.close_session_owner_registration(), deadline
             )
         self.call_lifecycle_owners.close_registration()
-        await self._join_empty_owner_for_unwind(
-            self.call_lifecycle_owners, deadline
-        )
+        await self._join_empty_owner_for_unwind(self.call_lifecycle_owners, deadline)
 
         self._state_stop.set()
+        await self._close_archive(deadline)
         await self._join_state_supervisors(deadline)
         if self._registry is not None:
             self._registry.close_registration()
-            await self._await_shutdown_deadline(
-                self._registry.join_until_empty(), deadline
-            )
+            await self._await_shutdown_deadline(self._registry.join_until_empty(), deadline)
 
         self._relay_stop.set()
         await self._join_task("relay", deadline)
@@ -1260,23 +1278,21 @@ class RuntimeSupervisor:
                 raise
 
     async def _close_dependencies(self, deadline: float) -> None:
+        await self._close_archive(deadline)
         await self._close_writer(deadline)
         if self._call_control is not None:
-            await self._await_shutdown_deadline(
-                self._call_control.aclose(), deadline
-            )
+            await self._await_shutdown_deadline(self._call_control.aclose(), deadline)
         if self._sink is not None:
             await self._await_shutdown_deadline(self._sink.close(), deadline)
         if self._metrics is not None:
             await self._await_shutdown_deadline(self._metrics.aclose(), deadline)
 
     async def _unwind_startup_dependencies(self, deadline: float) -> None:
+        await self._close_archive(deadline)
         deadline_failure: RuntimeError | None = None
         if self._call_control is not None:
             try:
-                await self._await_shutdown_deadline(
-                    self._call_control.aclose(), deadline
-                )
+                await self._await_shutdown_deadline(self._call_control.aclose(), deadline)
             except RuntimeError as error:
                 if str(error) == "runtime_shutdown_deadline_exceeded":
                     deadline_failure = error
@@ -1299,6 +1315,11 @@ class RuntimeSupervisor:
                     deadline_failure = error
         if deadline_failure is not None:
             raise deadline_failure
+
+    async def _close_archive(self, deadline: float) -> None:
+        if self._archive is not None:
+            await self._await_shutdown_deadline(self._archive.aclose(), deadline)
+            self._archive = None
 
     async def _await_shutdown_deadline[ResultT](
         self,
@@ -1369,6 +1390,24 @@ class RuntimeSupervisor:
             raise RuntimeError("stale_recovery_failed") from None
         measured = self._measured_call_control
         for stale in stale_leases:
+            if self._sparra_enabled or stale.lifecycle is not None:
+                lifecycle = await self._startup_await(
+                    self._writer.read_call_lifecycle(stale.call_id), code="stale_recovery_failed"
+                )
+                stale = replace(stale, lifecycle=lifecycle)
+            if stale.lifecycle is not None and not stale.lifecycle.transfer_fenced:
+                # Leasing is not a negative witness: held leases and later batches
+                # remain invisible. Actual AI departure preserves the original phone.
+                lifecycle = await self._startup_await(
+                    self._writer.mark_call_departed(stale.call_id, now=_aware_utc(self._utcnow())),
+                    code="stale_recovery_failed",
+                )
+                stale = replace(stale, lifecycle=lifecycle)
+            if stale.lifecycle is not None and stale.lifecycle.transfer_fenced:
+                if self._registry is None:
+                    raise RuntimeError("transfer_recovery_registry_missing")
+                await cast(Any, self._registry).restore_transfer_fence(stale)
+                continue
             command_id = _stale_cleanup_id(stale.call_id)
             try:
                 result = (
@@ -1410,9 +1449,7 @@ class RuntimeSupervisor:
             )
 
     def _register_fixed_supervisors(self) -> None:
-        inventory: tuple[
-            tuple[str, Callable[[], Coroutine[Any, Any, None]]], ...
-        ] = (
+        inventory: tuple[tuple[str, Callable[[], Coroutine[Any, Any, None]]], ...] = (
             ("relay", self._relay_loop),
             ("purge", self._purge_loop),
             ("reaper", self._reaper_loop),
@@ -1421,6 +1458,8 @@ class RuntimeSupervisor:
             ("readiness", self._readiness_loop),
             ("event-loop-lag", self._event_loop_lag_loop),
         )
+        if self._archive is not None:
+            inventory += (("archive", self._archive_loop),)
         for name, create_coroutine in inventory:
             task = self.fixed_supervisors.spawn_required(
                 create_coroutine(), name=f"voice-{name}-supervisor"
@@ -1441,9 +1480,7 @@ class RuntimeSupervisor:
             except asyncio.CancelledError:
                 raise
             except OperationSinkCommitAmbiguousError:
-                if await _wait_or_stop(
-                    self._relay_stop, float(self._relay.claim_lease_seconds)
-                ):
+                if await _wait_or_stop(self._relay_stop, float(self._relay.claim_lease_seconds)):
                     return
                 continue
             except BaseException:
@@ -1456,6 +1493,24 @@ class RuntimeSupervisor:
                 await self.begin_drain()
                 return
             if await _wait_or_stop(self._relay_stop, self._loop_interval_seconds):
+                return
+
+    async def _archive_loop(self) -> None:
+        while not self._state_stop.is_set():
+            archive = self._archive
+            if archive is None:
+                return
+            try:
+                await archive.run_once()
+            except asyncio.CancelledError:
+                if self._state_stop.is_set():
+                    return
+                raise
+            except Exception:
+                # Archive failure retains its real readiness/cleanup fences.
+                # The separate existing provider-purge owner keeps progressing.
+                pass
+            if await _wait_or_stop(self._state_stop, self._loop_interval_seconds):
                 return
 
     async def _purge_loop(self) -> None:
@@ -1521,14 +1576,8 @@ class RuntimeSupervisor:
             if self._registry is None
             else asyncio.create_task(self._registry.internal_failure_event.wait())
         )
-        watched = (
-            (stop, fatal)
-            if registry_fatal is None
-            else (stop, fatal, registry_fatal)
-        )
-        done, pending = await asyncio.wait(
-            watched, return_when=asyncio.FIRST_COMPLETED
-        )
+        watched = (stop, fatal) if registry_fatal is None else (stop, fatal, registry_fatal)
+        done, pending = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -1610,6 +1659,7 @@ class RuntimeSupervisor:
     async def _join_state_supervisors(self, deadline: float) -> bool:
         terminal_owner_failed = False
         for name in (
+            "archive",
             "purge",
             "reaper",
             "qualification-expiry",
@@ -1687,6 +1737,7 @@ async def build_production_runtime(
     metrics: RuntimeMetrics | None = None
     sink: _RuntimeSink | None = None
     raw_call_control: _ProcessCallControl | None = None
+    archive: RecordingArchive | None = None
     composition_failed = False
     try:
         factories.validate_artifacts(settings)
@@ -1700,14 +1751,11 @@ async def build_production_runtime(
         _validate_profile_selection(settings, manifest, selection, now=now)
 
         telnyx_api_key = factories.read_secret(settings.telnyx_api_key_file)
-        webhook_public_key = factories.read_secret(
-            settings.telnyx_webhook_public_key_file
-        )
+        webhook_public_key = factories.read_secret(settings.telnyx_webhook_public_key_file)
         openrouter_api_key = factories.read_secret(settings.openrouter_api_key_file)
         postgres_dsn = factories.read_secret(settings.postgres_dsn_file)
         if not all(
-            isinstance(value, SecretStr)
-            and bool(value.get_secret_value())
+            isinstance(value, SecretStr) and bool(value.get_secret_value())
             for value in (
                 telnyx_api_key,
                 webhook_public_key,
@@ -1719,9 +1767,7 @@ async def build_production_runtime(
         api_key_sha256 = hashlib.sha256(
             telnyx_api_key.get_secret_value().encode("utf-8")
         ).hexdigest()
-        if not hmac.compare_digest(
-            selection.profile.telnyx_api_key_sha256, api_key_sha256
-        ):
+        if not hmac.compare_digest(selection.profile.telnyx_api_key_sha256, api_key_sha256):
             raise RuntimeError("runtime_profile_api_key_mismatch")
 
         keyring = factories.load_keyring(settings)
@@ -1744,13 +1790,28 @@ async def build_production_runtime(
                 raise RuntimeError("runtime_supervisor_unavailable") from None
             await supervisor_ref.begin_drain()
 
+        async def prepare_sparra_fifo() -> None:
+            await maintain_call_content(
+                writer,
+                cast(Any, sink),
+                session_factory.erase_call_by_id,
+                utcnow=utcnow,
+                timeout_seconds=settings.call_cleanup_phase_timeout_seconds + 20,
+            )
+
         relay = OutboxRelay(
             writer,
             cast(Any, sink),
             on_degraded=begin_drain,
             drain=begin_drain,
+            before_fifo=prepare_sparra_fifo if manifest.sparra is not None else None,
+            stop_erased_call=(lambda call_id: session_factory.stop_call_content_by_id(call_id))
+            if manifest.sparra is not None
+            else None,
         )
-        raw_call_control = factories.call_control_factory(telnyx_api_key)
+        raw_call_control = factories.call_control_factory(telnyx_api_key, selection.profile)
+        if factories.archive_factory is not None:
+            archive = factories.archive_factory(settings, writer, keyring, raw_call_control, utcnow)
         inference = factories.inference_factory(
             openrouter_api_key,
             selection.profile,
@@ -1766,10 +1827,12 @@ async def build_production_runtime(
         supervisor = RuntimeSupervisor(
             writer=writer,
             call_control=raw_call_control,
+            archive=archive,
             metrics=metrics,
             candidate_run_id=candidate_run_id,
             deployment_id=settings.deployment_id,
             retention_days=manifest.transcript_retention_days,
+            sparra_enabled=manifest.sparra is not None,
             utcnow=utcnow,
             loop_interval_seconds=0.25,
             startup_phase_timeout_seconds=float(startup_phase_timeout_seconds),
@@ -1807,6 +1870,9 @@ async def build_production_runtime(
             candidate_run_id=candidate_run_id,
             admission_expires_at=admission_expires_at,
             qualification_observer=supervisor.observe_qualification_state,
+            sparra=manifest.sparra,
+            called_did=manifest.dids[0],
+            begin_call=getattr(sink, "begin_call", None),
         )
         lease_authority = ProcessLeaseAuthority(registry)
         gate = SynchronousUnauthenticatedGate(capacity)
@@ -1817,18 +1883,27 @@ async def build_production_runtime(
             timeout_seconds=settings.handshake_timeout_seconds,
         )
         recording_retention_days = (
-            manifest.recording_retention_days
-            or manifest.transcript_retention_days
+            manifest.recording_retention_days or manifest.transcript_retention_days
         )
 
         def recording_factory(identity: CallIdentity) -> RecordingBoundary:
-            del identity
+            snapshot = identity.begin_snapshot
+            if (
+                snapshot is not None
+                and snapshot.recording_enabled
+                and (settings.runtime_mode != "strict")
+            ):
+                raise ValueError("sparra_recording_unqualified") from None
             return TelnyxRecordingBoundary(
                 telnyx=cast(Any, measured_call_control),
                 writer=writer,
-                retention_days=recording_retention_days,
-                required=manifest.recording_required,
-                play_beep=manifest.recording_play_beep,
+                retention_days=30 if snapshot is not None else recording_retention_days,
+                required=snapshot.recording_enabled
+                if snapshot is not None
+                else manifest.recording_required,
+                play_beep=snapshot.recording_enabled
+                if snapshot is not None
+                else manifest.recording_play_beep,
                 utcnow=utcnow,
             )
 
@@ -1847,9 +1922,7 @@ async def build_production_runtime(
             recording_factory=recording_factory,
             recording_call_control_identity=measured_call_control,
             idle_timeout_seconds=settings.call_idle_timeout_seconds,
-            cleanup_phase_timeout_seconds=(
-                settings.call_cleanup_phase_timeout_seconds
-            ),
+            cleanup_phase_timeout_seconds=(settings.call_cleanup_phase_timeout_seconds),
         )
         verifier = TelnyxWebhookVerifier(
             public_key=webhook_public_key.get_secret_value(),
@@ -1861,10 +1934,21 @@ async def build_production_runtime(
                 "call.recording.error",
             ),
         )
+
+        async def resolve_webhook(event: VerifiedWebhook) -> ResolvedWebhook:
+            if event.event_type in {"call.recording.saved", "call.recording.error"}:
+                return ResolvedWebhook(resolve_recording_webhook(event))
+            return await registry.resolve_webhook(event)
+
+        async def resolve_duplicate_webhook(event: VerifiedWebhook) -> ResolvedWebhook:
+            if event.event_type in {"call.recording.saved", "call.recording.error"}:
+                return ResolvedWebhook(resolve_recording_webhook(event))
+            return await registry.resolve_duplicate_webhook(event)
+
         webhook_processor = TelnyxWebhookProcessor(
             verifier=verifier,
-            resolver=registry.resolve_webhook,
-            duplicate_resolver=registry.resolve_duplicate_webhook,
+            resolver=resolve_webhook,
+            duplicate_resolver=resolve_duplicate_webhook,
             finalizer_owner=supervisor,
         )
 
@@ -1880,6 +1964,7 @@ async def build_production_runtime(
                 local_drain=session_factory.drain_call_by_id,
                 monotonic=monotonic,
                 timeout_seconds=settings.call_cleanup_phase_timeout_seconds,
+                utcnow=utcnow,
             )
 
         async def purge_once() -> PurgeBatchResult:
@@ -1921,12 +2006,14 @@ async def build_production_runtime(
             webhook_processor=webhook_processor,
             recording_factory=recording_factory,
             recording_call_control_identity=measured_call_control,
+            archive=archive,
         )
     except asyncio.CancelledError:
         await _close_failed_composition(
             raw_call_control,
             sink,
             metrics,
+            archive=archive,
             timeout_seconds=float(startup_phase_timeout_seconds),
             hard_exit=hard_exit,
         )
@@ -1936,6 +2023,7 @@ async def build_production_runtime(
             raw_call_control,
             sink,
             metrics,
+            archive=archive,
             timeout_seconds=float(startup_phase_timeout_seconds),
             hard_exit=hard_exit,
         )
@@ -1958,8 +2046,7 @@ def _validate_profile_selection(
         and profile.runtime_contract_sha256 == settings.runtime_contract_sha256
         and profile.image_digest == settings.image_digest
         and profile.agent_bundle_sha256 == settings.agent_bundle_sha256
-        and profile.inference_profile_sha256
-        == settings.inference_profile_sha256
+        and profile.inference_profile_sha256 == settings.inference_profile_sha256
         and profile.inference_profile_sha256
         == canonical_inference_profile_sha256(profile.inference)
     )
@@ -1987,8 +2074,7 @@ def _validate_profile_selection(
             and isinstance(override, QualificationOverrideV1)
             and settings.qualification_run_id == override.run_id
             and override.deployment_id == settings.deployment_id
-            and override.qualified_profile_sha256
-            == canonical_qualified_profile_sha256(profile)
+            and override.qualified_profile_sha256 == canonical_qualified_profile_sha256(profile)
             and profile.qualified_at <= override.created_at < now < override.expires_at
             and profile.telnyx_data_locality == "EU"
         )
@@ -2001,6 +2087,7 @@ async def _close_failed_composition(
     sink: _RuntimeSink | None,
     metrics: RuntimeMetrics | None,
     *,
+    archive: RecordingArchive | None = None,
     timeout_seconds: float,
     hard_exit: Callable[[int], NoReturn] = os._exit,
 ) -> None:
@@ -2009,6 +2096,7 @@ async def _close_failed_composition(
     retained: set[asyncio.Task[None]] = set()
     cancellation: asyncio.CancelledError | None = None
     inventory = (
+        ("archive", None if archive is None else archive.aclose),
         ("call-control", None if call_control is None else call_control.aclose),
         ("sink", None if sink is None else sink.close),
         ("metrics", None if metrics is None else metrics.aclose),
@@ -2031,9 +2119,7 @@ async def _close_failed_composition(
         runner = run_close()
         create_failed = False
         try:
-            task = asyncio.create_task(
-                runner, name=f"voice-composition-close-{name}"
-            )
+            task = asyncio.create_task(runner, name=f"voice-composition-close-{name}")
         except BaseException:
             create_failed = True
         if create_failed:
@@ -2063,9 +2149,7 @@ async def _close_failed_composition(
             if remaining <= 0:
                 break
             try:
-                completed, _pending = await asyncio.wait(
-                    (task,), timeout=remaining
-                )
+                completed, _pending = await asyncio.wait((task,), timeout=remaining)
                 done.update(completed)
             except asyncio.CancelledError as error:
                 if cancellation is None:
@@ -2109,9 +2193,7 @@ def _new_publication() -> RuntimePublication:
 
 
 def _stale_cleanup_id(call_id: UUID) -> UUID:
-    digest = hashlib.sha256(
-        b"projetv0.voice.stale-cleanup.v1\x00" + call_id.bytes
-    ).digest()
+    digest = hashlib.sha256(b"projetv0.voice.stale-cleanup.v1\x00" + call_id.bytes).digest()
     return UUID(bytes=digest[:16], version=4)
 
 
@@ -2125,6 +2207,9 @@ def _stale_terminal_operation(
     operation_digest = hashlib.sha256(
         b"projetv0.voice.stale-terminal.v1\x00" + stale.call_id.bytes
     ).digest()
+    facts = stale.lifecycle
+    if facts is not None and facts.transfer_fenced:
+        raise RuntimeError("transfer_fence_cannot_stale_terminalize")
     return VoiceOperationV1(
         schema_version=1,
         operation_id=UUID(bytes=operation_digest[:16], version=4),
@@ -2134,14 +2219,30 @@ def _stale_terminal_operation(
         kind="call.upsert",
         payload=CallUpsertPayloadV1(
             telnyx_call_control_id=stale.call_control_id,
-            telnyx_call_leg_id=None,
-            telnyx_call_session_id=None,
+            telnyx_call_leg_id=None if facts is None else facts.telnyx_call_leg_id,
+            telnyx_call_session_id=None if facts is None else facts.telnyx_call_session_id,
             status="failed",
-            disclosure_state="failed",
-            started_at=None,
+            disclosure_state="completed"
+            if facts is not None
+            and facts.disclosure_evidence is not None
+            and facts.disclosure_evidence.completed_at is not None
+            else "failed",
+            started_at=None if facts is None else facts.started_at,
             ended_at=ended_at,
             end_reason="stale_process_recovery",
-            retention_until=ended_at + timedelta(days=retention_days),
+            retention_until=ended_at + timedelta(days=retention_days)
+            if facts is None
+            else facts.retention_until,
+            **(
+                cast(
+                    Any,
+                    (
+                        {"disclosure_evidence": facts.disclosure_evidence}
+                        if facts is not None and facts.disclosure_evidence is not None
+                        else {}
+                    ),
+                )
+            ),
         ),
     )
 

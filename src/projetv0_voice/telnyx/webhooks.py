@@ -25,23 +25,26 @@ from projetv0_voice.admission import (
     WebhookFinalizerOwner,
 )
 from projetv0_voice.models import (
-    MAX_PROVIDER_RECORDING_ID_CHARS,
     VoiceOperationV1,
+    _e164,
+    _provider_id,
     is_valid_provider_recording_id,
 )
 from projetv0_voice.persistence.commands import PersistenceError
+from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
 from projetv0_voice.telnyx.call_control import MAX_CALL_CONTROL_ID_CHARS
 
 MAX_WEBHOOK_BODY_BYTES = 65_536
 MAX_EVENT_ID_CHARS = 256
 MAX_EVENT_TYPE_CHARS = 128
-MAX_PROVIDER_ID_CHARS = MAX_PROVIDER_RECORDING_ID_CHARS
+MAX_PROVIDER_ID_CHARS = 1024
 MAX_CLIENT_STATE_B64_CHARS = 4_096
 HANDLED_WEBHOOK_TYPES = frozenset(
     {
         "call.initiated",
         "call.answered",
         "call.hangup",
+        "call.bridged",
         "call.recording.saved",
         "call.recording.error",
     }
@@ -101,11 +104,13 @@ class VerifiedWebhook:
     recording_ended_at: datetime | None = field(repr=False)
     recording_channels: str | None = field(repr=False)
     semantic_fingerprint_sha256: bytes = field(repr=False)
-    legacy_v1_semantic_fingerprint_sha256: bytes | None = field(
-        default=None, repr=False
-    )
-    direction: Literal["incoming"] | None = field(default=None, repr=False)
+    legacy_v1_semantic_fingerprint_sha256: bytes | None = field(default=None, repr=False)
+    direction: Literal["incoming", "outgoing"] | None = field(default=None, repr=False)
     call_state: Literal["parked", "answered"] | None = field(default=None, repr=False)
+    connection_id: str | None = field(default=None, repr=False)
+    to_e164: str | None = field(default=None, repr=False)
+    from_e164: str | None = field(default=None, repr=False)
+    hangup_cause: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -125,7 +130,7 @@ class VerifiedWebhook:
             )
             or self.recording_channels is not None
             and not _valid_recording_channels(self.recording_channels)
-            or self.direction not in {None, "incoming"}
+            or self.direction not in {None, "incoming", "outgoing"}
             or self.call_state not in {None, "parked", "answered"}
             or type(self.semantic_fingerprint_sha256) is not bytes
             or len(self.semantic_fingerprint_sha256) != 32
@@ -145,6 +150,7 @@ class VerifiedWebhook:
 class WebhookDurableEffect:
     lease: Mapping[str, object] | None = field(default=None, repr=False)
     operation: VoiceOperationV1 | None = field(default=None, repr=False)
+    admission_facts: LocalCallAdmissionFacts | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         normalized_lease = _validated_lease(self.lease)
@@ -301,9 +307,7 @@ class ObservedWebhookResult:
             raise ValueError("observed_webhook_result_invalid") from None
 
 
-WebhookResolver = Callable[
-    [VerifiedWebhook], ResolvedWebhook | Awaitable[ResolvedWebhook]
-]
+WebhookResolver = Callable[[VerifiedWebhook], ResolvedWebhook | Awaitable[ResolvedWebhook]]
 
 
 def _raise_constant(error_type: type[WebhookError], code: str) -> NoReturn:
@@ -348,7 +352,7 @@ def _optional_provider_id(payload: Mapping[str, object], name: str) -> str | Non
     bounded = _bounded_string(value, MAX_PROVIDER_ID_CHARS)
     if bounded is None:
         raise ValueError("invalid_provider_id")
-    return bounded
+    return _provider_id(bounded, 1024)
 
 
 def _optional_call_control_id(payload: Mapping[str, object]) -> str | None:
@@ -358,7 +362,7 @@ def _optional_call_control_id(payload: Mapping[str, object]) -> str | None:
     bounded = _bounded_string(value, MAX_CALL_CONTROL_ID_CHARS)
     if bounded is None:
         raise ValueError("invalid_call_control_id")
-    return bounded
+    return _provider_id(bounded, 1024)
 
 
 def _optional_recording_id(payload: Mapping[str, object]) -> str | None:
@@ -404,13 +408,13 @@ def _optional_recording_channels(payload: Mapping[str, object]) -> str | None:
     return cast(str, value)
 
 
-def _optional_direction(payload: Mapping[str, object]) -> Literal["incoming"] | None:
+def _optional_direction(payload: Mapping[str, object]) -> Literal["incoming", "outgoing"] | None:
     value = payload.get("direction")
     if value is None:
         return None
-    if value != "incoming":
+    if value not in {"incoming", "outgoing"}:
         raise ValueError("invalid_direction")
-    return "incoming"
+    return value
 
 
 def _optional_call_state(
@@ -444,7 +448,7 @@ def _semantic_fingerprint(
     recording_started_at: datetime | None,
     recording_ended_at: datetime | None,
     recording_channels: str | None,
-    direction: Literal["incoming"] | None,
+    direction: Literal["incoming", "outgoing"] | None,
     call_state: Literal["parked", "answered"] | None,
     include_action_fields: bool,
 ) -> bytes:
@@ -508,15 +512,15 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
             or event_type in {"call.initiated", "call.answered", "call.hangup"}
         ) and call_control_id is None:
             return None
-        direction: Literal["incoming"] | None = None
+        direction: Literal["incoming", "outgoing"] | None = None
         call_state: Literal["parked", "answered"] | None = None
         if event_type == "call.initiated":
             direction = _optional_direction(payload)
-            call_state = _optional_call_state(payload)
+            call_state = _optional_call_state(payload) if direction != "outgoing" else None
         elif event_type == "call.answered":
             call_state = _optional_call_state(payload)
         if event_type == "call.initiated" and (
-            direction != "incoming" or call_state != "parked"
+            direction != "outgoing" and (direction != "incoming" or call_state != "parked")
         ):
             return None
         if event_type == "call.answered" and call_state != "answered":
@@ -529,6 +533,24 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
         recording_started_at = _optional_utc_datetime(payload, "recording_started_at")
         recording_ended_at = _optional_utc_datetime(payload, "recording_ended_at")
         recording_channels = _optional_recording_channels(payload)
+        connection_raw = payload.get("connection_id")
+        if connection_raw is not None and not isinstance(connection_raw, str):
+            return None
+        connection_id = None if connection_raw is None else _provider_id(connection_raw, 256)
+        to_raw = payload.get("to")
+        to_e164 = None if to_raw is None else _e164(to_raw)
+        from_raw = payload.get("from")
+        try:
+            from_e164 = None if from_raw is None else _e164(from_raw)
+        except (ValueError, TypeError):
+            from_e164 = None
+        hangup_cause = _bounded_string(payload.get("hangup_cause"), 128)
+        routing_fields = (connection_id, to_e164, from_e164, hangup_cause)
+        if direction == "outgoing" and (
+            client_state is None or connection_id is None or to_e164 is None
+            or call_leg_id is None or call_session_id is None
+        ):
+            return None
         return VerifiedWebhook(
             event_id=event_id,
             event_type=event_type,
@@ -544,7 +566,32 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
             recording_channels=recording_channels,
             direction=direction,
             call_state=call_state,
-            semantic_fingerprint_sha256=_semantic_fingerprint(
+            connection_id=connection_id,
+            to_e164=to_e164,
+            from_e164=from_e164,
+            hangup_cause=hangup_cause,
+            semantic_fingerprint_sha256=hashlib.sha256(
+                _semantic_fingerprint(
+                    event_id=event_id,
+                    event_type=event_type,
+                    occurred_at=normalized_time,
+                    call_control_id=call_control_id,
+                    call_leg_id=call_leg_id,
+                    call_session_id=call_session_id,
+                    recording_id=recording_id,
+                    stream_id=stream_id,
+                    client_state=client_state,
+                    recording_started_at=recording_started_at,
+                    recording_ended_at=recording_ended_at,
+                    recording_channels=recording_channels,
+                    direction=direction,
+                    call_state=call_state,
+                    include_action_fields=True,
+                )
+                + json.dumps(routing_fields, separators=(",", ":")).encode()
+            ).digest()
+            if any(value is not None for value in routing_fields)
+            else _semantic_fingerprint(
                 event_id=event_id,
                 event_type=event_type,
                 occurred_at=normalized_time,
@@ -580,6 +627,7 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
                     include_action_fields=False,
                 )
                 if event_type in {"call.initiated", "call.answered"}
+                and not any(value is not None for value in routing_fields)
                 else None
             ),
         )

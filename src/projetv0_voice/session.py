@@ -16,8 +16,9 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-from pipecat.frames.frames import ErrorFrame
+from pipecat.frames.frames import ErrorFrame, FunctionCallResultProperties
 from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.workers.runner import WorkerRunner
 
 from projetv0_voice.admission import (
@@ -29,9 +30,22 @@ from projetv0_voice.admission import (
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
-from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.models import (
+    BeginCallSnapshotV1,
+    CallUpsertPayloadV1,
+    DisclosureEvidenceV1,
+    MessageResultV1,
+    RoutingV1,
+    TurnUpsertPayloadV1,
+    VoiceOperationV1,
+    _e164,
+)
+from projetv0_voice.persistence.business_contract import validate_turn_text
+from projetv0_voice.persistence.business_result import infer_partial_result
 from projetv0_voice.persistence.commands import PersistenceCommand
 from projetv0_voice.pipeline import (
+    SPARRA_DISCLOSURE,
+    SPARRA_RECORDING_DISCLOSURE,
     CallRuntime,
     FirstFailure,
     ObservedPipeline,
@@ -88,6 +102,8 @@ class CallIdentity:
     stream_id: str = field(repr=False)
     started_at: datetime
     retention_until: datetime
+    routing: RoutingV1 | None = field(default=None, repr=False)
+    begin_snapshot: BeginCallSnapshotV1 | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         required_text = (self.deployment_id, self.telnyx_call_control_id, self.stream_id)
@@ -260,7 +276,7 @@ MAX_TURN_TEXT_BYTES = 65_520
 
 
 class TurnWriter(Protocol):
-    def try_enqueue_turn(self, operation: VoiceOperationV1) -> bool: ...
+    def try_enqueue_turn(self, operation: VoiceOperationV1, *, truncated: bool = False) -> bool: ...
 
 
 class TurnRecorder:
@@ -320,13 +336,24 @@ class TurnRecorder:
         if not self._accepting or content is None or content == "":
             return
         accepted = False
+        capture_id = None
         try:
-            plaintext = self._bounded_copy(content)
+            if self._identity.routing is not None:
+                self._turn_no += 1
+                capture_id = self._uuid_factory()
+                accepted = True
+            bound = 16384 if self._identity.routing is not None else MAX_TURN_TEXT_BYTES
+            encoded = content.encode("utf-8")
+            plaintext = encoded[:bound].decode("utf-8", errors="ignore").encode("utf-8")
             if not plaintext:
                 return
             accepted = True
-            self._turn_no += 1
-            turn_id = self._uuid_factory()
+            if capture_id is None:
+                self._turn_no += 1
+                capture_id = self._uuid_factory()
+            else:
+                validate_turn_text(plaintext.decode("utf-8"))
+            turn_id = capture_id
             encrypted = self._keyring.encrypt(
                 plaintext,
                 aad=b"turn:" + str(turn_id).encode("ascii"),
@@ -355,10 +382,17 @@ class TurnRecorder:
                 kind="turn.upsert",
                 payload=payload,
             )
-            if not self._writer.try_enqueue_turn(operation):
+            enqueued = (
+                self._writer.try_enqueue_turn(operation, truncated=len(encoded) > bound)
+                if self._identity.routing is not None
+                else self._writer.try_enqueue_turn(operation)
+            )
+            if not enqueued:
                 self._record_turn_lost()
                 self._first_failure.signal("writer_failed")
         except Exception:
+            if self._identity.routing is not None and capture_id is not None:
+                cast(Any, self._writer).try_enqueue_capture_loss(self._identity.call_id, capture_id)
             if accepted:
                 self._record_turn_lost()
             self._first_failure.signal("persistence_failed")
@@ -426,7 +460,7 @@ SessionTaskFactory = Callable[[Coroutine[Any, Any, Any], str], asyncio.Task[Any]
 
 @dataclass(frozen=True, slots=True)
 class _FrozenTerminalOutcome:
-    status: Literal["closed", "failed"]
+    status: Literal["closing", "closed", "failed"]
     reason: str
 
 
@@ -463,7 +497,11 @@ class _TerminalOutcome:
     def freeze(self) -> _FrozenTerminalOutcome:
         if self._frozen is None:
             self._frozen = _FrozenTerminalOutcome(
-                status="closed" if self._reason == "closed" else "failed",
+                status="closing"
+                if self._reason == "qualified_line_connected"
+                else "closed"
+                if self._reason == "closed"
+                else "failed",
                 reason=self._reason,
             )
         return self._frozen
@@ -471,7 +509,7 @@ class _TerminalOutcome:
     def freeze_authoritative(
         self,
         *,
-        status: Literal["closed", "failed"],
+        status: Literal["closing", "closed", "failed"],
         reason: str,
     ) -> _FrozenTerminalOutcome:
         if self._frozen is None:
@@ -530,9 +568,7 @@ class CallSession:
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         if (
-            not isinstance(
-                profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1
-            )
+            not isinstance(profile, QualifiedDeploymentProfileV1 | QualificationCandidateProfileV1)
             or profile.deployment_id != identity.deployment_id
             or type(runtime_metrics) is not RuntimeMetrics
             or type(observers) is not _CallObservers
@@ -574,8 +610,86 @@ class CallSession:
         self._active_runner: WorkerRunner | None = None
         self._drain_requested = False
         self._drain_claimed = False
+        self._drain_task: asyncio.Task[None] | None = None
         self._drain_lock = asyncio.Lock()
         self._terminal_outcome = _TerminalOutcome("closed")
+        self._no_new_ai = False
+        self._controller: DisclosureController | None = None
+        self._recorder: TurnRecorder | None = None
+        self._active_runtime: CallRuntime | None = None
+        self._terminal_publication: VoiceOperationV1 | None = None
+        self._partial_result: MessageResultV1 | None = None
+        self._result_inference_task: asyncio.Task[MessageResultV1 | None] | None = None
+        self._result_inference_fenced = False
+
+    @property
+    def no_new_ai(self) -> bool:
+        return self._no_new_ai
+
+    def stop_new_ai(self) -> None:
+        self._no_new_ai = True
+        self.stop_result_inference()
+        if self._controller is not None:
+            self._controller.stop_input()
+        if self._recorder is not None:
+            self._recorder.close()
+
+    def stop_result_inference(self) -> None:
+        """A takeover intent irreversibly revokes this call's result request."""
+        self._result_inference_fenced = True
+        self._partial_result = None
+        if self._result_inference_task is not None:
+            self._result_inference_task.cancel()
+
+    async def _prepare_partial_result(self) -> None:
+        if self._identity.routing is None:
+            return
+        frozen = await cast(Any, self._writer).read_frozen_call_publication(self._identity.call_id)
+        if frozen is not None:
+            self._terminal_publication = frozen
+            return
+        retained = await cast(Any, self._writer).read_retained_call(self._identity.call_id)
+        facts = await cast(Any, self._writer).read_call_lifecycle(self._identity.call_id)
+        if (
+            self._no_new_ai
+            or getattr(self, "_result_inference_fenced", False)
+            or retained.erased
+            or (facts is not None and facts.transfer_fenced)
+        ):
+            return
+        task = asyncio.create_task(
+            infer_partial_result(
+                cast(Any, self._services.llm), retained, self._identity.routing.from_e164
+            ),
+            name="call-result-inference-owned",
+        )
+        self._result_inference_task = task
+        try:
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
+                result = await task
+            if not self._no_new_ai and not self._result_inference_fenced:
+                self._partial_result = result
+        except (Exception, asyncio.CancelledError):
+            self._partial_result = None
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _request_human_tool(self, params: FunctionCallParams) -> None:
+        if (
+            not isinstance(params.arguments, dict)
+            or params.arguments
+            or self._registry_terminalizer is None
+            or self._no_new_ai
+        ):
+            result = "unavailable_collect_message"
+        else:
+            result = await cast(Any, self._registry_terminalizer).request_human()
+        await params.result_callback(
+            {"status": result, "human_identity_verified": False},
+            properties=FunctionCallResultProperties(run_llm=not self._no_new_ai),
+        )
 
     async def run(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if self._run_started:
@@ -589,8 +703,12 @@ class CallSession:
             writer=self._writer,
             first_failure=first_failure,
             recording=self._recording,
-            recording_enabled=self._manifest.recording_mode != "off",
-            recording_required=self._manifest.recording_required,
+            recording_enabled=self._identity.begin_snapshot.recording_enabled
+            if self._identity.begin_snapshot is not None
+            else self._manifest.recording_mode != "off",
+            recording_required=self._identity.begin_snapshot.recording_enabled
+            if self._identity.begin_snapshot is not None
+            else self._manifest.recording_required,
             mark_timeout_seconds=self._profile.disclosure_mark_timeout_ms / 1000,
             runtime_metrics=self._runtime_metrics,
             utcnow=self._utcnow,
@@ -605,6 +723,9 @@ class CallSession:
             uuid_factory=self._uuid_factory,
             utcnow=self._utcnow,
         )
+        self._controller, self._recorder = controller, recorder
+        if self._no_new_ai:
+            self.stop_new_ai()
         pipeline: ObservedPipeline | None = None
         runtime: CallRuntime | None = None
         runner_task: asyncio.Task[None] | None = None
@@ -626,15 +747,28 @@ class CallSession:
                 controller=controller,
                 turn_recorder=recorder,
                 first_failure=first_failure,
+                begin_snapshot=self._identity.begin_snapshot,
+                transfer_handler=self._request_human_tool
+                if self._identity.begin_snapshot is not None
+                and self._registry_terminalizer is not None
+                and await cast(Any, self._registry_terminalizer).human_tool_available()
+                else None,
             )
             runtime = build_runtime(
                 pipeline=pipeline,
                 first_failure=first_failure,
-                greeting=self._manifest.greeting,
+                greeting=(
+                    SPARRA_RECORDING_DISCLOSURE
+                    if self._identity.begin_snapshot.recording_enabled
+                    else SPARRA_DISCLOSURE
+                )
+                if self._identity.begin_snapshot is not None
+                else self._manifest.greeting,
                 mark_name=controller.mark_name,
                 idle_timeout_seconds=self._idle_timeout_seconds,
                 observers=self._observers,
             )
+            self._active_runtime = runtime
 
             async def observe_native_fatal(
                 _worker: object,
@@ -711,6 +845,8 @@ class CallSession:
         self._active_runner = None
         if cancellation is not None:
             raise cancellation
+        if terminal_outcome.reason == "qualified_line_connected":
+            return
         if terminal_outcome.reason != "closed":
             raise CallSessionError(terminal_outcome.reason)
         final_error = first_failure.code
@@ -723,14 +859,46 @@ class CallSession:
         if reason is not None:
             self._latch_drain_reason(reason)
 
-        runner: WorkerRunner | None = None
         async with self._drain_lock:
             self._drain_requested = True
             if self._active_runner is not None and not self._drain_claimed:
                 self._drain_claimed = True
-                runner = self._active_runner
-        if runner is not None:
+                self._drain_task = asyncio.create_task(
+                    self._drain_runner_owned(self._active_runner),
+                    name="call-drain-owned",
+                )
+            task = self._drain_task
+        if task is not None:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # A cancelled waiter cannot revoke the call-owned departure.
+                    continue
+            await task
+
+    async def _drain_runner_owned(self, runner: WorkerRunner) -> None:
+        clear_task = None
+        if self._no_new_ai and self._active_runtime is not None:
+            clear_task = asyncio.create_task(
+                self._clear_takeover_owned(self._active_runtime), name="call-takeover-clear"
+            )
+        try:
+            # Cancellation is independent of the optional output acknowledgement.
             await runner.cancel(reason="drain")
+        finally:
+            if self._result_inference_task is not None and self._no_new_ai:
+                self._result_inference_task.cancel()
+                await asyncio.gather(self._result_inference_task, return_exceptions=True)
+            if clear_task is not None:
+                await clear_task
+
+    async def _clear_takeover_owned(self, runtime: CallRuntime) -> None:
+        try:
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
+                await runtime.request_clear()
+        except (Exception, asyncio.CancelledError):
+            return
 
     def _latch_drain_reason(self, reason: str) -> None:
         if type(reason) is not str or reason not in {
@@ -740,6 +908,8 @@ class CallSession:
             "token_deadline",
             "session_construction_failed",
             "telnyx_hangup",
+            "qualified_line_connected",
+            "content_erased",
         }:
             raise ValueError("call_drain_reason_invalid") from None
         self._terminal_outcome.request_reason(reason)
@@ -781,17 +951,10 @@ class CallSession:
         )
 
     async def _replay_pending_drain(self) -> None:
-        runner: WorkerRunner | None = None
         async with self._drain_lock:
-            if (
-                self._drain_requested
-                and not self._drain_claimed
-                and self._active_runner is not None
-            ):
-                self._drain_claimed = True
-                runner = self._active_runner
-        if runner is not None:
-            await runner.cancel(reason="drain")
+            requested = self._drain_requested
+        if requested:
+            await self.request_drain()
 
     @staticmethod
     def _default_task_factory(
@@ -862,9 +1025,7 @@ class CallSession:
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError as error:
-                caller_is_cancelling = (
-                    caller_task is not None and caller_task.cancelling() > 0
-                )
+                caller_is_cancelling = caller_task is not None and caller_task.cancelling() > 0
                 if caller_is_cancelling and cancellation is None:
                     cancellation = error
                     terminal_outcome.note_caller_cancellation()
@@ -1020,13 +1181,19 @@ class CallSession:
             first_failure,
             "recording_cleanup_failed",
         )
-        await self._attempt(self._services.aclose, first_failure, "service_close_failed")
+        await self._attempt(self._prepare_partial_result, first_failure, "persistence_failed")
+        if self._identity.routing is None:
+            await self._attempt(self._services.aclose, first_failure, "service_close_failed")
         self._promote_cleanup_failure(terminal_outcome, first_failure)
-        await self._finish_durable_boundaries(
-            first_failure=first_failure,
-            terminal_outcome=terminal_outcome,
-            disclosure_completed=controller.disclosure_completed,
-        )
+        try:
+            await self._finish_durable_boundaries(
+                first_failure=first_failure,
+                terminal_outcome=terminal_outcome,
+                disclosure_completed=controller.disclosure_completed,
+            )
+        finally:
+            if self._identity.routing is not None:
+                await self._attempt(self._services.aclose, first_failure, "service_close_failed")
 
     @staticmethod
     async def _join_task(task: asyncio.Task[None]) -> None:
@@ -1044,6 +1211,16 @@ class CallSession:
             or handshake.lease_claim is not self._identity.lease_claim
         ):
             raise CallSessionError("call_identity_mismatch")
+        routing = self._identity.routing
+        if routing is not None:
+            data = handshake.call_data.model_dump(by_alias=True)
+            caller = data.get("from")
+            try:
+                caller = None if caller is None else _e164(caller)
+            except (ValueError, TypeError):
+                caller = None
+            if data.get("to") != routing.to_e164 or caller != routing.from_e164:
+                raise CallSessionError("call_identity_mismatch")
 
     async def _finish_durable_boundaries(
         self,
@@ -1053,10 +1230,7 @@ class CallSession:
         disclosure_completed: bool,
     ) -> None:
         self._promote_cleanup_failure(terminal_outcome, first_failure)
-        if (
-            self._registry_terminalizer is not None
-            and self._metric_lease is not None
-        ):
+        if self._registry_terminalizer is not None and self._metric_lease is not None:
             proposed = self._terminal_proposal(terminal_outcome.reason)
             authority = await self._registry_terminalizer.reserve_or_read(proposed)
             frozen = terminal_outcome.freeze_authoritative(
@@ -1064,7 +1238,7 @@ class CallSession:
                 reason=authority.reason,
             )
             self._metric_lease.finish(authority.metric_class)
-            if authority.persist_call and not self._writer.fatal_event.is_set():
+            if not self._writer.fatal_event.is_set():
                 persisted = await self._commit_authoritative_terminal_call(
                     status=frozen.status,
                     reason=frozen.reason,
@@ -1073,7 +1247,13 @@ class CallSession:
                     ended_at=authority._closed_at,  # noqa: SLF001
                 )
                 if not persisted:
+                    if self._identity.routing is not None:
+                        await self._attempt(
+                            self._services.aclose, first_failure, "service_close_failed"
+                        )
                     return
+            if self._identity.routing is not None:
+                await self._attempt(self._services.aclose, first_failure, "service_close_failed")
             await self._registry_terminalizer.complete(authority)
             return
         frozen = terminal_outcome.freeze()
@@ -1087,6 +1267,8 @@ class CallSession:
                 first_failure,
                 "persistence_failed",
             )
+        if self._identity.routing is not None:
+            await self._attempt(self._services.aclose, first_failure, "service_close_failed")
         await self._attempt(
             lambda: self._lease_terminalizer.terminalize(
                 self._identity,
@@ -1099,6 +1281,10 @@ class CallSession:
 
     @staticmethod
     def _terminal_proposal(reason: str) -> TerminalProposal:
+        if reason == "qualified_line_connected":
+            return TerminalProposal(
+                status="closing", reason=reason, metric_class="drained", cleanup_hangup=False
+            )
         if reason == "recording_required_error":
             return TerminalProposal(
                 status="failed",
@@ -1130,18 +1316,19 @@ class CallSession:
     async def _commit_terminal_call(
         self,
         *,
-        status: Literal["closed", "failed"],
+        status: Literal["closing", "closed", "failed"],
         reason: str,
         disclosure_completed: bool,
         operation_id: UUID | None = None,
         ended_at: datetime | None = None,
     ) -> None:
         terminal_at = (
-            self._utcnow().astimezone(UTC)
-            if ended_at is None
-            else ended_at.astimezone(UTC)
+            self._utcnow().astimezone(UTC) if ended_at is None else ended_at.astimezone(UTC)
         )
-        operation = VoiceOperationV1(
+        if terminal_at >= self._identity.retention_until:
+            return
+        evidence = None if self._controller is None else self._controller.evidence
+        operation = self._terminal_publication or VoiceOperationV1(
             schema_version=1,
             operation_id=operation_id or self._uuid_factory(),
             deployment_id=self._identity.deployment_id,
@@ -1153,13 +1340,38 @@ class CallSession:
                 telnyx_call_leg_id=self._identity.telnyx_call_leg_id,
                 telnyx_call_session_id=self._identity.telnyx_call_session_id,
                 status=status,
-                disclosure_state="completed" if disclosure_completed else "failed",
+                disclosure_state="completed"
+                if disclosure_completed
+                or evidence is not None
+                and evidence.completed_at is not None
+                else "failed",
                 started_at=self._identity.started_at,
-                ended_at=terminal_at,
+                ended_at=None if status == "closing" else terminal_at,
                 end_reason=reason,
                 retention_until=self._identity.retention_until,
+                **(
+                    cast(
+                        Any,
+                        (
+                            {"disclosure_evidence": evidence}
+                            if self._identity.routing is not None and evidence is not None
+                            else {}
+                        ),
+                    )
+                ),
             ),
         )
+        self._terminal_publication = operation
+        if self._identity.routing is not None:
+            frozen = await cast(Any, self._writer).freeze_call_publication(
+                operation,
+                self._partial_result,
+                provider_callback=self._identity.routing.from_e164,
+                result_permitted=lambda: not self._no_new_ai and not self._result_inference_fenced,
+            )
+            if frozen is not None:
+                self._terminal_publication = frozen
+            return
         await self._writer.commit_control(
             PersistenceCommand("outbox", {"operation": operation}, None)
         )
@@ -1167,7 +1379,7 @@ class CallSession:
     async def _commit_authoritative_terminal_call(
         self,
         *,
-        status: Literal["closed", "failed"],
+        status: Literal["closing", "closed", "failed"],
         reason: str,
         disclosure_completed: bool,
         operation_id: UUID,
@@ -1186,9 +1398,7 @@ class CallSession:
                 continue
             except BaseException:
                 if self._registry_terminalizer is not None:
-                    self._registry_terminalizer.note_failure(
-                        "terminal_persistence_failed"
-                    )
+                    self._registry_terminalizer.note_failure("terminal_persistence_failed")
                 return False
             return True
 
@@ -1227,10 +1437,14 @@ class DisclosureController:
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
+        if identity.begin_snapshot is not None:
+            recording_enabled = identity.begin_snapshot.recording_enabled
+            recording_required = recording_enabled
         if (
             type(recording_enabled) is not bool
             or type(recording_required) is not bool
-            or recording_required and not recording_enabled
+            or recording_required
+            and not recording_enabled
             or not isinstance(mark_timeout_seconds, int | float)
             or isinstance(mark_timeout_seconds, bool)
             or mark_timeout_seconds <= 0
@@ -1260,6 +1474,24 @@ class DisclosureController:
         self._timeout_task: asyncio.Task[None] | None = None
         self._mark_armed_at: float | None = None
         self._continuations: set[asyncio.Task[None]] = set()
+        self._disclosure_started_at: datetime | None = None
+        self._disclosure_completed_at: datetime | None = None
+        self._disclosure_failed_at: datetime | None = None
+        self._input_gate_opened_at: datetime | None = None
+        self._gate_publication: VoiceOperationV1 | None = None
+
+    @property
+    def evidence(self) -> DisclosureEvidenceV1:
+        return DisclosureEvidenceV1(
+            schema_version=1,
+            started_at=self._disclosure_started_at,
+            completed_at=self._disclosure_completed_at,
+            failed_at=self._disclosure_failed_at,
+            input_gate_opened_at=self._input_gate_opened_at,
+        )
+
+    def stop_input(self) -> None:
+        self._input_closed = True
 
     @property
     def pending_task_count(self) -> int:
@@ -1281,6 +1513,8 @@ class DisclosureController:
                 return
             if self.state is DisclosureState.PLAYING:
                 self._audio_observed = True
+                if self._disclosure_started_at is None:
+                    self._disclosure_started_at = self._utcnow().astimezone(UTC)
 
     async def arm_expected_mark(self) -> bool:
         failed = False
@@ -1348,13 +1582,13 @@ class DisclosureController:
             ):
                 return False
             self.state = DisclosureState.ACK_COMMITTING
+            acknowledged_at = self._utcnow().astimezone(UTC)
+            self._disclosure_completed_at = acknowledged_at
             armed_at = self._mark_armed_at
             self._mark_armed_at = None
             if armed_at is not None:
                 with suppress(Exception):
-                    self._runtime_metrics.record_disclosure_ack(
-                        self._monotonic() - armed_at
-                    )
+                    self._runtime_metrics.record_disclosure_ack(self._monotonic() - armed_at)
             timeout_task = self._timeout_task
             self._timeout_task = None
             self._mark_armed_at = None
@@ -1362,7 +1596,7 @@ class DisclosureController:
                 timeout_task.cancel()
             task = asyncio.create_task(
                 self._run_owned_continuation(
-                    lambda: self._complete_disclosure(self._utcnow()),
+                    lambda: self._complete_disclosure(acknowledged_at),
                     "disclosure_commit_failed",
                 ),
                 name="disclosure-ack-continuation",
@@ -1374,6 +1608,8 @@ class DisclosureController:
         timeout_task: asyncio.Task[None] | None
         async with self._lock:
             self._input_closed = True
+            if self._disclosure_completed_at is None and self._disclosure_failed_at is None:
+                self._disclosure_failed_at = self._utcnow().astimezone(UTC)
             if self.state is not DisclosureState.ACTIVE:
                 self.state = DisclosureState.ABORTED
             timeout_task = self._timeout_task
@@ -1491,6 +1727,16 @@ class DisclosureController:
                 ended_at=None,
                 end_reason=None,
                 retention_until=self._identity.retention_until,
+                **(
+                    cast(
+                        Any,
+                        (
+                            {"disclosure_evidence": self.evidence}
+                            if self._identity.routing is not None
+                            else {}
+                        ),
+                    )
+                ),
             ),
         )
         try:
@@ -1519,9 +1765,15 @@ class DisclosureController:
             self.state = DisclosureState.DISCLOSURE_DURABLE
             if not self._recording_enabled:
                 self.state = DisclosureState.ACTIVE
-                return
-            self.state = DisclosureState.RECORDING_STARTING
-            self.recording_may_be_active = True
+                self._input_gate_opened_at = self._utcnow().astimezone(UTC)
+            else:
+                self.state = DisclosureState.RECORDING_STARTING
+                self.recording_may_be_active = True
+
+        if not self._recording_enabled:
+            if self._identity.routing is not None:
+                await self._publish_gate_evidence()
+            return
 
         result: RecordingStartResult
         try:
@@ -1568,6 +1820,40 @@ class DisclosureController:
                 failed = True
         if failed:
             self._first_failure.signal("recording_failed")
+        elif self._identity.begin_snapshot is not None:
+            async with self._lock:
+                if not self.is_active():
+                    return
+                self._input_gate_opened_at = self._utcnow().astimezone(UTC)
+            if self._identity.routing is not None:
+                await self._publish_gate_evidence()
+
+    async def _publish_gate_evidence(self) -> None:
+        assert self._input_gate_opened_at is not None
+        if self._gate_publication is None:
+            self._gate_publication = VoiceOperationV1(
+                schema_version=1,
+                operation_id=self._uuid_factory(),
+                deployment_id=self._identity.deployment_id,
+                call_id=self._identity.call_id,
+                occurred_at=self._input_gate_opened_at,
+                kind="call.upsert",
+                payload=CallUpsertPayloadV1(
+                    telnyx_call_control_id=self._identity.telnyx_call_control_id,
+                    telnyx_call_leg_id=self._identity.telnyx_call_leg_id,
+                    telnyx_call_session_id=self._identity.telnyx_call_session_id,
+                    status="active",
+                    disclosure_state="completed",
+                    started_at=self._identity.started_at,
+                    ended_at=None,
+                    end_reason=None,
+                    retention_until=self._identity.retention_until,
+                    disclosure_evidence=self.evidence,
+                ),
+            )
+        await self._writer.commit_control(
+            PersistenceCommand("outbox", {"operation": self._gate_publication}, None)
+        )
 
 
 __all__ = [

@@ -33,6 +33,8 @@ _ALLOWED_ENVIRONMENT_NAMES = (
     "VOICE_QUALIFICATION_OVERRIDE_PATH",
     "VOICE_KEYRING_PATH",
     "VOICE_SQLITE_PATH",
+    "VOICE_RECORDING_ARCHIVE_DIRECTORY",
+    "VOICE_RECORDING_DOWNLOAD_ORIGINS",
     "VOICE_RUNTIME_CONTRACT_SHA256",
     "VOICE_IMAGE_DIGEST",
     "VOICE_AGENT_BUNDLE_SHA256",
@@ -66,7 +68,7 @@ _DIRECT_SECRET_NAMES = frozenset(
         "VOICE_POSTGRES_DSN",
     }
 )
-_FORBIDDEN_EXACT = _DIRECT_SECRET_NAMES | {"TELNYX_LOG", "OPENAI_LOG"}
+_FORBIDDEN_EXACT = _DIRECT_SECRET_NAMES | {"TELNYX_LOG", "OPENAI_LOG", "TELNYX_BASE_URL"}
 _MISSING = object()
 _ASCII_WHITESPACE = frozenset(" \t\n\v\f\r")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -146,6 +148,8 @@ class RuntimeSettingsV1:
     otlp_http_endpoint: str
     bind_host: str
     bind_port: int
+    recording_archive_directory: PurePosixPath | None = None
+    recording_download_origins: tuple[str, ...] = ()
     _observability_token: ObservabilityBootstrapToken | None = field(
         default=None,
         init=False,
@@ -382,6 +386,25 @@ def _validate_mode(
         raise _SettingsInvalid
 
 
+def _recording_origins(capture: RuntimeEnvironmentCapture) -> tuple[str, ...]:
+    directory = _optional_string(capture,"VOICE_RECORDING_ARCHIVE_DIRECTORY")
+    origins = _optional_string(capture,"VOICE_RECORDING_DOWNLOAD_ORIGINS")
+    if (directory is None) != (origins is None):
+        raise _SettingsInvalid
+    if origins is None:
+        return ()
+    values = tuple(origins.split(","))
+    if not 1 <= len(values) <= 8 or len(set(values)) != len(values):
+        raise _SettingsInvalid
+    for value in values:
+        parsed=urlsplit(value)
+        if (parsed.scheme!="https" or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.port is not None or parsed.path
+            or parsed.query or parsed.fragment or value!="https://"+parsed.hostname.lower()):
+            raise _SettingsInvalid
+    return values
+
+
 def parse_runtime_settings(
     capture: RuntimeEnvironmentCapture,
     *,
@@ -465,6 +488,8 @@ def parse_runtime_settings(
             qualification_override_path=qualification_override_path,
             keyring_path=_required_path(capture, "VOICE_KEYRING_PATH"),
             sqlite_path=_required_path(capture, "VOICE_SQLITE_PATH"),
+            recording_archive_directory=_optional_path(capture,"VOICE_RECORDING_ARCHIVE_DIRECTORY"),
+            recording_download_origins=_recording_origins(capture),
             runtime_contract_sha256=_sha256(capture, "VOICE_RUNTIME_CONTRACT_SHA256"),
             image_digest=image_digest,
             agent_bundle_sha256=_sha256(capture, "VOICE_AGENT_BUNDLE_SHA256"),

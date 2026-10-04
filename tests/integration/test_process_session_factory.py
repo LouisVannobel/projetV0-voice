@@ -337,10 +337,7 @@ class _RealWriter:
     async def commit_control(self, command: object) -> None:
         self.control_commits.append(command)
         operation = command.payload["operation"]  # type: ignore[union-attr]
-        if (
-            operation.kind == "call.upsert"
-            and operation.payload.status in {"closed", "failed"}
-        ):
+        if operation.kind == "call.upsert" and operation.payload.status in {"closed", "failed"}:
             if self.terminal_started is not None:
                 self.terminal_started.set()
             if self.terminal_release is not None:
@@ -622,6 +619,294 @@ class _Session:
         self.events.append(f"session-drain:{reason}")
 
 
+@pytest.mark.parametrize("clear_behavior", ["stall", "raise", "cancel", "waiter_cancel", "erase"])
+@pytest.mark.asyncio
+async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
+    tmp_path, monkeypatch, clear_behavior
+):
+    import dataclasses
+    from datetime import timedelta
+    from uuid import uuid4
+
+    from pydantic import SecretStr
+
+    from projetv0_voice.config import SparraManifestV1
+    from projetv0_voice.models import BeginCallSnapshotV1
+    from projetv0_voice.persistence.writer import PersistenceWriter
+    from projetv0_voice.pipeline import CallRuntime
+    from projetv0_voice.session import CallSession
+
+    destination = "+33102030406"
+    did = "+33102030405"
+    policy = SparraManifestV1(
+        schema_version=1,
+        connection_id="fixture",
+        original_forward_line_e164=None,
+        qualified_transfer_destination_e164=destination,
+    )
+    writer = PersistenceWriter(
+        tmp_path / "takeover.sqlite", CryptoKeyring({1: b"k" * 32}, active_version=1),
+        utcnow=lambda: NOW,
+    )
+    writer_task = asyncio.create_task(writer.run())
+    assert await writer.wait_ready()
+
+    class Control(_RealControl):
+        async def transfer(self, control_id, request, *, command_id):
+            return CallControlResult("accepted")
+
+    control = Control()
+
+    async def begin(deployment, call_id, routing):
+        return BeginCallSnapshotV1(
+            schema_version=1,
+            call_id=call_id,
+            configuration_revision=1,
+            knowledge=dict(
+                business_name="Garage",
+                sector="garage",
+                opening_hours="",
+                services="",
+                prices="",
+                faq="",
+                instructions="",
+            ),
+            transfer_destination=destination,
+            retention_until=routing.admitted_at + timedelta(days=30),
+        )
+
+    registry = CallRegistry(
+        writer=writer,
+        call_control=control,
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        deployment_id="deployment-a",
+        capacity=1,
+        lease_ttl_seconds=30,
+        retention_days=30,
+        stream_url="wss://fixture.invalid/media",
+        utcnow=lambda: NOW,
+        monotonic=lambda: 100.0,
+        token_factory=lambda size: "A" * 43,
+        sparra=policy,
+        called_did=did,
+        begin_call=begin,
+    )
+
+    async def observed(kind, **changes):
+        received = dataclasses.replace(
+            _webhook(kind, str(uuid4())),
+            connection_id="fixture",
+            to_e164=did,
+            from_e164=None,
+            **changes,
+        )
+        resolution = await registry.resolve_webhook(received)
+        effect = resolution.effect
+        ticket = writer.submit_webhook(
+            receipt=dict(
+                event_id=received.event_id,
+                event_type=kind,
+                call_control_id=received.call_control_id,
+                occurred_at=received.occurred_at,
+                received_at=NOW,
+                semantic_fingerprint_sha256=received.semantic_fingerprint_sha256,
+            ),
+            lease=None if effect is None else effect.lease,
+            operation=None if effect is None else effect.operation,
+            admission_facts=None if effect is None else effect.admission_facts,
+        )
+        await registry.reconcile_after_commit(received, resolution, await ticket.wait())
+
+    await observed("call.initiated")
+    await observed("call.answered")
+    claim = await ProcessLeaseAuthority(registry).claim_once(
+        call_control_id="control-a",
+        token_digest=bytes.fromhex(
+            "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+        ),
+    )
+    assert claim is not None
+    entry = registry._by_control["control-a"]
+    facts = await writer.read_call_lifecycle(claim.call_id)
+    assert facts is not None and facts.admitted_at == NOW
+    assert facts.retention_until == NOW + timedelta(days=30)
+    assert facts.admission_generation == claim.generation
+    assert facts.recording_policy_revision == 1 and facts.recording_enabled is False
+    assert entry.begin_snapshot is not None
+    assert entry.begin_snapshot.call_id == claim.call_id
+    assert entry.begin_snapshot.retention_until == facts.retention_until
+    assert writer._utcnow() < facts.retention_until
+    events = []
+    metrics = RuntimeMetrics.in_memory()
+    factory = _real_process_factory(
+        registry=registry, writer=writer, metrics=metrics, events=events
+    )
+    factory._manifest = _real_manifest().model_copy(
+        update={"sparra": policy, "dids": (did,), "transcript_retention_days": 30}
+    )
+    factory._session_factory = lambda **kwargs: CallSession(
+        **{**kwargs, "cleanup_phase_timeout_seconds": 0.1, "utcnow": lambda: NOW}
+    )
+
+    async def forward_native_frame(current, frame, direction):
+        await FrameProcessor.process_frame(current, frame, direction)
+        await current.push_frame(frame, direction)
+
+    monkeypatch.setattr(_Processor, "process_frame", forward_native_frame)
+    from pipecat.frames.frames import TTSAudioRawFrame, TTSSpeakFrame
+
+    class NativeTtsBoundary(_Processor):
+        async def process_frame(self, frame, direction):
+            await FrameProcessor.process_frame(self, frame, direction)
+            if isinstance(frame, TTSSpeakFrame):
+                await self.push_frame(
+                    TTSAudioRawFrame(audio=bytes(320), sample_rate=8000, num_channels=1), direction
+                )
+            else:
+                await self.push_frame(frame, direction)
+
+    factory._tts_factory = lambda: NativeTtsBoundary("tts", events)
+    ready = asyncio.Event()
+    original_replay = CallSession._replay_pending_drain
+
+    async def replay(current):
+        await original_replay(current)
+        ready.set()
+
+    monkeypatch.setattr(CallSession, "_replay_pending_drain", replay)
+    clear_started = asyncio.Event()
+
+    async def clear(current):
+        clear_started.set()
+        if clear_behavior == "raise":
+            raise RuntimeError("owned clear fixture failure")
+        if clear_behavior == "cancel":
+            raise asyncio.CancelledError("owned clear fixture cancellation")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(CallRuntime, "request_clear", clear)
+    handshake = _exact_real_handshake(claim, events)
+    handshake = dataclasses.replace(
+        handshake, call_data=handshake.call_data.model_copy(update={"to_number": did})
+    )
+    running = asyncio.create_task(factory.run(handshake))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        session = registry._by_control["control-a"].session
+        for _ in range(100):
+            if session._controller.state.name == "MARK_PENDING":
+                break
+            await asyncio.sleep(0.01)
+        assert session._controller.state.name == "MARK_PENDING"
+        assert await session._controller.accept_mark(session._controller.mark_name)
+        await session._controller.join_continuations()
+        if clear_behavior == "erase":
+            from projetv0_voice.persistence.postgres_sink import CallErasureLease
+            from projetv0_voice.persistence.relay import maintain_call_content
+
+            before = registry._by_control["control-a"]
+            owner = before.lifecycle_owner
+            assert before.begin_future.done()
+            lease = CallErasureLease(
+                1,
+                claim.call_id,
+                uuid4(),
+                "deployment-a",
+                NOW + timedelta(days=30),
+                NOW + timedelta(seconds=30),
+            )
+
+            class ErasureSink:
+                async def lease_call_erasures(self, *args):
+                    return (lease,)
+
+                async def ack_call_erasure(self, *args):
+                    assert before.routing is None and before.begin_snapshot is None
+                    assert before.begin_future is None and before.begin_task is None
+                    assert before.construction_grant is None and before.session is None
+                    assert before.lifecycle_owner is None and before.lifecycle_owner_task is None
+                    assert (
+                        owner._grant is None and owner._handshake is None and owner._session is None
+                    )
+                    assert "stt-client-close" in events and "llm-client-close" in events
+
+            await asyncio.wait_for(
+                maintain_call_content(
+                    writer,
+                    ErasureSink(),
+                    factory.erase_call_by_id,
+                    utcnow=lambda: NOW,
+                    timeout_seconds=5,
+                ),
+                timeout=5,
+            )
+            await asyncio.wait_for(running, timeout=5)
+            facts = await writer.read_call_lifecycle(claim.call_id)
+            assert facts.content_erased and facts.disclosure_evidence is None
+            assert facts.content_departed_generation == claim.generation
+            assert (await writer.read_retained_call(claim.call_id)).erased
+            assert await writer.oldest_outbox_created_at() is None
+            assert control.hangups == []
+            assert await registry.live_call_count() == 1
+            assert "stt-client-close" in events and "llm-client-close" in events
+            return
+        generation = await registry.generation_handle("control-a")
+        assert await registry.request_human(generation) == "ringing"
+        facts = await writer.read_call_lifecycle(claim.call_id)
+        target = dict(
+            call_control_id="target",
+            call_leg_id="target-leg",
+            client_state=SecretStr(facts.transfer_correlation),
+            direction="outgoing",
+            call_state=None,
+        )
+
+        # Rebind the destination through the signed target event, never a model argument.
+        async def target_event(kind):
+            received = dataclasses.replace(
+                _webhook(kind, str(uuid4())),
+                connection_id="fixture",
+                to_e164=destination,
+                from_e164=None,
+                **{**target, "direction": "outgoing" if kind == "call.initiated" else None},
+            )
+            return await registry.resolve_webhook(received)
+
+        await target_event("call.initiated")
+        takeover = asyncio.create_task(target_event("call.bridged"))
+        if clear_behavior == "waiter_cancel":
+            await clear_started.wait()
+            takeover.cancel()
+        await asyncio.wait_for(takeover, timeout=1)
+        await session.request_drain("qualified_line_connected")
+        await asyncio.wait_for(running, timeout=5)
+        assert clear_started.is_set()
+        facts = await writer.read_call_lifecycle(claim.call_id)
+        assert facts.qualified_line_bridged_at == NOW
+        assert facts.bridge_operation_id is not None
+        assert session._drain_task.done()
+        assert registry._by_control["control-a"].begin_future is None
+        items = await writer.read_relay_batch(
+            batch_size=100, now=datetime.now(UTC) + timedelta(seconds=1), lease_seconds=60
+        )
+        call_payloads = [
+            item.operation.payload for item in items if item.operation.kind == "call.upsert"
+        ]
+        assert any(payload.status == "closing" for payload in call_payloads)
+        assert all(payload.ended_at is None for payload in call_payloads)
+        assert control.hangups == []
+        assert await registry.live_call_count() == 1
+        assert "stt-client-close" in events and "llm-client-close" in events
+    finally:
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        await writer.drain(2)
+        await writer_task
+        metrics._provider.shutdown(timeout_millis=10000.0)
+
+
 def _metric_points(owner: RuntimeMetrics, name: str) -> list[Any]:
     data = owner._metric_reader.get_metrics_data()  # noqa: SLF001
     if data is None:
@@ -698,8 +983,8 @@ async def test_registrar_rejection_closes_candidate_before_claim_or_metric() -> 
     registrar = _Registrar(reject=True)
     metrics = RuntimeMetrics.in_memory(monotonic=lambda: 1.0)
     events: list[str] = []
-    registry.preconsume_probe = lambda: events == [] or pytest.fail(
-        "eager owner crossed closed gate before grant"
+    registry.preconsume_probe = lambda: (
+        events == [] or pytest.fail("eager owner crossed closed gate before grant")
     )
     factory = _factory(
         registry=registry,
@@ -751,8 +1036,8 @@ async def test_eager_registrar_reaches_only_closed_owner_gate_before_grant() -> 
     registrar = _EagerRegistrar()
     metrics = RuntimeMetrics.in_memory(monotonic=iter((1.0, 2.0)).__next__)
     events: list[str] = []
-    registry.preconsume_probe = lambda: events == [] or pytest.fail(
-        "eager owner crossed closed gate before grant"
+    registry.preconsume_probe = lambda: (
+        events == [] or pytest.fail("eager owner crossed closed gate before grant")
     )
     factory = _factory(
         registry=registry,
@@ -936,8 +1221,9 @@ async def test_post_freeze_construction_persistence_fault_latches_process_failur
 
 
 @pytest.mark.asyncio
-async def test_real_composition_mismatched_handshake_cleans_terminalizes_and_balances_metric(
-) -> None:
+async def test_real_composition_mismatched_handshake_cleans_terminalizes_and_balances_metric() -> (
+    None
+):
     writer = _RealWriter()
     control = _RealControl()
     registry, claim = await _real_claim(writer, control)
