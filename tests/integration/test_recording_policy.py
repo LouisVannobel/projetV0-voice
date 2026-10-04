@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -132,17 +135,14 @@ async def test_native_pin_rejects_wrong_generation_erasure_and_late_authority(tm
 async def test_capacity_checks_actual_consumer_and_persistent_pending_reservation(
     tmp_path, monkeypatch
 ):
-    import shutil
-
     async with owned(tmp_path) as box:
         await bind(box)
-        usage = shutil.disk_usage(box.directory)
-        monkeypatch.setattr(shutil, "disk_usage", lambda path: replace_usage(usage, 33554447))
+        set_consumer_free_bytes(monkeypatch, box, 33554447)
         with pytest.raises(PersistenceError, match="recording_archive_unavailable"):
             await reserve(box)
         assert (await box.writer.read_call_lifecycle(CALL_ID)).audio_reserved_bytes == 0
         assert not box.writer.is_degraded
-        monkeypatch.setattr(shutil, "disk_usage", lambda path: replace_usage(usage, 33554448))
+        set_consumer_free_bytes(monkeypatch, box, 33554448)
         await reserve(box)
         await reserve(box)
         await restart(box)
@@ -152,6 +152,18 @@ async def test_capacity_checks_actual_consumer_and_persistent_pending_reservatio
 
 def replace_usage(usage, free):
     return type(usage)(usage.total, usage.used, free)
+
+
+def set_consumer_free_bytes(monkeypatch, box, free):
+    if box.consumer._directory_fd is not None:
+        def descriptor_usage(descriptor):
+            assert descriptor == box.consumer._directory_fd
+            return SimpleNamespace(f_bavail=free, f_frsize=1)
+
+        monkeypatch.setattr(os, "fstatvfs", descriptor_usage)
+    else:
+        usage = shutil.disk_usage(box.directory)
+        monkeypatch.setattr(shutil, "disk_usage", lambda path: replace_usage(usage, free))
 
 
 @pytest.mark.asyncio
@@ -203,12 +215,9 @@ async def test_broken_or_overdue_copy_refuses_new_on_capacity_but_keeps_off_writ
 
 @pytest.mark.asyncio
 async def test_two_real_calls_cannot_double_book_pending_additional_space(tmp_path, monkeypatch):
-    import shutil
-
     async with owned(tmp_path) as box:
         await bind(box)
-        usage = shutil.disk_usage(box.directory)
-        monkeypatch.setattr(shutil, "disk_usage", lambda path: replace_usage(usage, 33554448))
+        set_consumer_free_bytes(monkeypatch, box, 33554448)
         await reserve(box)
         call_id, generation = UUID(int=22), UUID(int=23)
         admitted = VoiceOperationV1(

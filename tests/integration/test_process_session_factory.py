@@ -645,7 +645,8 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
         qualified_transfer_destination_e164=destination,
     )
     writer = PersistenceWriter(
-        tmp_path / "takeover.sqlite", CryptoKeyring({1: b"k" * 32}, active_version=1)
+        tmp_path / "takeover.sqlite", CryptoKeyring({1: b"k" * 32}, active_version=1),
+        utcnow=lambda: NOW,
     )
     writer_task = asyncio.create_task(writer.run())
     assert await writer.wait_ready()
@@ -725,6 +726,17 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
             "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
         ),
     )
+    assert claim is not None
+    entry = registry._by_control["control-a"]
+    facts = await writer.read_call_lifecycle(claim.call_id)
+    assert facts is not None and facts.admitted_at == NOW
+    assert facts.retention_until == NOW + timedelta(days=30)
+    assert facts.admission_generation == claim.generation
+    assert facts.recording_policy_revision == 1 and facts.recording_enabled is False
+    assert entry.begin_snapshot is not None
+    assert entry.begin_snapshot.call_id == claim.call_id
+    assert entry.begin_snapshot.retention_until == facts.retention_until
+    assert writer._utcnow() < facts.retention_until
     events = []
     metrics = RuntimeMetrics.in_memory()
     factory = _real_process_factory(
