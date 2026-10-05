@@ -12,6 +12,7 @@ WORKDIR /opt/projetv0-voice
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
 COPY scripts/export_runtime_contract.py ./scripts/export_runtime_contract.py
+COPY scripts/prepare_tokenizers.py ./scripts/prepare_tokenizers.py
 COPY agents/agent-a/ ./agents/agent-a/
 COPY deployment-profiles/ ./deployment-profiles/
 
@@ -20,6 +21,7 @@ RUN uv lock --check \
     && python scripts/export_runtime_contract.py \
         --repo-root /opt/projetv0-voice \
         --output-dir /opt/projetv0-voice/build-artifacts \
+    && python scripts/prepare_tokenizers.py /opt/projetv0-voice/nltk_data \
     && rm -rf /root/.cache/uv
 
 FROM ${PYTHON_IMAGE} AS runtime
@@ -37,9 +39,14 @@ RUN PYTHONDONTWRITEBYTECODE=1 /usr/local/bin/python3 -m pip uninstall --yes pip 
 WORKDIR /opt/projetv0-voice
 
 ENV PATH="/opt/projetv0-voice/.venv/bin:$PATH"
+ENV NLTK_DATA="/opt/projetv0-voice/nltk_data"
 
 COPY --from=builder /opt/projetv0-voice/.venv /opt/projetv0-voice/.venv
 COPY --from=builder --chown=0:10001 --chmod=0440 /opt/projetv0-voice/build-artifacts/runtime-contract.json ./runtime-contract.json
+COPY --from=builder --chown=0:10001 /opt/projetv0-voice/nltk_data ./nltk_data
+
+RUN find ./nltk_data -type d -exec chmod 0550 {} + \
+    && find ./nltk_data -type f -exec chmod 0440 {} +
 
 EXPOSE 8080
 

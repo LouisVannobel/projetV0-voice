@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import aclosing
 from typing import Any, cast
 
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from pipecat.frames.frames import ErrorFrame, FatalErrorFrame, Frame
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.services.whisper.base_stt import language_to_whisper_language
@@ -18,6 +21,28 @@ from projetv0_voice.qualified_profile import InferenceProfileV1
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _ISO_639_1 = re.compile(r"^[a-z]{2}$")
+_STT_TIMEOUT_SECONDS = 8.0
+_HTTP_TIMEOUT = httpx.Timeout(8.0, connect=2.0)
+
+
+class _BoundedOpenAISTTService(OpenAISTTService):
+    """Bound native segmented transcription without changing its scheduling."""
+
+    # Pipecat 1.7.0's abstract STTService lacks yield; its native Whisper method yields.
+    # Preserve the native async-generator contract exercised by HTTP deadline tests.
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame]:  # type: ignore[override]
+        try:
+            async with asyncio.timeout(_STT_TIMEOUT_SECONDS):
+                async with aclosing(super().run_stt(audio)) as frames:
+                    async for frame in frames:
+                        if isinstance(frame, ErrorFrame):
+                            yield FatalErrorFrame(error="openrouter_stt_transport")
+                            return
+                        yield frame
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            yield FatalErrorFrame(error="openrouter_stt_timeout")
 
 
 class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
@@ -37,12 +62,15 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
             base_url=base_url,
             organization=organization,
             project=project,
+            max_retries=0,
+            timeout=_HTTP_TIMEOUT,
             http_client=DefaultAsyncHttpxClient(
                 limits=httpx.Limits(
                     max_keepalive_connections=100,
                     max_connections=1000,
                     keepalive_expiry=None,
                 ),
+                timeout=_HTTP_TIMEOUT,
                 trust_env=False,
             ),
             default_headers=default_headers,
@@ -67,7 +95,7 @@ def build_stt(
         raise ValueError("unsupported_stt_language")
     resolved_language = Language(service_language)
 
-    return OpenAISTTService(
+    return _BoundedOpenAISTTService(
         api_key=api_key.get_secret_value(),
         base_url=_OPENROUTER_BASE_URL,
         settings=OpenAISTTService.Settings(

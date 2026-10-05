@@ -105,7 +105,7 @@ def _require_mapping(value: object) -> dict[str, Any]:
 
 
 class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
-    """Add only bounded Telnyx mark/stop/error messages to the native serializer."""
+    """Validate inbound media and bounded native Telnyx extension messages."""
 
     def __init__(
         self,
@@ -150,8 +150,38 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
         return await super().serialize(frame)
 
     async def deserialize(self, data: str | bytes) -> Frame | None:
-        initial = _load_json(data, maximum_bytes=MAX_WEBSOCKET_MESSAGE_BYTES)
-        if not isinstance(initial, dict) or initial.get("event") not in {
+        initial = _require_mapping(
+            _load_json(
+                data,
+                maximum_bytes=MAX_WEBSOCKET_MESSAGE_BYTES,
+                object_pairs_hook=_unique_object,
+            )
+        )
+        if initial.get("event") == "media":
+            stream_id = bounded_utf8_text(
+                initial.get("stream_id"), maximum_bytes=MAX_STREAM_ID_BYTES
+            )
+            if stream_id != self._stream_id:
+                raise TelnyxSerializerError("telnyx_serializer_invalid")
+            media = _require_mapping(initial.get("media"))
+            track = media.get("track")
+            payload = media.get("payload")
+            if (
+                track not in ("inbound", "outbound")
+                or not isinstance(payload, str)
+                or not payload
+            ):
+                raise TelnyxSerializerError("telnyx_serializer_invalid")
+            if track == "outbound":
+                return None
+            try:
+                allowed = self.audio_admission.allows_audio()
+            except AudioAdmissionError:
+                raise TelnyxSerializerError("telnyx_audio_admission_failed") from None
+            if not allowed:
+                return None
+
+        if initial.get("event") not in {
             "mark",
             "stop",
             "error",

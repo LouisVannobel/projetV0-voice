@@ -5,6 +5,7 @@ import base64
 import inspect
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
@@ -15,12 +16,15 @@ from uuid import UUID
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
 from pipecat.bus.bus import WorkerBus
 from pipecat.frames.frames import (
+    EndFrame,
     ErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
+    InterruptionFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -34,6 +38,7 @@ from pipecat.processors.aggregators.llm_response_universal import LLMUserAggrega
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.registry.registry import WorkerRegistry
 from pipecat.runner.types import TelnyxCallData
+from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
@@ -48,9 +53,9 @@ from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
-from projetv0_voice.inference.services import build_llm
+from projetv0_voice.inference.services import build_llm, build_stt
 from projetv0_voice.metrics import RuntimeMetrics
-from projetv0_voice.models import BeginCallSnapshotV1, VoiceOperationV1
+from projetv0_voice.models import BeginCallSnapshotV1, RoutingV1, VoiceOperationV1
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
@@ -1220,6 +1225,529 @@ def _company_snapshot(enabled: bool) -> BeginCallSnapshotV1:
     })
 
 
+class _OpeningWriter(_SessionWriter):
+    """Two independently blocked fixture commits at the real controller boundary."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.ack_started = asyncio.Event()
+        self.ack_release = asyncio.Event()
+        self.gate_started = asyncio.Event()
+        self.gate_release = asyncio.Event()
+        self.gate_committed = asyncio.Event()
+        self.fail_gate = False
+        self.turns: list[VoiceOperationV1] = []
+
+    async def commit_control(self, command: object) -> None:
+        operation = command.payload["operation"]
+        if operation.kind == "call.upsert" and operation.payload.status == "active":
+            evidence = operation.payload.disclosure_evidence
+            if evidence.input_gate_opened_at is None:
+                self.ack_started.set()
+                await self.ack_release.wait()
+            else:
+                self.gate_started.set()
+                await self.gate_release.wait()
+                if self.fail_gate:
+                    raise RuntimeError("offline-gate-commit-failed")
+                self.gate_committed.set()
+        await super().commit_control(command)
+
+    def try_enqueue_turn(self, operation: VoiceOperationV1, *, truncated: bool = False) -> bool:
+        assert not truncated
+        self.turns.append(operation)
+        return super().try_enqueue_turn(operation)
+
+    async def read_frozen_call_publication(self, _call_id: UUID) -> None:
+        return None
+
+    async def read_retained_call(self, _call_id: UUID) -> object:
+        return SimpleNamespace(erased=False)
+
+    async def read_call_lifecycle(self, _call_id: UUID) -> None:
+        return None
+
+    async def freeze_call_publication(self, operation: VoiceOperationV1, *_args, **_kwargs):
+        self.commands.append(operation)
+        return operation
+
+
+class _OpeningPeers:
+    """Controlled HTTP/SSE peers; question entry is a native transcription fixture."""
+
+    def __init__(self, writer: _OpeningWriter) -> None:
+        self.writer = writer
+        self.texts: list[str] = []
+        self.conversations: list[dict[str, object]] = []
+        self.invitation = asyncio.Event()
+        self.invitation_blocked = False
+        self.invitation_release = asyncio.Event()
+        self.invitation_cancelled = asyncio.Event()
+        self.llm_status = 200
+        self.llm_requested = asyncio.Event()
+        self.llm_release = asyncio.Event()
+
+    async def http(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path.endswith("/audio/speech"):
+            text = body["input"]
+            self.texts.append(text)
+            if text == "Comment puis-je vous aider ?":
+                assert self.writer.gate_committed.is_set(), (
+                    "invitation before durable gate evidence"
+                )
+                self.invitation.set()
+                if self.invitation_blocked:
+                    try:
+                        await self.invitation_release.wait()
+                    except asyncio.CancelledError:
+                        self.invitation_cancelled.set()
+                        raise
+            return httpx.Response(
+                200, headers={"Content-Type": "audio/pcm"}, content=b"\x01\x00" * 2400,
+            )
+        assert request.url.path.endswith("/chat/completions")
+        assert body["stream"] is True
+        self.conversations.append(body)
+        self.llm_requested.set()
+        if self.llm_status != 200:
+            await self.llm_release.wait()
+            return httpx.Response(
+                self.llm_status, json={"error": {"message": "offline LLM unavailable"}},
+            )
+        chunk = {
+            "id": "offline-hours", "object": "chat.completion.chunk", "created": 1,
+            "model": "test/llm", "choices": [{"index": 0, "delta": {
+                "content": "Le garage est ouvert de 8 h à 18 h.",
+            }, "finish_reason": None}],
+        }
+        return httpx.Response(
+            200, headers={"Content-Type": "text/event-stream"},
+            content=("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode(),
+        )
+
+
+class _OpeningNativeLlm(OpenRouterLLMService):
+    def __init__(self, client: AsyncOpenAI) -> None:
+        self.offline_client = client
+        super().__init__(api_key="offline-secret", settings=self.Settings(model="test/llm"))
+
+    def create_client(self, **_kwargs) -> AsyncOpenAI:
+        return self.offline_client
+
+
+async def _opening_event(event: asyncio.Event, message: str) -> None:
+    try:
+        await asyncio.wait_for(event.wait(), timeout=3)
+    except TimeoutError:
+        raise AssertionError(message) from None
+
+
+def _opening_plaintext(operation: VoiceOperationV1) -> str:
+    payload = operation.payload
+    return CryptoKeyring({1: b"k" * 32}, active_version=1).decrypt(
+        EncryptedValue(
+            key_version=payload.key_version,
+            nonce=base64.b64decode(payload.nonce_b64),
+            ciphertext=base64.b64decode(payload.ciphertext_b64),
+        ),
+        aad=b"turn:" + str(payload.turn_id).encode("ascii"),
+    ).decode()
+
+
+@asynccontextmanager
+async def _native_sparra_opening():
+    events: list[str] = []
+    writer = _OpeningWriter(events)
+    peers = _OpeningPeers(writer)
+    incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        return await incoming.get()
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.send":
+            wire = json.loads(message["text"])
+            sent.append(wire)
+            if wire.get("event") == "mark":
+                await incoming.put({"type": "websocket.receive", "text": json.dumps({
+                    **wire, "stream_id": "stream-1",
+                })})
+
+    websocket = WebSocket(
+        {"type": "websocket", "asgi": {"version": "3.0"}, "scheme": "wss",
+         "server": ("voice.invalid", 443), "client": ("127.0.0.1", 12345),
+         "root_path": "", "path": "/media", "raw_path": b"/media",
+         "query_string": b"", "headers": [], "subprotocols": []},
+        receive=receive, send=send,
+    )
+    websocket.application_state = websocket.client_state = WebSocketState.CONNECTED
+    admission = AudioAdmission()
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-1", expected_call_control_id="call-control-1", audio_admission=admission,
+    )
+    transport = FastAPIWebsocketTransport(websocket, FastAPIWebsocketParams(
+        audio_in_enabled=True, audio_out_enabled=True, audio_out_end_silence_secs=0,
+        serializer=serializer,
+    ))
+    llm_http = httpx.AsyncClient(transport=httpx.MockTransport(peers.http), trust_env=False)
+    stt_http = httpx.AsyncClient(transport=httpx.MockTransport(peers.http), trust_env=False)
+    tts_http = httpx.AsyncClient(transport=httpx.MockTransport(peers.http), trust_env=False)
+    llm_client = AsyncOpenAI(
+        api_key="offline-secret", base_url="https://provider.invalid/v1", http_client=llm_http,
+        max_retries=0,
+    )
+    services = _SessionServices(
+        stt=build_stt(_profile().inference, SecretStr("offline-secret"),
+                      language="fr-FR", http_client=stt_http),
+        llm=_OpeningNativeLlm(llm_client),
+        tts=OpenRouterTTSService(
+            profile=_profile().inference, api_key=SecretStr("offline-secret"), http_client=tts_http,
+        ), events=events,
+    )
+    snapshot = _company_snapshot(False)
+    snapshot = snapshot.model_copy(update={"knowledge": snapshot.knowledge.model_copy(update={
+        "opening_hours": "Du lundi au vendredi, de 8 h à 18 h.",
+    })})
+    identity = replace(
+        _identity(), begin_snapshot=snapshot, retention_until=snapshot.retention_until,
+        routing=RoutingV1(
+            schema_version=1, direction="incoming", connection_id="offline",
+            to_e164="+33102030405", from_e164=None, telnyx_call_control_id="call-control-1",
+            telnyx_call_leg_id="call-leg-1", telnyx_call_session_id="call-session-1",
+            admitted_at=NOW,
+        ),
+    )
+    session = session_module.CallSession(
+        identity=identity, manifest=_manifest(), profile=_profile(), services=services,
+        writer=writer, keyring=CryptoKeyring({1: b"k" * 32}, active_version=1),
+        recording=_RecordingBoundary(events), lease_terminalizer=_LeaseTerminalizer(events),
+        runtime_metrics=_TEST_RUNTIME_METRICS, observers=_session_observers(services),
+        idle_timeout_seconds=60, cleanup_phase_timeout_seconds=0.5,
+        utcnow=lambda: NOW + timedelta(seconds=5), uuid_factory=_uuid_factory(),
+    )
+    handshake = AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData.model_validate({
+            "stream_id": "stream-1", "call_id": "call-control-1",
+            "outbound_encoding": "PCMU", "to": "+33102030405", "from": None,
+        }),
+        token_locator_id="telnyx-header-connected-v1", lease_claim=identity.lease_claim,
+        transport=transport, audio_admission=admission,
+    )
+    session.stop_result_inference()
+    running = asyncio.create_task(session.run(handshake))
+    fixture = SimpleNamespace(
+        session=session, running=running, writer=writer, peers=peers,
+        transport=transport, incoming=incoming, sent=sent, admission=admission,
+        serializer=serializer, llm=services.llm,
+    )
+    try:
+        try:
+            await _opening_event(writer.ack_started, "opening never reached ACK commit")
+        except AssertionError:
+            result = "pending"
+            if running.done():
+                error = None if running.cancelled() else running.exception()
+                result = type(error).__name__
+                if isinstance(error, session_module.CallSessionError):
+                    result += ":" + str(error)
+            controller = session._controller
+            raise AssertionError(
+                f"opening fixture unhealthy: task={result}; "
+                f"state={None if controller is None else controller.state.name}; "
+                f"tts_requests={len(peers.texts)}; wire_events="
+                f"{[wire.get('event') for wire in sent]}; commits={len(writer.commands)}"
+            ) from None
+        yield fixture
+    finally:
+        writer.ack_release.set()
+        writer.gate_release.set()
+        peers.invitation_release.set()
+        peers.llm_release.set()
+        if not running.done():
+            await session.request_drain()
+        await asyncio.wait_for(asyncio.gather(running, return_exceptions=True), timeout=5)
+        await llm_client.close()
+        await stt_http.aclose()
+        await tts_http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sparra_opening_fixture_reaches_authenticated_ack_before_release() -> None:
+    async with _native_sparra_opening() as fixture:
+        assert fixture.session._controller.state is session_module.DisclosureState.ACK_COMMITTING
+        assert not fixture.session._controller.is_active()
+        assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
+        assert len([wire for wire in fixture.sent if wire.get("event") == "mark"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_sparra_invitation_waits_for_both_durable_commits_and_is_recorded_once() -> None:
+    async with _native_sparra_opening() as fixture:
+        controller = fixture.session._controller
+        assert not controller.is_active()
+        assert not fixture.admission.allows_audio()
+        assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
+        assert fixture.writer.turns == []
+        assert fixture.peers.conversations == []
+        fixture.writer.ack_release.set()
+        await _opening_event(fixture.writer.gate_started, "gate evidence was not committed")
+        assert controller.is_active()
+        assert not fixture.writer.gate_committed.is_set()
+        assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
+        fixture.writer.gate_release.set()
+        await controller.join_continuations()
+        await _opening_event(
+            fixture.peers.invitation, "durable activation did not invite the caller",
+        )
+        await fixture.session._active_runtime.worker.queue_frame(EndFrame())
+        await asyncio.wait_for(fixture.running, timeout=5)
+        assert fixture.peers.texts == [
+            pipeline_module.SPARRA_DISCLOSURE, "Comment puis-je vous aider ?",
+        ]
+        assert fixture.peers.conversations == []
+        assert [_opening_plaintext(turn) for turn in fixture.writer.turns] == [
+            "Comment puis-je vous aider ?",
+        ]
+        assert await controller.accept_mark(controller.mark_name) is False
+
+
+@pytest.mark.asyncio
+async def test_sparra_repeated_native_start_does_not_replay_disclosure_or_mark() -> None:
+    async with _native_sparra_opening() as fixture:
+        worker = fixture.session._active_runtime.worker
+        # Duplicate delivery of the native event, without replacing the owned handler.
+        await worker._call_event_handler("on_pipeline_started", StartFrame())  # noqa: SLF001
+        await asyncio.sleep(0.1)
+        assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
+        assert len([wire for wire in fixture.sent if wire.get("event") == "mark"]) == 1
+        fixture.writer.ack_release.set()
+        fixture.writer.gate_release.set()
+        await fixture.session._controller.join_continuations()
+        await _opening_event(fixture.peers.invitation, "duplicate startup lost the invitation")
+        assert fixture.peers.texts.count("Comment puis-je vous aider ?") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["caller", "hangup", "failure", "cancel", "commit_failure"])
+async def test_sparra_pending_invitation_is_suppressed_by_call_lifecycle(winner: str) -> None:
+    async with _native_sparra_opening() as fixture:
+        fixture.writer.ack_release.set()
+        await _opening_event(fixture.writer.gate_started, "gate publication was not reached")
+        if winner == "caller":
+            started = asyncio.Event()
+            aggregator = next(p for p in fixture.session._active_runtime.pipeline.processors
+                              if isinstance(p, LLMUserAggregator))
+            aggregator.add_event_handler("on_user_turn_started", lambda *_args: started.set())
+            await fixture.transport.input().queue_frame(VADUserStartedSpeakingFrame())
+            await _opening_event(started, "native caller-start event was not delivered")
+        elif winner == "hangup":
+            await fixture.session.request_drain()
+        elif winner == "failure":
+            fixture.writer.fatal_event.set()
+            await asyncio.sleep(0)
+        elif winner == "cancel":
+            fixture.running.cancel()
+            await asyncio.sleep(0)
+        else:
+            fixture.writer.fail_gate = True
+        fixture.writer.gate_release.set()
+        await fixture.session._controller.join_continuations()
+        await asyncio.sleep(0.1)
+        assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
+        assert fixture.peers.conversations == []
+        assert fixture.writer.turns == []
+
+
+@pytest.mark.asyncio
+async def test_sparra_native_question_response_is_retained_without_silence_inference() -> None:
+    async with _native_sparra_opening() as fixture:
+        fixture.writer.ack_release.set()
+        fixture.writer.gate_release.set()
+        await fixture.session._controller.join_continuations()
+        await _opening_event(fixture.peers.invitation, "opening did not invite the caller")
+        # Wait for the native TTS/output/assistant context commit before the caller speaks.
+        for _ in range(300):
+            if fixture.writer.turns:
+                break
+            await asyncio.sleep(0.01)
+        assert [_opening_plaintext(turn) for turn in fixture.writer.turns] == [
+            "Comment puis-je vous aider ?",
+        ]
+        worker = fixture.session._active_runtime.worker
+        for _ in range(5):
+            await worker.queue_frame(InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=8000, num_channels=1,
+            ))
+        await asyncio.sleep(0.1)
+        assert fixture.peers.conversations == []
+        # Exercise the supported transcription-start fallback, without claiming
+        # that fabricated VAD boundaries or silent PCM qualify French ASR.
+        await worker.queue_frame(TranscriptionFrame(
+            text="Quels sont vos horaires ?", user_id="",
+            timestamp=NOW.isoformat(), language=Language.FR, finalized=True,
+        ))
+        for _ in range(400):
+            if len(fixture.writer.turns) == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert len(fixture.peers.conversations) == 1
+        assert [_opening_plaintext(turn) for turn in fixture.writer.turns] == [
+            "Comment puis-je vous aider ?", "Quels sont vos horaires ?",
+            "Le garage est ouvert de 8 h à 18 h.",
+        ]
+        assert [turn.payload.role for turn in fixture.writer.turns] == [
+            "assistant", "user", "assistant",
+        ]
+        assert len(fixture.peers.conversations[0]["messages"]) == 4
+        assert not fixture.peers.conversations[0].get("tools")
+        assert "request_human" not in fixture.peers.conversations[0]["messages"][0]["content"]
+        assert fixture.peers.conversations[0]["messages"][-2:] == [
+            {"role": "assistant", "content": "Comment puis-je vous aider ?"},
+            {"role": "user", "content": "Quels sont vos horaires ?"},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_sparra_caller_can_interrupt_queued_native_invitation() -> None:
+    async with _native_sparra_opening() as fixture:
+        fixture.peers.invitation_blocked = True
+        fixture.writer.ack_release.set()
+        fixture.writer.gate_release.set()
+        await fixture.session._controller.join_continuations()
+        await _opening_event(fixture.peers.invitation, "invitation was never queued")
+        await fixture.transport.input().queue_frame(VADUserStartedSpeakingFrame())
+        await _opening_event(
+            fixture.peers.invitation_cancelled, "native interruption did not cancel TTS",
+        )
+        assert fixture.writer.turns == []
+        assert fixture.peers.conversations == []
+
+
+@pytest.mark.asyncio
+async def test_sparra_native_llm_http_error_ends_active_call_without_fabricated_reply() -> None:
+    async with _native_sparra_opening() as fixture:
+        fixture.peers.llm_status = 503
+        fixture.writer.ack_release.set()
+        fixture.writer.gate_release.set()
+        await fixture.session._controller.join_continuations()
+        await _opening_event(fixture.peers.invitation, "opening did not invite the caller")
+        for _ in range(300):
+            if fixture.writer.turns:
+                break
+            await asyncio.sleep(0.01)
+        assert [_opening_plaintext(turn) for turn in fixture.writer.turns] == [
+            "Comment puis-je vous aider ?",
+        ]
+        assert fixture.admission.allows_audio()
+        error_seen = asyncio.Event()
+        native_errors: list[ErrorFrame] = []
+
+        def on_error(_llm: FrameProcessor, error: ErrorFrame) -> None:
+            native_errors.append(error)
+            error_seen.set()
+
+        fixture.llm.add_event_handler("on_error", on_error)
+        await fixture.session._active_runtime.worker.queue_frame(TranscriptionFrame(
+            text="Quels sont vos horaires ?", user_id="",
+            timestamp=NOW.isoformat(), language=Language.FR, finalized=True,
+        ))
+        await _opening_event(fixture.peers.llm_requested, "accepted caller did not reach LLM")
+        for _ in range(100):
+            if len(fixture.writer.turns) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert [_opening_plaintext(turn) for turn in fixture.writer.turns] == [
+            "Comment puis-je vous aider ?", "Quels sont vos horaires ?",
+        ]
+        fixture.peers.llm_release.set()
+        await _opening_event(error_seen, "native LLM HTTP 503 did not emit an error")
+        for _ in range(200):
+            if fixture.running.done():
+                break
+            await asyncio.sleep(0.01)
+        assert fixture.running.done(), (
+            "LLM HTTP error left the disclosed call ACTIVE instead of a controlled end"
+        )
+        with pytest.raises(session_module.CallSessionError, match="^call_failed$"):
+            await fixture.running
+        assert not fixture.session._controller.is_active()
+        assert not fixture.admission.allows_audio()
+        assert len(native_errors) == 1
+        assert native_errors[0].fatal
+        assert native_errors[0].error == "llm_failed"
+        assert native_errors[0].exception is None and native_errors[0].processor is None
+        assert fixture.peers.texts == [
+            pipeline_module.SPARRA_DISCLOSURE, "Comment puis-je vous aider ?",
+        ]
+        assert len(fixture.peers.conversations) == 1
+        assert [turn.payload.role for turn in fixture.writer.turns] == ["assistant", "user"]
+        terminal = next(
+            command for command in fixture.writer.commands
+            if isinstance(command, VoiceOperationV1) and command.kind == "call.upsert"
+            and command.payload.status == "failed"
+        )
+        assert terminal.payload.end_reason == "call_failed"
+        assert terminal.payload.message_result is None
+        before = len(fixture.sent)
+        assert await fixture.serializer.deserialize(json.dumps({
+            "event": "media", "stream_id": "stream-1", "sequence_number": "10",
+            "media": {"track": "inbound", "chunk": "10", "timestamp": "200",
+                      "payload": base64.b64encode(b"\xff" * 160).decode("ascii")},
+        })) is None
+        await asyncio.sleep(0)
+        assert len(fixture.sent) == before
+
+
+@pytest.mark.asyncio
+async def test_sparra_caller_start_fences_invitation_before_async_turn_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _native_sparra_opening() as fixture:
+        fixture.writer.ack_release.set()
+        await _opening_event(fixture.writer.gate_started, "gate publication was not reached")
+        runtime = fixture.session._active_runtime
+        aggregator = next(
+            processor for processor in runtime.pipeline.processors
+            if isinstance(processor, LLMUserAggregator)
+        )
+        turn_started = asyncio.Event()
+        race_released = asyncio.Event()
+        release_claimed = False
+        invitations: list[TTSSpeakFrame] = []
+        native_queue_frame = runtime.worker.queue_frame
+
+        async def queue_frame(frame: Frame, direction=FrameDirection.DOWNSTREAM) -> None:
+            if isinstance(frame, TTSSpeakFrame) and frame.text == "Comment puis-je vous aider ?":
+                invitations.append(frame)
+            await native_queue_frame(frame, direction)
+
+        async def release_gate_before_async_turn(_aggregator: FrameProcessor, frame: Frame) -> None:
+            nonlocal release_claimed
+            if isinstance(frame, InterruptionFrame) and not release_claimed:
+                release_claimed = True
+                # Native UserStartedSpeakingFrame is already broadcast, but its
+                # on_user_turn_started event is dispatched only after interruption.
+                assert not turn_started.is_set()
+                fixture.writer.gate_release.set()
+                await fixture.session._controller.join_continuations()
+                race_released.set()
+
+        monkeypatch.setattr(runtime.worker, "queue_frame", queue_frame)
+        aggregator.add_event_handler("on_user_turn_started", lambda *_args: turn_started.set())
+        aggregator.add_event_handler("on_before_push_frame", release_gate_before_async_turn)
+        await fixture.transport.input().queue_frame(VADUserStartedSpeakingFrame())
+        await _opening_event(race_released, "caller interruption did not race gate publication")
+        assert fixture.writer.gate_committed.is_set()
+        assert invitations == [], (
+            "native caller start queued an invitation before its async turn-start latch ran"
+        )
+        await _opening_event(turn_started, "native turn-start event was not eventually dispatched")
+        assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
+        assert fixture.peers.conversations == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_company_pin_drives_native_session_notice_and_recording_after_commit(enabled):
@@ -1261,14 +1789,15 @@ async def test_company_pin_drives_native_session_notice_and_recording_after_comm
     try:
         await asyncio.wait_for(writer.disclosure_committed.wait(), 5)
         for _ in range(100):
-            if session._controller.is_active():
+            if session._controller.is_active() and len(texts) == 2:
                 break
             await asyncio.sleep(0.01)
         assert session._controller.is_active()
         assert len(requests) == int(enabled)
-        assert len(texts) == 1
+        assert len(texts) == 2
         assert "assistant vocal automatisé" in texts[0]
         assert "texte est conservé trente jours" in texts[0]
+        assert texts[1] == "Comment puis-je vous aider ?"
         if enabled:
             assert "audio est conservé trente jours en France" in texts[0]
             assert "Telnyx" in texts[0] and "temporairement" in texts[0]

@@ -16,7 +16,7 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-from pipecat.frames.frames import ErrorFrame, FunctionCallResultProperties
+from pipecat.frames.frames import ErrorFrame, FunctionCallResultProperties, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.workers.runner import WorkerRunner
@@ -614,6 +614,8 @@ class CallSession:
         self._drain_lock = asyncio.Lock()
         self._terminal_outcome = _TerminalOutcome("closed")
         self._no_new_ai = False
+        self._caller_started = False
+        self._invitation_queued = False
         self._controller: DisclosureController | None = None
         self._recorder: TurnRecorder | None = None
         self._active_runtime: CallRuntime | None = None
@@ -691,6 +693,28 @@ class CallSession:
             properties=FunctionCallResultProperties(run_llm=not self._no_new_ai),
         )
 
+    def _note_caller_started(self) -> None:
+        self._caller_started = True
+
+    async def _queue_opening_invitation(self) -> None:
+        controller, runtime = self._controller, self._active_runtime
+        if (
+            self._invitation_queued
+            or self._caller_started
+            or self._no_new_ai
+            or self._drain_requested
+            or self._writer.fatal_event.is_set()
+            or controller is None
+            or not controller.is_active()
+            or runtime is None
+            or runtime.worker.has_finished()
+        ):
+            return
+        self._invitation_queued = True
+        await runtime.worker.queue_frame(
+            TTSSpeakFrame("Comment puis-je vous aider ?", append_to_context=True)
+        )
+
     async def run(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         if self._run_started:
             raise CallSessionError("call_session_already_run")
@@ -713,6 +737,9 @@ class CallSession:
             runtime_metrics=self._runtime_metrics,
             utcnow=self._utcnow,
             uuid_factory=self._uuid_factory,
+            on_active=self._queue_opening_invitation
+            if self._identity.begin_snapshot is not None
+            else None,
         )
         recorder = TurnRecorder(
             identity=self._identity,
@@ -752,6 +779,9 @@ class CallSession:
                 if self._identity.begin_snapshot is not None
                 and self._registry_terminalizer is not None
                 and await cast(Any, self._registry_terminalizer).human_tool_available()
+                else None,
+                on_user_turn_started=self._note_caller_started
+                if self._identity.begin_snapshot is not None
                 else None,
             )
             runtime = build_runtime(
@@ -1436,6 +1466,7 @@ class DisclosureController:
         monotonic: Callable[[], float] = time.monotonic,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
+        on_active: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if identity.begin_snapshot is not None:
             recording_enabled = identity.begin_snapshot.recording_enabled
@@ -1463,6 +1494,7 @@ class DisclosureController:
         self._monotonic = monotonic
         self._utcnow = utcnow
         self._uuid_factory = uuid_factory
+        self._on_active = on_active
         self.disclosure_generation = uuid_factory()
         self.mark_name = f"pv0-disclosure-{uuid_factory().hex}"
         self._lock = asyncio.Lock()
@@ -1773,6 +1805,8 @@ class DisclosureController:
         if not self._recording_enabled:
             if self._identity.routing is not None:
                 await self._publish_gate_evidence()
+            if self.is_active() and self._on_active is not None:
+                await self._on_active()
             return
 
         result: RecordingStartResult
@@ -1827,6 +1861,8 @@ class DisclosureController:
                 self._input_gate_opened_at = self._utcnow().astimezone(UTC)
             if self._identity.routing is not None:
                 await self._publish_gate_evidence()
+            if self.is_active() and self._on_active is not None:
+                await self._on_active()
 
     async def _publish_gate_evidence(self) -> None:
         assert self._input_gate_opened_at is not None

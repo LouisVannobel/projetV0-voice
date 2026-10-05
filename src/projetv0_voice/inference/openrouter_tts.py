@@ -28,6 +28,8 @@ _CONTENT_TYPE_ERROR = "openrouter_tts_content_type"
 _TRANSPORT_ERROR = "openrouter_tts_transport"
 _STREAM_ERROR = "openrouter_tts_stream"
 _EMPTY_AUDIO_ERROR = "openrouter_tts_empty_audio"
+_TIMEOUT_ERROR = "openrouter_tts_timeout"
+_TTS_TIMEOUT_SECONDS = 15.0
 
 
 class OpenRouterTTSService(TTSService):
@@ -131,67 +133,76 @@ class OpenRouterTTSService(TTSService):
 
         audio_emitted = False
         try:
-            async with self._client.stream(
-                "POST",
-                _TTS_ENDPOINT,
-                headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
-                json=self._request_body(text),
-            ) as response:
-                if response.status_code != 200:
-                    failure = await self._first_failure(
-                        context_id,
-                        _HTTP_STATUS_ERROR,
-                        audio_emitted=False,
-                    )
-                    if failure is not None:
-                        yield failure
-                    return
-                if not self._has_pcm_content_type(response):
-                    failure = await self._first_failure(
-                        context_id,
-                        _CONTENT_TYPE_ERROR,
-                        audio_emitted=False,
-                    )
-                    if failure is not None:
-                        yield failure
-                    return
+            async with asyncio.timeout(_TTS_TIMEOUT_SECONDS):
+                async with self._client.stream(
+                    "POST",
+                    _TTS_ENDPOINT,
+                    headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
+                    json=self._request_body(text),
+                ) as response:
+                    if response.status_code != 200:
+                        failure = await self._first_failure(
+                            context_id,
+                            _HTTP_STATUS_ERROR,
+                            audio_emitted=False,
+                        )
+                        if failure is not None:
+                            yield failure
+                        return
+                    if not self._has_pcm_content_type(response):
+                        failure = await self._first_failure(
+                            context_id,
+                            _CONTENT_TYPE_ERROR,
+                            audio_emitted=False,
+                        )
+                        if failure is not None:
+                            yield failure
+                        return
 
-                await self.start_tts_usage_metrics(text)
-                try:
-                    frames = self._stream_audio_frames_from_iterator(
-                        response.aiter_bytes(),
-                        in_sample_rate=self._input_sample_rate,
-                        context_id=context_id,
-                    )
-                    async for frame in frames:
-                        if isinstance(frame, TTSAudioRawFrame):
-                            # Pipecat 1.7.0 omits context_id only on its padded leftover.
-                            if frame.context_id is None:
-                                frame.context_id = context_id
-                            audio_emitted = True
-                        yield frame
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    failure = await self._first_failure(
-                        context_id,
-                        _STREAM_ERROR,
-                        audio_emitted=audio_emitted,
-                    )
-                    if failure is not None:
-                        yield failure
-                    return
+                    await self.start_tts_usage_metrics(text)
+                    try:
+                        frames = self._stream_audio_frames_from_iterator(
+                            response.aiter_bytes(),
+                            in_sample_rate=self._input_sample_rate,
+                            context_id=context_id,
+                        )
+                        async for frame in frames:
+                            if isinstance(frame, TTSAudioRawFrame):
+                                # Pipecat 1.7.0 omits context_id only on its padded leftover.
+                                if frame.context_id is None:
+                                    frame.context_id = context_id
+                                audio_emitted = True
+                            yield frame
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        failure = await self._first_failure(
+                            context_id,
+                            _STREAM_ERROR,
+                            audio_emitted=audio_emitted,
+                        )
+                        if failure is not None:
+                            yield failure
+                        return
 
-                if not audio_emitted:
-                    failure = await self._first_failure(
-                        context_id,
-                        _EMPTY_AUDIO_ERROR,
-                        audio_emitted=False,
-                    )
-                    if failure is not None:
-                        yield failure
+                    if not audio_emitted:
+                        failure = await self._first_failure(
+                            context_id,
+                            _EMPTY_AUDIO_ERROR,
+                            audio_emitted=False,
+                        )
+                        if failure is not None:
+                            yield failure
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            failure = await self._first_failure(
+                context_id,
+                _TIMEOUT_ERROR,
+                audio_emitted=audio_emitted,
+            )
+            if failure is not None:
+                yield failure
         except Exception:
             failure = await self._first_failure(
                 context_id,
