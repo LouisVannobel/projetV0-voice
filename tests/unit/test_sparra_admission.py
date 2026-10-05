@@ -109,11 +109,14 @@ def snapshot(call_id, routing):
     )
 
 
-async def start(tmp_path, begin=None, *, utcnow=None, monotonic=None, failpoint=None, sparra=True):
+async def start(
+    tmp_path, begin=None, *, utcnow=None, monotonic=None, failpoint=None,
+    sparra=True, writer_utcnow=None,
+):
     writer = PersistenceWriter(
         tmp_path / "voice.sqlite", CryptoKeyring({1: bytes(range(32))}, active_version=1),
         failpoint=failpoint,
-        utcnow=utcnow or (lambda: NOW),
+        utcnow=writer_utcnow or utcnow or (lambda: NOW),
     )
     worker = asyncio.create_task(writer.run())
     assert await writer.wait_ready()
@@ -471,6 +474,147 @@ async def test_unowned_sparra_expiry_cancellation_keeps_frozen_publication(tmp_p
         assert [action[0] for action in provider.actions].count("hangup") == 1
     finally:
         writer.commit_lease = real_commit
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expired_retention_terminal_failure_keeps_identity(tmp_path):
+    elapsed = [0.0]
+    reject_terminal = [False]
+
+    def failpoint(name):
+        if name == "after_mutation_before_commit" and reject_terminal[0]:
+            raise OSError("test-only expired native lease failure")
+
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        writer_utcnow=lambda: NOW,
+        monotonic=lambda: 100.0 + elapsed[0],
+        failpoint=failpoint,
+    )
+    real_commit = writer.commit_lease
+    attempts = []
+
+    async def fail_actual_expired_terminal_commit(**values):
+        if values["state"] == "terminal":
+            assert values.get("operation") is None
+            attempts.append(values["closed_at"])
+            reject_terminal[0] = True
+        await real_commit(**values)
+
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        # Fixed writer time retains coherent engineering facts; this does not
+        # qualify retention deletion or carrier-side end observation.
+        facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert facts is not None and facts.admission_generation == admitted.generation
+        writer.commit_lease = fail_actual_expired_terminal_commit
+        elapsed[0] = timedelta(days=31).total_seconds()
+        assert await registry.reap_expired() == 1
+        await asyncio.wait_for(worker, 2)
+        assert len(attempts) == 1
+        retained = await registry.snapshot("original")
+        assert retained is not None, "expired native lease failure still owns cleanup identity"
+        assert retained.generation == admitted.generation
+        assert registry.internal_failure_code == "terminal_persistence_failed"
+        assert await registry.live_call_count() == 1
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+    finally:
+        writer.commit_lease = real_commit
+        await registry.wait_background()
+        if not worker.done():
+            await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expired_retention_cancellation_retries_frozen_lease(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        writer_utcnow=lambda: NOW,
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    real_commit = writer.commit_lease
+    attempts = []
+
+    async def cancelled_after_expired_real_commit(**values):
+        if values["state"] == "terminal":
+            assert values.get("operation") is None
+            attempts.append(dict(values))
+        await real_commit(**values)
+        if values["state"] == "terminal" and len(attempts) == 1:
+            elapsed[0] += 2
+            raise asyncio.CancelledError("test-only expired native commit cancellation")
+
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert facts is not None and facts.admission_generation == admitted.generation
+        writer.commit_lease = cancelled_after_expired_real_commit
+        elapsed[0] = timedelta(days=31).total_seconds()
+        with pytest.raises(asyncio.CancelledError):
+            # Public reaper invokes cleanup with retry_cancelled_io=False.
+            await asyncio.wait_for(registry.reap_expired(), 2)
+        assert len(attempts) == 2
+        assert attempts[0] == attempts[1], "expired lease retry must freeze its exact close time"
+        assert attempts[0]["closed_at"] == NOW + timedelta(days=31)
+        assert await registry.live_call_count() == 0
+        assert registry.internal_failure_code is None
+        assert await terminal_publications(writer) == []
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            state, closed_at = connection.execute(
+                "SELECT state,closed_at FROM call_leases"
+            ).fetchone()
+            assert state == "terminal"
+            assert datetime.fromisoformat(closed_at.replace("Z", "+00:00")) == attempts[0][
+                "closed_at"
+            ]
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+    finally:
+        writer.commit_lease = real_commit
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expired_retention_success_omits_terminal_publication(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        writer_utcnow=lambda: NOW,
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    try:
+        await committed(registry, writer, event())
+        elapsed[0] = timedelta(days=31).total_seconds()
+        assert await registry.reap_expired() == 1
+        assert await registry.reap_expired() == 0
+        assert await registry.live_call_count() == 0
+        assert registry.internal_failure_code is None
+        assert await terminal_publications(writer) == []
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state FROM call_leases").fetchone() == ("terminal",)
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+            assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (1,)
+    finally:
         await registry.wait_background()
         await writer.drain(2)
         await worker

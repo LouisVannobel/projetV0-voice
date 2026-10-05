@@ -2663,7 +2663,10 @@ class CallRegistry:
         operation: VoiceOperationV1 | None = None
         cancellation: asyncio.CancelledError | None = None
         persistence_failed = False
-        if work.persist_terminal and self._sparra is not None and entry.routing is not None:
+        native_terminal = (
+            work.persist_terminal and self._sparra is not None and entry.routing is not None
+        )
+        if native_terminal:
             facts: LocalCallLifecycleFacts | None
             while True:
                 try:
@@ -2744,7 +2747,7 @@ class CallRegistry:
                         **({"operation": operation} if operation is not None else {}),
                     )
                 except asyncio.CancelledError as error:
-                    if operation is not None:
+                    if native_terminal:
                         if cancellation is None:
                             cancellation = error
                         continue
@@ -2753,7 +2756,7 @@ class CallRegistry:
                     self._set_internal_failure("terminal_persistence_failed")
                 except BaseException:
                     self._set_internal_failure("terminal_persistence_failed")
-                    persistence_failed = operation is not None
+                    persistence_failed = native_terminal
                 break
         if work.cleanup_hangup:
             while True:
