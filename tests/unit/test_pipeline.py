@@ -694,11 +694,76 @@ async def test_closed_call_observers_register_only_two_native_latency_events() -
 
 
 @pytest.mark.asyncio
+async def test_runtime_metrics_observer_counts_native_ttfb_only_at_its_origin() -> None:
+    class MeasuredStage(FrameProcessor):
+        def __init__(self, name: str, seconds: float) -> None:
+            super().__init__(name=name, enable_direct_mode=True)
+            self.seconds = seconds
+            self.forwarded_metrics: list[MetricsFrame] = []
+
+        def can_generate_metrics(self) -> bool:
+            return True
+
+        async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+            await super().process_frame(frame, direction)
+            if type(frame) is MetricsFrame:
+                self.forwarded_metrics.append(frame)
+            elif type(frame) is TextFrame:
+                await self.start_ttfb_metrics(start_time=1.0)
+                await self.stop_ttfb_metrics(end_time=1.0 + self.seconds)
+            await self.push_frame(frame, direction)
+
+    stt = MeasuredStage("stt-fixture-name", 0.125)
+    llm = MeasuredStage("llm-fixture-name", 0.25)
+    tts = MeasuredStage("tts-fixture-name", 0.5)
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+    )
+    try:
+        downstream, _ = await run_test(
+            Pipeline([stt, llm, tts]),
+            frames_to_send=[TextFrame("measure")],
+            observers=[observer],
+            pipeline_params=PipelineParams(
+                enable_metrics=True,
+                send_initial_empty_metrics=False,
+            ),
+            expected_down_frames=[MetricsFrame, MetricsFrame, MetricsFrame, TextFrame],
+        )
+        assert len(llm.forwarded_metrics) == 1
+        assert llm.forwarded_metrics[0] is downstream[0]
+        assert len(tts.forwarded_metrics) == 2
+        assert tts.forwarded_metrics[0] is downstream[0]
+        assert tts.forwarded_metrics[1] is downstream[1]
+
+        points = list(_metric_map(owner)["projetv0.voice.service_ttfb"].data.data_points)
+        assert [(dict(point.attributes), point.count, point.sum) for point in points] == [
+            ({"service": "stt"}, 1, 0.125),
+            ({"service": "llm"}, 1, 0.25),
+            ({"service": "tts"}, 1, 0.5),
+        ]
+        assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runtime_metrics_observer_uses_service_identity_and_exact_ttfb_items() -> None:
+    class ForgedOrigin:
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+        def __ne__(self, _other: object) -> bool:
+            return False
+
     stt = FrameProcessor(name="stt-secret-name")
     llm = FrameProcessor(name="llm-secret-name")
     tts = FrameProcessor(name="tts-secret-name")
-    destination = FrameProcessor(name="destination")
+    destination = FrameProcessor(name=stt.name)
     owner = RuntimeMetrics.in_memory()
     observer = pipeline_module.RuntimeMetricsObserver(
         runtime_metrics=owner,
@@ -709,17 +774,20 @@ async def test_runtime_metrics_observer_uses_service_identity_and_exact_ttfb_ite
     mixed = MetricsFrame(
         [
             TTFBMetricsData.model_construct(
-                processor=object(),
+                processor=stt.name,
                 model=object(),
                 value=0.2,
             ),
-            ProcessingMetricsData(processor="ignored", value=8.0),
-            TTFBMetricsData.model_construct(processor="ignored", value=True),
-            TTFBMetricsData.model_construct(processor="ignored", value=math.nan),
-            TTFBMetricsData.model_construct(processor="ignored", value=math.inf),
-            TTFBMetricsData.model_construct(processor="ignored", value=0.0),
-            TTFBMetricsData.model_construct(processor="ignored", value=-1.0),
-            TTFBMetricsData.model_construct(processor="ignored", value=0.3),
+            ProcessingMetricsData(processor=stt.name, value=8.0),
+            TTFBMetricsData.model_construct(processor=stt.name, value=True),
+            TTFBMetricsData.model_construct(processor=stt.name, value=math.nan),
+            TTFBMetricsData.model_construct(processor=stt.name, value=math.inf),
+            TTFBMetricsData.model_construct(processor=stt.name, value=0.0),
+            TTFBMetricsData.model_construct(processor=stt.name, value=-1.0),
+            TTFBMetricsData.model_construct(processor=stt.name, value="0.6"),
+            TTFBMetricsData.model_construct(processor=ForgedOrigin(), value=0.6),
+            TTFBMetricsData(processor=llm.name, value=0.7),
+            TTFBMetricsData.model_construct(processor=stt.name, value=0.3),
         ]
     )
 
@@ -730,7 +798,7 @@ async def test_runtime_metrics_observer_uses_service_identity_and_exact_ttfb_ite
         FramePushed(
             llm,
             destination,
-            MetricsFrame([TTFBMetricsData(processor="x", value=0.4)]),
+            MetricsFrame([TTFBMetricsData(processor=llm.name, value=0.4)]),
             FrameDirection.DOWNSTREAM,
             2,
         )
@@ -739,7 +807,7 @@ async def test_runtime_metrics_observer_uses_service_identity_and_exact_ttfb_ite
         FramePushed(
             tts,
             destination,
-            MetricsFrame([TTFBMetricsData(processor="x", value=0.5)]),
+            MetricsFrame([TTFBMetricsData(processor=tts.name, value=0.5)]),
             FrameDirection.DOWNSTREAM,
             3,
         )
@@ -785,8 +853,8 @@ async def test_runtime_metrics_observer_continues_per_item_after_metric_fault(
     monkeypatch.setattr(owner, "record_service_ttfb", fail_first)
     frame = MetricsFrame(
         [
-            TTFBMetricsData(processor="ignored", value=0.1),
-            TTFBMetricsData(processor="ignored", value=0.2),
+            TTFBMetricsData(processor=stt.name, value=0.1),
+            TTFBMetricsData(processor=stt.name, value=0.2),
         ]
     )
 
@@ -1149,7 +1217,7 @@ async def test_runtime_metrics_binding_rejects_deletion_and_still_forwards() -> 
             source=stt,
             destination=llm,
             frame=MetricsFrame(
-                [TTFBMetricsData(processor="must-not-be-read", value=0.125)]
+                [TTFBMetricsData(processor=stt.name, value=0.125)]
             ),
             direction=FrameDirection.DOWNSTREAM,
             timestamp=1,

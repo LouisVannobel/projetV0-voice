@@ -492,6 +492,8 @@ class RuntimeMetricsObserver(BaseObserver):
             try:
                 if type(item) is not TTFBMetricsData:
                     continue
+                if type(item.processor) is not str or item.processor != data.source.name:
+                    continue
                 value = item.value
                 if (
                     not isinstance(value, int | float)
