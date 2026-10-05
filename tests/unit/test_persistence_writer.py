@@ -157,6 +157,115 @@ async def start_writer(
     return writer, task
 
 
+def lease_terminal_operation() -> VoiceOperationV1:
+    return VoiceOperationV1(
+        schema_version=1,
+        operation_id=UUID(int=40_123),
+        deployment_id="agent-a",
+        call_id=UUID(int=123),
+        occurred_at=NOW + timedelta(seconds=30),
+        kind="call.upsert",
+        payload=CallUpsertPayloadV1(
+            telnyx_call_control_id="control-1",
+            telnyx_call_leg_id=None,
+            telnyx_call_session_id=None,
+            status="failed",
+            disclosure_state="failed",
+            started_at=None,
+            ended_at=NOW + timedelta(seconds=30),
+            end_reason="token_deadline",
+            retention_until=NOW + timedelta(days=30),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_lease_optional_operation_is_atomic_and_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "terminal-with-call.sqlite"
+    writer, task = await start_writer(database)
+    terminal = lease_terminal_operation()
+    values = {
+        key: value for key, value in lease_payload(state="terminal").items() if key != "action"
+    }
+    values["closed_at"] = terminal.occurred_at
+    try:
+        await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+        await writer.commit_lease(**values, operation=terminal)
+        await writer.commit_lease(**values, operation=terminal)
+        items = await writer.read_relay_batch(
+            batch_size=10, now=datetime.now(UTC), lease_seconds=30
+        )
+        assert len(items) == 1
+        assert canonical_operation_bytes(items[0].operation) == canonical_operation_bytes(terminal)
+        with sqlite3.connect(database) as connection:
+            state, closed_at = connection.execute(
+                "SELECT state,closed_at FROM call_leases"
+            ).fetchone()
+            assert state == "terminal"
+            assert datetime.fromisoformat(closed_at.replace("Z", "+00:00")) == terminal.occurred_at
+            assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (0,)
+    finally:
+        await stop_writer(writer, task)
+
+
+@pytest.mark.asyncio
+async def test_terminal_lease_optional_operation_rolls_back_both_mutations(tmp_path: Path) -> None:
+    database = tmp_path / "terminal-rollback.sqlite"
+    reject_terminal = False
+
+    def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit" and reject_terminal:
+            raise OSError("test-only atomic terminal failure")
+
+    writer, task = await start_writer(database, failpoint=failpoint)
+    terminal = lease_terminal_operation()
+    values = {
+        key: value for key, value in lease_payload(state="terminal").items() if key != "action"
+    }
+    values["closed_at"] = terminal.occurred_at
+    try:
+        await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+        reject_terminal = True
+        with pytest.raises(FatalPersistenceError):
+            await writer.commit_lease(**values, operation=terminal)
+        await asyncio.wait_for(task, 2)
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (0,)
+    finally:
+        if not task.done():
+            await stop_writer(writer, task)
+        else:
+            await task
+
+
+@pytest.mark.asyncio
+async def test_terminal_lease_optional_operation_rejects_another_call_before_mutation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "terminal-identity.sqlite"
+    writer, task = await start_writer(database)
+    terminal = lease_terminal_operation().model_copy(update={"call_id": UUID(int=999)})
+    values = {
+        key: value for key, value in lease_payload(state="terminal").items() if key != "action"
+    }
+    values["closed_at"] = terminal.occurred_at
+    try:
+        await writer.commit_control(PersistenceCommand("lease", lease_payload(), None))
+        with pytest.raises(ValueError, match="terminal_lease_operation_invalid"):
+            await writer.commit_lease(**values, operation=terminal)
+        assert writer.fatal_fault is None
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (0,)
+    finally:
+        await stop_writer(writer, task)
+
+
 async def stop_writer(writer: PersistenceWriter, task: asyncio.Task[None]) -> None:
     await writer.drain(timeout_seconds=2)
     await asyncio.wait_for(task, timeout=2)
@@ -1520,6 +1629,53 @@ async def test_cancelled_oldest_request_consumes_late_writer_failure(
         await asyncio.sleep(0)
         assert loop_errors == []
     finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_lifecycle_read_failure_owns_result_future(tmp_path: Path, cancelled: bool) -> None:
+    reached_commit, release_commit = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+
+    async def failpoint(name: str) -> None:
+        if name == "after_mutation_before_commit":
+            reached_commit.set()
+            await release_commit.wait()
+            raise RuntimeError("test-only late lifecycle writer failure")
+
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(dict(context)))
+    writer, owner = await start_writer(
+        tmp_path / "lifecycle-result-owner.sqlite", failpoint=failpoint
+    )
+    pending = asyncio.create_task(writer.read_call_lifecycle(UUID(int=123)))
+    try:
+        await asyncio.wait_for(reached_commit.wait(), 2)
+        if cancelled:
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        release_commit.set()
+        if not cancelled:
+            with pytest.raises(FatalPersistenceError):
+                await pending
+        await asyncio.wait_for(owner, 2)
+        assert writer.fatal_fault is not None
+        assert writer.fatal_fault.code == "persistence_command_failed"
+        # The fatal remains observable; collecting the completed caller must
+        # not emit a second, orphaned-result exception to the loop handler.
+        del pending
+        del owner
+        del writer
+        gc.collect()
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        assert loop_errors == []
+    finally:
+        release_commit.set()
         loop.set_exception_handler(previous_handler)
 
 

@@ -687,7 +687,20 @@ class PersistenceWriter:
         created_at: datetime,
         expires_at: datetime,
         closed_at: datetime | None,
+        operation: VoiceOperationV1 | None = None,
     ) -> None:
+        if operation is not None and (
+            not isinstance(operation, VoiceOperationV1)
+            or operation.kind != "call.upsert"
+            or operation.call_id != call_id
+            or state != "terminal"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or operation.payload.status not in {"failed", "closed"}
+            or operation.payload.telnyx_call_control_id != call_control_id
+            or operation.payload.ended_at != closed_at
+            or operation.occurred_at != closed_at
+        ):
+            raise ValueError("terminal_lease_operation_invalid") from None
         await self.commit_control(
             PersistenceCommand(
                 "lease",
@@ -702,6 +715,7 @@ class PersistenceWriter:
                     "created_at": created_at,
                     "expires_at": expires_at,
                     "closed_at": closed_at,
+                    **({"operation": operation} if operation is not None else {}),
                 },
                 None,
             )
@@ -884,13 +898,21 @@ class PersistenceWriter:
 
     async def read_call_lifecycle(self, call_id: UUID) -> LocalCallLifecycleFacts | None:
         result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
-        await self.commit_control(
-            PersistenceCommand(
-                "call_lifecycle_read",
-                {"call_id": call_id, "result": result},
-                None,
+        try:
+            await self.commit_control(
+                PersistenceCommand(
+                    "call_lifecycle_read",
+                    {"call_id": call_id, "result": result},
+                    None,
+                )
             )
-        )
+        except BaseException:
+            # The commit failure is propagated to the caller; retain ownership
+            # of the separate result future if its writer completes later.
+            result.add_done_callback(
+                lambda future: None if future.cancelled() else future.exception()
+            )
+            raise
         return cast(LocalCallLifecycleFacts | None, await result)
 
     async def _content_request(self, action: str, **values: object) -> object:
@@ -2534,6 +2556,9 @@ class PersistenceWriter:
                 command_result = await self._apply_archive_command(command.payload)
             elif command.kind == "lease":
                 await self._apply_lease(command.payload)
+                operation = command.payload.get("operation")
+                if operation is not None and command.payload.get("action") == "upsert":
+                    await self._insert_outbox(require_operation(command.payload))
             elif command.kind == "webhook_effect":
                 command_result = await self._apply_webhook_effect(command.payload)
             elif command.kind == "webhook_receipt_status":

@@ -14,7 +14,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
@@ -23,6 +23,7 @@ from projetv0_voice.config import AgentManifestV1, SparraManifestV1
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     CallUpsertPayloadV1,
+    DisclosureEvidenceV1,
     RoutingV1,
     VoiceOperationV1,
 )
@@ -141,6 +142,8 @@ def select_call_capacity(
 
 
 class _LeaseWriter(Protocol):
+    async def read_call_lifecycle(self, call_id: UUID) -> LocalCallLifecycleFacts | None: ...
+
     async def commit_lease(
         self,
         *,
@@ -153,7 +156,12 @@ class _LeaseWriter(Protocol):
         created_at: datetime,
         expires_at: datetime,
         closed_at: datetime | None,
+        operation: VoiceOperationV1 | None = None,
     ) -> None: ...
+
+
+class _DisclosureFields(TypedDict, total=False):
+    disclosure_evidence: DisclosureEvidenceV1
 
 
 class _CallControl(Protocol):
@@ -2652,8 +2660,76 @@ class CallRegistry:
             return
         entry = work.entry
         closed_at = self._require_aware(self._utcnow())
+        operation: VoiceOperationV1 | None = None
+        cancellation: asyncio.CancelledError | None = None
+        persistence_failed = False
+        if work.persist_terminal and self._sparra is not None and entry.routing is not None:
+            facts: LocalCallLifecycleFacts | None
+            while True:
+                try:
+                    facts = await self._writer.read_call_lifecycle(entry.call_id)
+                    break
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+                except BaseException:
+                    self._set_internal_failure("terminal_persistence_failed")
+                    persistence_failed = True
+                    facts = None
+                    break
+            if not persistence_failed and (
+                facts is None
+                or facts.call_id != entry.call_id
+                or facts.admission_generation != work.generation
+                or facts.admitted_at != entry.initiated_at
+                or facts.retention_until != entry.initiated_at + self._retention_delta
+                or facts.telnyx_call_leg_id != entry.call_leg_id
+                or facts.telnyx_call_session_id != entry.call_session_id
+            ):
+                self._set_internal_failure("terminal_persistence_failed")
+                persistence_failed = True
+            if not persistence_failed and facts is not None and closed_at < facts.retention_until:
+                starts = [
+                    value
+                    for value in (
+                        facts.started_at,
+                        entry.answered_at,
+                        entry.claimed_at,
+                    )
+                    if value is not None
+                ]
+                evidence = facts.disclosure_evidence
+                disclosure_fields: _DisclosureFields = {}
+                if evidence is not None:
+                    disclosure_fields["disclosure_evidence"] = evidence
+                operation = VoiceOperationV1(
+                    schema_version=1,
+                    operation_id=uuid5(
+                        entry.call_id, f"local-terminal:{work.generation}:{work.reason}"
+                    ),
+                    deployment_id=self._deployment_id,
+                    call_id=entry.call_id,
+                    occurred_at=closed_at,
+                    kind="call.upsert",
+                    payload=CallUpsertPayloadV1(
+                        telnyx_call_control_id=entry.call_control_id,
+                        telnyx_call_leg_id=entry.call_leg_id,
+                        telnyx_call_session_id=entry.call_session_id,
+                        status="failed",
+                        disclosure_state="completed"
+                        if evidence is not None and evidence.completed_at is not None
+                        else "failed",
+                        started_at=min(starts) if starts else None,
+                        ended_at=closed_at,
+                        end_reason=work.reason,
+                        retention_until=facts.retention_until,
+                        **disclosure_fields,
+                    ),
+                )
         if work.persist_terminal:
             while True:
+                if persistence_failed:
+                    break
                 try:
                     await self._writer.commit_lease(
                         call_control_id=entry.call_control_id,
@@ -2665,13 +2741,19 @@ class CallRegistry:
                         created_at=entry.created_at,
                         expires_at=entry.expires_at,
                         closed_at=closed_at,
+                        **({"operation": operation} if operation is not None else {}),
                     )
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as error:
+                    if operation is not None:
+                        if cancellation is None:
+                            cancellation = error
+                        continue
                     if retry_cancelled_io:
                         continue
                     self._set_internal_failure("terminal_persistence_failed")
                 except BaseException:
                     self._set_internal_failure("terminal_persistence_failed")
+                    persistence_failed = operation is not None
                 break
         if work.cleanup_hangup:
             while True:
@@ -2686,6 +2768,12 @@ class CallRegistry:
                 except BaseException:
                     pass
                 break
+        if persistence_failed:
+            # Keep the exact generation/capacity until the durable call and lease
+            # are accounted for; readiness is already failed closed above.
+            if cancellation is not None:
+                raise cancellation
+            return
         generation = CallGenerationHandle(entry.call_control_id, work.generation)
         while True:
             try:
@@ -2693,6 +2781,8 @@ class CallRegistry:
                 break
             except asyncio.CancelledError:
                 continue
+        if cancellation is not None:
+            raise cancellation
 
     async def complete_terminal_cleanup(self, generation: CallGenerationHandle) -> bool:
         abort_target_clearers: tuple[tuple[_AbortTarget, Callable[[_AbortTarget], None]], ...] = ()
