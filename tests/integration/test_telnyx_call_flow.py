@@ -178,7 +178,7 @@ def test_signed_event_allowlist_extracts_only_exact_bounded_action_fields(
             "call.initiated",
             {"call_control_id": "control-a", "direction": "incoming", "state": "answered"},
         ),
-        ("call.answered", {"call_control_id": "control-a"}),
+        ("call.answered", {"call_control_id": "control-a", "state": None}),
         ("call.answered", {"call_control_id": "control-a", "state": "parked"}),
         ("call.hangup", {}),
     ],
@@ -194,6 +194,26 @@ def test_handled_event_with_invalid_event_specific_fields_is_400_payload(
 
     with pytest.raises(InvalidWebhookPayload, match="invalid_payload"):
         verifier.verify(body=body, headers=headers)
+
+
+def test_signed_answered_without_state_is_normalized_before_correlation_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier, body, headers = _signed(
+        monkeypatch,
+        event_type="call.answered",
+        payload={"call_control_id": "control-a"},
+    )
+
+    event = verifier.verify(body=body, headers=headers)
+
+    assert event.event_type == "call.answered"
+    assert event.call_state == "answered"
+    assert event.direction is None
+    assert event.call_control_id == "control-a"
+    assert event.call_leg_id is None
+    assert event.call_session_id is None
+    assert event.client_state is None
 
 
 def test_direction_and_call_state_change_the_semantic_fingerprint(

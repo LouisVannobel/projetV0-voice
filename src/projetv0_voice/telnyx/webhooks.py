@@ -518,7 +518,7 @@ def _strict_envelope(body: bytes, required_types: frozenset[str]) -> VerifiedWeb
             direction = _optional_direction(payload)
             call_state = _optional_call_state(payload) if direction != "outgoing" else None
         elif event_type == "call.answered":
-            call_state = _optional_call_state(payload)
+            call_state = "answered" if "state" not in payload else _optional_call_state(payload)
         if event_type == "call.initiated" and (
             direction != "outgoing" and (direction != "incoming" or call_state != "parked")
         ):
