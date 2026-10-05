@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -10,7 +11,13 @@ from pydantic import ValidationError
 from projetv0_voice import config
 from projetv0_voice.admission import CallAdmissionRejected, CallRegistry
 from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.models import BeginCallSnapshotV1
+from projetv0_voice.models import (
+    BeginCallSnapshotV1,
+    CallUpsertPayloadV1,
+    DisclosureEvidenceV1,
+    VoiceOperationV1,
+)
+from projetv0_voice.persistence.commands import PersistenceCommand, canonical_operation_bytes
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.telnyx.call_control import CallControlResult
 from projetv0_voice.telnyx.webhooks import VerifiedWebhook
@@ -102,12 +109,19 @@ def snapshot(call_id, routing):
     )
 
 
-async def start(tmp_path, begin=None):
+async def start(
+    tmp_path, begin=None, *, utcnow=None, monotonic=None, failpoint=None,
+    sparra=True, writer_utcnow=None,
+):
     writer = PersistenceWriter(
-        tmp_path / "voice.sqlite", CryptoKeyring({1: bytes(range(32))}, active_version=1)
+        tmp_path / "voice.sqlite", CryptoKeyring({1: bytes(range(32))}, active_version=1),
+        failpoint=failpoint,
+        utcnow=writer_utcnow or utcnow or (lambda: NOW),
     )
     worker = asyncio.create_task(writer.run())
     assert await writer.wait_ready()
+    if sparra:
+        await writer.assert_sparra_compatible()
     provider = ControlledProvider()
 
     async def default_begin(deployment, call_id, routing):
@@ -123,11 +137,11 @@ async def start(tmp_path, begin=None):
         lease_ttl_seconds=30,
         stream_url="wss://fixture.invalid/media",
         retention_days=30,
-        utcnow=lambda: NOW,
-        monotonic=lambda: 100.0,
-        sparra=policy(),
-        called_did=DID,
-        begin_call=begin or default_begin,
+        utcnow=utcnow or (lambda: NOW),
+        monotonic=monotonic or (lambda: 100.0),
+        sparra=policy() if sparra else None,
+        called_did=DID if sparra else None,
+        begin_call=(begin or default_begin) if sparra else None,
     )
     return registry, writer, worker, provider
 
@@ -154,6 +168,530 @@ async def committed(registry, writer, observed, *, duplicate=False):
     )
     result = await ticket.wait()
     return await registry.reconcile_after_commit(observed, resolved, result)
+
+
+async def terminal_publications(writer):
+    items = await writer.read_relay_batch(
+        batch_size=100, now=datetime.now(UTC) + timedelta(seconds=1), lease_seconds=60
+    )
+    return [
+        item.operation
+        for item in items
+        if isinstance(item.operation.payload, CallUpsertPayloadV1)
+        and item.operation.payload.status in {"failed", "closed"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answered", [False, True])
+async def test_unowned_sparra_expiry_publishes_terminal_call_once(tmp_path, answered):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    try:
+        initiated = event()
+        await committed(registry, writer, initiated)
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        admitted_facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert admitted_facts is not None
+        if answered:
+            await committed(
+                registry, writer, event("call.answered", occurred_at=NOW + timedelta(seconds=1))
+            )
+        elapsed[0] = 30.0
+        assert await registry.reap_expired() == 1
+        assert await registry.reap_expired() == 0
+        await committed(
+            registry, writer, event("call.hangup", occurred_at=NOW + timedelta(seconds=31))
+        )
+        operations = await terminal_publications(writer)
+        assert len(operations) == 1, "unowned expiry must publish its actual terminal call"
+        operation = operations[0]
+        payload = operation.payload
+        assert operation.call_id == admitted.call_id
+        assert operation.deployment_id == "fixture"
+        assert operation.occurred_at == NOW + timedelta(seconds=30)
+        assert payload.status == "failed"
+        assert payload.end_reason == "token_deadline"
+        assert payload.telnyx_call_control_id == "original"
+        assert payload.telnyx_call_leg_id == "original-leg"
+        assert payload.telnyx_call_session_id == "session"
+        assert payload.started_at == (NOW + timedelta(seconds=1) if answered else None)
+        assert payload.ended_at == operation.occurred_at
+        assert payload.retention_until == admitted_facts.retention_until
+        assert payload.disclosure_state == "failed"
+        assert payload.message_result is None
+        assert await registry.live_call_count() == 0
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            lease = connection.execute("SELECT state,closed_at FROM call_leases").fetchone()
+            assert lease[0] == "terminal"
+            assert datetime.fromisoformat(lease[1].replace("Z", "+00:00")) == operation.occurred_at
+            # Only the two actual test webhooks, plus the answered event when supplied.
+            assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (
+                3 if answered else 2,
+            )
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expiry_preserves_retained_start_and_disclosure(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        admitted_facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert admitted_facts is not None
+        evidence = DisclosureEvidenceV1(
+            schema_version=1,
+            started_at=NOW + timedelta(seconds=2),
+            completed_at=NOW + timedelta(seconds=3),
+            failed_at=None,
+            input_gate_opened_at=NOW + timedelta(seconds=3),
+        )
+        # An engineering fixture already retained through the native writer,
+        # proving cleanup preserves evidence rather than inventing new evidence.
+        observed = VoiceOperationV1(
+            schema_version=1,
+            operation_id=uuid4(),
+            deployment_id="fixture",
+            call_id=admitted.call_id,
+            occurred_at=NOW + timedelta(seconds=3),
+            kind="call.upsert",
+            payload=CallUpsertPayloadV1(
+                telnyx_call_control_id="original",
+                telnyx_call_leg_id="original-leg",
+                telnyx_call_session_id="session",
+                status="active",
+                disclosure_state="completed",
+                started_at=NOW + timedelta(seconds=1),
+                ended_at=None,
+                end_reason=None,
+                retention_until=admitted_facts.retention_until,
+                disclosure_evidence=evidence,
+            ),
+        )
+        await writer.commit_control(PersistenceCommand("outbox", {"operation": observed}, None))
+        retained_facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert retained_facts is not None
+        assert retained_facts.started_at == observed.payload.started_at
+        assert retained_facts.disclosure_evidence == evidence
+        elapsed[0] = 30.0
+        await registry.reap_expired()
+        operations = await terminal_publications(writer)
+        assert len(operations) == 1
+        payload = operations[0].payload
+        assert payload.started_at == observed.payload.started_at
+        assert payload.disclosure_state == "completed"
+        assert payload.disclosure_evidence == evidence
+        assert payload.retention_until == observed.payload.retention_until
+        assert payload.end_reason == "token_deadline"
+        assert payload.message_result is None
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expiry_failure_retains_identity_and_rolls_back(tmp_path):
+    elapsed = [0.0]
+    reject_terminal = [False]
+
+    def failpoint(name):
+        if name == "after_mutation_before_commit" and reject_terminal[0]:
+            raise OSError("test-only terminal transaction failure")
+
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+        failpoint=failpoint,
+    )
+    real_commit = writer.commit_lease
+    terminal_attempts = []
+
+    async def fail_actual_terminal_commit(**values):
+        if values["state"] == "terminal":
+            terminal_attempts.append(values["operation"])
+            reject_terminal[0] = True
+        await real_commit(**values)
+
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        writer.commit_lease = fail_actual_terminal_commit
+        elapsed[0] = 30.0
+        await registry.reap_expired()
+        await asyncio.wait_for(worker, 2)
+        assert registry.internal_failure_code == "terminal_persistence_failed"
+        assert len(terminal_attempts) == 1
+        retained = await registry.snapshot("original")
+        assert retained is not None, "failed publication must retain its cleanup identity"
+        assert retained.generation == admitted.generation
+        assert await registry.live_call_count() == 1
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+    finally:
+        writer.commit_lease = real_commit
+        await registry.wait_background()
+        if not worker.done():
+            await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expiry_lifecycle_read_failure_keeps_cleanup_identity(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    real_read = writer.read_call_lifecycle
+
+    async def failed_read(call_id):
+        raise RuntimeError("test-only lifecycle read failure")
+
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        writer.read_call_lifecycle = failed_read
+        elapsed[0] = 30.0
+        assert await registry.reap_expired() == 1
+        writer.read_call_lifecycle = real_read
+        retained = await registry.snapshot("original")
+        assert retained is not None and retained.generation == admitted.generation
+        assert registry.internal_failure_code == "terminal_persistence_failed"
+        assert await registry.live_call_count() == 1
+        assert await terminal_publications(writer) == []
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+    finally:
+        writer.read_call_lifecycle = real_read
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expiry_missing_native_facts_does_not_release_identity(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        assert await writer.read_call_lifecycle(admitted.call_id) is not None
+        # Corrupt only this owned disposable fixture's retained lifecycle. The
+        # activated real writer must not turn missing evidence into a success.
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            connection.execute(
+                "UPDATE call_leases SET lifecycle_json=NULL WHERE call_id=?",
+                (str(admitted.call_id),),
+            )
+        assert await writer.read_call_lifecycle(admitted.call_id) is None
+        elapsed[0] = 30.0
+        assert await registry.reap_expired() == 1
+        retained = await registry.snapshot("original")
+        assert retained is not None, "missing native facts must retain actual cleanup identity"
+        assert retained.generation == admitted.generation
+        assert registry.internal_failure_code == "terminal_persistence_failed"
+        assert await registry.live_call_count() == 1
+        assert await terminal_publications(writer) == []
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expiry_cancellation_keeps_frozen_publication(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    real_commit = writer.commit_lease
+    attempts = []
+
+    async def cancelled_after_real_commit(**values):
+        if values["state"] == "terminal":
+            operation = values.get("operation")
+            assert operation is not None, "terminal lease and call must share one command"
+            attempts.append((values["closed_at"], canonical_operation_bytes(operation)))
+        await real_commit(**values)
+        if values["state"] == "terminal" and len(attempts) == 1:
+            elapsed[0] = 32.0
+            raise asyncio.CancelledError("test-only caller cancellation after actual commit")
+
+    try:
+        await committed(registry, writer, event())
+        writer.commit_lease = cancelled_after_real_commit
+        elapsed[0] = 30.0
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(registry.reap_expired(), 2)
+        assert len(attempts) == 2
+        assert attempts[0] == attempts[1], "retry must not change terminal identity or time"
+        operations = await terminal_publications(writer)
+        assert len(operations) == 1
+        assert canonical_operation_bytes(operations[0]) == attempts[0][1]
+        assert operations[0].occurred_at == NOW + timedelta(seconds=30)
+        assert await registry.live_call_count() == 0
+        assert registry.internal_failure_code is None
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+    finally:
+        writer.commit_lease = real_commit
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expired_retention_terminal_failure_keeps_identity(tmp_path):
+    elapsed = [0.0]
+    reject_terminal = [False]
+
+    def failpoint(name):
+        if name == "after_mutation_before_commit" and reject_terminal[0]:
+            raise OSError("test-only expired native lease failure")
+
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        writer_utcnow=lambda: NOW,
+        monotonic=lambda: 100.0 + elapsed[0],
+        failpoint=failpoint,
+    )
+    real_commit = writer.commit_lease
+    attempts = []
+
+    async def fail_actual_expired_terminal_commit(**values):
+        if values["state"] == "terminal":
+            assert values.get("operation") is None
+            attempts.append(values["closed_at"])
+            reject_terminal[0] = True
+        await real_commit(**values)
+
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        # Fixed writer time retains coherent engineering facts; this does not
+        # qualify retention deletion or carrier-side end observation.
+        facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert facts is not None and facts.admission_generation == admitted.generation
+        writer.commit_lease = fail_actual_expired_terminal_commit
+        elapsed[0] = timedelta(days=31).total_seconds()
+        assert await registry.reap_expired() == 1
+        await asyncio.wait_for(worker, 2)
+        assert len(attempts) == 1
+        retained = await registry.snapshot("original")
+        assert retained is not None, "expired native lease failure still owns cleanup identity"
+        assert retained.generation == admitted.generation
+        assert registry.internal_failure_code == "terminal_persistence_failed"
+        assert await registry.live_call_count() == 1
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "pending", None
+            )
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+    finally:
+        writer.commit_lease = real_commit
+        await registry.wait_background()
+        if not worker.done():
+            await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expired_retention_cancellation_retries_frozen_lease(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        writer_utcnow=lambda: NOW,
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    real_commit = writer.commit_lease
+    attempts = []
+
+    async def cancelled_after_expired_real_commit(**values):
+        if values["state"] == "terminal":
+            assert values.get("operation") is None
+            attempts.append(dict(values))
+        await real_commit(**values)
+        if values["state"] == "terminal" and len(attempts) == 1:
+            elapsed[0] += 2
+            raise asyncio.CancelledError("test-only expired native commit cancellation")
+
+    try:
+        await committed(registry, writer, event())
+        admitted = await registry.snapshot("original")
+        assert admitted is not None
+        facts = await writer.read_call_lifecycle(admitted.call_id)
+        assert facts is not None and facts.admission_generation == admitted.generation
+        writer.commit_lease = cancelled_after_expired_real_commit
+        elapsed[0] = timedelta(days=31).total_seconds()
+        with pytest.raises(asyncio.CancelledError):
+            # Public reaper invokes cleanup with retry_cancelled_io=False.
+            await asyncio.wait_for(registry.reap_expired(), 2)
+        assert len(attempts) == 2
+        assert attempts[0] == attempts[1], "expired lease retry must freeze its exact close time"
+        assert attempts[0]["closed_at"] == NOW + timedelta(days=31)
+        assert await registry.live_call_count() == 0
+        assert registry.internal_failure_code is None
+        assert await terminal_publications(writer) == []
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            state, closed_at = connection.execute(
+                "SELECT state,closed_at FROM call_leases"
+            ).fetchone()
+            assert state == "terminal"
+            assert datetime.fromisoformat(closed_at.replace("Z", "+00:00")) == attempts[0][
+                "closed_at"
+            ]
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+    finally:
+        writer.commit_lease = real_commit
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_sparra_expired_retention_success_omits_terminal_publication(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        writer_utcnow=lambda: NOW,
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    try:
+        await committed(registry, writer, event())
+        elapsed[0] = timedelta(days=31).total_seconds()
+        assert await registry.reap_expired() == 1
+        assert await registry.reap_expired() == 0
+        assert await registry.live_call_count() == 0
+        assert registry.internal_failure_code is None
+        assert await terminal_publications(writer) == []
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state FROM call_leases").fetchone() == ("terminal",)
+            assert connection.execute("SELECT COUNT(*) FROM outbox").fetchone() == (1,)
+            assert connection.execute("SELECT COUNT(*) FROM webhook_receipts").fetchone() == (1,)
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_unowned_non_sparra_expiry_keeps_legacy_lease_only_cleanup(tmp_path):
+    elapsed = [0.0]
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+        sparra=False,
+    )
+    try:
+        await committed(registry, writer, event())
+        elapsed[0] = 30.0
+        assert await registry.reap_expired() == 1
+        assert await terminal_publications(writer) == []
+        assert await registry.live_call_count() == 0
+        assert [action[0] for action in provider.actions].count("hangup") == 1
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_owned_sparra_expiry_leaves_publication_to_existing_owner(tmp_path):
+    from types import SimpleNamespace
+
+    elapsed = [0.0]
+    drains = []
+    registry, writer, worker, provider = await start(
+        tmp_path,
+        utcnow=lambda: NOW + timedelta(seconds=elapsed[0]),
+        monotonic=lambda: 100.0 + elapsed[0],
+    )
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        admitted = await registry.snapshot("original")
+        claim = await registry.claim_once(
+            call_control_id="original",
+            token_digest=admitted.token_digest,
+            abort_target_publisher=lambda target: True,
+            abort_target_clearer=lambda target: None,
+        )
+        assert claim is not None
+
+        async def wait():
+            pass
+
+        owner = SimpleNamespace(
+            _task=asyncio.current_task(),
+            _phase="constructing",
+            _session=None,
+            _terminal_capability=None,
+            request_drain=drains.append,
+            wait=wait,
+        )
+        grant = await registry.consume_claim_for_construction(claim, "stream", owner, owner._task)
+        assert grant is not None
+        elapsed[0] = 30.0
+        assert await registry.reap_expired() == 1
+        assert drains == ["token_deadline"]
+        assert await terminal_publications(writer) == []
+        assert await registry.live_call_count() == 1
+        assert not any(action[0] == "hangup" for action in provider.actions)
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert connection.execute("SELECT state,closed_at FROM call_leases").fetchone() == (
+                "active", None
+            )
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
 
 
 @pytest.mark.asyncio
