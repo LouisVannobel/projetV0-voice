@@ -365,7 +365,6 @@ class DisclosureOutputBarrier(FrameProcessor):
                     await self._abort_safely()
                     return
                 await self.push_frame(frame, direction)
-                await self._controller.mark_forwarded()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -767,11 +766,30 @@ def build_pipeline(
         except Exception:
             return
 
+    async def disclosure_mark_sent(_output: FrameProcessor, frame: Frame) -> None:
+        if not isinstance(frame, TelnyxMarkFrame) or frame.mark_name != controller.mark_name:
+            return
+        try:
+            await controller.mark_forwarded()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            first_failure.signal("disclosure_failed")
+            try:
+                await controller.abort("disclosure_failed")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
     assistant_aggregator.add_event_handler("on_assistant_turn_stopped", record_assistant_turn)
     services.tts.add_event_handler("on_error", sanitize_tts_error)
 
     barrier = DisclosureOutputBarrier(controller=controller)
+    output = transport.output()
+    # Native MediaSender pushes ordered marks only after send_message returns.
+    output.add_event_handler("on_after_push_frame", disclosure_mark_sent)
     return ObservedPipeline(
         [
             transport.input(),
@@ -782,7 +800,7 @@ def build_pipeline(
             services.llm,
             services.tts,
             barrier,
-            transport.output(),
+            output,
             assistant_aggregator,
         ],
         first_failure=first_failure,

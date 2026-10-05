@@ -621,7 +621,7 @@ async def test_disclosure_barrier_requires_audio_ignores_stop_and_forwards_one_e
     assert downstream == [audio, stopped, mark]
     assert controller.audio == 1
     assert controller.armed == 1
-    assert controller.forwarded == 1
+    assert controller.forwarded == 0
 
     empty = _GateController()
     downstream, _ = await run_test(
