@@ -527,6 +527,108 @@ def test_semantic_fingerprint_changes_when_an_effect_driving_field_changes(
     assert len(set(fingerprints)) == 3
 
 
+def test_signed_answered_provider_shape_without_state_normalizes_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Synthetic values preserve the observed provider field shape without live data.
+    parsed = json.loads(
+        event_body(
+            event_type="call.answered",
+            payload={
+                "call_control_id": "control-1",
+                "call_leg_id": "leg-1",
+                "call_session_id": "session-1",
+                "calling_party_type": "pstn",
+                "client_state": "synthetic-capsule",
+                "codec": "PCMU",
+                "connection_id": "connection-1",
+                "custom_headers": [],
+                "flow_destination": "voice",
+                "from": "+33123456789",
+                "sampling_rate": 8000,
+                "start_time": "2026-08-25T11:59:00Z",
+                "to": "+33987654321",
+            },
+        )
+    )
+    del parsed["data"]["payload"]["state"]
+    body = json.dumps(parsed).encode()
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    verified = verifier.verify(body=body, headers=headers)
+
+    assert verified.event_type == "call.answered"
+    assert verified.call_state == "answered"
+    assert verified.direction is None
+    assert verified.call_control_id == "control-1"
+    assert verified.call_leg_id == "leg-1"
+    assert verified.call_session_id == "session-1"
+    assert verified.connection_id == "connection-1"
+    assert verified.to_e164 == "+33987654321"
+    assert verified.from_e164 == "+33123456789"
+    assert verified.client_state.get_secret_value() == "synthetic-capsule"
+    parsed["data"]["payload"]["state"] = "answered"
+    explicit_body = json.dumps(parsed).encode()
+    explicit_verifier, explicit_headers = verifier_for(monkeypatch, explicit_body)
+    explicit = explicit_verifier.verify(body=explicit_body, headers=explicit_headers)
+    assert verified.semantic_fingerprint_sha256 == explicit.semantic_fingerprint_sha256
+    assert verified.legacy_v1_semantic_fingerprint_sha256 is None
+
+
+def test_signed_answered_omitted_state_preserves_explicit_state_fingerprints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit_body = event_body(event_type="call.answered")
+    parsed = json.loads(explicit_body)
+    del parsed["data"]["payload"]["state"]
+    omitted_body = json.dumps(parsed).encode()
+    explicit_verifier, explicit_headers = verifier_for(monkeypatch, explicit_body)
+    explicit = explicit_verifier.verify(body=explicit_body, headers=explicit_headers)
+    omitted_verifier, omitted_headers = verifier_for(monkeypatch, omitted_body)
+    omitted = omitted_verifier.verify(body=omitted_body, headers=omitted_headers)
+
+    assert omitted.call_state == explicit.call_state == "answered"
+    assert omitted.semantic_fingerprint_sha256 == explicit.semantic_fingerprint_sha256
+    assert omitted.semantic_fingerprint_sha256.hex() == (
+        "0ce310140d3b06406e6b6c6c7ee1261b82b45837745cd9d8608df40c63817c83"
+    )
+    assert omitted.legacy_v1_semantic_fingerprint_sha256 == (
+        explicit.legacy_v1_semantic_fingerprint_sha256
+    )
+    assert omitted.legacy_v1_semantic_fingerprint_sha256.hex() == (
+        "1610367f63f53eb708ca377d9bc173f265199ee742b7982677700b5ca086bfdb"
+    )
+
+
+@pytest.mark.parametrize("state", ["parked", "unknown", "", None, 1, True, [], {}])
+def test_signed_answered_explicit_invalid_state_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    state: object,
+) -> None:
+    body = event_body(
+        event_type="call.answered",
+        payload={"call_control_id": "control-1", "state": state},
+    )
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
+@pytest.mark.parametrize("missing", ["state", "direction"])
+def test_signed_initiated_still_requires_incoming_parked_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    parsed = json.loads(event_body())
+    del parsed["data"]["payload"][missing]
+    body = json.dumps(parsed).encode()
+    verifier, headers = verifier_for(monkeypatch, body)
+
+    with pytest.raises(webhooks().InvalidWebhookPayload, match="invalid_payload"):
+        verifier.verify(body=body, headers=headers)
+
+
 def test_signed_recording_id_rejects_url_shape_before_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
