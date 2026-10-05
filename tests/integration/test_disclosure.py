@@ -6,12 +6,29 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-from pipecat.frames.frames import InputAudioRawFrame, InterruptionFrame, StartFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    Frame,
+    InputAudioRawFrame,
+    InputTransportMessageFrame,
+    InterruptionFrame,
+    OutputAudioRawFrame,
+    OutputTransportMessageFrame,
+    OutputTransportMessageUrgentFrame,
+    StartFrame,
+    TTSAudioRawFrame,
+    TTSSpeakFrame,
+    TTSStoppedFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import run_test
+from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -22,6 +39,7 @@ from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1, RoutingV1
 from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
 pipeline_module = import_module("projetv0_voice.pipeline")
@@ -169,6 +187,198 @@ def _pinned_identity(enabled: bool):
     )
     return replace(_identity(), begin_snapshot=snapshot, retention_until=snapshot.retention_until,
                    routing=routing)
+
+
+class _DisclosureRelay(FrameProcessor):
+    def __init__(self, *, synthesize: bool = False) -> None:
+        super().__init__(enable_direct_mode=True)
+        self.synthesize = synthesize
+        self.input_audio: list[InputAudioRawFrame] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self.input_audio.append(frame)
+        if self.synthesize and isinstance(frame, TTSSpeakFrame):
+            await self.push_frame(
+                TTSAudioRawFrame(
+                    audio=b"\x01\x00" * 1920,
+                    sample_rate=8000,
+                    num_channels=1,
+                    context_id="paced-disclosure",
+                ),
+                direction,
+            )
+            await self.push_frame(TTSStoppedFrame(context_id="paced-disclosure"), direction)
+            return
+        await self.push_frame(frame, direction)
+
+
+class _PacedDisclosureOutput(BaseOutputTransport):
+    """Keep native chunking/MediaSender; replace only the offline wire sinks."""
+
+    def __init__(self, *, ack_during_send: object | None = None) -> None:
+        super().__init__(
+            TransportParams(
+                audio_out_enabled=True,
+                audio_out_sample_rate=8000,
+                audio_out_channels=1,
+                audio_out_10ms_chunks=2,
+                audio_out_end_silence_secs=0,
+            )
+        )
+        self.ack_during_send = ack_during_send
+        self.mark_enqueued = asyncio.Event()
+        self.mark_sent = asyncio.Event()
+        self.mark_pushed = asyncio.Event()
+        self.audio_written = bytearray()
+
+        async def after_process(_output: FrameProcessor, frame: Frame) -> None:
+            if isinstance(frame, TelnyxMarkFrame):
+                self.mark_enqueued.set()
+
+        async def after_push(_output: FrameProcessor, frame: Frame) -> None:
+            if isinstance(frame, TelnyxMarkFrame):
+                self.mark_pushed.set()
+
+        self.add_event_handler("on_after_process_frame", after_process)
+        self.add_event_handler("on_after_push_frame", after_push)
+
+    async def start(self, frame: StartFrame) -> None:
+        await super().start(frame)
+        await self.set_transport_ready(frame)
+
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        await asyncio.sleep(len(frame.audio) / (frame.sample_rate * frame.num_channels * 2))
+        self.audio_written.extend(frame.audio)
+        return True
+
+    async def send_message(
+        self, frame: OutputTransportMessageFrame | OutputTransportMessageUrgentFrame
+    ) -> None:
+        if isinstance(frame, TelnyxMarkFrame):
+            if self.ack_during_send is not None:
+                assert await self.ack_during_send.accept_mark(frame.mark_name)
+            self.mark_sent.set()
+
+
+def _paced_disclosure_runtime(controller, failure, output):
+    input_processor = _DisclosureRelay()
+    services = SimpleNamespace(
+        stt=_DisclosureRelay(),
+        llm=_DisclosureRelay(),
+        tts=_DisclosureRelay(synthesize=True),
+    )
+    transport = SimpleNamespace(input=lambda: input_processor, output=lambda: output)
+    pipeline = pipeline_module.build_pipeline(
+        transport=transport,
+        services=services,
+        controller=controller,
+        turn_recorder=SimpleNamespace(
+            record_user=lambda *_args: None,
+            record_assistant=lambda *_args: None,
+        ),
+        first_failure=failure,
+    )
+    runtime = pipeline_module.build_runtime(
+        pipeline=pipeline,
+        first_failure=failure,
+        greeting=pipeline_module.SPARRA_DISCLOSURE,
+        mark_name=controller.mark_name,
+        idle_timeout_seconds=60.0,
+        observers=pipeline_module._CallObservers(  # noqa: SLF001
+            runtime_metrics=_TEST_RUNTIME_METRICS,
+            stt=services.stt,
+            llm=services.llm,
+            tts=services.tts,
+        ),
+    )
+    return runtime, services
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack_during_send", [False, True])
+async def test_paced_disclosure_waits_for_native_output_mark_before_deadline_and_commit(
+    ack_during_send: bool,
+) -> None:
+    writer = _Writer(block=True)
+    controller, _, recording, failure = _controller(
+        writer=writer, timeout=0.02, identity=_pinned_identity(False)
+    )
+    output = _PacedDisclosureOutput(
+        ack_during_send=controller if ack_during_send else None
+    )
+    runtime, services = _paced_disclosure_runtime(controller, failure, output)
+    await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    try:
+        await asyncio.wait_for(output.mark_enqueued.wait(), timeout=2)
+        # The actual native audio queue is still playing a 240 ms greeting.
+        await asyncio.sleep(0.06)
+        assert not output.mark_sent.is_set()
+        assert failure.code is None
+        assert controller.state is session_module.DisclosureState.MARK_PENDING
+        assert controller.pending_task_count == 0
+        await runtime.worker.queue_frame(
+            InputAudioRawFrame(audio=b"\x02\x00" * 80, sample_rate=8000, num_channels=1)
+        )
+
+        await asyncio.wait_for(output.mark_pushed.wait(), timeout=2)
+        assert output.mark_sent.is_set()
+        assert len(output.audio_written) == 3840
+        if not ack_during_send:
+            # Output completion arms a deadline; it cannot itself open input.
+            assert controller.pending_task_count == 1
+            await runtime.worker.queue_frame(
+                InputTransportMessageFrame(
+                    message={"event": "mark", "mark": {"name": controller.mark_name}}
+                )
+            )
+        await asyncio.wait_for(writer.started.wait(), timeout=2)
+        assert controller.state is session_module.DisclosureState.ACK_COMMITTING
+        assert not controller.is_active()
+        assert recording.starts == 0
+        assert services.stt.input_audio == []
+        assert len(writer.commands) == 1
+
+        writer.release.set()
+        await controller.join_continuations()
+        assert controller.is_active()
+        assert failure.code is None
+        assert len(writer.commands) == 2
+        await runtime.worker.queue_frame(EndFrame())
+        await asyncio.wait_for(runner_task, timeout=2)
+    finally:
+        writer.release.set()
+        await controller.terminalize_and_join(cancel_continuations=True)
+        if not runner_task.done():
+            await runtime.runner.cancel(reason="test_cleanup")
+            await asyncio.wait_for(runner_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_paced_disclosure_output_mark_starts_missing_ack_deadline() -> None:
+    controller, writer, recording, failure = _controller(timeout=0.02)
+    output = _PacedDisclosureOutput()
+    runtime, _services = _paced_disclosure_runtime(controller, failure, output)
+    await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    try:
+        await asyncio.wait_for(output.mark_pushed.wait(), timeout=2)
+        assert output.mark_sent.is_set()
+        assert failure.code is None
+        assert controller.state is session_module.DisclosureState.MARK_PENDING
+        assert await asyncio.wait_for(failure.wait(), timeout=1) == "disclosure_timeout"
+        assert controller.state is session_module.DisclosureState.ABORTED
+        assert not controller.is_active()
+        assert not await controller.accept_mark(controller.mark_name)
+        assert writer.commands == []
+        assert recording.starts == 0
+    finally:
+        await controller.terminalize_and_join(cancel_continuations=True)
+        if not runner_task.done():
+            await runtime.runner.cancel(reason="test_cleanup")
+            await asyncio.wait_for(runner_task, timeout=2)
 
 
 @pytest.mark.asyncio
@@ -626,6 +836,65 @@ def _websocket_messages(
     websocket.application_state = WebSocketState.CONNECTED
     websocket.client_state = WebSocketState.CONNECTED
     return websocket
+
+
+@pytest.mark.asyncio
+async def test_real_fastapi_output_mark_starts_deadline_after_paced_wire_send() -> None:
+    controller, writer, recording, failure = _controller(timeout=0.02)
+    sent: list[dict[str, object]] = []
+    transport = FastAPIWebsocketTransport(
+        _websocket_messages([], sent),
+        FastAPIWebsocketParams(
+            audio_in_enabled=False,
+            audio_out_enabled=True,
+            audio_out_sample_rate=8000,
+            audio_out_10ms_chunks=2,
+            audio_out_end_silence_secs=0,
+            serializer=ProjetV0TelnyxFrameSerializer(
+                "stream-one", expected_call_control_id="call-one"
+            ),
+        ),
+    )
+    runtime, _services = _paced_disclosure_runtime(controller, failure, transport.output())
+    mark_enqueued = asyncio.Event()
+    mark_pushed = asyncio.Event()
+
+    async def after_process(_output: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, TelnyxMarkFrame):
+            mark_enqueued.set()
+
+    async def after_push(_output: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, TelnyxMarkFrame):
+            mark_pushed.set()
+
+    transport.output().add_event_handler("on_after_process_frame", after_process)
+    transport.output().add_event_handler("on_after_push_frame", after_push)
+    await runtime.runner.add_workers(runtime.worker)
+    runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+    try:
+        await asyncio.wait_for(mark_enqueued.wait(), timeout=2)
+        await asyncio.sleep(0.06)
+        assert not mark_pushed.is_set()
+        assert failure.code is None
+        await asyncio.wait_for(mark_pushed.wait(), timeout=2)
+        payloads = [
+            json.loads(message["text"])
+            for message in sent
+            if message.get("type") == "websocket.send" and isinstance(message.get("text"), str)
+        ]
+        assert payloads[0]["event"] == "media"
+        assert payloads[-1] == {"event": "mark", "mark": {"name": controller.mark_name}}
+        assert failure.code is None
+        assert controller.pending_task_count == 1
+        assert await asyncio.wait_for(failure.wait(), timeout=1) == "disclosure_timeout"
+        assert not controller.is_active()
+        assert writer.commands == []
+        assert recording.starts == 0
+    finally:
+        await controller.terminalize_and_join(cancel_continuations=True)
+        if not runner_task.done():
+            await runtime.runner.cancel(reason="test_cleanup")
+            await asyncio.wait_for(runner_task, timeout=2)
 
 
 @pytest.mark.asyncio
