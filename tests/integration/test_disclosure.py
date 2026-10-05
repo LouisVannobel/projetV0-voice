@@ -760,7 +760,10 @@ def _media(byte: int) -> str:
         {
             "event": "media",
             "stream_id": "stream-one",
-            "media": {"payload": base64.b64encode(bytes([byte]) * 80).decode("ascii")},
+            "media": {
+                "track": "inbound",
+                "payload": base64.b64encode(bytes([byte]) * 80).decode("ascii"),
+            },
         }
     )
 

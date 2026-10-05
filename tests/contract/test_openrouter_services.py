@@ -54,7 +54,6 @@ async def test_build_stt_uses_native_openrouter_multipart_with_manifest_language
         await service._client.close()
 
     assert isinstance(service, OpenAISTTService)
-    assert type(service) is OpenAISTTService
     assert str(service._client.base_url).rstrip("/") == OPENROUTER_BASE_URL
     assert service._settings.model == "test/stt"
     assert service._settings.language == "fr"

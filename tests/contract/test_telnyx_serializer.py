@@ -118,7 +118,13 @@ async def test_native_pcmu_audio_dtmf_and_clear_remain_equivalent() -> None:
         {
             "event": "media",
             "stream_id": "stream-one",
-            "media": {"payload": base64.b64encode(bytes(range(80))).decode("ascii")},
+            "sequence_number": "1",
+            "media": {
+                "track": "inbound",
+                "chunk": "1",
+                "timestamp": "0",
+                "payload": base64.b64encode(bytes(range(80))).decode("ascii"),
+            },
         }
     )
     project_audio = await project.deserialize(media)
@@ -155,7 +161,13 @@ async def test_documented_large_media_payload_still_delegates_to_native() -> Non
         {
             "event": "media",
             "stream_id": "stream-one",
-            "media": {"payload": base64.b64encode(ulaw).decode("ascii")},
+            "sequence_number": "1",
+            "media": {
+                "track": "inbound",
+                "chunk": "1",
+                "timestamp": "0",
+                "payload": base64.b64encode(ulaw).decode("ascii"),
+            },
         }
     )
     assert len(media.encode("utf-8")) > 65_536
@@ -182,7 +194,13 @@ async def test_audio_admission_is_closed_until_once_bound_and_fails_closed() -> 
         {
             "event": "media",
             "stream_id": "stream-one",
-            "media": {"payload": base64.b64encode(bytes(range(80))).decode("ascii")},
+            "sequence_number": "1",
+            "media": {
+                "track": "inbound",
+                "chunk": "1",
+                "timestamp": "0",
+                "payload": base64.b64encode(bytes(range(80))).decode("ascii"),
+            },
         }
     )
 
@@ -214,6 +232,108 @@ async def test_audio_admission_is_closed_until_once_bound_and_fails_closed() -> 
     assert str(failed.value) == "telnyx_audio_admission_failed"
     assert "provider-secret" not in repr(failed.value)
     assert failed.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_outbound_media_is_dropped_before_native_decode_or_audio_admission(
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = serializer_module.AudioAdmission()
+
+    def admission_predicate() -> bool:
+        raise AssertionError("outbound media reached audio admission")
+
+    if admitted:
+        admission.bind(admission_predicate)
+
+    async def forbidden_decode(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("outbound media reached the native PCMU converter")
+
+    monkeypatch.setattr("pipecat.serializers.telnyx.ulaw_to_pcm", forbidden_decode)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one", expected_call_control_id="call-one", audio_admission=admission
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    payload = {
+        "event": "media",
+        "stream_id": "stream-one",
+        "sequence_number": "1",
+        "media": {
+            "track": "outbound",
+            "chunk": "1",
+            "timestamp": "0",
+            "payload": base64.b64encode(bytes(range(80))).decode("ascii"),
+        },
+    }
+
+    assert await serializer.deserialize(json.dumps(payload)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "wrong-stream",
+        "missing-stream",
+        "missing-track",
+        "invalid-track",
+        "missing-media",
+        "list-media",
+        "missing-payload",
+        "nonstring-payload",
+    ],
+)
+async def test_media_critical_shape_is_validated_even_when_admission_is_closed(
+    admitted: bool,
+    invalid: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = serializer_module.AudioAdmission()
+    if admitted:
+        admission.bind(lambda: True)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one", expected_call_control_id="call-one", audio_admission=admission
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    media: dict[str, object] = {
+        "track": "inbound",
+        "chunk": "1",
+        "timestamp": "0",
+        "payload": base64.b64encode(bytes(range(80))).decode("ascii"),
+    }
+    payload: dict[str, object] = {
+        "event": "media",
+        "stream_id": "stream-one",
+        "sequence_number": "1",
+        "media": media,
+    }
+    if invalid == "wrong-stream":
+        payload["stream_id"] = "sentinel-wrong-stream"
+    elif invalid == "missing-stream":
+        del payload["stream_id"]
+    elif invalid == "missing-track":
+        del media["track"]
+    elif invalid == "invalid-track":
+        media["track"] = "inbound_track"
+    elif invalid == "missing-media":
+        del payload["media"]
+    elif invalid == "list-media":
+        payload["media"] = []
+    elif invalid == "missing-payload":
+        del media["payload"]
+    elif invalid == "nonstring-payload":
+        media["payload"] = 123
+
+    async def forbidden_decode(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("invalid media reached the native PCMU converter")
+
+    monkeypatch.setattr("pipecat.serializers.telnyx.ulaw_to_pcm", forbidden_decode)
+    with pytest.raises(TelnyxSerializerError) as raised:
+        await serializer.deserialize(json.dumps(payload))
+    _assert_constant_safe(raised.value, "sentinel-wrong-stream")
 
 
 @pytest.mark.asyncio
