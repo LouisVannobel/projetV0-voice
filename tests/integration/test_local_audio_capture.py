@@ -100,6 +100,7 @@ class SentOutput(_PacedDisclosureOutput):
 @asynccontextmanager
 async def capture_case(
     tmp_path, *, failpoint=None, terminal_publication=False, monotonic=None,
+    recorder_factory=None,
 ):
     assert hasattr(audio_capture, "LocalAudioCapture"), (
         "missing native LocalAudioCapture composition"
@@ -198,10 +199,14 @@ async def capture_case(
         )
         input_processor = _DisclosureRelay()
         transport = SimpleNamespace(input=lambda: input_processor, output=lambda: output)
+        turn_recorder = (
+            SimpleNamespace(record_user=lambda *_args: None, record_assistant=lambda *_args: None)
+            if recorder_factory is None
+            else recorder_factory(identity, writer, keyring, failure)
+        )
         pipeline = pipeline_module.build_pipeline(
             transport=transport, services=services, controller=controller,
-            turn_recorder=SimpleNamespace(record_user=lambda *_args: None,
-                                         record_assistant=lambda *_args: None),
+            turn_recorder=turn_recorder,
             first_failure=failure, begin_snapshot=pin, capture_tap=capture.tap,
         )
         runtime = pipeline_module.build_runtime(pipeline=pipeline, first_failure=failure,
@@ -215,7 +220,7 @@ async def capture_case(
         yield SimpleNamespace(writer=writer, keyring=keyring, path=path, capture=capture,
             controller=controller, active=active, output=output, stt=stt, tts=services.tts,
             runtime=runtime,
-            serializer=serializer, failure=failure, pin=pin)
+            serializer=serializer, failure=failure, pin=pin, turn_recorder=turn_recorder)
     finally:
         if controller is not None:
             await controller.terminalize_and_join(cancel_continuations=True)

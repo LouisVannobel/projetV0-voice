@@ -71,6 +71,7 @@ from projetv0_voice.persistence.commands import (
     encrypt_audio_operation,
     encrypt_control_operation_v2,
     encrypt_operation,
+    encrypt_turn_operation_v2,
     operation_aad,
     operation_aad_from_metadata,
     require_operation,
@@ -574,6 +575,50 @@ class PersistenceWriter:
             "outbox",
             {"operation": operation, "truncated": truncated},
             None,
+            enqueued_at=self._monotonic(),
+        )
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull:
+            self.transcript_loss_count += 1
+            self._signal_fatal("queue_full")
+            return False
+        self._track_pending(command)
+        return True
+
+    def _turn_v2_matches(
+        self, operation: VoiceOperationV2, generation: UUID, pin: _AudioPin | None,
+    ) -> bool:
+        payload = operation.payload
+        return (
+            pin is not None and isinstance(payload, TurnUpsertPayloadV1)
+            and pin.generation == generation and pin.deployment_id == operation.deployment_id
+            and pin.call_id == operation.call_id and pin.input_gate_opened
+            and self._utcnow() < pin.retention_until
+            and pin.admitted_at <= payload.started_at <= payload.ended_at < pin.retention_until
+            and pin.admitted_at <= operation.occurred_at < pin.retention_until
+        )
+
+    def try_enqueue_turn_v2(
+        self, operation: VoiceOperationV2, *, generation: UUID, truncated: bool = False,
+    ) -> bool:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "turn.upsert" or not isinstance(generation, UUID)
+            or type(truncated) is not bool
+        ):
+            raise ValueError("invalid_turn_v2_command")
+        if not self._accepting or self._degraded:
+            self.transcript_loss_count += 1
+            self._signal_fatal("persistence_degraded")
+            return False
+        if not self._turn_v2_matches(
+            operation, generation, self._audio_pins.get(operation.call_id)
+        ):
+            return False
+        command = PersistenceCommand(
+            "sparra_content", {"action": "turn_v2", "operation": operation,
+                "generation": generation, "truncated": truncated}, None,
             enqueued_at=self._monotonic(),
         )
         try:
@@ -1894,15 +1939,19 @@ class PersistenceWriter:
                 continue
             aad = operation_aad_from_metadata(
                 dict(
-                    schema_version=1,
+                    schema_version=self._contract_version,
                     kind="turn.upsert",
                     call_id=str(call_id),
                     operation_id=op_id,
                     deployment_id=deployment_id,
                 )
             )
-            operation = decode_operation(
-                self._keyring.decrypt(EncryptedValue(key_version, nonce, ciphertext), aad=aad)
+            plaintext = self._keyring.decrypt(
+                EncryptedValue(key_version, nonce, ciphertext), aad=aad
+            )
+            operation = (
+                decode_operation_v2(plaintext) if self._contract_version == 2
+                else decode_operation(plaintext)
             )
             payload = operation.payload
             if (
@@ -1939,7 +1988,9 @@ class PersistenceWriter:
             loss_count,
         )
 
-    async def _retain_turn(self, operation: VoiceOperationV1, *, truncated: bool) -> bool:
+    async def _retain_turn(
+        self, operation: VoiceOperationV1 | VoiceOperationV2, *, truncated: bool,
+    ) -> bool:
         if await self._read_call_lifecycle(operation.call_id) is None:
             return not self._sparra_active  # Preserve absent-Sparra legacy queue bytes.
         connection = self._require_owner_connection()
@@ -1974,7 +2025,13 @@ class PersistenceWriter:
             and len(json.dumps(retained_map, ensure_ascii=False, allow_nan=False).encode("utf-8"))
             <= 524288
         )
-        encrypted = encrypt_operation(operation, self._keyring).encrypted if fits else None
+        encrypted = None
+        if fits:
+            encrypted = (
+                encrypt_turn_operation_v2(operation, self._keyring).encrypted
+                if isinstance(operation, VoiceOperationV2)
+                else encrypt_operation(operation, self._keyring).encrypted
+            )
         await connection.execute(
             "INSERT INTO sparra_turn_decisions VALUES (?,?,?,?,?,?,?,?,?)",
             (
@@ -2162,9 +2219,55 @@ class PersistenceWriter:
         )
         return None
 
+    async def _apply_turn_v2_command(self, values: Mapping[str, object]) -> bool:
+        operation = values.get("operation")
+        generation = values.get("generation")
+        truncated = values.get("truncated")
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "turn.upsert" or not isinstance(generation, UUID)
+            or type(truncated) is not bool
+        ):
+            raise CommandSerializationError("invalid_turn_v2_command")
+        pin = await self._read_audio_pin(operation.call_id)
+        if (
+            not self._turn_v2_matches(operation, generation, pin)
+            or await self._content_denied(operation.call_id)
+        ):
+            return False
+        if not await self._retain_turn(operation, truncated=truncated):
+            return False
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT key_version,nonce,ciphertext FROM sparra_turn_decisions WHERE call_id=? "
+            "AND op_id=? AND ciphertext IS NOT NULL",
+            (str(operation.call_id), str(operation.operation_id)),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None or not isinstance(operation.payload, TurnUpsertPayloadV1):
+            raise CommandSerializationError("invalid_turn_v2_command")
+        previous = await self._load_operation_by_id(str(operation.operation_id))
+        if previous is not None:
+            if canonical_operation_bytes(previous) != canonical_operation_bytes(operation):
+                raise CommandConflictError("operation_identity_conflict")
+            return True
+        now = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,turn_id,"
+            "recording_id,crypto_version,key_version,nonce,ciphertext,created_at,attempts,"
+            "next_attempt_at,last_error_code) VALUES(?,?,?,2,?,?,NULL,?,?,?,?,?,0,?,NULL)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind,
+             str(operation.call_id), str(operation.payload.turn_id), CRYPTO_VERSION,
+             row[0], row[1], row[2], now, now),
+        )
+        return True
+
     async def _apply_content_command(self, values: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
         action = values.get("action")
+        if action == "turn_v2":
+            return await self._apply_turn_v2_command(values)
         if action == "audio_terminal":
             return await self._apply_audio_terminal(values)
         if action == "audio_choice":
@@ -4266,7 +4369,9 @@ class PersistenceWriter:
             command.committed.set_exception(error)
 
     def _count_lost_command(self, command: PersistenceCommand) -> None:
-        if command.kind == "outbox":
+        if command.kind == "outbox" or (
+            command.kind == "sparra_content" and command.payload.get("action") == "turn_v2"
+        ):
             self.transcript_loss_count += 1
 
     def _fail_pending(self, error: FatalPersistenceError) -> None:

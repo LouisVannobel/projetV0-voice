@@ -313,6 +313,10 @@ MAX_TURN_TEXT_BYTES = 65_520
 class TurnWriter(Protocol):
     def try_enqueue_turn(self, operation: VoiceOperationV1, *, truncated: bool = False) -> bool: ...
 
+    def try_enqueue_turn_v2(
+        self, operation: VoiceOperationV2, *, generation: UUID, truncated: bool = False,
+    ) -> bool: ...
+
 
 class TurnRecorder:
     """Synchronous, atomic turn encryption and shared-writer admission."""
@@ -408,20 +412,27 @@ class TurnRecorder:
                 ended_at=event_time,
                 interrupted=interrupted,
             )
-            operation = VoiceOperationV1(
-                schema_version=1,
-                operation_id=self._uuid_factory(),
-                deployment_id=self._identity.deployment_id,
-                call_id=self._identity.call_id,
-                occurred_at=occurred_at,
-                kind="turn.upsert",
-                payload=payload,
-            )
-            enqueued = (
-                self._writer.try_enqueue_turn(operation, truncated=len(encoded) > bound)
-                if self._identity.routing is not None
-                else self._writer.try_enqueue_turn(operation)
-            )
+            if isinstance(getattr(self._identity, "begin_snapshot", None), BeginCallSnapshotV2):
+                fresh = VoiceOperationV2(
+                    schema_version=2, operation_id=self._uuid_factory(),
+                    deployment_id=self._identity.deployment_id, call_id=self._identity.call_id,
+                    occurred_at=occurred_at, kind="turn.upsert", payload=payload,
+                )
+                enqueued = self._writer.try_enqueue_turn_v2(
+                    fresh, generation=self._identity.generation.generation,
+                    truncated=len(encoded) > bound,
+                )
+            else:
+                operation = VoiceOperationV1(
+                    schema_version=1, operation_id=self._uuid_factory(),
+                    deployment_id=self._identity.deployment_id, call_id=self._identity.call_id,
+                    occurred_at=occurred_at, kind="turn.upsert", payload=payload,
+                )
+                enqueued = (
+                    self._writer.try_enqueue_turn(operation, truncated=len(encoded) > bound)
+                    if self._identity.routing is not None
+                    else self._writer.try_enqueue_turn(operation)
+                )
             if not enqueued:
                 self._record_turn_lost()
                 self._first_failure.signal("writer_failed")
