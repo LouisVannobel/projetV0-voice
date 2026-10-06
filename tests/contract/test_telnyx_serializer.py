@@ -12,6 +12,7 @@ from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
     ControlFrame,
     DataFrame,
+    Frame,
     InputAudioRawFrame,
     InputDTMFFrame,
     InputTransportMessageFrame,
@@ -135,12 +136,89 @@ async def test_native_pcmu_audio_dtmf_and_clear_remain_equivalent() -> None:
     assert project_audio.sample_rate == native_audio.sample_rate == 8000
     assert project_audio.num_channels == native_audio.num_channels == 1
 
-    dtmf = json.dumps({"event": "dtmf", "dtmf": {"digit": "5"}})
+    dtmf = json.dumps(
+        {
+            "event": "dtmf",
+            "stream_id": "stream-one",
+            "occurred_at": "2026-10-01T10:00:00.123Z",
+            "sequence_number": "2",
+            "dtmf": {"digit": "5"},
+        }
+    )
     project_dtmf = await project.deserialize(dtmf)
     native_dtmf = await native.deserialize(dtmf)
     assert isinstance(project_dtmf, InputDTMFFrame)
     assert isinstance(native_dtmf, InputDTMFFrame)
     assert project_dtmf.button == native_dtmf.button == KeypadEntry.FIVE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("stream_id", [None, "sentinel-wrong-stream"], ids=["missing", "wrong"])
+async def test_dtmf_stream_is_validated_before_native_delegation_even_when_audio_is_closed(
+    admitted: bool,
+    stream_id: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = serializer_module.AudioAdmission()
+    admission.bind(lambda: admitted)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one", expected_call_control_id="call-one", audio_admission=admission
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    native_calls = 0
+    native_deserialize = TelnyxFrameSerializer.deserialize
+
+    async def observed_native(native: TelnyxFrameSerializer, data: str | bytes) -> Frame | None:
+        nonlocal native_calls
+        native_calls += 1
+        return await native_deserialize(native, data)
+
+    monkeypatch.setattr(TelnyxFrameSerializer, "deserialize", observed_native)
+    payload: dict[str, object] = {
+        "event": "dtmf", "occurred_at": "2026-10-01T10:00:00.123Z",
+        "sequence_number": "2", "dtmf": {"digit": "2"},
+    }
+    if stream_id is not None:
+        payload["stream_id"] = stream_id
+    with pytest.raises(TelnyxSerializerError) as raised:
+        await serializer.deserialize(json.dumps(payload))
+    assert native_calls == 0
+    _assert_constant_safe(raised.value, "sentinel-wrong-stream")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("digit,expected", [("1", KeypadEntry.ONE), ("2", KeypadEntry.TWO)])
+async def test_matching_dtmf_remains_native_control_when_media_admission_is_closed(
+    admitted: bool,
+    digit: str,
+    expected: KeypadEntry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = serializer_module.AudioAdmission()
+    admission.bind(lambda: admitted)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one", expected_call_control_id="call-one", audio_admission=admission
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    native_calls = 0
+    native_deserialize = TelnyxFrameSerializer.deserialize
+
+    async def observed_native(native: TelnyxFrameSerializer, data: str | bytes) -> Frame | None:
+        nonlocal native_calls
+        native_calls += 1
+        return await native_deserialize(native, data)
+
+    monkeypatch.setattr(TelnyxFrameSerializer, "deserialize", observed_native)
+    frame = await serializer.deserialize(json.dumps({
+        "event": "dtmf", "stream_id": "stream-one",
+        "occurred_at": "2026-10-01T10:00:00.123Z", "sequence_number": "2",
+        "dtmf": {"digit": digit},
+    }))
+    assert native_calls == 1
+    assert isinstance(frame, InputDTMFFrame)
+    assert frame.button == expected
 
 
 @pytest.mark.asyncio

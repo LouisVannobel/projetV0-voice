@@ -181,6 +181,13 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
             if not allowed:
                 return None
 
+        if initial.get("event") == "dtmf":
+            stream_id = bounded_utf8_text(
+                initial.get("stream_id"), maximum_bytes=MAX_STREAM_ID_BYTES
+            )
+            if stream_id != self._stream_id:
+                raise TelnyxSerializerError("telnyx_serializer_invalid")
+
         if initial.get("event") not in {
             "mark",
             "stop",
