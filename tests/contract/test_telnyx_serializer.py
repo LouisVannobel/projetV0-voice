@@ -4,6 +4,7 @@ import base64
 import inspect
 import json
 import struct
+from datetime import UTC, datetime
 from importlib import import_module
 from importlib.metadata import version
 
@@ -33,6 +34,7 @@ from projetv0_voice.telnyx.frames import MAX_MARK_NAME_BYTES, TelnyxMarkFrame
 from projetv0_voice.telnyx.serializer import ProjetV0TelnyxFrameSerializer, TelnyxSerializerError
 
 serializer_module = import_module("projetv0_voice.telnyx.serializer")
+frames_module = import_module("projetv0_voice.telnyx.frames")
 
 
 class _UnknownSystemFrame(SystemFrame):
@@ -219,6 +221,127 @@ async def test_matching_dtmf_remains_native_control_when_media_admission_is_clos
     assert native_calls == 1
     assert isinstance(frame, InputDTMFFrame)
     assert frame.button == expected
+
+
+@pytest.mark.asyncio
+async def test_dtmf_retains_native_keypad_and_validated_metadata_without_reordering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = serializer_module.AudioAdmission()
+    admission.bind(lambda: False)
+    serializer = ProjetV0TelnyxFrameSerializer(
+        "stream-one", expected_call_control_id="call-one", audio_admission=admission
+    )
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    native_calls = 0
+    native_deserialize = TelnyxFrameSerializer.deserialize
+
+    async def observed_native(native: TelnyxFrameSerializer, data: str | bytes) -> Frame | None:
+        nonlocal native_calls
+        native_calls += 1
+        return await native_deserialize(native, data)
+
+    monkeypatch.setattr(TelnyxFrameSerializer, "deserialize", observed_native)
+    examples = [
+        ("2025-06-05T08:54:19.698408Z", "5", "1", KeypadEntry.ONE, 698408),
+        ("2025-06-05T08:54:19.698407Z", "4", "2", KeypadEntry.TWO, 698407),
+        ("2025-06-05T08:54:19Z", "0", "#", KeypadEntry.POUND, 0),
+        ("2025-06-05T08:54:19.1Z", "9007199254740991", "*", KeypadEntry.STAR, 100000),
+        ("2025-06-05T08:54:19.123Z", "42", "5", KeypadEntry.FIVE, 123000),
+    ]
+    for index, (occurred_at, sequence, digit, button, micros) in enumerate(examples, start=1):
+        frame = await serializer.deserialize(json.dumps({
+            "event": "dtmf", "stream_id": "stream-one", "occurred_at": occurred_at,
+            "sequence_number": sequence, "dtmf": {"digit": digit},
+            "provider_extra": "discarded-dtmf-raw-payload",
+        }))
+        assert native_calls == index
+        assert isinstance(frame, InputDTMFFrame) and isinstance(frame, SystemFrame)
+        assert type(frame) is frames_module.TelnyxInputDTMFFrame
+        assert frame.button == button
+        assert frame.occurred_at == datetime(2025, 6, 5, 8, 54, 19, micros, tzinfo=UTC)
+        assert frame.sequence_number == int(sequence)
+        assert frame.metadata == {}
+        assert "discarded-dtmf-raw-payload" not in repr(frame)
+        assert "occurred_at=" not in repr(frame) and "sequence_number=" not in repr(frame)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        pytest.param({}, id="both-missing"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z"}, id="sequence-missing"),
+        pytest.param({"sequence_number": "5"}, id="timestamp-missing"),
+        pytest.param({"occurred_at": None, "sequence_number": "5"}, id="timestamp-null"),
+        pytest.param({"occurred_at": True, "sequence_number": "5"}, id="timestamp-bool"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19", "sequence_number": "5"},
+                     id="timestamp-naive"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19+00:00", "sequence_number": "5"},
+                     id="timestamp-offset"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19.1234567Z", "sequence_number": "5"},
+                     id="timestamp-seven-fractions"),
+        pytest.param({"occurred_at": "2025-02-30T08:54:19Z", "sequence_number": "5"},
+                     id="timestamp-invalid-calendar"),
+        pytest.param({"occurred_at": "x" * 33, "sequence_number": "5"}, id="timestamp-oversize"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": True},
+                     id="sequence-bool"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": 5},
+                     id="sequence-native-int"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": 5.0},
+                     id="sequence-float"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": "01"},
+                     id="sequence-leading-zero"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": "-1"},
+                     id="sequence-negative"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": "+1"},
+                     id="sequence-signed"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": "١"},
+                     id="sequence-non-ascii"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z", "sequence_number": "9" * 17},
+                     id="sequence-oversize"),
+        pytest.param({"occurred_at": "2025-06-05T08:54:19Z",
+                      "sequence_number": "9007199254740992"}, id="sequence-js-safe-plus-one"),
+    ],
+)
+@pytest.mark.parametrize("digit,button", [("1", KeypadEntry.ONE), ("2", KeypadEntry.TWO)])
+async def test_unknown_dtmf_metadata_preserves_native_control_with_audio_closed(
+    metadata: dict[str, object], digit: str, button: KeypadEntry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serializer = ProjetV0TelnyxFrameSerializer("stream-one", expected_call_control_id="call-one")
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    native_calls = 0
+    native_deserialize = TelnyxFrameSerializer.deserialize
+
+    async def observed_native(native: TelnyxFrameSerializer, data: str | bytes) -> Frame | None:
+        nonlocal native_calls
+        native_calls += 1
+        return await native_deserialize(native, data)
+
+    monkeypatch.setattr(TelnyxFrameSerializer, "deserialize", observed_native)
+    frame = await serializer.deserialize(json.dumps({
+        "event": "dtmf", "stream_id": "stream-one", "dtmf": {"digit": digit}, **metadata,
+    }))
+    assert native_calls == 1
+    assert isinstance(frame, InputDTMFFrame) and isinstance(frame, SystemFrame)
+    assert type(frame) is frames_module.TelnyxInputDTMFFrame
+    assert frame.button == button
+    assert frame.occurred_at is None and frame.sequence_number is None
+    assert frame.metadata == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("digit", ["A", "12", "", None], ids=["a", "multiple", "empty", "null"])
+async def test_dtmf_metadata_extension_keeps_native_invalid_key_result(digit: str | None) -> None:
+    serializer = ProjetV0TelnyxFrameSerializer("stream-one", expected_call_control_id="call-one")
+    await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+    payload = json.dumps({
+        "event": "dtmf", "stream_id": "stream-one", "occurred_at": "2025-06-05T08:54:19Z",
+        "sequence_number": "5", "dtmf": {"digit": digit},
+    })
+    assert await serializer.deserialize(payload) is None
+    assert await _native_serializer().deserialize(payload) is None
 
 
 @pytest.mark.asyncio
