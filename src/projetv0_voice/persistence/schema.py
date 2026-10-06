@@ -205,3 +205,47 @@ LOCAL_AUDIO_CHOICE_MIGRATION_SQL = (
     "FROM local_audio_pin_v6;\n"
     "DROP TABLE local_audio_pin_v6;\nPRAGMA user_version = 7;"
 )
+
+LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION = 8
+_LOCAL_AUDIO_PIN_V8_TABLE = _LOCAL_AUDIO_PIN_V7_TABLE.replace(
+    "    choice_occurred_at TEXT,\n",
+    "    choice_occurred_at TEXT,\n"
+    "    committed_last_sequence INTEGER CHECK (committed_last_sequence BETWEEN 0 AND 599),\n"
+    "    committed_total_samples INTEGER DEFAULT 0 "
+    "CHECK (committed_total_samples BETWEEN 0 AND 4800000),\n"
+    "    CHECK ((committed_total_samples IS NULL AND committed_last_sequence IS NULL) "
+    "OR (committed_total_samples IS NOT NULL AND committed_total_samples=0 "
+    "AND committed_last_sequence IS NULL) "
+    "OR (committed_total_samples IS NOT NULL AND committed_total_samples>0 "
+    "AND committed_last_sequence IS NOT NULL AND committed_total_samples "
+    "BETWEEN committed_last_sequence+1 AND (committed_last_sequence+1)*8000)),\n",
+)
+LOCAL_AUDIO_TERMINAL_SLOTS_SQL = """
+CREATE TABLE local_audio_terminal (
+    call_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('audio.finish','audio.revoke')),
+    op_id TEXT UNIQUE NOT NULL,
+    deployment_id TEXT NOT NULL,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint)=32),
+    key_version INTEGER NOT NULL CHECK (key_version>0),
+    nonce BLOB NOT NULL CHECK (length(nonce)=12),
+    ciphertext BLOB NOT NULL CHECK (length(ciphertext)>=16),
+    acked INTEGER NOT NULL DEFAULT 0 CHECK (acked IN (0,1)),
+    PRIMARY KEY(call_id,kind)
+);
+"""
+LOCAL_AUDIO_TERMINAL_SCHEMA_SQL = LOCAL_AUDIO_CHOICE_SCHEMA_SQL.replace(
+    _LOCAL_AUDIO_PIN_V7_TABLE, _LOCAL_AUDIO_PIN_V8_TABLE
+).replace("PRAGMA user_version = 7;", LOCAL_AUDIO_TERMINAL_SLOTS_SQL + "\nPRAGMA user_version = 8;")
+LOCAL_AUDIO_TERMINAL_MIGRATION_SQL = (
+    "ALTER TABLE local_audio_pin RENAME TO local_audio_pin_v7;\n"
+    + _LOCAL_AUDIO_PIN_V8_TABLE
+    + "INSERT INTO local_audio_pin(call_id,generation,workspace_id,deployment_id,recording_id,"
+    "configuration_revision,recording_policy,audio_available,admitted_at,retention_until,denied_at,"
+    "choice_state,choice_occurred_at,committed_last_sequence,committed_total_samples) "
+    "SELECT call_id,generation,workspace_id,deployment_id,recording_id,"
+    "configuration_revision,recording_policy,audio_available,admitted_at,retention_until,denied_at,"
+    "choice_state,choice_occurred_at,NULL,NULL FROM local_audio_pin_v7;\n"
+    "DROP TABLE local_audio_pin_v7;\n"
+    + LOCAL_AUDIO_TERMINAL_SLOTS_SQL + "\nPRAGMA user_version = 8;"
+)

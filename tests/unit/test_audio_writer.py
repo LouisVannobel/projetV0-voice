@@ -146,7 +146,7 @@ async def test_v2_admitted_chunk_commits_real_ciphertext_and_claim_decodes_exact
                 "SELECT schema_version,kind,key_version,nonce,ciphertext FROM outbox "
                 "WHERE kind='audio.chunk'"
             ).fetchone()
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert (version, kind) == (2, "audio.chunk") and len(nonce) == 12
         plaintext = keyring.decrypt(EncryptedValue(key_version, nonce, ciphertext),
                                     aad=operation_aad(operation))
@@ -488,7 +488,7 @@ async def test_control_v2_fresh_disclosure_and_gate_commit_exact_crypto_and_immu
                 "SELECT op_id,schema_version,kind,key_version,nonce,ciphertext FROM outbox "
                 "ORDER BY queue_id"
             ).fetchall()
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert len(frozen) == 2
         for row, operation in zip(frozen, (first, gated), strict=True):
             assert row[:3] == (str(operation.operation_id), 2, "call.upsert")

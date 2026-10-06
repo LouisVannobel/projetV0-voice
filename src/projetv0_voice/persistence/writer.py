@@ -25,6 +25,8 @@ import aiosqlite
 
 from projetv0_voice.audio_contract import (
     AudioChunkPayloadV2,
+    AudioFinishPayloadV2,
+    AudioRevokePayloadV2,
     BeginCallSnapshotV2,
     VoiceOperationV2,
 )
@@ -80,6 +82,9 @@ from projetv0_voice.persistence.schema import (
     LOCAL_AUDIO_CHOICE_SCHEMA_VERSION,
     LOCAL_AUDIO_SCHEMA_SQL,
     LOCAL_AUDIO_SCHEMA_VERSION,
+    LOCAL_AUDIO_TERMINAL_MIGRATION_SQL,
+    LOCAL_AUDIO_TERMINAL_SCHEMA_SQL,
+    LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION,
     QUALIFICATION_RUNS_SQL,
     RECORDING_ARCHIVE_SQL,
     SCHEMA_SQL,
@@ -158,6 +163,7 @@ _EXPECTED_V4_SCHEMA_OBJECTS = _expected_schema_objects(V4_SCHEMA_SQL)
 _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
 _EXPECTED_AUDIO_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_SCHEMA_SQL)
 _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_CHOICE_SCHEMA_SQL)
+_EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_TERMINAL_SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
     ("table", "webhook_receipts"),
@@ -291,6 +297,9 @@ class _AudioPin:
     choice_state: Literal["undecided", "accepted", "off"] = "undecided"
     choice_occurred_at: datetime | None = None
     input_gate_opened: bool = False
+    committed_last_sequence: int | None = None
+    committed_total_samples: int | None = 0
+    terminal_finished: bool = False
 
     @property
     def denied(self) -> bool:
@@ -1031,6 +1040,22 @@ class PersistenceWriter:
             raise PersistenceError("audio_choice_refused")
         return facts
 
+    async def publish_audio_terminal_v2(
+        self, operation: VoiceOperationV2, *, generation: UUID
+    ) -> None:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind not in {"audio.finish", "audio.revoke"}
+            or not isinstance(generation, UUID)
+            or operation.kind == "audio.finish" and self._audio_inflight
+        ):
+            raise PersistenceError("audio_terminal_refused")
+        result = await self._content_request(
+            "audio_terminal", operation=operation, generation=generation
+        )
+        if result is not True:
+            raise PersistenceError("audio_terminal_refused")
+
     def offer_audio_chunk(self, operation: VoiceOperationV2) -> bool:
         if (
             self._contract_version != 2 or not self._ready_ok or not self._accepting
@@ -1041,6 +1066,10 @@ class PersistenceWriter:
             return False
         pin = self._audio_pins.get(operation.call_id)
         if pin is None or not self._audio_operation_matches(operation, pin):
+            return False
+        if operation.payload.sequence != (
+            0 if pin.committed_last_sequence is None else pin.committed_last_sequence + 1
+        ):
             return False
         try:
             prepared = encrypt_audio_operation(operation, self._keyring)
@@ -1099,6 +1128,7 @@ class PersistenceWriter:
         return (
             isinstance(payload, AudioChunkPayloadV2) and pin.available and not pin.denied
             and pin.choice_state == "accepted" and pin.input_gate_opened
+            and pin.committed_total_samples is not None and not pin.terminal_finished
             and pin.policy == "local_30d" and pin.retention_until > self._utcnow()
             and operation.call_id == pin.call_id and operation.deployment_id == pin.deployment_id
             and payload.workspace_id == pin.workspace_id
@@ -1840,6 +1870,9 @@ class PersistenceWriter:
             )
             await connection.execute("DELETE FROM call_leases WHERE call_id=?", (call_id,))
             if self._contract_version == 2:
+                await connection.execute(
+                    "DELETE FROM local_audio_terminal WHERE call_id=?", (call_id,)
+                )
                 await connection.execute("DELETE FROM local_audio_pin WHERE call_id=?", (call_id,))
                 self._audio_pins.pop(UUID(call_id), None)
             collected += 1
@@ -1985,7 +2018,8 @@ class PersistenceWriter:
         cursor = await self._require_owner_connection().execute(
             "SELECT call_id,generation,workspace_id,deployment_id,recording_id,"
             "configuration_revision,recording_policy,audio_available,admitted_at,"
-            "retention_until,denied_at,choice_state,choice_occurred_at "
+            "retention_until,denied_at,choice_state,choice_occurred_at,"
+            "committed_last_sequence,committed_total_samples "
             "FROM local_audio_pin WHERE call_id=?", (str(call_id),)
         )
         row = await cursor.fetchone()
@@ -2005,6 +2039,12 @@ class PersistenceWriter:
             and evidence.completed_at is not None and evidence.failed_at is None
             and evidence.input_gate_opened_at is not None
         )
+        cursor = await self._require_owner_connection().execute(
+            "SELECT 1 FROM local_audio_terminal WHERE call_id=? AND kind='audio.finish'",
+            (str(call_id),),
+        )
+        terminal_finished = await cursor.fetchone() is not None
+        await cursor.close()
         return _AudioPin(
             UUID(row[0]), UUID(row[1]), UUID(row[2]), row[3],
             None if row[4] is None else UUID(row[4]), row[5],
@@ -2012,7 +2052,8 @@ class PersistenceWriter:
             _parse_datetime(row[8]), _parse_datetime(row[9]),
             None if row[10] is None else _parse_datetime(row[10]),
             cast(Literal["undecided", "accepted", "off"], row[11]),
-            None if row[12] is None else _parse_datetime(row[12]), gate_opened,
+            None if row[12] is None else _parse_datetime(row[12]), gate_opened, row[13], row[14],
+            terminal_finished,
         )
 
     async def _apply_audio_command(self, values: Mapping[str, object]) -> object:
@@ -2049,7 +2090,9 @@ class PersistenceWriter:
             existing_pin = await self._read_audio_pin(snapshot.call_id)
             if existing_pin is not None:
                 context = replace(existing_pin, denied_at=None, choice_state="undecided",
-                                  choice_occurred_at=None, input_gate_opened=False)
+                                  choice_occurred_at=None, input_gate_opened=False,
+                                  committed_last_sequence=None, committed_total_samples=0,
+                                  terminal_finished=False)
                 return existing_pin if context == bound_pin else None
             await connection.execute(
                 "INSERT INTO local_audio_pin(call_id,generation,workspace_id,deployment_id,"
@@ -2082,6 +2125,19 @@ class PersistenceWriter:
             operation
         ):
             raise CommandSerializationError("invalid_audio_command")
+        existing_operation = await self._load_operation_by_id(str(operation.operation_id))
+        if existing_operation is not None:
+            if canonical_operation_bytes(existing_operation) != prepared.plaintext:
+                raise CommandConflictError("audio_operation_conflict")
+            return None
+        expected_sequence = (
+            0 if pin.committed_last_sequence is None else pin.committed_last_sequence + 1
+        )
+        if pin.committed_total_samples is None:
+            raise _AudioChunkRefused("audio_chunk_refused")
+        total_samples = pin.committed_total_samples + audio_payload.sample_count
+        if audio_payload.sequence != expected_sequence or total_samples > 4_800_000:
+            raise _AudioChunkRefused("audio_chunk_refused")
         try:
             await connection.execute(
                 "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,recording_id,"
@@ -2099,11 +2155,18 @@ class PersistenceWriter:
                 or canonical_operation_bytes(existing_operation) != prepared.plaintext
             ):
                 raise CommandConflictError("audio_operation_conflict") from None
+            return None
+        await connection.execute(
+            "UPDATE local_audio_pin SET committed_last_sequence=?,committed_total_samples=? "
+            "WHERE call_id=?", (audio_payload.sequence, total_samples, str(operation.call_id)),
+        )
         return None
 
     async def _apply_content_command(self, values: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
         action = values.get("action")
+        if action == "audio_terminal":
+            return await self._apply_audio_terminal(values)
         if action == "audio_choice":
             return await self._apply_audio_choice(values)
         if action == "control_v2":
@@ -2463,6 +2526,91 @@ class PersistenceWriter:
             "UPDATE call_leases SET lifecycle_json = ? WHERE call_id = ?",
             (json.dumps(values, sort_keys=True, separators=(",", ":")), str(facts.call_id)),
         )
+
+    async def _apply_audio_terminal(self, values: Mapping[str, object]) -> bool:
+        operation = values.get("operation")
+        generation = values.get("generation")
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or not isinstance(generation, UUID)
+            or not isinstance(operation.payload, (AudioFinishPayloadV2, AudioRevokePayloadV2))
+        ):
+            return False
+        payload = operation.payload
+        pin = await self._read_audio_pin(operation.call_id)
+        facts = await self._read_call_lifecycle(operation.call_id)
+        if (
+            pin is None or facts is None or pin.generation != generation
+            or facts.admission_generation != generation
+            or operation.deployment_id != pin.deployment_id
+            or payload.workspace_id != pin.workspace_id or payload.recording_id != pin.recording_id
+            or payload.configuration_revision != pin.revision
+            or payload.retention_until != pin.retention_until
+            or facts.retention_until != pin.retention_until
+        ):
+            return False
+        connection = self._require_owner_connection()
+        plaintext = canonical_operation_bytes(operation)
+        fingerprint = hashlib.sha256(plaintext).digest()
+        cursor = await connection.execute(
+            "SELECT op_id,fingerprint,key_version,nonce,ciphertext,acked FROM local_audio_terminal "
+            "WHERE call_id=? AND kind=?", (str(operation.call_id), operation.kind),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            if existing[0] != str(operation.operation_id) or existing[1] != fingerprint:
+                return False
+            encrypted = EncryptedValue(existing[2], existing[3], existing[4])
+            if self._keyring.decrypt(encrypted, aad=operation_aad(operation)) != plaintext:
+                raise FatalPersistenceError("audio_terminal_invalid")
+            if existing[5] == 1:
+                return True
+        else:
+            if isinstance(payload, AudioFinishPayloadV2) and (
+                pin.committed_total_samples is None or pin.denied
+                or pin.retention_until <= self._utcnow()
+                or facts.content_erased
+                or payload.last_sequence != pin.committed_last_sequence
+                or payload.total_samples != pin.committed_total_samples
+            ):
+                return False
+            if await self._load_operation_by_id(str(operation.operation_id)) is not None:
+                return False
+            prepared = encrypt_audio_operation(operation, self._keyring)
+            encrypted = prepared.encrypted
+            await connection.execute(
+                "INSERT INTO local_audio_terminal(call_id,kind,op_id,deployment_id,fingerprint,"
+                "key_version,nonce,ciphertext) VALUES(?,?,?,?,?,?,?,?)",
+                (str(operation.call_id), operation.kind, str(operation.operation_id),
+                 operation.deployment_id, fingerprint, encrypted.key_version, encrypted.nonce,
+                 encrypted.ciphertext),
+            )
+        if isinstance(payload, AudioRevokePayloadV2):
+            await connection.execute(
+                "UPDATE local_audio_pin SET choice_state='off',denied_at=COALESCE(denied_at,?) "
+                "WHERE call_id=?", (_iso(self._utcnow()), str(operation.call_id)),
+            )
+            await connection.execute(
+                "DELETE FROM outbox WHERE call_id=? AND kind IN ('audio.chunk','audio.finish')",
+                (str(operation.call_id),),
+            )
+        existing_outbox = await self._load_operation_by_id(str(operation.operation_id))
+        if existing_outbox is not None:
+            if canonical_operation_bytes(existing_outbox) != plaintext:
+                raise CommandConflictError("audio_terminal_conflict")
+            return True
+        now = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,recording_id,"
+            "crypto_version,key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind, 2,
+             str(operation.call_id), str(payload.recording_id), CRYPTO_VERSION,
+             encrypted.key_version,
+             encrypted.nonce, encrypted.ciphertext, now, now),
+        )
+        return True
 
     async def _apply_audio_choice(self, values: Mapping[str, object]) -> AudioChoiceFacts | None:
         call_id = self._required_uuid(values, "call_id")
@@ -2835,7 +2983,8 @@ class PersistenceWriter:
             return
         if (
             self._pragma_int(await self._pragma_scalar("user_version"))
-            in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION}
+            in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION,
+                LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION}
         ):
             raise FatalPersistenceError("writer_contract_mismatch")
         connection = self._require_owner_connection()
@@ -2920,13 +3069,13 @@ class PersistenceWriter:
         version = self._pragma_int(await self._pragma_scalar("user_version"))
         schema = await self._application_schema_objects()
         if schema:
-            expected = (
-                _EXPECTED_AUDIO_SCHEMA_OBJECTS if version == LOCAL_AUDIO_SCHEMA_VERSION
-                else _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS
-            )
+            expected = {
+                LOCAL_AUDIO_SCHEMA_VERSION: _EXPECTED_AUDIO_SCHEMA_OBJECTS,
+                LOCAL_AUDIO_CHOICE_SCHEMA_VERSION: _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS,
+                LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION: _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS,
+            }.get(version)
             if (
-                version not in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION}
-                or schema != expected
+                expected is None or schema != expected
             ):
                 raise FatalPersistenceError("writer_contract_mismatch")
             cursor = await connection.execute(
@@ -2939,13 +3088,18 @@ class PersistenceWriter:
             await cursor.close()
             if marker != [(1, 2)] or legacy != (0,):
                 raise FatalPersistenceError("writer_contract_mismatch")
-            if version == LOCAL_AUDIO_SCHEMA_VERSION:
+            if version != LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION:
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
-                    for statement in LOCAL_AUDIO_CHOICE_MIGRATION_SQL.split(";"):
+                    if version == LOCAL_AUDIO_SCHEMA_VERSION:
+                        for statement in LOCAL_AUDIO_CHOICE_MIGRATION_SQL.split(";"):
+                            if statement.strip():
+                                await connection.execute(statement)
+                        await self._call_failpoint("after_audio_choice_migration_before_commit")
+                    for statement in LOCAL_AUDIO_TERMINAL_MIGRATION_SQL.split(";"):
                         if statement.strip():
                             await connection.execute(statement)
-                    await self._call_failpoint("after_audio_choice_migration_before_commit")
+                    await self._call_failpoint("after_audio_terminal_migration_before_commit")
                     self._check_storage_limit()
                     await connection.commit()
                 except BaseException:
@@ -2964,7 +3118,7 @@ class PersistenceWriter:
         if not schema:
             try:
                 await connection.executescript(
-                    "BEGIN IMMEDIATE;\n" + LOCAL_AUDIO_CHOICE_SCHEMA_SQL + "\nCOMMIT;"
+                    "BEGIN IMMEDIATE;\n" + LOCAL_AUDIO_TERMINAL_SCHEMA_SQL + "\nCOMMIT;"
                 )
             except BaseException:
                 with contextlib.suppress(Exception):
@@ -2972,8 +3126,8 @@ class PersistenceWriter:
                 raise
         if (
             self._pragma_int(await self._pragma_scalar("user_version"))
-            != LOCAL_AUDIO_CHOICE_SCHEMA_VERSION
-            or await self._application_schema_objects() != _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS
+            != LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION
+            or await self._application_schema_objects() != _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS
         ):
             raise FatalPersistenceError("sqlite_schema_mismatch")
         self.pragma_state = {
@@ -3169,6 +3323,18 @@ class PersistenceWriter:
                     prepared = command.payload.get("prepared")
                     if isinstance(prepared, PreparedControlOperationV2):
                         refreshed = await self._read_audio_pin(prepared.operation.call_id)
+                        if refreshed is not None:
+                            self._audio_pins[refreshed.call_id] = refreshed
+                elif action == "audio_chunk":
+                    audio_prepared = command.payload.get("prepared")
+                    if isinstance(audio_prepared, PreparedAudioOperation):
+                        refreshed = await self._read_audio_pin(audio_prepared.operation.call_id)
+                        if refreshed is not None:
+                            self._audio_pins[refreshed.call_id] = refreshed
+                elif action == "audio_terminal" and command_result is True:
+                    audio_terminal = command.payload.get("operation")
+                    if isinstance(audio_terminal, VoiceOperationV2):
+                        refreshed = await self._read_audio_pin(audio_terminal.call_id)
                         if refreshed is not None:
                             self._audio_pins[refreshed.call_id] = refreshed
             if (
@@ -3979,6 +4145,10 @@ class PersistenceWriter:
             applied = cursor.rowcount == 1
             await cursor.close()
             if applied and delivered is not None:
+                if self._contract_version == 2:
+                    await connection.execute(
+                        "UPDATE local_audio_terminal SET acked=1 WHERE op_id=?", (delivered[0],)
+                    )
                 # This exact claim is ACKed only after the relay's native sink
                 # ingest returned a known success. Local archive COMMIT alone
                 # never reaches this path, and ambiguous native COMMIT does not ACK.
