@@ -1790,6 +1790,40 @@ class PersistenceWriter:
             VoiceOperationV1 | None, await self._content_request("frozen_read", call_id=call_id)
         )
 
+    async def freeze_call_publication_v2(
+        self, operation: VoiceOperationV2, result: MessageResultV1 | None, *, generation: UUID,
+        provider_callback: str | None, result_permitted: Callable[[], bool] | None = None,
+    ) -> VoiceOperationV2 | None:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "call.upsert" or not isinstance(generation, UUID)
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or operation.payload.status not in {"closing", "closed", "failed"}
+        ):
+            raise PersistenceError("final_call_v2_refused")
+        value = await self._content_request("freeze_v2", call_id=operation.call_id,
+            operation=operation, message_result=result, generation=generation,
+            provider_callback=provider_callback, result_permitted=result_permitted)
+        if value is False:
+            raise PersistenceError("final_call_v2_refused")
+        if value is not None and not isinstance(value, VoiceOperationV2):
+            raise CommandSerializationError("invalid_final_call_v2_result")
+        return value
+
+    async def read_frozen_call_publication_v2(
+        self, call_id: UUID, *, generation: UUID,
+    ) -> VoiceOperationV2 | None:
+        if self._contract_version != 2 or not isinstance(generation, UUID):
+            raise PersistenceError("final_call_v2_refused")
+        value = await self._content_request(
+            "frozen_read_v2", call_id=call_id, generation=generation
+        )
+        if value is False:
+            raise PersistenceError("final_call_v2_refused")
+        if value is not None and not isinstance(value, VoiceOperationV2):
+            raise CommandSerializationError("invalid_final_call_v2_result")
+        return value
+
     async def erase_call_content(
         self,
         call_id: UUID,
@@ -2071,6 +2105,137 @@ class PersistenceWriter:
             self._keyring.decrypt(EncryptedValue(row[2], row[3], row[4]), aad=aad)
         )
 
+    async def _frozen_publication_v2(self, call_id: UUID) -> VoiceOperationV2 | None:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT op_id,deployment_id,key_version,nonce,ciphertext "
+            "FROM sparra_publications WHERE call_id=?", (str(call_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        aad = operation_aad_from_metadata({"schema_version": 2, "operation_id": row[0],
+            "deployment_id": row[1], "call_id": str(call_id), "kind": "call.upsert"})
+        operation = decode_operation_v2(self._keyring.decrypt(
+            EncryptedValue(row[2], row[3], row[4]), aad=aad
+        ))
+        if (
+            operation.call_id != call_id or str(operation.operation_id) != row[0]
+            or operation.deployment_id != row[1] or operation.kind != "call.upsert"
+        ):
+            raise CommandConflictError("frozen_operation_identity_conflict")
+        return operation
+
+    async def _queue_frozen_publication_v2(self, operation: VoiceOperationV2) -> None:
+        existing = await self._load_operation_by_id(str(operation.operation_id))
+        if existing is not None:
+            if canonical_operation_bytes(existing) != canonical_operation_bytes(operation):
+                raise CommandConflictError("operation_identity_conflict")
+            return
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT key_version,nonce,ciphertext FROM sparra_publications "
+            "WHERE call_id=? AND op_id=?",
+            (str(operation.call_id), str(operation.operation_id)),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            raise CommandSerializationError("invalid_final_call_v2_result")
+        now = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,crypto_version,"
+            "key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,2,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind,
+             str(operation.call_id), CRYPTO_VERSION, row[0], row[1], row[2], now, now),
+        )
+
+    async def _apply_final_call_v2(self, values: Mapping[str, object]) -> object:
+        if self._contract_version != 2:
+            raise CommandSerializationError("writer_contract_mismatch")
+        call_id = self._required_uuid(values, "call_id")
+        generation = self._required_uuid(values, "generation")
+        facts = await self._read_call_lifecycle(call_id)
+        pin = await self._read_audio_pin(call_id)
+        if facts is None or pin is None:
+            return None
+        if (
+            facts.admission_generation != generation or pin.generation != generation
+            or pin.admitted_at != facts.admitted_at or pin.retention_until != facts.retention_until
+        ):
+            return False
+        if await self._content_denied(call_id):
+            return None
+        if values.get("action") == "frozen_read_v2":
+            return await self._frozen_publication_v2(call_id)
+        operation = values.get("operation")
+        if (
+            not isinstance(operation, VoiceOperationV2) or operation.call_id != call_id
+            or operation.kind != "call.upsert"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+        ):
+            raise CommandSerializationError("invalid_final_call_v2_command")
+        payload = operation.payload
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT call_control_id,tenant_id,agent_id,created_at FROM call_leases WHERE call_id=?",
+            (str(call_id),),
+        )
+        leases = list(await cursor.fetchall())
+        await cursor.close()
+        if (
+            payload.status not in {"closing", "closed", "failed"}
+            or operation.deployment_id != pin.deployment_id
+            or payload.retention_until != facts.retention_until or len(leases) != 1
+            or leases[0][0] != payload.telnyx_call_control_id
+            or leases[0][1] != str(pin.workspace_id) or leases[0][2] != pin.deployment_id
+            or _parse_datetime(leases[0][3]) != facts.admitted_at
+            or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
+            or payload.telnyx_call_session_id != facts.telnyx_call_session_id
+            or operation.occurred_at < facts.admitted_at
+            or payload.started_at is not None and payload.started_at < facts.admitted_at
+            or payload.status != "closing" and payload.ended_at != operation.occurred_at
+        ):
+            return False
+        existing = await self._frozen_publication_v2(call_id)
+        if existing is not None:
+            await self._queue_frozen_publication_v2(existing)
+            return existing
+        retained = await self._retained_call(call_id)
+        changes: dict[str, object] = {
+            "transcript_loss_count": retained.loss_count, "message_result": None,
+        }
+        result = values.get("message_result")
+        permitted = values.get("result_permitted")
+        if (
+            isinstance(result, MessageResultV1) and not facts.transfer_fenced
+            and (permitted is None or callable(permitted) and permitted())
+        ):
+            callback = values.get("provider_callback")
+            try:
+                validate_result_provenance(result, retained,
+                    callback if isinstance(callback, str) else None)
+                changes["message_result"] = encrypt_message_result(
+                    result, call_id=call_id, keyring=self._keyring,
+                    authenticated_turns={t.turn_id: t.role for t in retained.turns},
+                )
+            except ValueError:
+                return False
+        operation = operation.model_copy(
+            update={"payload": payload.model_copy(update=changes)}
+        )
+        prepared = encrypt_control_operation_v2(operation, self._keyring)
+        await connection.execute(
+            "INSERT INTO sparra_publications VALUES (?,?,?,?,?,?)",
+            (str(call_id), str(operation.operation_id), operation.deployment_id,
+             prepared.encrypted.key_version, prepared.encrypted.nonce,
+             prepared.encrypted.ciphertext),
+        )
+        await self._merge_lifecycle_operation(operation)
+        await self._queue_frozen_publication_v2(operation)
+        return operation
+
     async def _read_audio_pin(self, call_id: UUID) -> _AudioPin | None:
         cursor = await self._require_owner_connection().execute(
             "SELECT call_id,generation,workspace_id,deployment_id,recording_id,"
@@ -2266,6 +2431,8 @@ class PersistenceWriter:
     async def _apply_content_command(self, values: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
         action = values.get("action")
+        if action in {"freeze_v2", "frozen_read_v2"}:
+            return await self._apply_final_call_v2(values)
         if action == "turn_v2":
             return await self._apply_turn_v2_command(values)
         if action == "audio_terminal":

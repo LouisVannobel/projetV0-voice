@@ -665,7 +665,7 @@ class CallSession:
         self._controller: DisclosureController | None = None
         self._recorder: TurnRecorder | None = None
         self._active_runtime: CallRuntime | None = None
-        self._terminal_publication: VoiceOperationV1 | None = None
+        self._terminal_publication: VoiceOperationV1 | VoiceOperationV2 | None = None
         self._partial_result: MessageResultV1 | None = None
         self._result_inference_task: asyncio.Task[MessageResultV1 | None] | None = None
         self._result_inference_fenced = False
@@ -692,7 +692,12 @@ class CallSession:
     async def _prepare_partial_result(self) -> None:
         if self._identity.routing is None:
             return
-        frozen = await cast(Any, self._writer).read_frozen_call_publication(self._identity.call_id)
+        frozen = (
+            await cast(Any, self._writer).read_frozen_call_publication_v2(
+                self._identity.call_id, generation=self._identity.generation.generation
+            ) if isinstance(getattr(self._identity, "begin_snapshot", None), BeginCallSnapshotV2)
+            else await cast(Any, self._writer).read_frozen_call_publication(self._identity.call_id)
+        )
         if frozen is not None:
             self._terminal_publication = frozen
             return
@@ -1425,14 +1430,9 @@ class CallSession:
         if terminal_at >= self._identity.retention_until:
             return
         evidence = None if self._controller is None else self._controller.evidence
-        operation = self._terminal_publication or VoiceOperationV1(
-            schema_version=1,
-            operation_id=operation_id or self._uuid_factory(),
-            deployment_id=self._identity.deployment_id,
-            call_id=self._identity.call_id,
-            occurred_at=terminal_at,
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        operation = self._terminal_publication
+        if operation is None:
+            payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=self._identity.telnyx_call_control_id,
                 telnyx_call_leg_id=self._identity.telnyx_call_leg_id,
                 telnyx_call_session_id=self._identity.telnyx_call_session_id,
@@ -1456,16 +1456,36 @@ class CallSession:
                         ),
                     )
                 ),
-            ),
-        )
+            )
+            if isinstance(getattr(self._identity, "begin_snapshot", None), BeginCallSnapshotV2):
+                operation = VoiceOperationV2(schema_version=2,
+                    operation_id=operation_id or self._uuid_factory(),
+                    deployment_id=self._identity.deployment_id, call_id=self._identity.call_id,
+                    occurred_at=terminal_at, kind="call.upsert", payload=payload)
+            else:
+                operation = VoiceOperationV1(schema_version=1,
+                    operation_id=operation_id or self._uuid_factory(),
+                    deployment_id=self._identity.deployment_id, call_id=self._identity.call_id,
+                    occurred_at=terminal_at, kind="call.upsert", payload=payload)
         self._terminal_publication = operation
         if self._identity.routing is not None:
-            frozen = await cast(Any, self._writer).freeze_call_publication(
-                operation,
-                self._partial_result,
-                provider_callback=self._identity.routing.from_e164,
-                result_permitted=lambda: not self._no_new_ai and not self._result_inference_fenced,
-            )
+            if isinstance(operation, VoiceOperationV2):
+                frozen = await cast(Any, self._writer).freeze_call_publication_v2(
+                    operation, self._partial_result,
+                    generation=self._identity.generation.generation,
+                    provider_callback=self._identity.routing.from_e164,
+                    result_permitted=lambda: (
+                        not self._no_new_ai and not self._result_inference_fenced
+                    ),
+                )
+            else:
+                frozen = await cast(Any, self._writer).freeze_call_publication(
+                    operation, self._partial_result,
+                    provider_callback=self._identity.routing.from_e164,
+                    result_permitted=lambda: (
+                        not self._no_new_ai and not self._result_inference_fenced
+                    ),
+                )
             if frozen is not None:
                 self._terminal_publication = frozen
             return
