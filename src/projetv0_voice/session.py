@@ -27,7 +27,7 @@ from projetv0_voice.admission import (
     TerminalAuthority,
     TerminalProposal,
 )
-from projetv0_voice.audio_capture import LocalAudioCapture
+from projetv0_voice.audio_capture import AudioCaptureSummary, AudioFinishReason, LocalAudioCapture
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
@@ -760,6 +760,7 @@ class CallSession:
         local_capture = (
             LocalAudioCapture(
                 snapshot=self._identity.begin_snapshot, deployment_id=self._identity.deployment_id,
+                generation=self._identity.generation.generation,
                 keyring=self._keyring, writer=self._writer,
             )
             if isinstance(self._identity.begin_snapshot, BeginCallSnapshotV2)
@@ -795,6 +796,8 @@ class CallSession:
             local_audio_refuse=None if local_capture is None else local_capture.refuse,
             local_audio_close=None if local_capture is None else local_capture.close_admission,
             local_audio_quiesce=None if local_capture is None else quiesce_local_capture,
+            local_audio_finish=None if local_capture is None else local_capture.finish,
+            local_audio_revoke=None if local_capture is None else local_capture.revoke,
         )
         recorder = TurnRecorder(
             identity=self._identity,
@@ -1524,6 +1527,10 @@ class DisclosureController:
         local_audio_refuse: Callable[[], None] | None = None,
         local_audio_close: Callable[[], None] | None = None,
         local_audio_quiesce: Callable[[], Awaitable[None]] | None = None,
+        local_audio_finish: (
+            Callable[[AudioFinishReason], Awaitable[AudioCaptureSummary]] | None
+        ) = None,
+        local_audio_revoke: Callable[[], Awaitable[AudioCaptureSummary]] | None = None,
     ) -> None:
         if isinstance(identity.begin_snapshot, BeginCallSnapshotV1):
             recording_enabled = identity.begin_snapshot.recording_enabled
@@ -1566,6 +1573,10 @@ class DisclosureController:
         self._local_audio_refuse = local_audio_refuse
         self._local_audio_close = local_audio_close
         self._local_audio_quiesce = local_audio_quiesce
+        self._local_audio_finish = local_audio_finish
+        self._local_audio_revoke = local_audio_revoke
+        self._local_revoke_requested = False
+        self._local_choice_off = False
         self._local_refused = False
         self._local_quiesced = False
         self._local_quiesce_lock = asyncio.Lock()
@@ -1762,11 +1773,21 @@ class DisclosureController:
                 self._local_quiesced = True
 
     async def _deny_local_audio(self) -> None:
-        await self._writer.commit_audio_choice(
+        decided = await self._writer.commit_audio_choice(
             self._identity.call_id, generation=self._identity.generation.generation,
             choice="off", occurred_at=None,
         )
-        await self._quiesce_local_audio()
+        self._local_choice_off = decided.choice_state == "off"
+        await self._revoke_local_audio()
+
+    async def _revoke_local_audio(self) -> None:
+        if self._local_audio_revoke is None:
+            await self._quiesce_local_audio()
+            return
+        async with self._local_quiesce_lock:
+            await self._local_start_done.wait()
+            summary = await self._local_audio_revoke()
+            self._local_quiesced = not summary.pending
 
     def _schedule_local_denial(self) -> None:
         if self._local_denial_task is not None:
@@ -1793,6 +1814,7 @@ class DisclosureController:
         if digit == "2":
             # Close the concrete capture offer latch before any lock/SQL await.
             self._refuse_local_audio()
+            self._local_revoke_requested = True
             self._cancel_choice_timeout()
             async with self._lock:
                 if self._local_control_closed():
@@ -1916,6 +1938,7 @@ class DisclosureController:
                 self._identity.call_id, generation=self._identity.generation.generation,
                 choice="off", occurred_at=None,
             )
+        self._local_choice_off = decided.choice_state == "off"
         accepted = decided.choice_state == "accepted" and not self._local_refused
         if self._local_denial_task is not None:
             await self._local_denial_task
@@ -1945,15 +1968,19 @@ class DisclosureController:
                 self._local_start_done.set()
             if not started:
                 self._refuse_local_audio()
-                await self._writer.commit_audio_choice(
+                decided = await self._writer.commit_audio_choice(
                     self._identity.call_id, generation=self._identity.generation.generation,
                     choice="off", occurred_at=None,
                 )
+                self._local_choice_off = decided.choice_state == "off"
         if self._local_refused:
             if self._local_denial_task is not None:
                 await self._local_denial_task
             else:
-                await self._quiesce_local_audio()
+                if self._local_revoke_requested:
+                    await self._revoke_local_audio()
+                else:
+                    await self._quiesce_local_audio()
         async with self._lock:
             if self._first_failure.code is not None or self._input_closed:
                 return
@@ -2023,7 +2050,26 @@ class DisclosureController:
     async def cleanup_termination(self, reason: str) -> None:
         try:
             if self._local_snapshot is not None:
-                await self._quiesce_local_audio()
+                if (
+                    (self._local_revoke_requested or self._local_choice_off)
+                    and self._local_audio_revoke is not None
+                ):
+                    await self._revoke_local_audio()
+                    if not self._local_quiesced:
+                        raise RuntimeError("local_audio_terminal_pending")
+                elif self._local_audio_finish is None:
+                    await self._quiesce_local_audio()
+                else:
+                    audio_reason: AudioFinishReason = (
+                        "complete" if reason == "closed"
+                        else "transfer" if reason == "qualified_line_connected"
+                        else "interrupted" if reason in {"external_cancel", "process_draining"}
+                        else "failure"
+                    )
+                    summary = await self._local_audio_finish(audio_reason)
+                    if summary.pending:
+                        raise RuntimeError("local_audio_terminal_pending")
+                    self._local_quiesced = True
                 return
             await self._recording.cleanup(
                 self._identity,

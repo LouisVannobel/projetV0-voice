@@ -98,7 +98,9 @@ class SentOutput(_PacedDisclosureOutput):
 
 
 @asynccontextmanager
-async def capture_case(tmp_path, *, failpoint=None):
+async def capture_case(
+    tmp_path, *, failpoint=None, terminal_publication=False, monotonic=None,
+):
     assert hasattr(audio_capture, "LocalAudioCapture"), (
         "missing native LocalAudioCapture composition"
     )
@@ -148,8 +150,10 @@ async def capture_case(tmp_path, *, failpoint=None):
         )
         await ticket.wait()
         await writer.bind_audio_snapshot(pin, generation=GENERATION)
-        capture = audio_capture.LocalAudioCapture(snapshot=pin, deployment_id="capture-deploy",
-                                                 keyring=keyring, writer=writer)
+        capture = audio_capture.LocalAudioCapture(
+            snapshot=pin, deployment_id="capture-deploy", generation=GENERATION,
+            keyring=keyring, writer=writer,
+        )
         active = asyncio.Event()
 
         async def became_active():
@@ -166,6 +170,10 @@ async def capture_case(tmp_path, *, failpoint=None):
                 pytest.fail("V2 local capture invoked provider recording cleanup")
 
         failure = pipeline_module.FirstFailure()
+        terminal_callbacks = {
+            "local_audio_revoke": capture.revoke,
+            "local_audio_finish": capture.finish,
+        } if terminal_publication else {}
         controller = session_module.DisclosureController(
             identity=identity, writer=writer, first_failure=failure,
             recording=NoProviderRecording(),
@@ -175,6 +183,8 @@ async def capture_case(tmp_path, *, failpoint=None):
             local_audio_refuse=capture.refuse,
             local_audio_close=capture.close_admission,
             local_audio_quiesce=quiesce,
+            **terminal_callbacks,
+            **({"monotonic": monotonic} if monotonic is not None else {}),
         )
         admission = AudioAdmission()
         admission.bind(controller.is_active)

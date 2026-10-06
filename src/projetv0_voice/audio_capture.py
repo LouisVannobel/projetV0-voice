@@ -12,7 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -44,6 +44,7 @@ from projetv0_voice.persistence.commands import PersistenceError
 from projetv0_voice.persistence.writer import PersistenceWriter
 
 CaptureState = Literal["off", "recording", "partial", "stopped"]
+AudioFinishReason = Literal["complete", "limit", "failure", "transfer", "interrupted"]
 _MONO_BYTES_PER_SECOND = 16000
 _MAX_MONO_BYTES = 16000
 _NATIVE_THRESHOLD_BYTES = 14400
@@ -76,6 +77,7 @@ class AudioChunkHolder:
         self._carry = bytearray()
         self._accepted_samples = self._submitted_samples = self._committed_samples = 0
         self._sequence = 0
+        self._committed_last_sequence: int | None = None
         self._pending: VoiceOperationV2 | None = None
         self._closed = not snapshot.audio_available or snapshot.recording_policy != "local_30d"
         self._partial = self._closed
@@ -196,13 +198,14 @@ class AudioChunkHolder:
             if not isinstance(payload, AudioChunkPayloadV2):
                 return self._refuse()
             self._committed_samples += payload.sample_count
+            self._committed_last_sequence = payload.sequence
             self._pending = None
         return True
 
     def _summary(self) -> AudioCaptureSummary:
         return AudioCaptureSummary(
             self._submitted_samples, self._committed_samples,
-            self._sequence - 1 if self._sequence else None,
+            self._committed_last_sequence,
             self._reason, self._partial, self._pending is not None,
         )
 
@@ -486,12 +489,22 @@ class LocalAudioCapture:
 
     def __init__(
         self, *, snapshot: BeginCallSnapshotV2, deployment_id: str,
-        keyring: CryptoKeyring, writer: PersistenceWriter,
+        generation: UUID, keyring: CryptoKeyring, writer: PersistenceWriter,
     ) -> None:
+        if not isinstance(generation, UUID):
+            raise ValueError("audio_generation_invalid")
         self.holder = AudioChunkHolder(snapshot=snapshot, deployment_id=deployment_id,
                                        keyring=keyring, writer=writer)
+        self._snapshot = snapshot
+        self._deployment_id = validate_deployment_id(deployment_id)
+        self._generation, self._writer = generation, writer
+        self._finish_operation: VoiceOperationV2 | None = None
+        self._revoke_operation: VoiceOperationV2 | None = None
+        self._finish_pending = self._revoke_pending = False
+        self._finish_lock, self._revoke_lock = asyncio.Lock(), asyncio.Lock()
+        self._limit_finish_task: asyncio.Task[AudioCaptureSummary] | None = None
         self.tap = BoundedAudioBufferTap(
-            offer_chunk=self.holder.offer_native_pcm, on_event_join=self.holder.after_event_join,
+            offer_chunk=self.holder.offer_native_pcm, on_event_join=self._after_event_join,
             ready_for_native_event=self.holder.ready_for_native_event,
             on_capture_refused=self.holder.notify_capture_refused,
         )
@@ -514,7 +527,22 @@ class LocalAudioCapture:
         self._closed = True
         self.tap.close_admission()
 
-    async def quiesce(self) -> AudioCaptureSummary:
+    async def _after_event_join(self) -> bool:
+        settled = await self.holder.after_event_join()
+        if self.holder.summary.reason == "limit" and self._limit_finish_task is None:
+            self._limit_finish_task = asyncio.create_task(
+                self.finish("limit"), name="sparra-audio-limit-finish"
+            )
+        return settled
+
+    def _terminal_summary(self, summary: AudioCaptureSummary) -> AudioCaptureSummary:
+        return AudioCaptureSummary(
+            summary.submitted_samples, summary.committed_samples, summary.last_sequence,
+            summary.reason, summary.partial,
+            summary.pending or self._finish_pending or self._revoke_pending,
+        )
+
+    async def _quiesce_capture(self) -> AudioCaptureSummary:
         self.close_admission()
         async with self._quiesce_lock:
             if not await self.tap.quiesce():
@@ -525,3 +553,81 @@ class LocalAudioCapture:
                     "failure", True, True,
                 )
             return await self.holder.finish()
+
+    async def quiesce(self) -> AudioCaptureSummary:
+        task = self._limit_finish_task
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.shield(task)
+        return self._terminal_summary(await self._quiesce_capture())
+
+    def _terminal_operation(
+        self, kind: Literal["audio.finish", "audio.revoke"],
+        summary: AudioCaptureSummary | None = None, reason: AudioFinishReason = "failure",
+    ) -> VoiceOperationV2:
+        pin = self._snapshot
+        payload: dict[str, object] = {
+            "schema_version": 2, "workspace_id": str(pin.workspace_id),
+            "recording_id": str(pin.recording_id),
+            "configuration_revision": pin.configuration_revision,
+            "retention_until": pin.retention_until.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
+            "reason": "caller_declined" if kind == "audio.revoke" else reason,
+        }
+        if summary is not None:
+            payload.update(
+                last_sequence=summary.last_sequence, total_samples=summary.committed_samples
+            )
+        return VoiceOperationV2.model_validate({
+            "schema_version": 2, "operation_id": str(uuid4()),
+            "deployment_id": self._deployment_id, "call_id": str(pin.call_id),
+            "occurred_at": datetime.now(UTC), "kind": kind, "payload": payload,
+        })
+
+    async def finish(self, reason: AudioFinishReason) -> AudioCaptureSummary:
+        if reason not in {"complete", "limit", "failure", "transfer", "interrupted"}:
+            raise ValueError("audio_finish_reason_invalid")
+        self.close_admission()
+        async with self._finish_lock:
+            summary = await self._quiesce_capture()
+            if summary.pending or self._revoke_operation is not None:
+                return self._terminal_summary(summary)
+            if self._finish_operation is None:
+                selected: AudioFinishReason = (
+                    "limit" if summary.reason == "limit"
+                    else "failure" if reason == "complete" and summary.partial else reason
+                )
+                self._finish_operation = self._terminal_operation("audio.finish", summary, selected)
+            self._finish_pending = True
+            try:
+                await self._writer.publish_audio_terminal_v2(
+                    self._finish_operation, generation=self._generation
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.holder.notify_capture_refused()
+                return self._terminal_summary(self.holder.summary)
+            self._finish_pending = False
+            return self._terminal_summary(summary)
+
+    async def revoke(self) -> AudioCaptureSummary:
+        self.refuse()
+        if self._revoke_operation is None:
+            self._revoke_operation = self._terminal_operation("audio.revoke")
+        self._revoke_pending = True
+        async with self._revoke_lock:
+            try:
+                # Writer admission precedes native/receipt quiescence, including unknown audio.
+                await self._writer.publish_audio_terminal_v2(
+                    self._revoke_operation, generation=self._generation
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.holder.notify_capture_refused()
+                return self._terminal_summary(self.holder.summary)
+            self._revoke_pending = False
+            # Known revoke COMMIT supersedes finish delivery, including a cancelled waiter.
+            self._finish_pending = False
+            return self._terminal_summary(await self._quiesce_capture())
