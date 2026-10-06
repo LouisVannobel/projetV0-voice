@@ -1065,11 +1065,8 @@ class RuntimeSupervisor:
                 },
                 lease=None if effect is None else effect.lease,
                 operation=None if effect is None else effect.operation,
-                **(
-                    {"admission_facts": effect.admission_facts}
-                    if effect is not None and effect.admission_facts is not None
-                    else {}
-                ),
+                operation_generation=None if effect is None else effect.operation_generation,
+                admission_facts=None if effect is None else effect.admission_facts,
                 legacy_v1_semantic_fingerprint_sha256=(event.legacy_v1_semantic_fingerprint_sha256),
                 qualification_run_id=(
                     self._candidate_run_id

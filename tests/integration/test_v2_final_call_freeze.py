@@ -29,9 +29,10 @@ from projetv0_voice.session_factory import _RegistryTerminalizer
 
 
 @asynccontextmanager
-async def final_case(tmp_path, *, clock=None, failpoint=None):
+async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None):
     current = [NOW] if clock is None else clock
-    async with registry_case(tmp_path, utcnow=lambda: current[0], failpoint=failpoint) as case:
+    async with registry_case(tmp_path, utcnow=lambda: current[0], failpoint=failpoint,
+                             reply=reply) as case:
         initiated = event(occurred_at=NOW, from_e164="+33102030407")
         assert (await committed(case.registry, case.writer, initiated)).status_code == 200
         assert (await committed(case.registry, case.writer,

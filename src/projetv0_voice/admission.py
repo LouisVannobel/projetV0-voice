@@ -293,7 +293,7 @@ class _CallEntry:
     transfer_task: asyncio.Task[None] | None = field(default=None, repr=False)
     content_stop_task: asyncio.Task[None] | None = field(default=None, repr=False)
     transfer_future: asyncio.Future[str] | None = field(default=None, repr=False)
-    bridge_publication: VoiceOperationV1 | None = field(default=None, repr=False)
+    bridge_publication: VoiceOperationV1 | VoiceOperationV2 | None = field(default=None, repr=False)
     no_new_ai: bool = False
     abort_target_clearers: list[tuple[_AbortTarget, Callable[[_AbortTarget], None]]] = field(
         default_factory=list, repr=False
@@ -1570,7 +1570,7 @@ class CallRegistry:
             if event.direction == "outgoing" or event.event_type == "call.bridged":
                 return ResolvedWebhook(None)
             return None
-        operation = None
+        operation: VoiceOperationV1 | VoiceOperationV2 | None = None
         assert facts is not None
         if session is not None:
             await cast(Any, session).request_drain("qualified_line_connected")
@@ -1599,14 +1599,7 @@ class CallRegistry:
                     and lifecycle.bridge_operation_id is None
                     and facts.bridge_operation_id is None
                 ):
-                    operation = entry.bridge_publication or VoiceOperationV1(
-                        schema_version=1,
-                        operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
-                        deployment_id=self._deployment_id,
-                        call_id=entry.call_id,
-                        occurred_at=bridged_at,
-                        kind="call.upsert",
-                        payload=CallUpsertPayloadV1(
+                    payload = CallUpsertPayloadV1(
                             telnyx_call_control_id=entry.call_control_id,
                             telnyx_call_leg_id=entry.call_leg_id,
                             telnyx_call_session_id=entry.call_session_id,
@@ -1631,14 +1624,34 @@ class CallRegistry:
                                     ),
                                 )
                             ),
-                        ),
                     )
+                    operation = entry.bridge_publication
+                    if operation is None:
+                        if self._operation_contract_version == 2:
+                            operation = VoiceOperationV2(schema_version=2,
+                                operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
+                                deployment_id=self._deployment_id, call_id=entry.call_id,
+                                occurred_at=bridged_at, kind="call.upsert", payload=payload)
+                        else:
+                            operation = VoiceOperationV1(schema_version=1,
+                                operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
+                                deployment_id=self._deployment_id, call_id=entry.call_id,
+                                occurred_at=bridged_at, kind="call.upsert", payload=payload)
                     entry.bridge_publication = operation
                     facts = replace(facts, bridge_operation_id=operation.operation_id)
                 elif lifecycle is not None and lifecycle.bridge_operation_id is not None:
                     facts = replace(facts, bridge_operation_id=lifecycle.bridge_operation_id)
                 entry.transfer_facts = facts
-        await cast(Any, self._writer).commit_transfer_observation(facts, operation)
+        if self._operation_contract_version == 2:
+            if not isinstance(self._writer, PersistenceWriter):
+                raise CallAdmissionRejected("call_identity_conflict")
+            if isinstance(operation, VoiceOperationV1):
+                raise CallAdmissionRejected("call_identity_conflict")
+            await self._writer.commit_transfer_observation_v2(
+                facts, operation, generation=entry.generation
+            )
+        else:
+            await cast(Any, self._writer).commit_transfer_observation(facts, operation)
         return ResolvedWebhook(None)
 
     def _pending_effect(self, entry: _CallEntry) -> WebhookDurableEffect:
@@ -1712,17 +1725,15 @@ class CallRegistry:
         if (
             entry.routing is not None or entry.transfer_facts is not None
         ) and closed_at >= entry.initiated_at + self._retention_delta:
-            return WebhookDurableEffect(lease=lease)
+            return WebhookDurableEffect(
+                lease=lease,
+                operation_generation=(
+                    entry.generation if self._operation_contract_version == 2 else None
+                ),
+            )
         actual_start = entry.answered_at or entry.claimed_at
         answered = actual_start is not None
-        operation = VoiceOperationV1(
-            schema_version=1,
-            operation_id=uuid5(entry.call_id, event.event_id),
-            deployment_id=self._deployment_id,
-            call_id=entry.call_id,
-            occurred_at=closed_at,
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
@@ -1732,9 +1743,24 @@ class CallRegistry:
                 ended_at=closed_at,
                 end_reason="telnyx_hangup",
                 retention_until=entry.initiated_at + timedelta(days=self._retention_days),
+        )
+        operation: VoiceOperationV1 | VoiceOperationV2
+        if self._operation_contract_version == 2:
+            operation = VoiceOperationV2(schema_version=2,
+                operation_id=uuid5(entry.call_id, event.event_id),
+                deployment_id=self._deployment_id,
+                call_id=entry.call_id, occurred_at=closed_at, kind="call.upsert", payload=payload)
+        else:
+            operation = VoiceOperationV1(schema_version=1,
+                operation_id=uuid5(entry.call_id, event.event_id),
+                deployment_id=self._deployment_id,
+                call_id=entry.call_id, occurred_at=closed_at, kind="call.upsert", payload=payload)
+        return WebhookDurableEffect(
+            lease=lease, operation=operation,
+            operation_generation=(
+                entry.generation if self._operation_contract_version == 2 else None
             ),
         )
-        return WebhookDurableEffect(lease=lease, operation=operation)
 
     async def resolve_webhook(self, event: VerifiedWebhook) -> ResolvedWebhook:
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
@@ -2008,8 +2034,8 @@ class CallRegistry:
                         ),
                     }
                 )
-                effect = effect.__class__(
-                    lease=effect.lease,
+                effect = replace(
+                    effect,
                     operation=effect.operation.model_copy(update={"payload": payload}),
                 )
         return ResolvedWebhook(effect, reservation)

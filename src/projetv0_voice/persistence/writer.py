@@ -669,10 +669,11 @@ class PersistenceWriter:
         *,
         receipt: Mapping[str, object],
         lease: Mapping[str, object] | None,
-        operation: VoiceOperationV1 | None,
+        operation: VoiceOperationV1 | VoiceOperationV2 | None,
         legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
         qualification_run_id: UUID | None = None,
         admission_facts: LocalCallAdmissionFacts | None = None,
+        operation_generation: UUID | None = None,
     ) -> WebhookCommitTicket:
         """Synchronously transfer one webhook transaction to the writer owner."""
 
@@ -684,10 +685,21 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_webhook_receipt")
         if lease is not None and not isinstance(lease, Mapping):
             raise CommandSerializationError("invalid_lease_command")
-        if operation is not None and not isinstance(operation, VoiceOperationV1):
+        if operation is not None and not isinstance(operation, VoiceOperationV1 | VoiceOperationV2):
             raise CommandSerializationError("invalid_outbox_command")
-        if self._contract_version == 2 and operation is not None:
+        if operation is not None and operation.schema_version != self._contract_version:
             raise CommandSerializationError("writer_contract_mismatch")
+        if isinstance(operation, VoiceOperationV2) and (
+            not isinstance(operation_generation, UUID) or operation.kind != "call.upsert"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or operation.payload.status not in {"closed", "failed"}
+            or "message_result" in operation.payload.model_fields_set
+        ):
+            raise CommandSerializationError("invalid_phone_effect_v2")
+        if operation_generation is not None and (
+            self._contract_version != 2 or not isinstance(operation_generation, UUID)
+        ):
+            raise CommandSerializationError("invalid_phone_effect_v2")
         if legacy_v1_semantic_fingerprint_sha256 is not None and (
             type(legacy_v1_semantic_fingerprint_sha256) is not bytes
             or len(legacy_v1_semantic_fingerprint_sha256) != 32
@@ -705,6 +717,7 @@ class PersistenceWriter:
                 "legacy_v1_semantic_fingerprint_sha256": (legacy_v1_semantic_fingerprint_sha256),
                 "qualification_run_id": qualification_run_id,
                 "admission_facts": admission_facts,
+                "operation_generation": operation_generation,
                 "result": result,
             },
             None,
@@ -2735,6 +2748,89 @@ class PersistenceWriter:
             )
         )
 
+    async def commit_transfer_observation_v2(
+        self, facts: LocalCallLifecycleFacts, operation: VoiceOperationV2 | None,
+        *, generation: UUID,
+    ) -> None:
+        if self._contract_version != 2 or not isinstance(generation, UUID):
+            raise CommandSerializationError("invalid_phone_observation_v2")
+        await self.commit_control(PersistenceCommand("transfer_observation",
+            {"facts": facts, "operation": operation, "operation_generation": generation}, None))
+
+    async def _validate_phone_fact_v2(
+        self, operation: VoiceOperationV2, generation: UUID,
+        facts: LocalCallLifecycleFacts, receipt: Mapping[str, object] | None = None,
+    ) -> None:
+        payload = operation.payload
+        pin = await self._read_audio_pin(operation.call_id)
+        cursor = await self._require_owner_connection().execute(
+            "SELECT call_control_id,tenant_id,agent_id FROM call_leases WHERE call_id=?",
+            (str(operation.call_id),),
+        )
+        leases = list(await cursor.fetchall())
+        await cursor.close()
+        if (
+            self._contract_version != 2 or not isinstance(payload, CallUpsertPayloadV1)
+            or operation.kind != "call.upsert" or operation.call_id != facts.call_id
+            or generation != facts.admission_generation
+            or payload.retention_until != facts.retention_until
+            or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
+            or payload.telnyx_call_session_id != facts.telnyx_call_session_id
+            or "message_result" in payload.model_fields_set or len(leases) != 1
+            or payload.telnyx_call_control_id != leases[0][0]
+            or operation.occurred_at < facts.admitted_at
+            or pin is not None and (pin.generation != generation
+                or pin.deployment_id != operation.deployment_id
+                or leases[0][1] != str(pin.workspace_id) or leases[0][2] != pin.deployment_id)
+        ):
+            raise CommandConflictError("phone_fact_identity_conflict")
+        if receipt is None:
+            valid = (
+                payload.status == "closing" and facts.transfer_command_id is not None
+                and facts.target_call_control_id is not None
+                and facts.target_call_leg_id is not None
+                and facts.qualified_line_bridged_at == operation.occurred_at
+                and operation.operation_id == uuid5(operation.call_id, "qualified-line-bridge")
+            )
+        else:
+            valid = (
+                payload.status in {"closed", "failed"}
+                and receipt.get("event_type") == "call.hangup"
+                and receipt.get("call_control_id") == payload.telnyx_call_control_id
+                and receipt.get("occurred_at") == operation.occurred_at
+                and receipt.get("call_leg_id") == facts.telnyx_call_leg_id
+                and receipt.get("call_session_id") == facts.telnyx_call_session_id
+                and isinstance(receipt.get("event_id"), str)
+                and operation.operation_id == uuid5(operation.call_id, str(receipt["event_id"]))
+                and payload.ended_at == operation.occurred_at
+            )
+        if not valid:
+            raise CommandConflictError("phone_fact_observation_conflict")
+
+    async def _insert_phone_fact_v2(self, operation: VoiceOperationV2) -> None:
+        if await self._content_denied(operation.call_id) or await self._read_audio_pin(
+            operation.call_id
+        ) is None:
+            return
+        prepared = encrypt_control_operation_v2(operation, self._keyring)
+        decode_operation_v2(prepared.plaintext)
+        existing = await self._load_operation_by_id(str(operation.operation_id))
+        if existing is not None:
+            if canonical_operation_bytes(existing) != prepared.plaintext:
+                raise CommandConflictError("operation_identity_conflict")
+            return
+        await self._merge_lifecycle_operation(operation)
+        encrypted = prepared.encrypted
+        now = _iso(self._utcnow())
+        await self._require_owner_connection().execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,crypto_version,"
+            "key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,2,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind,
+             str(operation.call_id), CRYPTO_VERSION, encrypted.key_version, encrypted.nonce,
+             encrypted.ciphertext, now, now),
+        )
+
     async def _read_call_lifecycle(self, call_id: object) -> LocalCallLifecycleFacts | None:
         if not isinstance(call_id, UUID):
             raise CommandSerializationError("local_call_id_invalid")
@@ -3051,6 +3147,18 @@ class PersistenceWriter:
         current = await self._read_call_lifecycle(facts.call_id)
         if current is None or current.admitted_at != facts.admitted_at:
             raise CommandConflictError("transfer_admission_missing")
+        operation = payload.get("operation")
+        generation = payload.get("operation_generation")
+        if self._contract_version == 2:
+            # Intent commands have no publication; observations carry the original generation.
+            if generation is not None and (
+                not isinstance(generation, UUID) or generation != current.admission_generation
+            ):
+                raise CommandConflictError("phone_fact_identity_conflict")
+            if operation is not None and (
+                not isinstance(operation, VoiceOperationV2) or not isinstance(generation, UUID)
+            ):
+                raise CommandSerializationError("invalid_phone_observation_v2")
         if current.admission_generation is not None and (
             facts.admission_generation not in {None, current.admission_generation}
             or facts.transfer_generation not in {None, current.admission_generation}
@@ -3076,6 +3184,13 @@ class PersistenceWriter:
                     raise CommandConflictError("transfer_observation_conflict")
                 # Older in-flight observations may omit newer durable facts.
                 facts = replace(facts, **{name: old})
+        if isinstance(operation, VoiceOperationV2):
+            if not isinstance(generation, UUID):
+                raise CommandSerializationError("invalid_phone_observation_v2")
+            await self._validate_phone_fact_v2(
+                operation, generation,
+                replace(facts, admission_generation=current.admission_generation),
+            )
         await self._store_lifecycle(
             replace(
                 facts,
@@ -3092,11 +3207,16 @@ class PersistenceWriter:
                 or facts.content_departed_generation,
             )
         )
-        operation = payload.get("operation")
         if operation is not None:
-            if not isinstance(operation, VoiceOperationV1) or operation.call_id != facts.call_id:
-                raise CommandSerializationError("transfer_operation_invalid")
-            await self._insert_outbox(operation)
+            if isinstance(operation, VoiceOperationV2):
+                await self._insert_phone_fact_v2(operation)
+            else:
+                if (
+                    not isinstance(operation, VoiceOperationV1)
+                    or operation.call_id != facts.call_id
+                ):
+                    raise CommandSerializationError("transfer_operation_invalid")
+                await self._insert_outbox(operation)
 
     async def drain(self, timeout_seconds: float) -> None:
         if timeout_seconds <= 0:
@@ -3810,6 +3930,23 @@ class PersistenceWriter:
         if not isinstance(receipt, Mapping):
             raise CommandSerializationError("invalid_webhook_receipt")
         normalized_receipt = self._normalized_receipt(receipt)
+        operation = payload.get("operation")
+        generation = payload.get("operation_generation")
+        if generation is not None:
+            if not isinstance(generation, UUID):
+                raise CommandSerializationError("invalid_phone_effect_v2")
+            if isinstance(operation, VoiceOperationV2):
+                facts = await self._read_call_lifecycle(operation.call_id)
+                if facts is None:
+                    raise CommandConflictError("phone_fact_identity_conflict")
+                await self._validate_phone_fact_v2(operation, generation, facts, receipt)
+            else:
+                lease = payload.get("lease")
+                if not isinstance(lease, Mapping):
+                    raise CommandSerializationError("invalid_phone_effect_v2")
+                facts = await self._read_call_lifecycle(lease.get("call_id"))
+                if facts is None or facts.admission_generation != generation:
+                    raise CommandConflictError("phone_fact_identity_conflict")
         legacy_fingerprint = payload.get("legacy_v1_semantic_fingerprint_sha256")
         if legacy_fingerprint is not None and (
             type(legacy_fingerprint) is not bytes or len(legacy_fingerprint) != 32
@@ -3828,7 +3965,6 @@ class PersistenceWriter:
         if qualification_run_id is not None:
             await self._consume_qualification_run(qualification_run_id)
         lease = payload.get("lease")
-        operation = payload.get("operation")
         if lease is not None:
             if not isinstance(lease, Mapping):
                 raise CommandSerializationError("invalid_lease_command")
@@ -3879,9 +4015,12 @@ class PersistenceWriter:
                     await self._store_lifecycle(facts)
         await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
         if operation is not None:
-            if not isinstance(operation, VoiceOperationV1):
-                raise CommandSerializationError("invalid_outbox_command")
-            await self._insert_outbox(operation)
+            if isinstance(operation, VoiceOperationV2):
+                await self._insert_phone_fact_v2(operation)
+            else:
+                if not isinstance(operation, VoiceOperationV1):
+                    raise CommandSerializationError("invalid_outbox_command")
+                await self._insert_outbox(operation)
         return WebhookCommitResult("first", "applied")
 
     async def _record_original_end(
