@@ -33,7 +33,7 @@ from projetv0_voice.metrics import (
     RuntimePublication,
     RuntimePublishedSnapshot,
 )
-from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.models import BeginCallSnapshotV1, CallUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
 from projetv0_voice.persistence.writer import (
     PersistenceWriter,
@@ -1889,7 +1889,7 @@ async def build_production_runtime(
         def recording_factory(identity: CallIdentity) -> RecordingBoundary:
             snapshot = identity.begin_snapshot
             if (
-                snapshot is not None
+                isinstance(snapshot, BeginCallSnapshotV1)
                 and snapshot.recording_enabled
                 and (settings.runtime_mode != "strict")
             ):
@@ -1899,11 +1899,11 @@ async def build_production_runtime(
                 writer=writer,
                 retention_days=30 if snapshot is not None else recording_retention_days,
                 required=snapshot.recording_enabled
-                if snapshot is not None
-                else manifest.recording_required,
+                if isinstance(snapshot, BeginCallSnapshotV1)
+                else snapshot is None and manifest.recording_required,
                 play_beep=snapshot.recording_enabled
-                if snapshot is not None
-                else manifest.recording_play_beep,
+                if isinstance(snapshot, BeginCallSnapshotV1)
+                else snapshot is None and manifest.recording_play_beep,
                 utcnow=utcnow,
             )
 

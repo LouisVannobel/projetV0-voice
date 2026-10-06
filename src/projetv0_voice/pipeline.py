@@ -53,9 +53,10 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
-from projetv0_voice.telnyx.frames import TelnyxMarkFrame
+from projetv0_voice.telnyx.frames import TelnyxInputDTMFFrame, TelnyxMarkFrame
 
 
 class FirstFailure:
@@ -250,6 +251,8 @@ class GateController(Protocol):
 
     async def mark_forwarded(self) -> None: ...
 
+    async def accept_dtmf(self, frame: TelnyxInputDTMFFrame) -> bool: ...
+
 
 _CLOSED_INPUT_FRAMES = (
     InputDTMFFrame,
@@ -284,6 +287,11 @@ def build_input_gate(
         try:
             if isinstance(frame, (StartFrame, EndFrame, CancelFrame, ErrorFrame)):
                 return True
+            if (
+                isinstance(frame, TelnyxInputDTMFFrame) and hasattr(controller, "accept_dtmf")
+                and await controller.accept_dtmf(frame)
+            ):
+                return False
             if isinstance(frame, InputTransportMessageFrame):
                 message = frame.message
                 if not isinstance(message, dict):
@@ -686,7 +694,7 @@ def build_pipeline(
     controller: GateController,
     turn_recorder: PipelineTurnRecorder,
     first_failure: FirstFailure,
-    begin_snapshot: BeginCallSnapshotV1 | None = None,
+    begin_snapshot: BeginCallSnapshotV1 | BeginCallSnapshotV2 | None = None,
     transfer_handler: FunctionCallHandler | None = None,
     on_user_turn_started: Callable[[], None] | None = None,
 ) -> ObservedPipeline:

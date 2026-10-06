@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
@@ -27,6 +27,7 @@ from projetv0_voice.admission import (
     TerminalAuthority,
     TerminalProposal,
 )
+from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
@@ -42,7 +43,12 @@ from projetv0_voice.models import (
 )
 from projetv0_voice.persistence.business_contract import validate_turn_text
 from projetv0_voice.persistence.business_result import infer_partial_result
-from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.persistence.commands import (
+    FatalPersistenceError,
+    PersistenceCommand,
+    PersistenceError,
+)
+from projetv0_voice.persistence.writer import AudioChoiceFacts
 from projetv0_voice.pipeline import (
     SPARRA_DISCLOSURE,
     SPARRA_RECORDING_DISCLOSURE,
@@ -59,6 +65,7 @@ from projetv0_voice.qualified_profile import (
     QualifiedDeploymentProfileV1,
     RuntimeDeploymentProfileV1,
 )
+from projetv0_voice.telnyx.frames import TelnyxInputDTMFFrame
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
 
 
@@ -67,6 +74,10 @@ class DisclosureState(Enum):
     MARK_PENDING = auto()
     ACK_COMMITTING = auto()
     DISCLOSURE_DURABLE = auto()
+    WAITING_CHOICE = auto()
+    CHOICE_COMMITTING = auto()
+    GATE_COMMITTING = auto()
+    LOCAL_AUDIO_STARTING = auto()
     RECORDING_STARTING = auto()
     ACTIVE = auto()
     ABORTED = auto()
@@ -103,7 +114,9 @@ class CallIdentity:
     started_at: datetime
     retention_until: datetime
     routing: RoutingV1 | None = field(default=None, repr=False)
-    begin_snapshot: BeginCallSnapshotV1 | None = field(default=None, repr=False)
+    begin_snapshot: BeginCallSnapshotV1 | BeginCallSnapshotV2 | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         required_text = (self.deployment_id, self.telnyx_call_control_id, self.stream_id)
@@ -131,6 +144,18 @@ class CallIdentity:
             or self.retention_until <= self.started_at
         ):
             raise ValueError("call_identity_invalid")
+        if self.begin_snapshot is not None and (
+            self.begin_snapshot.call_id != self.call_id
+            or self.begin_snapshot.retention_until != self.retention_until
+            or self.routing is not None and (
+                self.routing.admitted_at != self.started_at
+                or self.routing.admitted_at + timedelta(days=30) != self.retention_until
+                or self.routing.telnyx_call_control_id != self.telnyx_call_control_id
+                or self.routing.telnyx_call_leg_id != self.telnyx_call_leg_id
+                or self.routing.telnyx_call_session_id != self.telnyx_call_session_id
+            )
+        ):
+            raise ValueError("call_identity_mismatch")
 
     def __repr__(self) -> str:
         return "CallIdentity()"
@@ -138,6 +163,15 @@ class CallIdentity:
 
 class ControlWriter(Protocol):
     async def commit_control(self, command: PersistenceCommand) -> None: ...
+
+    async def publish_control_v2(
+        self, operation: VoiceOperationV2, *, generation: UUID
+    ) -> None: ...
+
+    async def commit_audio_choice(
+        self, call_id: UUID, *, generation: UUID, choice: Literal["accept", "off"],
+        occurred_at: datetime | None,
+    ) -> AudioChoiceFacts: ...
 
 
 class RecordingBoundary(Protocol):
@@ -728,10 +762,10 @@ class CallSession:
             first_failure=first_failure,
             recording=self._recording,
             recording_enabled=self._identity.begin_snapshot.recording_enabled
-            if self._identity.begin_snapshot is not None
+            if isinstance(self._identity.begin_snapshot, BeginCallSnapshotV1)
             else self._manifest.recording_mode != "off",
             recording_required=self._identity.begin_snapshot.recording_enabled
-            if self._identity.begin_snapshot is not None
+            if isinstance(self._identity.begin_snapshot, BeginCallSnapshotV1)
             else self._manifest.recording_required,
             mark_timeout_seconds=self._profile.disclosure_mark_timeout_ms / 1000,
             runtime_metrics=self._runtime_metrics,
@@ -787,11 +821,7 @@ class CallSession:
             runtime = build_runtime(
                 pipeline=pipeline,
                 first_failure=first_failure,
-                greeting=(
-                    SPARRA_RECORDING_DISCLOSURE
-                    if self._identity.begin_snapshot.recording_enabled
-                    else SPARRA_DISCLOSURE
-                )
+                greeting=controller.announcement_text
                 if self._identity.begin_snapshot is not None
                 else self._manifest.greeting,
                 mark_name=controller.mark_name,
@@ -1467,10 +1497,15 @@ class DisclosureController:
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_factory: Callable[[], UUID] = uuid4,
         on_active: Callable[[], Awaitable[None]] | None = None,
+        local_audio_start: Callable[[], Awaitable[bool]] | None = None,
+        local_audio_refuse: Callable[[], None] | None = None,
+        local_audio_quiesce: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        if identity.begin_snapshot is not None:
+        if isinstance(identity.begin_snapshot, BeginCallSnapshotV1):
             recording_enabled = identity.begin_snapshot.recording_enabled
             recording_required = recording_enabled
+        elif isinstance(identity.begin_snapshot, BeginCallSnapshotV2):
+            recording_enabled = recording_required = False
         if (
             type(recording_enabled) is not bool
             or type(recording_required) is not bool
@@ -1495,6 +1530,25 @@ class DisclosureController:
         self._utcnow = utcnow
         self._uuid_factory = uuid_factory
         self._on_active = on_active
+        self._local_snapshot = (
+            identity.begin_snapshot if isinstance(identity.begin_snapshot, BeginCallSnapshotV2)
+            else None
+        )
+        self._local_enabled = (
+            self._local_snapshot is not None and self._local_snapshot.audio_available
+            and self._local_snapshot.recording_policy == "local_30d"
+        )
+        self._local_audio_start = local_audio_start
+        self._local_audio_refuse = local_audio_refuse
+        self._local_audio_quiesce = local_audio_quiesce
+        self._local_refused = False
+        self._local_quiesced = False
+        self._local_quiesce_lock = asyncio.Lock()
+        self._local_start_done = asyncio.Event()
+        self._local_start_done.set()
+        self._local_denial_task: asyncio.Task[None] | None = None
+        self._choice_timeout_task: asyncio.Task[None] | None = None
+        self._choice_deadline: float | None = None
         self.disclosure_generation = uuid_factory()
         self.mark_name = f"pv0-disclosure-{uuid_factory().hex}"
         self._lock = asyncio.Lock()
@@ -1510,7 +1564,25 @@ class DisclosureController:
         self._disclosure_completed_at: datetime | None = None
         self._disclosure_failed_at: datetime | None = None
         self._input_gate_opened_at: datetime | None = None
-        self._gate_publication: VoiceOperationV1 | None = None
+        self._gate_publication: VoiceOperationV1 | VoiceOperationV2 | None = None
+
+    @property
+    def announcement_text(self) -> str:
+        pin = self._local_snapshot
+        if pin is not None and self._local_enabled:
+            return (
+                "Bonjour. Je suis Sparra, un assistant vocal automatisé. "
+                "Pour prendre votre message, l'audio de notre conversation peut être conservé "
+                f"30 jours pour {pin.knowledge.business_name}. "
+                f"Vous pouvez contacter cet établissement au {pin.recording_contact_phone}. "
+                "Le texte de cet échange est conservé trente jours, "
+                "même sans enregistrement audio. "
+                "Sans choix, l'appel continue sans enregistrement. "
+                "Pendant l'appel, tapez 2 pour arrêter l'enregistrement. "
+                "Après cette annonce, tapez 1 pour accepter l'enregistrement audio, "
+                "ou 2 pour continuer sans."
+            )
+        return SPARRA_RECORDING_DISCLOSURE if self._recording_enabled else SPARRA_DISCLOSURE
 
     @property
     def evidence(self) -> DisclosureEvidenceV1:
@@ -1524,6 +1596,8 @@ class DisclosureController:
 
     def stop_input(self) -> None:
         self._input_closed = True
+        if self._local_snapshot is not None:
+            self._refuse_local_audio()
 
     @property
     def pending_task_count(self) -> int:
@@ -1616,6 +1690,8 @@ class DisclosureController:
             self.state = DisclosureState.ACK_COMMITTING
             acknowledged_at = self._utcnow().astimezone(UTC)
             self._disclosure_completed_at = acknowledged_at
+            if self._local_enabled:
+                self._choice_deadline = self._monotonic() + 5.0
             armed_at = self._mark_armed_at
             self._mark_armed_at = None
             if armed_at is not None:
@@ -1636,6 +1712,230 @@ class DisclosureController:
             self._track(task)
             return True
 
+    def _refuse_local_audio(self) -> None:
+        if self._local_refused:
+            return
+        self._local_refused = True
+        if self._local_audio_refuse is not None:
+            try:
+                self._local_audio_refuse()
+            except Exception:
+                self._first_failure.signal("local_audio_refusal_failed")
+
+    def _cancel_choice_timeout(self) -> None:
+        timer = self._choice_timeout_task
+        self._choice_timeout_task = None
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+
+    async def _quiesce_local_audio(self) -> None:
+        async with self._local_quiesce_lock:
+            await self._local_start_done.wait()
+            if not self._local_quiesced:
+                if self._local_audio_quiesce is not None:
+                    await self._local_audio_quiesce()
+                self._local_quiesced = True
+
+    async def _deny_local_audio(self) -> None:
+        await self._writer.commit_audio_choice(
+            self._identity.call_id, generation=self._identity.generation.generation,
+            choice="off", occurred_at=None,
+        )
+        await self._quiesce_local_audio()
+
+    def _schedule_local_denial(self) -> None:
+        if self._local_denial_task is not None:
+            return
+        task = asyncio.create_task(
+            self._run_owned_continuation(self._deny_local_audio, "local_audio_denial_failed"),
+            name="local-audio-denial",
+        )
+        self._local_denial_task = task
+        self._track(task)
+
+    def _local_control_closed(self) -> bool:
+        return (
+            self._input_closed or self._first_failure.code is not None
+            or self.state is DisclosureState.ABORTED
+        )
+
+    async def accept_dtmf(self, frame: TelnyxInputDTMFFrame) -> bool:
+        if not self._local_enabled or not isinstance(frame, TelnyxInputDTMFFrame):
+            return False
+        if self._local_control_closed():
+            return True
+        digit = frame.button.value
+        if digit == "2":
+            # Close the concrete capture offer latch before any lock/SQL await.
+            self._refuse_local_audio()
+            self._cancel_choice_timeout()
+            async with self._lock:
+                if self._local_control_closed():
+                    return True
+                if self.state is DisclosureState.WAITING_CHOICE:
+                    self.state = DisclosureState.CHOICE_COMMITTING
+                    task = asyncio.create_task(
+                        self._run_owned_continuation(
+                            lambda: self._finish_local_choice("off", None),
+                            "local_audio_choice_failed",
+                        ), name="local-audio-choice-off",
+                    )
+                    self._track(task)
+                else:
+                    self._schedule_local_denial()
+            return True
+        async with self._lock:
+            if self.state is not DisclosureState.WAITING_CHOICE:
+                return True
+            deadline = self._choice_deadline
+            timed_out = deadline is None or self._monotonic() >= deadline
+            timestamp = frame.occurred_at
+            if digit == "1" and not timed_out:
+                if (
+                    timestamp is None or frame.sequence_number is None
+                    or self._disclosure_completed_at is None
+                    or not self._disclosure_completed_at <= timestamp <= self._utcnow()
+                ):
+                    return True
+                choice: Literal["accept", "off"] = "accept"
+            else:
+                choice = "off"
+                timestamp = None
+                self._refuse_local_audio()
+            self._cancel_choice_timeout()
+            self.state = DisclosureState.CHOICE_COMMITTING
+            task = asyncio.create_task(
+                self._run_owned_continuation(
+                    lambda: self._finish_local_choice(choice, timestamp),
+                    "local_audio_choice_failed",
+                ), name="local-audio-choice",
+            )
+            self._track(task)
+            return True
+
+    def _local_control_operation(self, occurred_at: datetime) -> VoiceOperationV2:
+        return VoiceOperationV2(
+            schema_version=2, operation_id=self._uuid_factory(),
+            deployment_id=self._identity.deployment_id, call_id=self._identity.call_id,
+            occurred_at=occurred_at, kind="call.upsert",
+            payload=CallUpsertPayloadV1(
+                telnyx_call_control_id=self._identity.telnyx_call_control_id,
+                telnyx_call_leg_id=self._identity.telnyx_call_leg_id,
+                telnyx_call_session_id=self._identity.telnyx_call_session_id,
+                status="active", disclosure_state="completed", started_at=self._identity.started_at,
+                ended_at=None, end_reason=None, retention_until=self._identity.retention_until,
+                disclosure_evidence=self.evidence,
+            ),
+        )
+
+    async def _complete_local_disclosure(self, acknowledged_at: datetime) -> None:
+        await self._writer.publish_control_v2(
+            self._local_control_operation(acknowledged_at),
+            generation=self._identity.generation.generation,
+        )
+        async with self._lock:
+            self.disclosure_completed = True
+            if (
+                self._first_failure.code is not None or self._input_closed
+                or self.state is not DisclosureState.ACK_COMMITTING
+            ):
+                return
+            deadline = self._choice_deadline
+            if (
+                self._local_refused or not self._local_enabled
+                or deadline is None or self._monotonic() >= deadline
+            ):
+                self.state = DisclosureState.CHOICE_COMMITTING
+                choose_off = True
+            else:
+                self.state = DisclosureState.WAITING_CHOICE
+                choose_off = False
+                task = asyncio.create_task(
+                    self._local_choice_timeout(), name="local-audio-choice-timeout"
+                )
+                self._choice_timeout_task = task
+                self._track(task)
+        if choose_off:
+            await self._finish_local_choice("off", None)
+
+    async def _local_choice_timeout(self) -> None:
+        deadline = self._choice_deadline
+        if deadline is None:
+            return
+        await asyncio.sleep(max(0.0, deadline - self._monotonic()))
+        async with self._lock:
+            if self.state is not DisclosureState.WAITING_CHOICE or self._input_closed:
+                return
+            self.state = DisclosureState.CHOICE_COMMITTING
+            self._choice_timeout_task = None
+            self._refuse_local_audio()
+        await self._run_owned_continuation(
+            lambda: self._finish_local_choice("off", None), "local_audio_choice_failed"
+        )
+
+    async def _finish_local_choice(
+        self, choice: Literal["accept", "off"], timestamp: datetime | None
+    ) -> None:
+        if choice == "off":
+            self._refuse_local_audio()
+        try:
+            decided = await self._writer.commit_audio_choice(
+                self._identity.call_id, generation=self._identity.generation.generation,
+                choice=choice, occurred_at=timestamp,
+            )
+        except FatalPersistenceError:
+            raise
+        except PersistenceError:
+            self._refuse_local_audio()
+            decided = await self._writer.commit_audio_choice(
+                self._identity.call_id, generation=self._identity.generation.generation,
+                choice="off", occurred_at=None,
+            )
+        accepted = decided.choice_state == "accepted" and not self._local_refused
+        if self._local_denial_task is not None:
+            await self._local_denial_task
+            accepted = False
+        async with self._lock:
+            if self._first_failure.code is not None or self._input_closed:
+                return
+            self.state = DisclosureState.GATE_COMMITTING
+            self._input_gate_opened_at = self._utcnow().astimezone(UTC)
+        await self._publish_gate_evidence()
+        if accepted and not self._local_refused:
+            async with self._lock:
+                if self._first_failure.code is not None or self._input_closed:
+                    return
+                self.state = DisclosureState.LOCAL_AUDIO_STARTING
+                self._local_start_done.clear()
+            try:
+                started = (
+                    self._local_audio_start is not None and await self._local_audio_start() is True
+                )
+            except asyncio.CancelledError:
+                self._refuse_local_audio()
+                raise
+            except Exception:
+                started = False
+            finally:
+                self._local_start_done.set()
+            if not started:
+                self._refuse_local_audio()
+                await self._writer.commit_audio_choice(
+                    self._identity.call_id, generation=self._identity.generation.generation,
+                    choice="off", occurred_at=None,
+                )
+        if self._local_refused:
+            if self._local_denial_task is not None:
+                await self._local_denial_task
+            else:
+                await self._quiesce_local_audio()
+        async with self._lock:
+            if self._first_failure.code is not None or self._input_closed:
+                return
+            self.state = DisclosureState.ACTIVE
+        if self._on_active is not None and self.is_active():
+            await self._on_active()
+
     async def abort(self, code: str) -> None:
         timeout_task: asyncio.Task[None] | None
         async with self._lock:
@@ -1650,6 +1950,9 @@ class DisclosureController:
             if timeout_task is not None:
                 timeout_task.cancel()
         self._first_failure.signal(code)
+        if self._local_snapshot is not None:
+            self._refuse_local_audio()
+            self._cancel_choice_timeout()
 
     async def join_continuations(self) -> None:
         while True:
@@ -1666,6 +1969,9 @@ class DisclosureController:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def terminalize_and_join(self, *, cancel_continuations: bool) -> None:
+        if self._local_snapshot is not None:
+            self._refuse_local_audio()
+            self._cancel_choice_timeout()
         async with self._lock:
             self._input_closed = True
             if self.state is not DisclosureState.ACTIVE:
@@ -1682,6 +1988,9 @@ class DisclosureController:
 
     async def cleanup_termination(self, reason: str) -> None:
         try:
+            if self._local_snapshot is not None:
+                await self._quiesce_local_audio()
+                return
             await self._recording.cleanup(
                 self._identity,
                 recording_may_be_active=self.recording_may_be_active,
@@ -1741,6 +2050,10 @@ class DisclosureController:
                 if self.state is not DisclosureState.ACTIVE:
                     self.state = DisclosureState.ABORTED
                 return
+
+        if self._local_snapshot is not None:
+            await self._complete_local_disclosure(acknowledged_at)
+            return
 
         operation = VoiceOperationV1(
             schema_version=1,
@@ -1866,6 +2179,15 @@ class DisclosureController:
 
     async def _publish_gate_evidence(self) -> None:
         assert self._input_gate_opened_at is not None
+        if self._local_snapshot is not None:
+            if self._gate_publication is None:
+                self._gate_publication = self._local_control_operation(self._input_gate_opened_at)
+            if not isinstance(self._gate_publication, VoiceOperationV2):
+                raise RuntimeError("local_audio_control_invalid")
+            await self._writer.publish_control_v2(
+                self._gate_publication, generation=self._identity.generation.generation
+            )
+            return
         if self._gate_publication is None:
             self._gate_publication = VoiceOperationV1(
                 schema_version=1,
