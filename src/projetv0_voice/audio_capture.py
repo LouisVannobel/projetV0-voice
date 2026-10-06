@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
+from uuid import uuid4
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -24,12 +30,197 @@ from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.utils.base_object import BaseObject
 
+from projetv0_voice.audio_contract import (
+    AUDIO_CHUNK_AAD_DOMAIN,
+    MAX_AUDIO_AAD_BYTES,
+    AudioChunkPayloadV2,
+    BeginCallSnapshotV2,
+    VoiceOperationV2,
+    canonical_audio_chunk_aad,
+)
+from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.models import validate_deployment_id
+from projetv0_voice.persistence.commands import PersistenceError
+from projetv0_voice.persistence.writer import PersistenceWriter
+
 CaptureState = Literal["off", "recording", "partial", "stopped"]
 _MONO_BYTES_PER_SECOND = 16000
 _MAX_MONO_BYTES = 16000
 _NATIVE_THRESHOLD_BYTES = 14400
 _MAX_FRAME_BYTES = 1600
 _MAX_SAMPLES = 4_800_000
+
+
+@dataclass(frozen=True, slots=True)
+class AudioCaptureSummary:
+    submitted_samples: int
+    committed_samples: int
+    last_sequence: int | None
+    reason: Literal["complete", "limit", "failure"]
+    partial: bool
+    pending: bool
+
+
+class AudioChunkHolder:
+    """Coalesce one bounded native event into the existing writer's audio slot."""
+
+    def __init__(
+        self, *, snapshot: BeginCallSnapshotV2, deployment_id: str,
+        keyring: CryptoKeyring, writer: PersistenceWriter,
+    ) -> None:
+        if not isinstance(snapshot, BeginCallSnapshotV2):
+            raise ValueError("audio_snapshot_unavailable")
+        self._snapshot = snapshot
+        self._deployment_id = validate_deployment_id(deployment_id)
+        self._keyring, self._writer = keyring, writer
+        self._carry = bytearray()
+        self._accepted_samples = self._submitted_samples = self._committed_samples = 0
+        self._sequence = 0
+        self._pending: VoiceOperationV2 | None = None
+        self._closed = not snapshot.audio_available or snapshot.recording_policy != "local_30d"
+        self._partial = self._closed
+        self._reason: Literal["complete", "limit", "failure"] = (
+            "failure" if self._closed else "complete"
+        )
+        self._finished = False
+
+    def ready_for_native_event(self) -> bool:
+        return not self._closed and self._pending is None
+
+    def notify_capture_refused(self) -> None:
+        # The tap has closed frame admission. Its already admitted native tail
+        # may still settle, so this status notification does not close the holder.
+        self._partial = True
+        if self._reason != "limit":
+            self._reason = "failure"
+
+    def _refuse(self) -> bool:
+        self._closed = self._partial = True
+        if self._reason != "limit":
+            self._reason = "failure"
+        return False
+
+    def _offer(self, pcm: bytes) -> bool:
+        if self._pending is not None or self._sequence >= 600:
+            return self._refuse()
+        sample_count = len(pcm) // 4
+        metadata = {
+            "schema_version": 2, "workspace_id": str(self._snapshot.workspace_id),
+            "deployment_id": self._deployment_id, "call_id": str(self._snapshot.call_id),
+            "recording_id": str(self._snapshot.recording_id), "sequence": self._sequence,
+            "sample_count": sample_count, "sample_rate": 8000, "channels": 2,
+            "sample_format": "s16le",
+            "configuration_revision": self._snapshot.configuration_revision,
+            "retention_until": self._snapshot.retention_until.isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
+            "crypto_version": 1, "key_version": self._keyring.active_version,
+        }
+        aad = AUDIO_CHUNK_AAD_DOMAIN + json.dumps(
+            metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        if len(aad) > MAX_AUDIO_AAD_BYTES:
+            return self._refuse()
+        encrypted = self._keyring.encrypt(pcm, aad=aad)
+        payload = {key: value for key, value in metadata.items()
+                   if key not in {"deployment_id", "call_id"}}
+        payload.update(
+            nonce_b64=base64.b64encode(encrypted.nonce).decode("ascii"),
+            ciphertext_b64=base64.b64encode(encrypted.ciphertext).decode("ascii"),
+        )
+        operation = VoiceOperationV2.model_validate({
+            "schema_version": 2, "operation_id": str(uuid4()),
+            "deployment_id": self._deployment_id, "call_id": str(self._snapshot.call_id),
+            "occurred_at": datetime.now(UTC), "kind": "audio.chunk", "payload": payload,
+        })
+        if canonical_audio_chunk_aad(operation) != aad:
+            return self._refuse()
+        if self._writer.offer_audio_chunk(operation) is not True:
+            return self._refuse()
+        self._pending = operation
+        self._submitted_samples += sample_count
+        self._sequence += 1
+        return True
+
+    def offer_native_pcm(self, pcm: bytes, rate: int, channels: int) -> bool:
+        try:
+            if (
+                self._closed or self._pending is not None or type(pcm) is not bytes
+                or rate != 8000 or channels != 2 or not pcm or len(pcm) % 4
+                or len(pcm) > 32000 or datetime.now(UTC) >= self._snapshot.retention_until
+            ):
+                return self._refuse()
+            accepted = min(len(pcm), (_MAX_SAMPLES - self._accepted_samples) * 4)
+            if accepted <= 0:
+                self._reason = "limit"
+                return self._refuse()
+            view = memoryview(pcm)[:accepted]
+            missing = 32000 - len(self._carry)
+            self._accepted_samples += accepted // 4
+            if len(view) < missing:
+                self._carry.extend(view)
+            else:
+                self._carry.extend(view[:missing])
+                chunk = bytes(self._carry)
+                self._carry.clear()
+                if not self._offer(chunk):
+                    return False
+                self._carry.extend(view[missing:])
+            if self._accepted_samples == _MAX_SAMPLES:
+                self._reason = "limit"
+                self._closed = self._partial = True
+            return True
+        except Exception:
+            return self._refuse()
+
+    async def after_event_join(self) -> bool:
+        operation = self._pending
+        if operation is None:
+            return True
+        try:
+            await self._writer.wait_for_audio_commit(operation.operation_id)
+        except asyncio.CancelledError:
+            self._refuse()
+            raise
+        except PersistenceError as error:
+            if str(error) == "audio_chunk_refused" and self._pending is operation:
+                # The actual owner confirmed a fenced rollback, not an unknown
+                # commit. No further unsaved tail can pass that terminal fence.
+                self._pending = None
+                self._carry.clear()
+            return self._refuse()
+        except Exception:
+            return self._refuse()
+        if self._pending is operation:
+            payload = operation.payload
+            if not isinstance(payload, AudioChunkPayloadV2):
+                return self._refuse()
+            self._committed_samples += payload.sample_count
+            self._pending = None
+        return True
+
+    def _summary(self) -> AudioCaptureSummary:
+        return AudioCaptureSummary(
+            self._submitted_samples, self._committed_samples,
+            self._sequence - 1 if self._sequence else None,
+            self._reason, self._partial, self._pending is not None,
+        )
+
+    async def finish(self) -> AudioCaptureSummary:
+        self._closed = True
+        if self._finished or not await self.after_event_join():
+            return self._summary()
+        if self._carry:
+            tail = bytes(self._carry)
+            self._carry.clear()
+            try:
+                if not self._offer(tail) or not await self.after_event_join():
+                    return self._summary()
+            except Exception:
+                self._refuse()
+                return self._summary()
+        self._finished = True
+        return self._summary()
 
 
 class BoundedAudioBufferTap(FrameProcessor):
@@ -44,9 +235,15 @@ class BoundedAudioBufferTap(FrameProcessor):
         *,
         offer_chunk: Callable[[bytes, int, int], bool],
         monotonic: Callable[[], float] = time.monotonic,
+        on_event_join: Callable[[], Awaitable[bool]] | None = None,
+        ready_for_native_event: Callable[[], bool] | None = None,
+        on_capture_refused: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(enable_direct_mode=True)
         self._offer_chunk = offer_chunk
+        self._on_event_join = on_event_join
+        self._ready_for_native_event = ready_for_native_event
+        self._on_capture_refused = on_capture_refused
         self._monotonic = monotonic
         self._recorder = AudioBufferProcessor(
             sample_rate=8000, num_channels=2, buffer_size=_NATIVE_THRESHOLD_BYTES,
@@ -94,9 +291,15 @@ class BoundedAudioBufferTap(FrameProcessor):
         except Exception:
             self._refuse_capture()
 
-    def _refuse_capture(self) -> None:
+    def _mark_capture_refused(self) -> None:
         self._closed = True
         self._state = "partial"
+        if self._on_capture_refused is not None:
+            with suppress(Exception):
+                self._on_capture_refused()
+
+    def _refuse_capture(self) -> None:
+        self._mark_capture_refused()
         if self._completion is None or self._completion.done():
             self._completion = asyncio.create_task(
                 self._stop_and_join(), name="sparra-audio-event-join"
@@ -110,6 +313,10 @@ class BoundedAudioBufferTap(FrameProcessor):
                 await self._recorder.stop_recording()  # type: ignore[no-untyped-call]
                 self._stop_called = True
             await BaseObject.cleanup(self._recorder)  # type: ignore[no-untyped-call]
+            if self._on_event_join is not None and await self._on_event_join() is not True:
+                self._closed = True
+                self._state = "partial"
+                return False
         except Exception:
             self._closed = True
             self._state = "partial"
@@ -129,6 +336,21 @@ class BoundedAudioBufferTap(FrameProcessor):
             self._state = "partial"
             return False
         self._pending_join = False
+        if self._on_event_join is not None:
+            # Native events are joined. Subthreshold frames may resume while
+            # this same completion awaits the exact local writer receipt.
+            self._permit = False
+            try:
+                if await self._on_event_join() is not True:
+                    self._closed = True
+                    self._state = "partial"
+                    self._pending_join = True
+                    return False
+            except Exception:
+                self._closed = True
+                self._state = "partial"
+                self._pending_join = True
+                return False
         if self._closed:
             return await self._stop_and_join()
         self._permit = False
@@ -162,17 +384,14 @@ class BoundedAudioBufferTap(FrameProcessor):
                 rate != 8000 or channels != 2 or not pcm or len(pcm) % 4
                 or len(pcm) > 32000 or self._total_samples + len(pcm) // 4 > _MAX_SAMPLES
             ):
-                self._closed = True
-                self._state = "partial"
+                self._mark_capture_refused()
                 return
             self._total_samples += len(pcm) // 4
             if self._offer_chunk(pcm, rate, channels) is not True:
-                self._closed = True
-                self._state = "partial"
+                self._mark_capture_refused()
         except Exception:
             # Native BaseObject logs callback exceptions, so none may escape here.
-            self._closed = True
-            self._state = "partial"
+            self._mark_capture_refused()
 
     def _project_audio(
         self, frame: InputAudioRawFrame | OutputAudioRawFrame, now: float
@@ -220,7 +439,11 @@ class BoundedAudioBufferTap(FrameProcessor):
                     self._refuse_capture()
                 else:
                     projected = self._project_audio(frame, self._monotonic())
-                    if projected is None:
+                    if projected is None or (
+                        max(projected[0], projected[1]) >= _NATIVE_THRESHOLD_BYTES
+                        and self._ready_for_native_event is not None
+                        and self._ready_for_native_event() is not True
+                    ):
                         self._refuse_capture()
                     else:
                         self._permit = True
