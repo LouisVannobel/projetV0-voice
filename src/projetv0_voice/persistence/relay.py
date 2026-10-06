@@ -8,9 +8,11 @@ import random as random_module
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
+from projetv0_voice.audio_contract import VoiceOperationV2
+from projetv0_voice.models import VoiceOperationV1
 from projetv0_voice.persistence.postgres_sink import (
     OperationConflictError,
     OperationSinkCommitAmbiguousError,
@@ -20,7 +22,12 @@ from projetv0_voice.persistence.postgres_sink import (
     OperationSinkTransientError,
     PostgresOperationSink,
 )
-from projetv0_voice.persistence.writer import OutboxItem, PersistenceWriter, RelayClaimResult
+from projetv0_voice.persistence.writer import (
+    OutboxItem,
+    PersistenceWriter,
+    RelayClaimResult,
+    _valid_contract_version,
+)
 
 DURABLE_AGE_LIMIT_SECONDS = 900.0
 ACK_BUDGET_SECONDS = 1.5
@@ -101,6 +108,38 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+async def _ingest_fixed(
+    sink: PostgresOperationSink,
+    operation: VoiceOperationV1 | VoiceOperationV2,
+    *,
+    contract_version: Literal[1, 2],
+    ingest_v2: Callable[[VoiceOperationV2], Awaitable[None]] | None,
+) -> None:
+    if contract_version == 2:
+        if not isinstance(operation, VoiceOperationV2) or ingest_v2 is None:
+            raise OperationSinkContractError("relay_contract_mismatch")
+        await ingest_v2(operation)
+        return
+    if not isinstance(operation, VoiceOperationV1):
+        raise OperationSinkContractError("relay_contract_mismatch")
+    await sink.ingest(operation)
+
+
+@runtime_checkable
+class _V2IngestSink(Protocol):
+    async def ingest_v2(self, operation: VoiceOperationV2) -> None: ...
+
+
+def _select_v2_ingest(
+    sink: PostgresOperationSink, version: Literal[1, 2]
+) -> Callable[[VoiceOperationV2], Awaitable[None]] | None:
+    if version == 1:
+        return None
+    if not isinstance(sink, _V2IngestSink) or not callable(sink.ingest_v2):
+        raise ValueError("relay_v2_consumer_required")
+    return sink.ingest_v2
+
+
 async def maintain_call_content(
     writer: PersistenceWriter,
     sink: PostgresOperationSink,
@@ -108,8 +147,13 @@ async def maintain_call_content(
     *,
     utcnow: Callable[[], datetime],
     timeout_seconds: float,
+    contract_version: Literal[1, 2] | None = None,
 ) -> None:
     """Native local cleanup and exact ACK replay, awaited before FIFO age gating."""
+    version = writer.contract_version if contract_version is None else contract_version
+    if version != writer.contract_version:
+        raise ValueError("relay_contract_mismatch")
+    ingest_v2 = _select_v2_ingest(sink, version)
 
     async def acknowledge(call_id: UUID, token: UUID, cleaned_at: datetime) -> None:
         acknowledged = False
@@ -147,7 +191,8 @@ async def maintain_call_content(
             if not claimed or claimed[0].queue_id != head:
                 raise OperationSinkTransientError("erased_recording_claim_held")
             item = claimed[0]
-            await sink.ingest(item.operation)
+            await _ingest_fixed(sink, item.operation, contract_version=version,
+                                ingest_v2=ingest_v2)
             acknowledged = await writer.ack_outbox(
                 queue_id=item.queue_id, expected_claim_attempt=item.claim_attempt
             )
@@ -175,7 +220,20 @@ class OutboxRelay:
         drain_timeout_seconds: float = 5.0,
         before_fifo: Callable[[], Awaitable[None]] | None = None,
         stop_erased_call: Callable[[UUID], Awaitable[None]] | None = None,
+        contract_version: Literal[1, 2] | None = None,
     ) -> None:
+        selected: Literal[1, 2] = (
+            writer.contract_version if isinstance(writer, PersistenceWriter) else 1
+        )
+        version = selected if contract_version is None else contract_version
+        if not _valid_contract_version(version):
+            raise ValueError("invalid_relay_contract")
+        if isinstance(writer, PersistenceWriter) and version != writer.contract_version:
+            raise ValueError("relay_contract_mismatch")
+        self._contract_version: Literal[1, 2] = version
+        self._ingest_v2: Callable[[VoiceOperationV2], Awaitable[None]] | None = (
+            _select_v2_ingest(sink, version)
+        )
         if (
             type(claim_lease_seconds) is not int
             or claim_lease_seconds < 10
@@ -267,7 +325,10 @@ class OutboxRelay:
 
                 processed += 1
                 try:
-                    await self._sink.ingest(item.operation)
+                    await _ingest_fixed(
+                        self._sink, item.operation, contract_version=self._contract_version,
+                        ingest_v2=self._ingest_v2,
+                    )
                 except OperationSinkErasedError:
                     if item.operation.kind == "recording.upsert":
                         # A rejected recording has not handed off its real purge identity.

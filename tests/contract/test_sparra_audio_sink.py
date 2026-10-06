@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import sqlite3
 from datetime import timedelta
 from uuid import UUID
 
@@ -23,7 +25,11 @@ from test_sparra_sink import snapshot as legacy_snapshot
 from projetv0_voice import audio_contract
 from projetv0_voice.audio_contract import VoiceOperationV2
 from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.persistence.commands import encrypt_audio_operation
+from projetv0_voice.persistence.commands import (
+    PersistenceError,
+    canonical_operation_bytes,
+    encrypt_audio_operation,
+)
 from projetv0_voice.persistence.postgres_sink import (
     OperationConflictError,
     OperationSinkCommitAmbiguousError,
@@ -31,6 +37,7 @@ from projetv0_voice.persistence.postgres_sink import (
     OperationSinkErasedError,
     OperationSinkPermanentError,
 )
+from projetv0_voice.persistence.relay import OutboxRelay
 
 CALL_ID = UUID(int=2)
 WORKSPACE_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -278,3 +285,141 @@ async def test_v2_cancellation_rolls_back_returns_pool_and_allows_close():
         assert connection.transaction_rollbacks == 1 and pool.active == 0
         await sink.close()
         assert len(pool.close_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_before_ack(tmp_path):
+    from test_audio_writer import NOW as WRITER_NOW
+    from test_audio_writer import chunk, owned, seed_admission
+
+    path = tmp_path / "voice.sqlite"
+    clock = [WRITER_NOW]
+    async with owned(path, contract_version=2, utcnow=lambda: clock[0]) as (writer, keyring):
+        await seed_admission(writer)
+        operation = chunk(keyring)
+        assert writer.offer_audio_chunk(operation)
+        await writer.wait_for_audio_commit(operation.operation_id)
+    with sqlite3.connect(path) as db:
+        frozen = db.execute(
+            "SELECT op_id,created_at,key_version,nonce,ciphertext FROM outbox"
+        ).fetchone()
+    result = {
+        "schema_version": 2, "status": "applied", "operation_id": str(operation.operation_id),
+        "payload_sha256": hashlib.sha256(canonical_operation_bytes(operation)).hexdigest(),
+    }
+    sink, pool, connection, _factory = sink_with_rows(
+        [(result,)], commit_error=OSError("owned-v2-response-lost")
+    )
+
+    async def unexpected_degradation():
+        pytest.fail("unknown V2 commit must retain its durable claim")
+
+    async with owned(path, contract_version=2, utcnow=lambda: clock[0]) as (writer, _keyring):
+        relay = OutboxRelay(writer, sink, utcnow=lambda: clock[0],
+                            on_degraded=unexpected_degradation, drain=unexpected_degradation)
+        with pytest.raises(OperationSinkCommitAmbiguousError):
+            await relay.run_once()
+        with sqlite3.connect(path) as db:
+            assert db.execute(
+                "SELECT op_id,created_at,key_version,nonce,ciphertext FROM outbox"
+            ).fetchone() == frozen
+            claim = db.execute("SELECT attempts,next_attempt_at FROM outbox").fetchone()
+            assert claim[0] == 1
+        held = await relay.run_once()
+        assert held.acked == 0 and len(connection.calls) == 1
+        connection.commit_error = None
+        connection.rows = [({**result, "status": "duplicate"},)]
+        clock[0] = WRITER_NOW + timedelta(seconds=11)
+        delivered = await relay.run_once()
+        assert delivered.acked == 1 and not writer.is_degraded
+        assert len(connection.calls) == 2
+        assert all(call[0] == "SELECT voice.ingest_operation_v2(%s::jsonb)"
+                   for call in connection.calls)
+        assert connection.calls[0][1][0].obj == connection.calls[1][1][0].obj
+        assert VoiceOperationV2.model_validate(connection.calls[1][1][0].obj) == operation
+        assert await writer.oldest_outbox_created_at() is None
+        assert pool.active == 0 and connection.transaction_commits == 1
+    await sink.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_expiry_and_erasure_preserve_end_and_ack_before_finite_pin_gc(tmp_path):
+    from test_audio_writer import (
+        CALL,
+        DEADLINE,
+        GENERATION,
+        WORKSPACE,
+        chunk,
+        owned,
+        seed_admission,
+    )
+    from test_audio_writer import NOW as WRITER_NOW
+    from test_audio_writer import snapshot as writer_snapshot
+
+    path = tmp_path / "voice.sqlite"
+    clock = [WRITER_NOW]
+    token = UUID(int=900)
+    async with owned(path, contract_version=2, utcnow=lambda: clock[0]) as (writer, keyring):
+        await seed_admission(writer)
+        await writer.assert_sparra_compatible()
+        operation = chunk(keyring)
+        assert writer.offer_audio_chunk(operation)
+        await writer.wait_for_audio_commit(operation.operation_id)
+        held = await writer.read_relay_batch(batch_size=1, now=WRITER_NOW, lease_seconds=30)
+        assert len(held) == 1
+        clock[0] = DEADLINE + timedelta(seconds=901)
+        assert writer.offer_audio_chunk(chunk(keyring, 1)) is False
+        assert (await writer.read_call_lifecycle(CALL)).original_ended_at is None
+        await writer.cleanup_local_state(now=clock[0])
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT count(*) FROM local_audio_pin").fetchone()[0] == 1
+            assert db.execute("SELECT count(*) FROM outbox").fetchone()[0] == 1
+        cleaned = await writer.erase_call_content(CALL, lease_token=token, now=clock[0])
+        assert cleaned is not None
+        assert writer.offer_audio_chunk(operation) is False
+        assert (await writer.read_call_lifecycle(CALL)).original_ended_at is None
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT denied_at FROM local_audio_pin").fetchone()[0] is not None
+            assert db.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+        await writer.cleanup_local_state(now=clock[0])
+        assert await writer.read_call_lifecycle(CALL) is not None
+        end = WRITER_NOW + timedelta(seconds=10)
+        ticket = writer.submit_webhook(
+            receipt={"event_id": "original-hangup", "event_type": "call.hangup",
+                "call_control_id": "control-a", "call_leg_id": "leg-a",
+                "call_session_id": "session-a", "occurred_at": end, "received_at": clock[0],
+                "semantic_fingerprint_sha256": b"e" * 32},
+            lease={"action": "upsert", "call_control_id": "control-a", "call_id": CALL,
+                "tenant_id": str(WORKSPACE), "agent_id": "agent-a", "state": "terminal",
+                "token_hash": b"b" * 32, "created_at": WRITER_NOW,
+                "expires_at": WRITER_NOW + timedelta(hours=1), "closed_at": end},
+            operation=None,
+        )
+        await ticket.wait()
+        assert (await writer.read_call_lifecycle(CALL)).original_ended_at == end
+        await writer.cleanup_local_state(now=clock[0])
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT count(*) FROM local_audio_pin").fetchone()[0] == 1
+        # Real sink codec + pool double: an unknown remote ACK is not local ACK evidence.
+        sink, _pool, connection, _factory = sink_with_rows(
+            [(None,)], commit_error=OSError("owned-erasure-ack-response-lost")
+        )
+        try:
+            with pytest.raises(OperationSinkCommitAmbiguousError):
+                await sink.ack_call_erasure(CALL, token, cleaned)
+            await writer.cleanup_local_state(now=clock[0])
+            assert await writer.read_call_lifecycle(CALL) is not None
+            connection.commit_error = None
+            await sink.ack_call_erasure(CALL, token, cleaned)
+            await writer.finish_erasure_ack(CALL, token, acknowledged=True)
+        finally:
+            await sink.close()
+        await writer.cleanup_local_state(now=clock[0])
+        assert await writer.read_call_lifecycle(CALL) is None
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT count(*) FROM local_audio_pin").fetchone()[0] == 0
+            assert db.execute("SELECT count(*) FROM sparra_content_fences").fetchone()[0] == 0
+        with pytest.raises(PersistenceError, match="audio_pin_unavailable"):
+            await writer.bind_audio_snapshot(writer_snapshot(), generation=GENERATION)
+        assert writer.offer_audio_chunk(operation) is False
+        assert await writer.quick_check() and not writer.is_degraded

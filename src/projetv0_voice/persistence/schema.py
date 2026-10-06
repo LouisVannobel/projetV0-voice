@@ -137,3 +137,41 @@ CREATE TABLE recording_archives (
 SCHEMA_SQL = V4_SCHEMA_SQL.replace(
     "PRAGMA user_version = 4;", RECORDING_ARCHIVE_SQL + "\nPRAGMA user_version = 5;"
 )
+
+LOCAL_AUDIO_SCHEMA_VERSION = 6
+LOCAL_AUDIO_PIN_SQL = """
+CREATE TABLE local_audio_contract (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    contract_version INTEGER NOT NULL CHECK (contract_version = 2)
+);
+CREATE TABLE local_audio_pin (
+    call_id TEXT PRIMARY KEY NOT NULL,
+    generation TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    deployment_id TEXT NOT NULL,
+    recording_id TEXT,
+    configuration_revision INTEGER NOT NULL CHECK (configuration_revision > 0),
+    recording_policy TEXT NOT NULL CHECK (recording_policy IN ('off','local_30d')),
+    audio_available INTEGER NOT NULL CHECK (audio_available IN (0,1)),
+    admitted_at TEXT NOT NULL,
+    retention_until TEXT NOT NULL,
+    denied_at TEXT,
+    CHECK ((audio_available = 1 AND recording_policy = 'local_30d' AND recording_id IS NOT NULL)
+        OR (audio_available = 0 AND recording_id IS NULL))
+);
+INSERT INTO local_audio_contract(singleton,contract_version) VALUES(1,2);
+"""
+LOCAL_AUDIO_SCHEMA_SQL = SCHEMA_SQL.replace(
+    "kind TEXT NOT NULL CHECK (kind IN ('call.upsert', 'turn.upsert', 'recording.upsert'))",
+    "kind TEXT NOT NULL CHECK (kind IN ('call.upsert', 'turn.upsert', 'recording.upsert', "
+    "'audio.chunk', 'audio.finish', 'audio.revoke'))",
+).replace(
+    "schema_version INTEGER NOT NULL CHECK (schema_version = 1)",
+    "schema_version INTEGER NOT NULL CHECK (schema_version IN (1,2))",
+).replace(
+    "last_error_code TEXT\n",
+    "last_error_code TEXT,\n    CHECK ((schema_version = 1 AND kind IN "
+    "('call.upsert','turn.upsert','recording.upsert')) OR schema_version = 2)\n",
+).replace(
+    "PRAGMA user_version = 5;", LOCAL_AUDIO_PIN_SQL + "\nPRAGMA user_version = 6;"
+)
