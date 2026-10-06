@@ -19,6 +19,7 @@ from pipecat.processors.audio import audio_buffer_processor as native_audio
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameProcessor, FrameProcessorSetup
 from pipecat.utils.asyncio.task_manager import TaskManager
+from test_audio_writer import authenticate_audio
 
 from projetv0_voice import audio_capture
 from projetv0_voice.audio_contract import (
@@ -76,6 +77,8 @@ async def owned_writer(path, **options):
         )
         await ticket.wait()
         await writer.bind_audio_snapshot(snapshot(), generation=GENERATION)
+        await authenticate_audio(writer, call_control_id="holder-control", call_leg_id="holder-leg",
+                                 call_session_id="holder-session")
         yield writer, keyring
     finally:
         await writer.drain(timeout_seconds=2)
@@ -146,8 +149,11 @@ async def test_holder_coalesces_three_native_sized_events_into_exact_real_writer
         )
         assert summary.reason == "complete" and not summary.partial and not summary.pending
         claimed = await writer.read_relay_batch(batch_size=10, now=NOW, lease_seconds=30)
+        assert tuple(item.operation.kind for item in claimed[:2]) == ("call.upsert", "call.upsert")
+        chunks = tuple(item for item in claimed if item.operation.kind == "audio.chunk")
+        assert len(claimed) == len(chunks) + 2
         decoded, lengths = [], []
-        for item in claimed:
+        for item in chunks:
             assert item.operation.kind == "audio.chunk"
             payload = item.operation.payload
             assert isinstance(payload, AudioChunkPayloadV2)

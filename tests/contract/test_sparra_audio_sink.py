@@ -288,20 +288,24 @@ async def test_v2_cancellation_rolls_back_returns_pool_and_allows_close():
 
 
 @pytest.mark.asyncio
-async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_before_ack(tmp_path):
+async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_before_ack(
+    tmp_path, monkeypatch,
+):
     from test_audio_writer import NOW as WRITER_NOW
-    from test_audio_writer import chunk, owned, seed_admission
+    from test_audio_writer import authenticate_audio, chunk, owned, seed_admission
 
     path = tmp_path / "voice.sqlite"
     clock = [WRITER_NOW]
     async with owned(path, contract_version=2, utcnow=lambda: clock[0]) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         operation = chunk(keyring)
         assert writer.offer_audio_chunk(operation)
         await writer.wait_for_audio_commit(operation.operation_id)
     with sqlite3.connect(path) as db:
         frozen = db.execute(
-            "SELECT op_id,created_at,key_version,nonce,ciphertext FROM outbox"
+            "SELECT op_id,created_at,key_version,nonce,ciphertext FROM outbox "
+            "WHERE kind='audio.chunk'"
         ).fetchone()
     result = {
         "schema_version": 2, "status": "applied", "operation_id": str(operation.operation_id),
@@ -310,6 +314,27 @@ async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_bef
     sink, pool, connection, _factory = sink_with_rows(
         [(result,)], commit_error=OSError("owned-v2-response-lost")
     )
+    original_execute = connection.execute
+    audio_attempts = 0
+
+    async def reply_for_operation(sql, params, *, prepare):
+        nonlocal audio_attempts
+        candidate = VoiceOperationV2.model_validate(params[0].obj)
+        is_audio = candidate.kind == "audio.chunk"
+        if is_audio:
+            audio_attempts += 1
+        connection.rows = [({
+            "schema_version": 2,
+            "status": "duplicate" if audio_attempts > 1 and is_audio else "applied",
+            "operation_id": str(candidate.operation_id),
+            "payload_sha256": hashlib.sha256(canonical_operation_bytes(candidate)).hexdigest(),
+        },)]
+        connection.commit_error = (
+            OSError("owned-v2-response-lost") if is_audio and audio_attempts == 1 else None
+        )
+        return await original_execute(sql, params, prepare=prepare)
+
+    monkeypatch.setattr(connection, "execute", reply_for_operation)
 
     async def unexpected_degradation():
         pytest.fail("unknown V2 commit must retain its durable claim")
@@ -321,24 +346,25 @@ async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_bef
             await relay.run_once()
         with sqlite3.connect(path) as db:
             assert db.execute(
-                "SELECT op_id,created_at,key_version,nonce,ciphertext FROM outbox"
+                "SELECT op_id,created_at,key_version,nonce,ciphertext FROM outbox "
+                "WHERE kind='audio.chunk'"
             ).fetchone() == frozen
             claim = db.execute("SELECT attempts,next_attempt_at FROM outbox").fetchone()
             assert claim[0] == 1
         held = await relay.run_once()
-        assert held.acked == 0 and len(connection.calls) == 1
+        assert held.acked == 0 and len(connection.calls) == 3
         connection.commit_error = None
         connection.rows = [({**result, "status": "duplicate"},)]
         clock[0] = WRITER_NOW + timedelta(seconds=11)
         delivered = await relay.run_once()
         assert delivered.acked == 1 and not writer.is_degraded
-        assert len(connection.calls) == 2
+        assert len(connection.calls) == 4
         assert all(call[0] == "SELECT voice.ingest_operation_v2(%s::jsonb)"
                    for call in connection.calls)
-        assert connection.calls[0][1][0].obj == connection.calls[1][1][0].obj
-        assert VoiceOperationV2.model_validate(connection.calls[1][1][0].obj) == operation
+        assert connection.calls[2][1][0].obj == connection.calls[3][1][0].obj
+        assert VoiceOperationV2.model_validate(connection.calls[3][1][0].obj) == operation
         assert await writer.oldest_outbox_created_at() is None
-        assert pool.active == 0 and connection.transaction_commits == 1
+        assert pool.active == 0 and connection.transaction_commits == 3
     await sink.close()
 
 
@@ -349,6 +375,7 @@ async def test_audio_expiry_and_erasure_preserve_end_and_ack_before_finite_pin_g
         DEADLINE,
         GENERATION,
         WORKSPACE,
+        authenticate_audio,
         chunk,
         owned,
         seed_admission,
@@ -361,19 +388,25 @@ async def test_audio_expiry_and_erasure_preserve_end_and_ack_before_finite_pin_g
     token = UUID(int=900)
     async with owned(path, contract_version=2, utcnow=lambda: clock[0]) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         await writer.assert_sparra_compatible()
         operation = chunk(keyring)
         assert writer.offer_audio_chunk(operation)
         await writer.wait_for_audio_commit(operation.operation_id)
-        held = await writer.read_relay_batch(batch_size=1, now=WRITER_NOW, lease_seconds=30)
-        assert len(held) == 1
+        held = await writer.read_relay_batch(batch_size=3, now=WRITER_NOW, lease_seconds=30)
+        assert tuple(item.operation.kind for item in held) == (
+            "call.upsert", "call.upsert", "audio.chunk"
+        )
         clock[0] = DEADLINE + timedelta(seconds=901)
         assert writer.offer_audio_chunk(chunk(keyring, 1)) is False
         assert (await writer.read_call_lifecycle(CALL)).original_ended_at is None
         await writer.cleanup_local_state(now=clock[0])
         with sqlite3.connect(path) as db:
             assert db.execute("SELECT count(*) FROM local_audio_pin").fetchone()[0] == 1
-            assert db.execute("SELECT count(*) FROM outbox").fetchone()[0] == 1
+            assert db.execute(
+                "SELECT count(*) FROM outbox WHERE kind='audio.chunk'"
+            ).fetchone()[0] == 1
+            assert db.execute("SELECT count(*) FROM outbox").fetchone()[0] == 3
         cleaned = await writer.erase_call_content(CALL, lease_token=token, now=clock[0])
         assert cleaned is not None
         assert writer.offer_audio_chunk(operation) is False

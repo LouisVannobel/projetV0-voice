@@ -89,6 +89,33 @@ async def seed_admission(writer):
     await writer.bind_audio_snapshot(snapshot(), generation=GENERATION)
 
 
+async def authenticate_audio(
+    writer, *, call_control_id="control-a", call_leg_id="leg-a", call_session_id="session-a",
+):
+    """Commit native disclosure, caller acceptance, then durable gate evidence."""
+    for gate in (False, True):
+        operation = VoiceOperationV2(
+            schema_version=2, operation_id=UUID(int=902 if gate else 901),
+            deployment_id="agent-a", call_id=CALL, occurred_at=NOW, kind="call.upsert",
+            payload=CallUpsertPayloadV1(
+                telnyx_call_control_id=call_control_id, telnyx_call_leg_id=call_leg_id,
+                telnyx_call_session_id=call_session_id, status="active",
+                disclosure_state="completed",
+                started_at=NOW, ended_at=None, end_reason=None, retention_until=DEADLINE,
+                disclosure_evidence=DisclosureEvidenceV1(
+                    schema_version=1, started_at=NOW, completed_at=NOW, failed_at=None,
+                    input_gate_opened_at=NOW if gate else None,
+                ),
+            ),
+        )
+        await writer.publish_control_v2(operation, generation=GENERATION)
+        if not gate:
+            accepted = await writer.commit_audio_choice(
+                CALL, generation=GENERATION, choice="accept", occurred_at=NOW
+            )
+            assert accepted.choice_state == "accepted"
+
+
 @asynccontextmanager
 async def owned(path, *, utcnow=lambda: NOW, **options):
     keyring = CryptoKeyring({1: KEY}, active_version=1)
@@ -110,22 +137,27 @@ async def test_v2_admitted_chunk_commits_real_ciphertext_and_claim_decodes_exact
     path = tmp_path / "voice.sqlite"
     async with owned(path, contract_version=2) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         operation = chunk(keyring)
         assert writer.offer_audio_chunk(operation) is True
         await writer.wait_for_audio_commit(operation.operation_id)
         with sqlite3.connect(path) as db:
             version, kind, key_version, nonce, ciphertext = db.execute(
-                "SELECT schema_version,kind,key_version,nonce,ciphertext FROM outbox"
+                "SELECT schema_version,kind,key_version,nonce,ciphertext FROM outbox "
+                "WHERE kind='audio.chunk'"
             ).fetchone()
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         assert (version, kind) == (2, "audio.chunk") and len(nonce) == 12
         plaintext = keyring.decrypt(EncryptedValue(key_version, nonce, ciphertext),
                                     aad=operation_aad(operation))
         assert plaintext == canonical_operation_bytes(operation)
         assert decode_operation_v2(plaintext) == operation
         assert len(operation_aad(operation)) + len(nonce) + len(ciphertext) <= 46812
-        claimed = await writer.read_relay_batch(batch_size=1, now=NOW, lease_seconds=30)
-        assert len(claimed) == 1 and claimed[0].operation == operation
+        claimed = await writer.read_relay_batch(batch_size=3, now=NOW, lease_seconds=30)
+        assert tuple(item.operation.kind for item in claimed) == (
+            "call.upsert", "call.upsert", "audio.chunk"
+        )
+        assert claimed[-1].operation == operation
         assert b"\x01\x00\x02\x00" * 8000 not in path.read_bytes()
         assert (await writer.read_call_lifecycle(CALL)).original_ended_at is None
 
@@ -146,6 +178,7 @@ async def test_one_audio_commit_and_low_queue_refusal_preserve_native_control(tm
         tmp_path / "voice.sqlite", contract_version=2, failpoint=hold_commit
     ) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         first, second = chunk(keyring), chunk(keyring, 1)
         armed = True
         assert writer.offer_audio_chunk(first)
@@ -262,6 +295,7 @@ async def test_committed_audio_receipt_keeps_its_bounded_slot_until_exact_wait_c
 ):
     async with owned(tmp_path / "voice.sqlite", contract_version=2) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         first, second = chunk(keyring), chunk(keyring, 1)
         assert writer.offer_audio_chunk(first)
         await writer.wait_until_idle()  # Actual native COMMIT, no receipt wait yet.
@@ -288,6 +322,7 @@ async def test_queued_erase_refuses_cached_audio_without_poisoning_native_contro
         tmp_path / "voice.sqlite", contract_version=2, failpoint=hold_commit
     ) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         operation = chunk(keyring)
         armed = True
         control = writer.submit_webhook(receipt={"event_id": "held-control",
@@ -356,6 +391,7 @@ async def test_audio_physical_growth_and_unknown_capacity_preserve_control(tmp_p
         path, contract_version=2, file_size=file_size, failpoint=hold_commit
     ) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         with sqlite3.connect(path) as db:
             page = db.execute("PRAGMA page_size").fetchone()[0]
             before_pages = db.execute("PRAGMA page_count").fetchone()[0]
@@ -397,6 +433,7 @@ async def test_fixed_v2_provenance_refusal_never_repairs_or_mutates_database(tmp
     path = tmp_path / "voice.sqlite"
     async with owned(path, contract_version=2) as (writer, keyring):
         await seed_admission(writer)
+        await authenticate_audio(writer)
         assert writer.offer_audio_chunk(chunk(keyring))
         await writer.wait_for_audio_commit(UUID(int=100))
     if tamper != "default-v1":
@@ -451,7 +488,7 @@ async def test_control_v2_fresh_disclosure_and_gate_commit_exact_crypto_and_immu
                 "SELECT op_id,schema_version,kind,key_version,nonce,ciphertext FROM outbox "
                 "ORDER BY queue_id"
             ).fetchall()
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         assert len(frozen) == 2
         for row, operation in zip(frozen, (first, gated), strict=True):
             assert row[:3] == (str(operation.operation_id), 2, "call.upsert")

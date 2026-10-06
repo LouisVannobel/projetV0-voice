@@ -175,3 +175,33 @@ LOCAL_AUDIO_SCHEMA_SQL = SCHEMA_SQL.replace(
 ).replace(
     "PRAGMA user_version = 5;", LOCAL_AUDIO_PIN_SQL + "\nPRAGMA user_version = 6;"
 )
+
+# V6 remains the exact historical provenance for this single forward migration.
+LOCAL_AUDIO_CHOICE_SCHEMA_VERSION = 7
+_LOCAL_AUDIO_PIN_V6_TABLE = LOCAL_AUDIO_PIN_SQL[
+    LOCAL_AUDIO_PIN_SQL.index("CREATE TABLE local_audio_pin"):
+    LOCAL_AUDIO_PIN_SQL.index("INSERT INTO local_audio_contract")
+]
+_LOCAL_AUDIO_PIN_V7_TABLE = _LOCAL_AUDIO_PIN_V6_TABLE.replace(
+    "    denied_at TEXT,\n",
+    "    denied_at TEXT,\n"
+    "    choice_state TEXT NOT NULL DEFAULT 'undecided' "
+    "CHECK (choice_state IN ('undecided','accepted','off')),\n"
+    "    choice_occurred_at TEXT,\n"
+    "    CHECK ((choice_state='undecided' AND choice_occurred_at IS NULL) "
+    "OR (choice_state='accepted' AND choice_occurred_at IS NOT NULL) OR choice_state='off'),\n",
+)
+LOCAL_AUDIO_CHOICE_SCHEMA_SQL = LOCAL_AUDIO_SCHEMA_SQL.replace(
+    _LOCAL_AUDIO_PIN_V6_TABLE, _LOCAL_AUDIO_PIN_V7_TABLE
+).replace("PRAGMA user_version = 6;", "PRAGMA user_version = 7;")
+LOCAL_AUDIO_CHOICE_MIGRATION_SQL = (
+    "ALTER TABLE local_audio_pin RENAME TO local_audio_pin_v6;\n"
+    + _LOCAL_AUDIO_PIN_V7_TABLE
+    + "INSERT INTO local_audio_pin(call_id,generation,workspace_id,deployment_id,recording_id,"
+    "configuration_revision,recording_policy,audio_available,admitted_at,retention_until,"
+    "denied_at) "
+    "SELECT call_id,generation,workspace_id,deployment_id,recording_id,configuration_revision,"
+    "recording_policy,audio_available,admitted_at,retention_until,denied_at "
+    "FROM local_audio_pin_v6;\n"
+    "DROP TABLE local_audio_pin_v6;\nPRAGMA user_version = 7;"
+)
