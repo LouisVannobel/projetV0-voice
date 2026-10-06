@@ -1780,7 +1780,12 @@ async def build_production_runtime(
         )
         if not isinstance(metrics, RuntimeMetrics):
             raise RuntimeError("runtime_metrics_composition_invalid")
-        writer = PersistenceWriter(Path(str(settings.sqlite_path)), keyring)
+        operation_contract_version: Literal[1, 2] = (
+            1 if manifest.sparra is None else manifest.sparra.operation_contract_version
+        )
+        writer = PersistenceWriter(
+            Path(str(settings.sqlite_path)), keyring, contract_version=operation_contract_version
+        )
         sink = factories.sink_factory(postgres_dsn)
 
         supervisor_ref: RuntimeSupervisor | None = None
@@ -1802,6 +1807,7 @@ async def build_production_runtime(
         relay = OutboxRelay(
             writer,
             cast(Any, sink),
+            contract_version=operation_contract_version,
             on_degraded=begin_drain,
             drain=begin_drain,
             before_fifo=prepare_sparra_fifo if manifest.sparra is not None else None,
@@ -1872,7 +1878,9 @@ async def build_production_runtime(
             qualification_observer=supervisor.observe_qualification_state,
             sparra=manifest.sparra,
             called_did=manifest.dids[0],
-            begin_call=getattr(sink, "begin_call", None),
+            begin_call=getattr(
+                sink, "begin_call_v2" if operation_contract_version == 2 else "begin_call", None
+            ),
         )
         lease_authority = ProcessLeaseAuthority(registry)
         gate = SynchronousUnauthenticatedGate(capacity)

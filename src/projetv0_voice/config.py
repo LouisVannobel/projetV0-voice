@@ -29,6 +29,7 @@ def _require_exact_int(value: object) -> object:
 
 
 SchemaVersionV1 = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
+OperationContractVersion = Annotated[Literal[1, 2], BeforeValidator(_require_exact_int)]
 PositiveInt = Annotated[int, Field(gt=0), BeforeValidator(_require_exact_int)]
 PcmuSampleRate = Annotated[Literal[8000], BeforeValidator(_require_exact_int)]
 
@@ -70,6 +71,14 @@ class SparraManifestV1(BaseModel):
     connection_id: StrictStr
     original_forward_line_e164: StrictStr | None
     qualified_transfer_destination_e164: StrictStr | None
+    operation_contract_version: OperationContractVersion = 1
+
+    @model_serializer(mode="wrap")
+    def omit_legacy_selector(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        serialized: dict[str, object] = handler(self)
+        if "operation_contract_version" not in self.model_fields_set:
+            serialized.pop("operation_contract_version", None)
+        return serialized
 
     @field_validator("connection_id")
     @classmethod

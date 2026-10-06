@@ -19,6 +19,7 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
 
+from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.config import AgentManifestV1, SparraManifestV1
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
@@ -32,6 +33,7 @@ from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguou
 from projetv0_voice.persistence.writer import (
     LocalCallAdmissionFacts,
     LocalCallLifecycleFacts,
+    PersistenceWriter,
     QualificationRunConsumed,
     WebhookCommitResult,
     WebhookCommitValue,
@@ -56,6 +58,8 @@ if TYPE_CHECKING:
         WebhookDisposition,
         WebhookDurableEffect,
     )
+
+PinnedBeginSnapshot = BeginCallSnapshotV1 | BeginCallSnapshotV2
 
 
 class WebhookFinalizationHandle(Protocol):
@@ -281,9 +285,9 @@ class _CallEntry:
     session: object | None = field(default=None, repr=False)
     resources_released: bool = False
     routing: RoutingV1 | None = None
-    begin_snapshot: BeginCallSnapshotV1 | None = None
+    begin_snapshot: PinnedBeginSnapshot | None = None
     begin_task: asyncio.Task[None] | None = field(default=None, repr=False)
-    begin_future: asyncio.Future[BeginCallSnapshotV1] | None = field(default=None, repr=False)
+    begin_future: asyncio.Future[PinnedBeginSnapshot] | None = field(default=None, repr=False)
     answered_at: datetime | None = None
     transfer_facts: LocalCallLifecycleFacts | None = field(default=None, repr=False)
     transfer_task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -597,7 +601,7 @@ class CallConstructionGrant:
     started_at: datetime = field(repr=False)
     retention_until: datetime = field(repr=False)
     routing: RoutingV1 | None = field(default=None, repr=False)
-    begin_snapshot: BeginCallSnapshotV1 | None = field(default=None, repr=False)
+    begin_snapshot: PinnedBeginSnapshot | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -909,7 +913,7 @@ class CallRegistry:
         background_task_factory: BackgroundTaskFactory = _default_background_task_factory,
         sparra: SparraManifestV1 | None = None,
         called_did: str | None = None,
-        begin_call: Callable[[str, UUID, RoutingV1], Awaitable[BeginCallSnapshotV1]] | None = None,
+        begin_call: Callable[[str, UUID, RoutingV1], Awaitable[PinnedBeginSnapshot]] | None = None,
     ) -> None:
         if (
             type(capacity) is not int
@@ -942,9 +946,18 @@ class CallRegistry:
             raise ValueError("call_registry_config_invalid")
         self._writer = writer
         if sparra is not None and (
-            capacity != 1 or retention_days != 30 or called_did is None or begin_call is None
+            capacity != 1 or retention_days != 30 or called_did is None or not callable(begin_call)
         ):
             raise ValueError("sparra_admission_config_invalid")
+        self._operation_contract_version: Literal[1, 2] = (
+            1 if sparra is None else sparra.operation_contract_version
+        )
+        if (
+            isinstance(writer, PersistenceWriter)
+            and writer.contract_version != self._operation_contract_version
+            or self._operation_contract_version == 2 and not isinstance(writer, PersistenceWriter)
+        ):
+            raise ValueError("sparra_writer_contract_mismatch")
         self._sparra = sparra
         self._called_did = called_did
         self._begin_call = begin_call
@@ -1092,7 +1105,7 @@ class CallRegistry:
             raise CallAdmissionRejected("call_event_invalid")
         return routing
 
-    async def _ensure_begin_snapshot(self, control_id: str) -> BeginCallSnapshotV1:
+    async def _ensure_begin_snapshot(self, control_id: str) -> PinnedBeginSnapshot:
         async with self._lock:
             entry = self._by_control.get(control_id)
             if (
@@ -1122,7 +1135,7 @@ class CallRegistry:
         return await asyncio.shield(begin_future)
 
     async def _begin_future_owned(
-        self, entry: _CallEntry, future: asyncio.Future[BeginCallSnapshotV1]
+        self, entry: _CallEntry, future: asyncio.Future[PinnedBeginSnapshot]
     ) -> None:
         try:
             result = await self._begin_owned(entry)
@@ -1134,7 +1147,7 @@ class CallRegistry:
             if not future.done():
                 future.set_result(result)
 
-    async def _begin_owned(self, entry: _CallEntry) -> BeginCallSnapshotV1:
+    async def _begin_owned(self, entry: _CallEntry) -> PinnedBeginSnapshot:
         assert self._begin_call is not None and entry.routing is not None
         remaining = min(
             entry.token_deadline - float(self._monotonic()),
@@ -1146,20 +1159,30 @@ class CallRegistry:
             except OperationSinkCommitAmbiguousError:
                 snapshot = await self._begin_call(self._deployment_id, entry.call_id, entry.routing)
         if (
-            not isinstance(snapshot, BeginCallSnapshotV1)
-            or snapshot.call_id != entry.call_id
+            not isinstance(snapshot, BeginCallSnapshotV2)
+            if self._operation_contract_version == 2
+            else not isinstance(snapshot, BeginCallSnapshotV1)
+        ):
+            raise CallAdmissionRejected("call_identity_conflict")
+        if (
+            snapshot.call_id != entry.call_id
             or snapshot.retention_until != entry.initiated_at + timedelta(days=30)
         ):
             raise CallAdmissionRejected("call_identity_conflict")
         try:
-            await cast(Any, self._writer).bind_recording_policy(
-                snapshot, generation=entry.generation
-            )
+            if isinstance(snapshot, BeginCallSnapshotV2):
+                if not isinstance(self._writer, PersistenceWriter):
+                    raise CallAdmissionRejected("call_identity_conflict")
+                await self._writer.bind_audio_snapshot(snapshot, generation=entry.generation)
+            else:
+                await cast(Any, self._writer).bind_recording_policy(
+                    snapshot, generation=entry.generation
+                )
         except PersistenceError:
             raise CallAdmissionRejected("call_identity_conflict") from None
         # Company preference is pinned; native audio activation stays closed
         # until disclosure, recording and retention qualification are complete.
-        if snapshot.recording_enabled:
+        if isinstance(snapshot, BeginCallSnapshotV1) and snapshot.recording_enabled:
             # Exercise actual owned capacity/readiness before the immutable
             # capability gate. A rejected ON admission must not retain copy authority.
             try:
@@ -1664,7 +1687,11 @@ class CallRegistry:
                 admission_generation=entry.generation,
             )
         )
-        return WebhookDurableEffect(lease=lease, operation=operation, admission_facts=facts)
+        return WebhookDurableEffect(
+            lease=lease,
+            operation=operation if self._operation_contract_version == 1 else None,
+            admission_facts=facts,
+        )
 
     def _terminal_effect(self, entry: _CallEntry, event: VerifiedWebhook) -> WebhookDurableEffect:
         from projetv0_voice.telnyx.webhooks import WebhookDurableEffect
