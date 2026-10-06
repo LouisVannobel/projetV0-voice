@@ -27,6 +27,7 @@ from projetv0_voice.admission import (
     TerminalAuthority,
     TerminalProposal,
 )
+from projetv0_voice.audio_capture import LocalAudioCapture
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
@@ -48,7 +49,7 @@ from projetv0_voice.persistence.commands import (
     PersistenceCommand,
     PersistenceError,
 )
-from projetv0_voice.persistence.writer import AudioChoiceFacts
+from projetv0_voice.persistence.writer import AudioChoiceFacts, PersistenceWriter
 from projetv0_voice.pipeline import (
     SPARRA_DISCLOSURE,
     SPARRA_RECORDING_DISCLOSURE,
@@ -756,6 +757,22 @@ class CallSession:
 
         first_failure = FirstFailure(shared_failure_event=self._writer.fatal_event)
         native_fatal = _NativeFatalObservation()
+        local_capture = (
+            LocalAudioCapture(
+                snapshot=self._identity.begin_snapshot, deployment_id=self._identity.deployment_id,
+                keyring=self._keyring, writer=self._writer,
+            )
+            if isinstance(self._identity.begin_snapshot, BeginCallSnapshotV2)
+            and self._identity.begin_snapshot.audio_available
+            and self._identity.begin_snapshot.recording_policy == "local_30d"
+            and isinstance(self._writer, PersistenceWriter)
+            else None
+        )
+
+        async def quiesce_local_capture() -> None:
+            if local_capture is not None and (await local_capture.quiesce()).pending:
+                raise RuntimeError("local_audio_quiesce_pending")
+
         controller = DisclosureController(
             identity=self._identity,
             writer=self._writer,
@@ -774,6 +791,10 @@ class CallSession:
             on_active=self._queue_opening_invitation
             if self._identity.begin_snapshot is not None
             else None,
+            local_audio_start=None if local_capture is None else local_capture.start,
+            local_audio_refuse=None if local_capture is None else local_capture.refuse,
+            local_audio_close=None if local_capture is None else local_capture.close_admission,
+            local_audio_quiesce=None if local_capture is None else quiesce_local_capture,
         )
         recorder = TurnRecorder(
             identity=self._identity,
@@ -809,6 +830,7 @@ class CallSession:
                 turn_recorder=recorder,
                 first_failure=first_failure,
                 begin_snapshot=self._identity.begin_snapshot,
+                capture_tap=None if local_capture is None else local_capture.tap,
                 transfer_handler=self._request_human_tool
                 if self._identity.begin_snapshot is not None
                 and self._registry_terminalizer is not None
@@ -1124,7 +1146,8 @@ class CallSession:
     ) -> None:
         await self._attempt(
             lambda: controller.terminalize_and_join(
-                cancel_continuations=cancel_continuations
+                cancel_continuations=cancel_continuations,
+                normal_completion=terminal_outcome.reason == "closed",
             ),
             first_failure,
             "call_failed",
@@ -1499,6 +1522,7 @@ class DisclosureController:
         on_active: Callable[[], Awaitable[None]] | None = None,
         local_audio_start: Callable[[], Awaitable[bool]] | None = None,
         local_audio_refuse: Callable[[], None] | None = None,
+        local_audio_close: Callable[[], None] | None = None,
         local_audio_quiesce: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if isinstance(identity.begin_snapshot, BeginCallSnapshotV1):
@@ -1540,6 +1564,7 @@ class DisclosureController:
         )
         self._local_audio_start = local_audio_start
         self._local_audio_refuse = local_audio_refuse
+        self._local_audio_close = local_audio_close
         self._local_audio_quiesce = local_audio_quiesce
         self._local_refused = False
         self._local_quiesced = False
@@ -1968,9 +1993,18 @@ class DisclosureController:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    async def terminalize_and_join(self, *, cancel_continuations: bool) -> None:
+    async def terminalize_and_join(
+        self, *, cancel_continuations: bool, normal_completion: bool = False
+    ) -> None:
+        self._input_closed = True
         if self._local_snapshot is not None:
-            self._refuse_local_audio()
+            if (
+                normal_completion and not cancel_continuations and not self._local_refused
+                and self._first_failure.code is None and self._local_audio_close is not None
+            ):
+                self._local_audio_close()
+            else:
+                self._refuse_local_audio()
             self._cancel_choice_timeout()
         async with self._lock:
             self._input_closed = True

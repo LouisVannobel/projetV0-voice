@@ -53,6 +53,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.audio_capture import BoundedAudioBufferTap
 from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
@@ -695,6 +696,7 @@ def build_pipeline(
     turn_recorder: PipelineTurnRecorder,
     first_failure: FirstFailure,
     begin_snapshot: BeginCallSnapshotV1 | BeginCallSnapshotV2 | None = None,
+    capture_tap: BoundedAudioBufferTap | None = None,
     transfer_handler: FunctionCallHandler | None = None,
     on_user_turn_started: Callable[[], None] | None = None,
 ) -> ObservedPipeline:
@@ -858,6 +860,7 @@ def build_pipeline(
             services.tts,
             barrier,
             output,
+            *([capture_tap] if capture_tap is not None else []),
             assistant_aggregator,
         ],
         first_failure=first_failure,

@@ -206,6 +206,10 @@ class AudioChunkHolder:
             self._reason, self._partial, self._pending is not None,
         )
 
+    @property
+    def summary(self) -> AudioCaptureSummary:
+        return self._summary()
+
     async def finish(self) -> AudioCaptureSummary:
         self._closed = True
         if self._finished or not await self.after_event_join():
@@ -357,10 +361,17 @@ class BoundedAudioBufferTap(FrameProcessor):
         return True
 
     async def stop_capture(self) -> bool:
-        self._closed = True
-        if self._state != "partial":
-            self._state = "stopped"
+        self.close_admission()
         return await self.quiesce()
+
+    def close_admission(self, *, partial: bool = False) -> None:
+        """Close new dispatch synchronously while retaining already admitted audio."""
+        if partial:
+            self._mark_capture_refused()
+        else:
+            self._closed = True
+            if self._state != "partial":
+                self._state = "stopped"
 
     async def quiesce(self) -> bool:
         self._closed = True
@@ -468,3 +479,49 @@ class BoundedAudioBufferTap(FrameProcessor):
                     self._bot_speaking = isinstance(frame, BotStartedSpeakingFrame)
                 await self._recorder.queue_frame(frame, direction)
         await self.push_frame(frame, direction)
+
+
+class LocalAudioCapture:
+    """One call-owned native tap and holder; completion is local byte evidence only."""
+
+    def __init__(
+        self, *, snapshot: BeginCallSnapshotV2, deployment_id: str,
+        keyring: CryptoKeyring, writer: PersistenceWriter,
+    ) -> None:
+        self.holder = AudioChunkHolder(snapshot=snapshot, deployment_id=deployment_id,
+                                       keyring=keyring, writer=writer)
+        self.tap = BoundedAudioBufferTap(
+            offer_chunk=self.holder.offer_native_pcm, on_event_join=self.holder.after_event_join,
+            ready_for_native_event=self.holder.ready_for_native_event,
+            on_capture_refused=self.holder.notify_capture_refused,
+        )
+        self._available = snapshot.audio_available and snapshot.recording_policy == "local_30d"
+        self._quiesce_lock = asyncio.Lock()
+        self._closed = False
+
+    async def start(self) -> bool:
+        if self._closed or not self._available:
+            return False
+        await self.tap.start_capture()
+        return self.tap.state == "recording"
+
+    def refuse(self) -> None:
+        self._closed = True
+        if self.tap.state != "stopped":
+            self.tap.close_admission(partial=True)
+
+    def close_admission(self) -> None:
+        self._closed = True
+        self.tap.close_admission()
+
+    async def quiesce(self) -> AudioCaptureSummary:
+        self.close_admission()
+        async with self._quiesce_lock:
+            if not await self.tap.quiesce():
+                self.holder.notify_capture_refused()
+                current = self.holder.summary
+                return AudioCaptureSummary(
+                    current.submitted_samples, current.committed_samples, current.last_sequence,
+                    "failure", True, True,
+                )
+            return await self.holder.finish()
