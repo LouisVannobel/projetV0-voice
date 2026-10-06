@@ -13,8 +13,18 @@ from datetime import timedelta
 from uuid import UUID
 
 import pytest
-from test_audio_choice_writer import historical_v6, wait_for_queued
-from test_audio_writer import (
+
+from projetv0_voice.audio_contract import VoiceOperationV2
+from projetv0_voice.crypto import EncryptedValue
+from projetv0_voice.persistence.commands import (
+    PersistenceError,
+    canonical_operation_bytes,
+    decode_operation_v2,
+    operation_aad,
+)
+from projetv0_voice.persistence.schema import LOCAL_AUDIO_CHOICE_MIGRATION_SQL
+from tests.unit.test_audio_choice_writer import historical_v6, wait_for_queued
+from tests.unit.test_audio_writer import (
     CALL,
     DEADLINE,
     GENERATION,
@@ -27,16 +37,6 @@ from test_audio_writer import (
     seed_admission,
     snapshot,
 )
-
-from projetv0_voice.audio_contract import VoiceOperationV2
-from projetv0_voice.crypto import EncryptedValue
-from projetv0_voice.persistence.commands import (
-    PersistenceError,
-    canonical_operation_bytes,
-    decode_operation_v2,
-    operation_aad,
-)
-from projetv0_voice.persistence.schema import LOCAL_AUDIO_CHOICE_MIGRATION_SQL
 
 
 def terminal(*, revoke=False, last=0, total=8000, reason="complete", operation_id=2000):
@@ -328,10 +328,9 @@ async def test_terminal_historical_seven_migrates_atomically_with_unknown_accoun
         if name == "after_audio_terminal_migration_before_commit":
             raise RuntimeError("owned-terminal-migration-fault")
 
-    from test_audio_writer import KEY
-
     from projetv0_voice.crypto import CryptoKeyring
     from projetv0_voice.persistence.writer import PersistenceWriter
+    from tests.unit.test_audio_writer import KEY
 
     refused = PersistenceWriter(failed, CryptoKeyring({1: KEY}, active_version=1),
                                 contract_version=2, failpoint=fail_upgrade,
@@ -418,7 +417,7 @@ async def test_terminal_finish_seals_cached_and_queued_chunk_admission(tmp_path)
 
 @pytest.mark.asyncio
 async def test_terminal_gc_preserves_unknown_ack_then_collects_exact_eligible_slots(tmp_path):
-    from test_postgres_sink import sink_with_rows
+    from tests.contract.test_postgres_sink import sink_with_rows
 
     path = tmp_path / "terminal-gc.sqlite"
     clock = [NOW]

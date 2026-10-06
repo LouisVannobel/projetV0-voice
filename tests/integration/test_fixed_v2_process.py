@@ -12,21 +12,6 @@ from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
-from test_config import manifest_data, write_bundle
-from test_postgres_sink import sink_with_rows
-from test_sparra_admission import (
-    DID,
-    ControlledProvider,
-    committed,
-    event,
-    policy,
-)
-from test_sparra_admission import (
-    NOW as LEGACY_NOW,
-)
-from test_sparra_admission import (
-    snapshot as legacy_snapshot,
-)
 
 from projetv0_voice.admission import CallRegistry
 from projetv0_voice.audio_contract import BeginCallSnapshotV2
@@ -35,6 +20,21 @@ from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.persistence.relay import OutboxRelay
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.session import CallIdentity
+from tests.contract.test_postgres_sink import sink_with_rows
+from tests.unit.test_config import manifest_data, write_bundle
+from tests.unit.test_sparra_admission import (
+    DID,
+    ControlledProvider,
+    committed,
+    event,
+    policy,
+)
+from tests.unit.test_sparra_admission import (
+    NOW as LEGACY_NOW,
+)
+from tests.unit.test_sparra_admission import (
+    snapshot as legacy_snapshot,
+)
 
 NOW = LEGACY_NOW.replace(microsecond=123000)
 KEY = bytes(range(32))

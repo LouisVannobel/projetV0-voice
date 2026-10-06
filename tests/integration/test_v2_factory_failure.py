@@ -10,8 +10,14 @@ from uuid import uuid4
 
 import pytest
 from pipecat.runner.types import TelnyxCallData
-from test_fixed_v2_process import NOW, registry_case
-from test_process_session_factory import (
+
+from projetv0_voice.crypto import EncryptedValue
+from projetv0_voice.metrics import RuntimeMetrics
+from projetv0_voice.persistence.commands import decode_operation_v2, operation_aad_from_metadata
+from projetv0_voice.session import CallSession
+from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
+from tests.integration.test_fixed_v2_process import NOW, registry_case
+from tests.integration.test_process_session_factory import (
     _AudioAdmission,
     _factory,
     _metric_points,
@@ -19,14 +25,8 @@ from test_process_session_factory import (
     _real_process_factory,
     _Registrar,
 )
-from test_sparra_admission import DID, committed, event
-from test_sparra_admission import snapshot as legacy_snapshot
-
-from projetv0_voice.crypto import EncryptedValue
-from projetv0_voice.metrics import RuntimeMetrics
-from projetv0_voice.persistence.commands import decode_operation_v2, operation_aad_from_metadata
-from projetv0_voice.session import CallSession
-from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
+from tests.unit.test_sparra_admission import DID, committed, event
+from tests.unit.test_sparra_admission import snapshot as legacy_snapshot
 
 
 @asynccontextmanager

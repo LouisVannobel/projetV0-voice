@@ -10,7 +10,12 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 import pytest
-from test_audio_writer import (
+
+from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.persistence.commands import PersistenceError, encrypt_audio_operation
+from projetv0_voice.persistence.schema import LOCAL_AUDIO_SCHEMA_SQL, LOCAL_AUDIO_SCHEMA_VERSION
+from projetv0_voice.persistence.writer import LocalCallLifecycleFacts, PersistenceWriter
+from tests.unit.test_audio_writer import (
     CALL,
     DEADLINE,
     GENERATION,
@@ -24,11 +29,6 @@ from test_audio_writer import (
     seed_admission,
     snapshot,
 )
-
-from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.persistence.commands import PersistenceError, encrypt_audio_operation
-from projetv0_voice.persistence.schema import LOCAL_AUDIO_SCHEMA_SQL, LOCAL_AUDIO_SCHEMA_VERSION
-from projetv0_voice.persistence.writer import LocalCallLifecycleFacts, PersistenceWriter
 
 
 def historical_v6(path):

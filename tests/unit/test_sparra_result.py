@@ -7,9 +7,9 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from test_sparra_admission import NOW, committed, event, start
 
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
+from tests.unit.test_sparra_admission import NOW, committed, event, start
 
 
 def capture(writer, call_id, number, text="Pouvez-vous me rappeler ?"):
@@ -690,13 +690,12 @@ async def test_content_stop_reserves_phone_fence_before_first_writer_await(tmp_p
 async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_generation(
     tmp_path, reason
 ):
-    from test_sparra_admission import DID, ControlledProvider, policy, snapshot
-
     from projetv0_voice.admission import CallRegistry
     from projetv0_voice.lifecycle import RuntimeSupervisor
     from projetv0_voice.persistence.postgres_sink import CallErasureLease
     from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
     from projetv0_voice.persistence.writer import PersistenceWriter
+    from tests.unit.test_sparra_admission import DID, ControlledProvider, policy, snapshot
 
     original_registry, original_writer, original_worker, _ = await start(tmp_path)
     await committed(original_registry, original_writer, event())
@@ -1017,10 +1016,9 @@ async def test_cleanup_ack_has_no_registry_caller_pin_or_completed_future(tmp_pa
 
 @pytest.mark.asyncio
 async def test_cleanup_ack_joins_inflight_begin_before_releasing_its_content(tmp_path):
-    from test_sparra_admission import snapshot
-
     from projetv0_voice.persistence.postgres_sink import CallErasureLease
     from projetv0_voice.persistence.relay import maintain_call_content
+    from tests.unit.test_sparra_admission import snapshot
 
     entered, cancelled = asyncio.Event(), asyncio.Event()
 

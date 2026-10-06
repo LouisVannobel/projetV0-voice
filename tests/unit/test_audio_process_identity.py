@@ -6,13 +6,13 @@ import sqlite3
 from uuid import UUID, uuid4
 
 import pytest
-from test_audio_writer import CALL, DEADLINE, GENERATION, NOW, WORKSPACE, owned, snapshot
 
 from projetv0_voice.audio_contract import VoiceOperationV2
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.models import CallUpsertPayloadV1, DisclosureEvidenceV1
 from projetv0_voice.persistence.commands import PersistenceError, canonical_operation_bytes
 from projetv0_voice.persistence.writer import LocalCallAdmissionFacts, PersistenceWriter
+from tests.unit.test_audio_writer import CALL, DEADLINE, GENERATION, NOW, WORKSPACE, owned, snapshot
 
 AGENT = "native-agent"
 DEPLOYMENT = "native-deployment"

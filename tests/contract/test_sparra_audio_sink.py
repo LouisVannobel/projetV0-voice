@@ -11,16 +11,6 @@ from uuid import UUID
 import pytest
 from psycopg.types.json import Jsonb, JsonbDumper
 from pydantic import ValidationError
-from test_postgres_sink import (
-    NOW,
-    SqlstateError,
-    exception_graph,
-    ingest_result,
-    operation,
-    sink_with_rows,
-)
-from test_sparra_sink import routing
-from test_sparra_sink import snapshot as legacy_snapshot
 
 from projetv0_voice import audio_contract
 from projetv0_voice.audio_contract import VoiceOperationV2
@@ -38,6 +28,16 @@ from projetv0_voice.persistence.postgres_sink import (
     OperationSinkPermanentError,
 )
 from projetv0_voice.persistence.relay import OutboxRelay
+from tests.contract.test_postgres_sink import (
+    NOW,
+    SqlstateError,
+    exception_graph,
+    ingest_result,
+    operation,
+    sink_with_rows,
+)
+from tests.contract.test_sparra_sink import routing
+from tests.contract.test_sparra_sink import snapshot as legacy_snapshot
 
 CALL_ID = UUID(int=2)
 WORKSPACE_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -291,8 +291,8 @@ async def test_v2_cancellation_rolls_back_returns_pool_and_allows_close():
 async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_before_ack(
     tmp_path, monkeypatch,
 ):
-    from test_audio_writer import NOW as WRITER_NOW
-    from test_audio_writer import authenticate_audio, chunk, owned, seed_admission
+    from tests.unit.test_audio_writer import NOW as WRITER_NOW
+    from tests.unit.test_audio_writer import authenticate_audio, chunk, owned, seed_admission
 
     path = tmp_path / "voice.sqlite"
     clock = [WRITER_NOW]
@@ -370,7 +370,7 @@ async def test_fixed_v2_restart_replays_identical_cipher_and_real_sink_codec_bef
 
 @pytest.mark.asyncio
 async def test_audio_expiry_and_erasure_preserve_end_and_ack_before_finite_pin_gc(tmp_path):
-    from test_audio_writer import (
+    from tests.unit.test_audio_writer import (
         CALL,
         DEADLINE,
         GENERATION,
@@ -380,8 +380,8 @@ async def test_audio_expiry_and_erasure_preserve_end_and_ack_before_finite_pin_g
         owned,
         seed_admission,
     )
-    from test_audio_writer import NOW as WRITER_NOW
-    from test_audio_writer import snapshot as writer_snapshot
+    from tests.unit.test_audio_writer import NOW as WRITER_NOW
+    from tests.unit.test_audio_writer import snapshot as writer_snapshot
 
     path = tmp_path / "voice.sqlite"
     clock = [WRITER_NOW]

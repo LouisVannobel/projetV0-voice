@@ -13,10 +13,6 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from test_audio_writer import owned
-from test_disclosure import _TEST_RUNTIME_METRICS, _local_choice_wait
-from test_fixed_v2_process import NOW, registry_case
-from test_sparra_admission import committed, event
 
 from projetv0_voice.audio_contract import VoiceOperationV2
 from projetv0_voice.crypto import EncryptedValue
@@ -26,6 +22,10 @@ from projetv0_voice.persistence.relay import OutboxRelay
 from projetv0_voice.pipeline import FirstFailure
 from projetv0_voice.session import CallIdentity, CallSession, TurnRecorder, _TerminalOutcome
 from projetv0_voice.session_factory import _RegistryTerminalizer
+from tests.integration.test_disclosure import _TEST_RUNTIME_METRICS, _local_choice_wait
+from tests.integration.test_fixed_v2_process import NOW, registry_case
+from tests.unit.test_audio_writer import owned
+from tests.unit.test_sparra_admission import committed, event
 
 
 @asynccontextmanager

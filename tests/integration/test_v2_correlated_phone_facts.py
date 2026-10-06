@@ -12,9 +12,6 @@ from uuid import uuid4, uuid5
 
 import pytest
 from pydantic import SecretStr
-from test_fixed_v2_process import NOW
-from test_sparra_admission import TARGET, event
-from test_v2_final_call_freeze import final_case, frozen_bytes
 
 from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.crypto import EncryptedValue
@@ -26,6 +23,9 @@ from projetv0_voice.persistence.commands import (
 )
 from projetv0_voice.persistence.relay import OutboxRelay
 from projetv0_voice.telnyx.webhooks import ResolvedWebhook
+from tests.integration.test_fixed_v2_process import NOW
+from tests.integration.test_v2_final_call_freeze import final_case, frozen_bytes
+from tests.unit.test_sparra_admission import TARGET, event
 
 
 @asynccontextmanager

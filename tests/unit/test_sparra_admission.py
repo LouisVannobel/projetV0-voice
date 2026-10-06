@@ -824,7 +824,7 @@ async def test_normal_answer_and_early_streaming_share_one_begin_future(tmp_path
 
 
 def test_manifest_extension_is_strict_and_legacy_serialization_omits_absence():
-    from test_config import manifest_data
+    from tests.unit.test_config import manifest_data
 
     legacy = config.AgentManifestV1.model_validate(manifest_data())
     assert "sparra" not in legacy.model_dump()
@@ -1102,7 +1102,7 @@ async def test_bound_target_failure_is_distinct_and_wrong_leg_cannot_take_over(t
 async def test_real_signed_webhook_extracts_binding_and_nullable_caller_before_admission(
     tmp_path, monkeypatch, caller
 ):
-    from test_telnyx_webhooks import event_body, verifier_for
+    from tests.unit.test_telnyx_webhooks import event_body, verifier_for
 
     body = event_body(
         occurred_at=NOW.isoformat(),

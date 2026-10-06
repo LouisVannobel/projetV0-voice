@@ -19,7 +19,6 @@ from pipecat.processors.audio import audio_buffer_processor as native_audio
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameProcessor, FrameProcessorSetup
 from pipecat.utils.asyncio.task_manager import TaskManager
-from test_audio_writer import authenticate_audio
 
 from projetv0_voice import audio_capture
 from projetv0_voice.audio_contract import (
@@ -29,6 +28,7 @@ from projetv0_voice.audio_contract import (
 )
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
 from projetv0_voice.persistence.writer import LocalCallAdmissionFacts, PersistenceWriter
+from tests.unit.test_audio_writer import authenticate_audio
 
 NOW = datetime(2026, 10, 6, 10, tzinfo=UTC)
 DEADLINE = NOW + timedelta(days=30)

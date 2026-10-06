@@ -993,10 +993,9 @@ def test_linux_kernel_accepts_real_task11_export_without_importing_producer() ->
 @pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
 def test_linux_kernel_old_profile_cannot_authorize_new_explicit2_owned_bundle() -> None:
     """Real file/profile loaders; rejection is not positive V2 release qualification."""
-    from test_config import manifest_data, write_bundle
-
     from projetv0_voice.config import load_agent_manifest
     from projetv0_voice.production_wiring import _bundle_digest, build_production_factories
+    from tests.unit.test_config import manifest_data, write_bundle
 
     fixture = Path("tests/fixtures/qualified-deployment-profile-v1.json").read_bytes()
     old_profile = QualifiedDeploymentProfileV1.model_validate_json(fixture)

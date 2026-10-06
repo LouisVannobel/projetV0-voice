@@ -20,19 +20,6 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
-from test_audio_writer import (
-    CALL,
-    DEADLINE,
-    GENERATION,
-    NOW,
-    authenticate_audio,
-    owned,
-    seed_admission,
-)
-from test_disclosure import _TEST_RUNTIME_METRICS, _local_choice_wait, pipeline_module
-from test_local_audio_capture import accept_local, capture_case
-from test_sparra_admission import committed, event, start
-from test_sparra_result import capture as legacy_capture
 
 from projetv0_voice.audio_contract import VoiceOperationV2
 from projetv0_voice.crypto import EncryptedValue
@@ -50,6 +37,23 @@ from projetv0_voice.persistence.commands import (
 )
 from projetv0_voice.pipeline import FirstFailure
 from projetv0_voice.session import TurnRecorder
+from tests.integration.test_disclosure import (
+    _TEST_RUNTIME_METRICS,
+    _local_choice_wait,
+    pipeline_module,
+)
+from tests.integration.test_local_audio_capture import accept_local, capture_case
+from tests.unit.test_audio_writer import (
+    CALL,
+    DEADLINE,
+    GENERATION,
+    NOW,
+    authenticate_audio,
+    owned,
+    seed_admission,
+)
+from tests.unit.test_sparra_admission import committed, event, start
+from tests.unit.test_sparra_result import capture as legacy_capture
 
 
 def make_recorder(identity, writer, keyring, failure):
@@ -166,7 +170,7 @@ async def test_turn_v2_native_truncation_count_and_retained_map_bounds(tmp_path)
             call_id=CALL, deployment_id="agent-a", routing=object(), begin_snapshot=None,
             generation=SimpleNamespace(generation=GENERATION),
         )
-        from test_audio_writer import snapshot
+        from tests.unit.test_audio_writer import snapshot
         identity.begin_snapshot = snapshot()
         failure = FirstFailure()
         recorder = make_recorder(identity, writer, keyring, failure)

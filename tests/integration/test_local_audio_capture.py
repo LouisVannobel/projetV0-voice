@@ -23,15 +23,6 @@ from pipecat.frames.frames import (
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import STTService
-from test_disclosure import (
-    _TEST_RUNTIME_METRICS,
-    _DisclosureRelay,
-    _local_choice_wait,
-    _PacedDisclosureOutput,
-    _uuids,
-    pipeline_module,
-    session_module,
-)
 
 from projetv0_voice import audio_capture
 from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
@@ -45,6 +36,15 @@ from projetv0_voice.models import RoutingV1
 from projetv0_voice.persistence.commands import decode_operation_v2, operation_aad_from_metadata
 from projetv0_voice.persistence.writer import LocalCallAdmissionFacts, PersistenceWriter
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
+from tests.integration.test_disclosure import (
+    _TEST_RUNTIME_METRICS,
+    _DisclosureRelay,
+    _local_choice_wait,
+    _PacedDisclosureOutput,
+    _uuids,
+    pipeline_module,
+    session_module,
+)
 
 NOW = datetime.now(UTC).replace(microsecond=0)
 CALL, WORKSPACE, RECORDING, GENERATION = (UUID(int=value) for value in (1, 2, 3, 4))

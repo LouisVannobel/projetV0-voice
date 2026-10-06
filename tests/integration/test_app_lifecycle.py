@@ -1380,7 +1380,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     order: list[str] = []
     recording_requests = []
     control_actions: list[str] = []
-    from test_postgres_sink import sink_with_rows
+    from tests.contract.test_postgres_sink import sink_with_rows
 
     native_sink, native_pool, native_connection, _pool_factory = sink_with_rows([])
 
@@ -1494,7 +1494,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     def inference_factories(_key, _profile, language):
         order.append(f"inference:{language}")
         if company_case == "local_audio_v2":
-            from test_process_session_factory import _Llm, _Processor, _SttClient
+            from tests.integration.test_process_session_factory import _Llm, _Processor, _SttClient
 
             return RuntimeInferenceFactories(
                 stt_http_client_factory=lambda: _SttClient(order),
@@ -1577,13 +1577,16 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         import sqlite3
 
         from pipecat.runner.types import TelnyxCallData
-        from test_process_session_factory import _AudioAdmission, _OfflineTransport
-        from test_sparra_admission import event
 
         from projetv0_voice import session as session_module
         from projetv0_voice.audio_capture import LocalAudioCapture
         from projetv0_voice.audio_contract import BeginCallSnapshotV2
         from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
+        from tests.integration.test_process_session_factory import (
+            _AudioAdmission,
+            _OfflineTransport,
+        )
+        from tests.unit.test_sparra_admission import event
 
         bound = []
         native_constructor = graph.session_factory._session_factory

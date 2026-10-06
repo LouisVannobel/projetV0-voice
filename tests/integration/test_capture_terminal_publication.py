@@ -9,16 +9,6 @@ import sqlite3
 
 import pytest
 from pipecat.frames.frames import EndFrame
-from test_disclosure import _local_choice_wait
-from test_local_audio_capture import (
-    CALL,
-    GENERATION,
-    NOW,
-    accept_local,
-    caller_frames,
-    capture_case,
-)
-from test_postgres_sink import sink_with_rows
 
 from projetv0_voice import audio_capture
 from projetv0_voice.crypto import EncryptedValue
@@ -29,6 +19,16 @@ from projetv0_voice.persistence.commands import (
 )
 from projetv0_voice.persistence.relay import OutboxRelay
 from projetv0_voice.persistence.writer import PersistenceWriter
+from tests.contract.test_postgres_sink import sink_with_rows
+from tests.integration.test_disclosure import _local_choice_wait
+from tests.integration.test_local_audio_capture import (
+    CALL,
+    GENERATION,
+    NOW,
+    accept_local,
+    caller_frames,
+    capture_case,
+)
 
 
 def terminal_row(case, kind):
