@@ -87,6 +87,15 @@ class PreparedAudioOperation:
     envelope_size: int
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedControlOperationV2:
+    operation: VoiceOperationV2 = field(repr=False)
+    plaintext: bytes = field(repr=False)
+    aad: bytes = field(repr=False)
+    encrypted: EncryptedValue = field(repr=False)
+    envelope_size: int
+
+
 @overload
 def canonical_operation_bytes(operation: VoiceOperationV1) -> bytes: ...
 
@@ -191,6 +200,25 @@ def encrypt_audio_operation(
         plaintext=plaintext,
         aad=aad,
         encrypted=encrypted,
+        envelope_size=envelope_size,
+    )
+
+
+def encrypt_control_operation_v2(
+    operation: VoiceOperationV2, keyring: CryptoKeyring
+) -> PreparedControlOperationV2:
+    if not isinstance(operation, VoiceOperationV2) or operation.kind != "call.upsert":
+        raise CommandSerializationError("invalid_control_v2_command")
+    plaintext = canonical_operation_bytes(operation)
+    if len(plaintext) > MAX_ENCRYPTED_COMMAND_BYTES:
+        raise EncryptedCommandTooLarge("encrypted_command_too_large")
+    aad = operation_aad(operation)
+    encrypted = keyring.encrypt(plaintext, aad=aad)
+    envelope_size = len(aad) + AES_GCM_NONCE_BYTES + len(encrypted.ciphertext)
+    if envelope_size > MAX_ENCRYPTED_COMMAND_BYTES:
+        raise EncryptedCommandTooLarge("encrypted_command_too_large")
+    return PreparedControlOperationV2(
+        operation=operation, plaintext=plaintext, aad=aad, encrypted=encrypted,
         envelope_size=envelope_size,
     )
 

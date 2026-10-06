@@ -18,11 +18,17 @@ from projetv0_voice.audio_contract import (
     canonical_audio_chunk_aad,
 )
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
-from projetv0_voice.models import CallUpsertPayloadV1, RecordingUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.models import (
+    CallUpsertPayloadV1,
+    DisclosureEvidenceV1,
+    RecordingUpsertPayloadV1,
+    VoiceOperationV1,
+)
 from projetv0_voice.persistence.commands import (
     PersistenceCommand,
     PersistenceError,
     canonical_operation_bytes,
+    decode_operation,
     decode_operation_v2,
     encrypt_audio_operation,
     operation_aad,
@@ -404,3 +410,175 @@ async def test_fixed_v2_provenance_refusal_never_repairs_or_mutates_database(tmp
     assert await refused.wait_ready() is False
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
     assert path.read_bytes() == before
+
+
+def active_control_v2(*, gate=False):
+    started = NOW + timedelta(seconds=1)
+    completed = NOW + timedelta(seconds=2)
+    opened = NOW + timedelta(seconds=3) if gate else None
+    return VoiceOperationV2(
+        schema_version=2, operation_id=UUID(int=801 if gate else 800), deployment_id="agent-a",
+        call_id=CALL, occurred_at=opened or completed, kind="call.upsert",
+        payload=CallUpsertPayloadV1(
+            telnyx_call_control_id="control-a", telnyx_call_leg_id="leg-a",
+            telnyx_call_session_id="session-a", status="active", disclosure_state="completed",
+            started_at=started, ended_at=None, end_reason=None, retention_until=DEADLINE,
+            disclosure_evidence=DisclosureEvidenceV1(
+                schema_version=1, started_at=started, completed_at=completed, failed_at=None,
+                input_gate_opened_at=opened,
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_v2_fresh_disclosure_and_gate_commit_exact_crypto_and_immutable_replay(
+    tmp_path,
+):
+    path = tmp_path / "voice.sqlite"
+    now = NOW + timedelta(seconds=3)
+    first, gated = active_control_v2(), active_control_v2(gate=True)
+    async with owned(path, contract_version=2, utcnow=lambda: now) as (writer, keyring):
+        await seed_admission(writer)
+        await writer.publish_control_v2(first, generation=GENERATION)
+        first_facts = await writer.read_call_lifecycle(CALL)
+        assert first_facts.started_at == first.payload.started_at
+        assert first_facts.disclosure_evidence == first.payload.disclosure_evidence
+        assert first_facts.original_ended_at is None
+        await writer.publish_control_v2(gated, generation=GENERATION)
+        with sqlite3.connect(path) as db:
+            frozen = db.execute(
+                "SELECT op_id,schema_version,kind,key_version,nonce,ciphertext FROM outbox "
+                "ORDER BY queue_id"
+            ).fetchall()
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert len(frozen) == 2
+        for row, operation in zip(frozen, (first, gated), strict=True):
+            assert row[:3] == (str(operation.operation_id), 2, "call.upsert")
+            plaintext = keyring.decrypt(EncryptedValue(*row[3:]), aad=operation_aad(operation))
+            assert plaintext == canonical_operation_bytes(operation)
+            assert decode_operation_v2(plaintext) == operation
+        await writer.publish_control_v2(first, generation=GENERATION)
+        await writer.publish_control_v2(gated, generation=GENERATION)
+        with sqlite3.connect(path) as db:
+            assert db.execute(
+                "SELECT op_id,schema_version,kind,key_version,nonce,ciphertext FROM outbox "
+                "ORDER BY queue_id"
+            ).fetchall() == frozen
+        facts = await writer.read_call_lifecycle(CALL)
+        assert facts.admission_generation == GENERATION
+        assert facts.admitted_at == NOW and facts.retention_until == DEADLINE
+        assert facts.disclosure_evidence.input_gate_opened_at == now
+        assert facts.original_ended_at is None and facts.recording_enabled is False
+        claimed = await writer.read_relay_batch(batch_size=2, now=now, lease_seconds=30)
+        assert tuple(item.operation for item in claimed) == (first, gated)
+        assert not writer.is_degraded
+
+
+@pytest.mark.asyncio
+async def test_control_v2_default_v1_refuses_before_queue_and_preserves_legacy_bytes(tmp_path):
+    path = tmp_path / "voice.sqlite"
+    operation = active_control_v2()
+    legacy = VoiceOperationV1.model_validate({
+        **operation.model_dump(mode="python"), "schema_version": 1,
+    })
+    async with owned(path) as (writer, keyring):
+        with pytest.raises(PersistenceError):
+            await writer.publish_control_v2(operation, generation=GENERATION)
+        assert writer.queue_size == 0 and not writer.is_degraded
+        await writer.commit_control(PersistenceCommand("outbox", {"operation": legacy}, None))
+        with sqlite3.connect(path) as db:
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+            row = db.execute(
+                "SELECT schema_version,key_version,nonce,ciphertext FROM outbox"
+            ).fetchone()
+        assert row[0] == 1
+        plaintext = keyring.decrypt(EncryptedValue(*row[1:]), aad=operation_aad(legacy))
+        assert plaintext == canonical_operation_bytes(legacy)
+        assert decode_operation(plaintext) == legacy
+        assert await writer.quick_check()
+
+
+@pytest.mark.asyncio
+async def test_control_v2_rejects_v1_and_noncall_without_mutation_or_degradation(tmp_path):
+    async with owned(tmp_path / "voice.sqlite", contract_version=2) as (writer, keyring):
+        await seed_admission(writer)
+        legacy = VoiceOperationV1.model_validate({
+            **active_control_v2().model_dump(mode="python"), "schema_version": 1,
+        })
+        before = await writer.read_call_lifecycle(CALL)
+        for operation in (legacy, chunk(keyring)):
+            with pytest.raises(PersistenceError):
+                await writer.publish_control_v2(operation, generation=GENERATION)
+            assert writer.queue_size == 0 and not writer.is_degraded
+        assert await writer.read_call_lifecycle(CALL) == before
+        assert await writer.oldest_outbox_created_at() is None
+        assert await writer.quick_check()
+
+
+@pytest.mark.asyncio
+async def test_control_v2_requires_original_generation_retention_and_provider_identity(tmp_path):
+    now = NOW + timedelta(seconds=3)
+    async with owned(tmp_path / "voice.sqlite", contract_version=2, utcnow=lambda: now) as (
+        writer, _keyring,
+    ):
+        await seed_admission(writer)
+        original = active_control_v2()
+        wire = original.model_dump(mode="python")
+        wrong_retention = VoiceOperationV2.model_validate({
+            **wire, "payload": {**wire["payload"], "retention_until": DEADLINE + timedelta(days=1)},
+        })
+        wrong_identity = VoiceOperationV2.model_validate({
+            **wire, "payload": {**wire["payload"], "telnyx_call_session_id": "other-session"},
+        })
+        before = await writer.read_call_lifecycle(CALL)
+        for operation, generation in (
+            (original, UUID(int=999)), (wrong_retention, GENERATION), (wrong_identity, GENERATION),
+        ):
+            with pytest.raises(PersistenceError):
+                await writer.publish_control_v2(operation, generation=generation)
+            assert not writer.is_degraded
+        assert await writer.read_call_lifecycle(CALL) == before
+        assert await writer.oldest_outbox_created_at() is None
+        assert await writer.quick_check()
+
+
+@pytest.mark.asyncio
+async def test_control_v2_keeps_the_original_configuration_pin_after_revision_conflict(tmp_path):
+    path = tmp_path / "voice.sqlite"
+    now = NOW + timedelta(seconds=3)
+    async with owned(path, contract_version=2, utcnow=lambda: now) as (writer, _keyring):
+        await seed_admission(writer)
+        changed = BeginCallSnapshotV2.model_validate({
+            **snapshot().model_dump(mode="python"), "configuration_revision": 8,
+        })
+        with pytest.raises(PersistenceError, match="audio_pin_unavailable"):
+            await writer.bind_audio_snapshot(changed, generation=GENERATION)
+        with sqlite3.connect(path) as db:
+            assert db.execute(
+                "SELECT generation,configuration_revision,retention_until FROM local_audio_pin"
+            ).fetchone() == (str(GENERATION), 7, DEADLINE.isoformat().replace("+00:00", "Z"))
+        await writer.publish_control_v2(active_control_v2(), generation=GENERATION)
+        assert not writer.is_degraded and await writer.quick_check()
+
+
+@pytest.mark.asyncio
+async def test_control_v2_expiry_and_committed_erase_refuse_without_false_phone_end(tmp_path):
+    clock = [NOW + timedelta(seconds=3)]
+    async with owned(tmp_path / "voice.sqlite", contract_version=2, utcnow=lambda: clock[0]) as (
+        writer, _keyring,
+    ):
+        await seed_admission(writer)
+        operation = active_control_v2()
+        clock[0] = DEADLINE
+        with pytest.raises(PersistenceError):
+            await writer.publish_control_v2(operation, generation=GENERATION)
+        assert not writer.is_degraded
+        clock[0] = NOW
+        await writer.erase_call_content(CALL, now=clock[0])
+        with pytest.raises(PersistenceError):
+            await writer.publish_control_v2(operation, generation=GENERATION)
+        facts = await writer.read_call_lifecycle(CALL)
+        assert facts.content_erased and facts.original_ended_at is None
+        assert await writer.oldest_outbox_created_at() is None
+        assert not writer.is_degraded and await writer.quick_check()

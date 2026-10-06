@@ -62,11 +62,14 @@ from projetv0_voice.persistence.commands import (
     PersistenceCommand,
     PersistenceError,
     PreparedAudioOperation,
+    PreparedControlOperationV2,
     canonical_operation_bytes,
     decode_operation,
     decode_operation_v2,
     encrypt_audio_operation,
+    encrypt_control_operation_v2,
     encrypt_operation,
+    operation_aad,
     operation_aad_from_metadata,
     require_operation,
 )
@@ -975,6 +978,21 @@ class PersistenceWriter:
         if not isinstance(value, _AudioPin):
             raise PersistenceError("audio_pin_unavailable")
         self._audio_pins[value.call_id] = value
+
+    async def publish_control_v2(self, operation: VoiceOperationV2, *, generation: UUID) -> None:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "call.upsert"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or not isinstance(generation, UUID)
+        ):
+            raise PersistenceError("control_v2_unavailable")
+        prepared = encrypt_control_operation_v2(operation, self._keyring)
+        published = await self._content_request(
+            "control_v2", prepared=prepared, generation=generation
+        )
+        if published is not True:
+            raise PersistenceError("control_v2_refused")
 
     def offer_audio_chunk(self, operation: VoiceOperationV2) -> bool:
         if (
@@ -2031,6 +2049,8 @@ class PersistenceWriter:
     async def _apply_content_command(self, values: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
         action = values.get("action")
+        if action == "control_v2":
+            return await self._apply_control_v2_command(values)
         if action in {"audio_bind", "audio_chunk"}:
             return await self._apply_audio_command(values)
         if action == "recording_head":
@@ -2387,7 +2407,69 @@ class PersistenceWriter:
             (json.dumps(values, sort_keys=True, separators=(",", ":")), str(facts.call_id)),
         )
 
-    async def _merge_lifecycle_operation(self, operation: VoiceOperationV1) -> None:
+    async def _apply_control_v2_command(self, values: Mapping[str, object]) -> bool:
+        prepared = values.get("prepared")
+        generation = values.get("generation")
+        if (
+            self._contract_version != 2 or not isinstance(prepared, PreparedControlOperationV2)
+            or not isinstance(generation, UUID)
+        ):
+            raise CommandSerializationError("invalid_control_v2_command")
+        operation = prepared.operation
+        payload = operation.payload
+        if operation.kind != "call.upsert" or not isinstance(payload, CallUpsertPayloadV1):
+            raise CommandSerializationError("invalid_control_v2_command")
+        facts = await self._read_call_lifecycle(operation.call_id)
+        pin = await self._read_audio_pin(operation.call_id)
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT call_control_id,tenant_id,agent_id,created_at FROM call_leases WHERE call_id=?",
+            (str(operation.call_id),),
+        )
+        leases = list(await cursor.fetchall())
+        await cursor.close()
+        if (
+            facts is None or pin is None or facts.admission_generation != generation
+            or pin.generation != generation or pin.admitted_at != facts.admitted_at
+            or pin.retention_until != facts.retention_until
+            or payload.retention_until != facts.retention_until
+            or facts.retention_until <= self._utcnow() or facts.transfer_fenced
+            or await self._content_denied(operation.call_id)
+            or operation.deployment_id != pin.deployment_id or len(leases) != 1
+            or leases[0][0] != payload.telnyx_call_control_id
+            or leases[0][1] != str(pin.workspace_id) or leases[0][2] != pin.deployment_id
+            or _parse_datetime(leases[0][3]) != facts.admitted_at
+            or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
+            or payload.telnyx_call_session_id != facts.telnyx_call_session_id
+        ):
+            return False
+        if (
+            prepared.aad != operation_aad(operation)
+            or prepared.plaintext != canonical_operation_bytes(operation)
+            or self._keyring.decrypt(prepared.encrypted, aad=prepared.aad) != prepared.plaintext
+        ):
+            raise CommandSerializationError("invalid_control_v2_command")
+        existing = await self._load_operation_by_id(str(operation.operation_id))
+        if existing is not None:
+            if canonical_operation_bytes(existing) != prepared.plaintext:
+                raise CommandConflictError("operation_identity_conflict")
+            return True
+        await self._merge_lifecycle_operation(operation)
+        encrypted = prepared.encrypted
+        created = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,crypto_version,"
+            "key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind, 2,
+             str(operation.call_id), CRYPTO_VERSION, encrypted.key_version, encrypted.nonce,
+             encrypted.ciphertext, created, created),
+        )
+        return True
+
+    async def _merge_lifecycle_operation(
+        self, operation: VoiceOperationV1 | VoiceOperationV2
+    ) -> None:
         facts = await self._read_call_lifecycle(operation.call_id)
         if facts is None or not isinstance(operation.payload, CallUpsertPayloadV1):
             return
