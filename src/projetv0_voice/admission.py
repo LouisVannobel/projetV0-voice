@@ -19,7 +19,7 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
 
-from projetv0_voice.audio_contract import BeginCallSnapshotV2
+from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1, SparraManifestV1
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
@@ -3254,19 +3254,16 @@ class CallRegistry:
         entry = authority._entry
         if authority._closed_at >= entry.initiated_at + self._retention_delta:
             return None
+        if self._operation_contract_version == 2 and not isinstance(
+            entry.begin_snapshot, BeginCallSnapshotV2
+        ):
+            return None
         started_at = entry.claimed_at or entry.answered_at
         read_facts = getattr(self._writer, "read_call_lifecycle", None)
         facts = await read_facts(entry.call_id) if callable(read_facts) else None
         if facts is not None:
             started_at = facts.started_at or started_at
-        operation = VoiceOperationV1(
-            schema_version=1,
-            operation_id=authority.completion_token,
-            deployment_id=self._deployment_id,
-            call_id=entry.call_id,
-            occurred_at=authority._closed_at,
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
@@ -3292,8 +3289,16 @@ class CallRegistry:
                         ),
                     )
                 ),
-            ),
         )
+        operation: VoiceOperationV1 | VoiceOperationV2
+        if self._operation_contract_version == 2:
+            operation = VoiceOperationV2(schema_version=2, operation_id=authority.completion_token,
+                deployment_id=self._deployment_id, call_id=entry.call_id,
+                occurred_at=authority._closed_at, kind="call.upsert", payload=payload)
+        else:
+            operation = VoiceOperationV1(schema_version=1, operation_id=authority.completion_token,
+                deployment_id=self._deployment_id, call_id=entry.call_id,
+                occurred_at=authority._closed_at, kind="call.upsert", payload=payload)
         commit_control = getattr(self._writer, "commit_control", None)
         if not callable(commit_control):
             self._note_terminal_failure("terminal_persistence_failed")
@@ -3301,7 +3306,15 @@ class CallRegistry:
         cancellation: asyncio.CancelledError | None = None
         while True:
             try:
-                await commit_control(PersistenceCommand("outbox", {"operation": operation}, None))
+                if isinstance(operation, VoiceOperationV2):
+                    if not isinstance(self._writer, PersistenceWriter):
+                        raise RuntimeError("terminal_persistence_failed")
+                    await self._writer.freeze_call_publication_v2(operation, None,
+                        generation=authority._generation, provider_callback=None)
+                else:
+                    await commit_control(
+                        PersistenceCommand("outbox", {"operation": operation}, None)
+                    )
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error

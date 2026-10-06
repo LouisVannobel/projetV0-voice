@@ -2203,9 +2203,7 @@ class PersistenceWriter:
             await self._queue_frozen_publication_v2(existing)
             return existing
         retained = await self._retained_call(call_id)
-        changes: dict[str, object] = {
-            "transcript_loss_count": retained.loss_count, "message_result": None,
-        }
+        changes: dict[str, object] = {"transcript_loss_count": retained.loss_count}
         result = values.get("message_result")
         permitted = values.get("result_permitted")
         if (
@@ -2222,9 +2220,12 @@ class PersistenceWriter:
                 )
             except ValueError:
                 return False
-        operation = operation.model_copy(
-            update={"payload": payload.model_copy(update=changes)}
-        )
+        payload_values = payload.model_dump(mode="python", exclude={"message_result"})
+        payload_values.update(changes)
+        operation = VoiceOperationV2.model_validate({
+            **operation.model_dump(mode="python"),
+            "payload": CallUpsertPayloadV1.model_validate(payload_values),
+        })
         prepared = encrypt_control_operation_v2(operation, self._keyring)
         await connection.execute(
             "INSERT INTO sparra_publications VALUES (?,?,?,?,?,?)",

@@ -63,6 +63,7 @@ def pin(call_id, routing, *, enabled=False, available=False):
 async def registry_case(
     tmp_path, *, enabled=False, available=False, reply=None, ambiguous=False,
     utcnow=lambda: NOW, failpoint=None,
+    deployment_id="fixture",
 ):
     writer = PersistenceWriter(tmp_path / "voice.sqlite", CryptoKeyring({1: KEY}, active_version=1),
                                contract_version=2, utcnow=utcnow, failpoint=failpoint)
@@ -87,8 +88,8 @@ async def registry_case(
         assert await writer.wait_ready()
         await writer.assert_sparra_compatible()
         registry = CallRegistry(
-            writer=writer, call_control=provider, tenant_id=str(WORKSPACE), agent_id="fixture",
-            deployment_id="fixture", capacity=1, lease_ttl_seconds=30,
+            writer=writer, call_control=provider, tenant_id=str(WORKSPACE), agent_id=deployment_id,
+            deployment_id=deployment_id, capacity=1, lease_ttl_seconds=30,
             stream_url="wss://fixture.invalid/media", retention_days=30,
             utcnow=utcnow, monotonic=lambda: 100.0,
             sparra=fixed_policy(), called_did=DID, begin_call=begin,

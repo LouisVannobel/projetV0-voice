@@ -17,11 +17,13 @@ from projetv0_voice.admission import (
     TerminalProposal,
     _TerminalCapability,
 )
+from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.pipeline import _CallObservers
 from projetv0_voice.qualified_profile import RuntimeDeploymentProfileV1
 from projetv0_voice.session import (
@@ -619,14 +621,12 @@ class ProcessSessionFactory:
     ) -> None:
         read_facts = getattr(self._writer, "read_call_lifecycle", None)
         facts = await read_facts(grant.call_id) if callable(read_facts) else None
-        operation = VoiceOperationV1(
-            schema_version=1,
-            operation_id=authority.completion_token,
-            deployment_id=grant.deployment_id,
-            call_id=grant.call_id,
-            occurred_at=authority._closed_at,  # noqa: SLF001
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        local_v2 = (
+            isinstance(self._writer, PersistenceWriter) and self._writer.contract_version == 2
+        )
+        if local_v2 and not isinstance(grant.begin_snapshot, BeginCallSnapshotV2):
+            return
+        payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=grant.telnyx_call_control_id,
                 telnyx_call_leg_id=grant.telnyx_call_leg_id,
                 telnyx_call_session_id=grant.telnyx_call_session_id,
@@ -650,13 +650,27 @@ class ProcessSessionFactory:
                         ),
                     )
                 ),
-            ),
         )
+        operation: VoiceOperationV1 | VoiceOperationV2
+        if local_v2:
+            operation = VoiceOperationV2(schema_version=2, operation_id=authority.completion_token,
+                deployment_id=grant.deployment_id, call_id=grant.call_id,
+                occurred_at=authority._closed_at, kind="call.upsert", payload=payload)
+        else:
+            operation = VoiceOperationV1(schema_version=1, operation_id=authority.completion_token,
+                deployment_id=grant.deployment_id, call_id=grant.call_id,
+                occurred_at=authority._closed_at, kind="call.upsert", payload=payload)
         while True:
             try:
-                await self._writer.commit_control(
-                    PersistenceCommand("outbox", {"operation": operation}, None)
-                )
+                if isinstance(operation, VoiceOperationV2):
+                    if not isinstance(self._writer, PersistenceWriter):
+                        raise RuntimeError("terminal_persistence_failed")
+                    await self._writer.freeze_call_publication_v2(operation, None,
+                        generation=grant.generation.generation, provider_callback=None)
+                else:
+                    await self._writer.commit_control(
+                        PersistenceCommand("outbox", {"operation": operation}, None)
+                    )
             except asyncio.CancelledError:
                 continue
             except BaseException:
@@ -674,14 +688,12 @@ class ProcessSessionFactory:
         started_at = entry.claimed_at or entry.answered_at
         if facts is not None:
             started_at = facts.started_at or started_at
-        operation = VoiceOperationV1(
-            schema_version=1,
-            operation_id=authority.completion_token,
-            deployment_id=self._registry._deployment_id,  # type: ignore[attr-defined]  # noqa: SLF001
-            call_id=entry.call_id,
-            occurred_at=authority._closed_at,  # noqa: SLF001
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        local_v2 = (
+            isinstance(self._writer, PersistenceWriter) and self._writer.contract_version == 2
+        )
+        if local_v2 and not isinstance(entry.begin_snapshot, BeginCallSnapshotV2):
+            return True, None
+        payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
@@ -707,14 +719,30 @@ class ProcessSessionFactory:
                         ),
                     )
                 ),
-            ),
         )
+        operation: VoiceOperationV1 | VoiceOperationV2
+        if local_v2:
+            operation = VoiceOperationV2(schema_version=2, operation_id=authority.completion_token,
+                deployment_id=self._registry._deployment_id,  # type: ignore[attr-defined]  # noqa: SLF001
+                call_id=entry.call_id, occurred_at=authority._closed_at,
+                kind="call.upsert", payload=payload)
+        else:
+            operation = VoiceOperationV1(schema_version=1, operation_id=authority.completion_token,
+                deployment_id=self._registry._deployment_id,  # type: ignore[attr-defined]  # noqa: SLF001
+                call_id=entry.call_id, occurred_at=authority._closed_at,
+                kind="call.upsert", payload=payload)
         cancellation: asyncio.CancelledError | None = None
         while True:
             try:
-                await self._writer.commit_control(
-                    PersistenceCommand("outbox", {"operation": operation}, None)
-                )
+                if isinstance(operation, VoiceOperationV2):
+                    if not isinstance(self._writer, PersistenceWriter):
+                        raise RuntimeError("terminal_persistence_failed")
+                    await self._writer.freeze_call_publication_v2(operation, None,
+                        generation=authority._generation, provider_callback=None)
+                else:
+                    await self._writer.commit_control(
+                        PersistenceCommand("outbox", {"operation": operation}, None)
+                    )
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error
