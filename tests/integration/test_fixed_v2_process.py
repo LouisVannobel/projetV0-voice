@@ -66,7 +66,8 @@ async def registry_case(
     deployment_id="fixture",
 ):
     writer = PersistenceWriter(tmp_path / "voice.sqlite", CryptoKeyring({1: KEY}, active_version=1),
-                               contract_version=2, utcnow=utcnow, failpoint=failpoint)
+                               contract_version=2, utcnow=utcnow, failpoint=failpoint,
+                               process_agent_id=deployment_id, process_deployment_id=deployment_id)
     task = asyncio.create_task(writer.run())
     sink, pool, connection, _factory = sink_with_rows([])
     begins = []
@@ -256,7 +257,10 @@ async def test_fixed_v2_process_mixed_selector_refuses_and_old_v1_owner_still_dr
         await writer.drain(2)
         await asyncio.wait_for(task, 2)
     frozen = legacy.read_bytes()
-    refused = PersistenceWriter(legacy, keyring, contract_version=2, utcnow=lambda: NOW)
+    refused = PersistenceWriter(
+        legacy, keyring, contract_version=2, utcnow=lambda: NOW,
+        process_agent_id="fixture", process_deployment_id="fixture",
+    )
     task = asyncio.create_task(refused.run())
     assert not await refused.wait_ready()
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)

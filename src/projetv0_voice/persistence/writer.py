@@ -50,6 +50,7 @@ from projetv0_voice.models import (
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
+    validate_deployment_id,
 )
 from projetv0_voice.persistence.business_contract import encrypt_message_result, validate_turn_text
 from projetv0_voice.persistence.business_result import (
@@ -474,10 +475,24 @@ class PersistenceWriter:
         max_storage_bytes: int = MAX_STORAGE_BYTES,
         failpoint: Failpoint | None = None,
         contract_version: Literal[1, 2] = 1,
+        process_agent_id: str | None = None,
+        process_deployment_id: str | None = None,
     ) -> None:
         if not _valid_contract_version(contract_version):
             raise ValueError("invalid_writer_contract")
+        if contract_version == 2:
+            try:
+                if type(process_agent_id) is not str or type(process_deployment_id) is not str:
+                    raise ValueError("invalid_writer_process_identity")
+                validate_deployment_id(process_agent_id)
+                validate_deployment_id(process_deployment_id)
+            except ValueError:
+                raise ValueError("invalid_writer_process_identity") from None
         self._contract_version: Literal[1, 2] = contract_version
+        self._process_agent_id: str | None = process_agent_id if contract_version == 2 else None
+        self._process_deployment_id: str | None = (
+            process_deployment_id if contract_version == 2 else None
+        )
         self._audio_pins: dict[UUID, _AudioPin] = {}
         self._audio_receipt: tuple[UUID, asyncio.Future[None]] | None = None
         self._audio_inflight = False
@@ -593,6 +608,7 @@ class PersistenceWriter:
         return (
             pin is not None and isinstance(payload, TurnUpsertPayloadV1)
             and pin.generation == generation and pin.deployment_id == operation.deployment_id
+            and pin.deployment_id == self._process_deployment_id
             and pin.call_id == operation.call_id and pin.input_gate_opened
             and self._utcnow() < pin.retention_until
             and pin.admitted_at <= payload.started_at <= payload.ended_at < pin.retention_until
@@ -1189,6 +1205,7 @@ class PersistenceWriter:
             and pin.committed_total_samples is not None and not pin.terminal_finished
             and pin.policy == "local_30d" and pin.retention_until > self._utcnow()
             and operation.call_id == pin.call_id and operation.deployment_id == pin.deployment_id
+            and pin.deployment_id == self._process_deployment_id
             and payload.workspace_id == pin.workspace_id
             and payload.recording_id == pin.recording_id
             and payload.configuration_revision == pin.revision
@@ -2202,7 +2219,8 @@ class PersistenceWriter:
             or operation.deployment_id != pin.deployment_id
             or payload.retention_until != facts.retention_until or len(leases) != 1
             or leases[0][0] != payload.telnyx_call_control_id
-            or leases[0][1] != str(pin.workspace_id) or leases[0][2] != pin.deployment_id
+            or leases[0][1] != str(pin.workspace_id)
+            or leases[0][2] != self._process_agent_id
             or _parse_datetime(leases[0][3]) != facts.admitted_at
             or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
             or payload.telnyx_call_session_id != facts.telnyx_call_session_id
@@ -2267,6 +2285,16 @@ class PersistenceWriter:
             or row[11] not in {"undecided", "accepted", "off"}
         ):
             raise FatalPersistenceError("audio_pin_invalid")
+        cursor = await self._require_owner_connection().execute(
+            "SELECT agent_id FROM call_leases WHERE call_id=?", (str(call_id),)
+        )
+        lease = await cursor.fetchone()
+        await cursor.close()
+        if (
+            row[3] != self._process_deployment_id
+            or lease is None or lease[0] != self._process_agent_id
+        ):
+            return None
         facts = await self._read_call_lifecycle(call_id)
         evidence = None if facts is None else facts.disclosure_evidence
         gate_opened = (
@@ -2314,12 +2342,16 @@ class PersistenceWriter:
                 or facts.retention_until <= self._utcnow()
                 or await self._content_fenced(snapshot.call_id)
                 or len(leases) != 1 or leases[0][0] != str(snapshot.workspace_id)
+                or leases[0][1] != self._process_agent_id
                 or leases[0][2] not in {"pending", "active"}
                 or _parse_datetime(leases[0][3]) != facts.admitted_at
             ):
                 return None
+            deployment_id = self._process_deployment_id
+            if deployment_id is None:
+                return None
             bound_pin = _AudioPin(
-                snapshot.call_id, generation, snapshot.workspace_id, leases[0][1],
+                snapshot.call_id, generation, snapshot.workspace_id, deployment_id,
                 snapshot.recording_id, snapshot.configuration_revision, snapshot.recording_policy,
                 snapshot.audio_available, facts.admitted_at, facts.retention_until,
             )
@@ -2330,6 +2362,13 @@ class PersistenceWriter:
                                   committed_last_sequence=None, committed_total_samples=0,
                                   terminal_finished=False)
                 return existing_pin if context == bound_pin else None
+            cursor = await connection.execute(
+                "SELECT 1 FROM local_audio_pin WHERE call_id=?", (str(snapshot.call_id),)
+            )
+            incompatible_pin = await cursor.fetchone() is not None
+            await cursor.close()
+            if incompatible_pin:
+                return None
             await connection.execute(
                 "INSERT INTO local_audio_pin(call_id,generation,workspace_id,deployment_id,"
                 "recording_id,configuration_revision,recording_policy,audio_available,"
@@ -2777,11 +2816,13 @@ class PersistenceWriter:
             or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
             or payload.telnyx_call_session_id != facts.telnyx_call_session_id
             or "message_result" in payload.model_fields_set or len(leases) != 1
+            or operation.deployment_id != self._process_deployment_id
+            or leases[0][2] != self._process_agent_id
             or payload.telnyx_call_control_id != leases[0][0]
             or operation.occurred_at < facts.admitted_at
             or pin is not None and (pin.generation != generation
                 or pin.deployment_id != operation.deployment_id
-                or leases[0][1] != str(pin.workspace_id) or leases[0][2] != pin.deployment_id)
+                or leases[0][1] != str(pin.workspace_id))
         ):
             raise CommandConflictError("phone_fact_identity_conflict")
         if receipt is None:
@@ -3066,7 +3107,8 @@ class PersistenceWriter:
             or await self._content_denied(operation.call_id)
             or operation.deployment_id != pin.deployment_id or len(leases) != 1
             or leases[0][0] != payload.telnyx_call_control_id
-            or leases[0][1] != str(pin.workspace_id) or leases[0][2] != pin.deployment_id
+            or leases[0][1] != str(pin.workspace_id)
+            or leases[0][2] != self._process_agent_id
             or _parse_datetime(leases[0][3]) != facts.admitted_at
             or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
             or payload.telnyx_call_session_id != facts.telnyx_call_session_id

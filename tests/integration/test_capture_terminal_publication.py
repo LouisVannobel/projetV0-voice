@@ -105,7 +105,10 @@ async def test_capture_terminal_native_normal_tail_exact_finish_relay_and_restar
         assert terminal_row(case, "audio.finish") == (*frozen[:5], 1)
         assert (await case.writer.read_call_lifecycle(CALL)).original_ended_at is None
         path, keyring = case.path, case.keyring
-    writer = PersistenceWriter(path, keyring, contract_version=2, utcnow=lambda: NOW)
+    writer = PersistenceWriter(
+        path, keyring, contract_version=2, utcnow=lambda: NOW,
+        process_agent_id="capture-deploy", process_deployment_id="capture-deploy",
+    )
     task = asyncio.create_task(writer.run())
     try:
         assert await writer.wait_ready()

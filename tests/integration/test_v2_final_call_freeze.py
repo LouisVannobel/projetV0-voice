@@ -193,7 +193,10 @@ async def test_final_call_v2_real_codec_ack_restart_reuses_frozen_result_and_cip
         await case.session._prepare_partial_result()
         assert len(case.requests) == 1 and case.session._terminal_publication == frozen
         path, generation, call = case.path, case.grant.generation.generation, case.grant.call_id
-    async with owned(path, contract_version=2, utcnow=lambda: NOW) as (writer, _keyring):
+    async with owned(
+        path, contract_version=2, utcnow=lambda: NOW,
+        process_agent_id="fixture", process_deployment_id="fixture",
+    ) as (writer, _keyring):
         assert await writer.read_frozen_call_publication_v2(call, generation=generation) == frozen
         changed = base.model_copy(update={"operation_id": uuid4()})
         assert await writer.freeze_call_publication_v2(changed, None, generation=generation,

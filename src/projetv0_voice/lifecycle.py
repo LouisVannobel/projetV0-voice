@@ -1781,7 +1781,13 @@ async def build_production_runtime(
             1 if manifest.sparra is None else manifest.sparra.operation_contract_version
         )
         writer = PersistenceWriter(
-            Path(str(settings.sqlite_path)), keyring, contract_version=operation_contract_version
+            Path(str(settings.sqlite_path)),
+            keyring,
+            contract_version=operation_contract_version,
+            process_agent_id=manifest.agent_id if operation_contract_version == 2 else None,
+            process_deployment_id=(
+                settings.deployment_id if operation_contract_version == 2 else None
+            ),
         )
         sink = factories.sink_factory(postgres_dsn)
 

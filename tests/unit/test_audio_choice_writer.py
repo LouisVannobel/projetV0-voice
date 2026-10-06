@@ -119,7 +119,8 @@ async def test_choice_exact_v6_upgrade_preserves_cipher_and_refuses_unknown_prov
                            else "PRAGMA user_version=1337")
         frozen = candidate.read_bytes()
         writer = PersistenceWriter(candidate, CryptoKeyring({1: KEY}, active_version=1),
-                                   contract_version=mode)
+                                   contract_version=mode, process_agent_id="agent-a",
+                                   process_deployment_id="agent-a")
         task = asyncio.create_task(writer.run())
         assert await writer.wait_ready() is False
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
@@ -132,7 +133,8 @@ async def test_choice_exact_v6_upgrade_preserves_cipher_and_refuses_unknown_prov
             raise RuntimeError("owned-migration-fault")
 
     writer = PersistenceWriter(failed, CryptoKeyring({1: KEY}, active_version=1),
-                               contract_version=2, failpoint=fail_migration)
+                               contract_version=2, failpoint=fail_migration,
+                               process_agent_id="agent-a", process_deployment_id="agent-a")
     task = asyncio.create_task(writer.run())
     ready = await writer.wait_ready()
     if ready:

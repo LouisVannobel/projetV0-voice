@@ -57,7 +57,10 @@ def holder(writer, keyring):
 @asynccontextmanager
 async def owned_writer(path, **options):
     keyring = CryptoKeyring({1: bytes(range(32))}, active_version=1)
-    writer = PersistenceWriter(path, keyring, contract_version=2, utcnow=lambda: NOW, **options)
+    writer = PersistenceWriter(
+        path, keyring, contract_version=2, utcnow=lambda: NOW,
+        process_agent_id="agent-a", process_deployment_id="agent-a", **options,
+    )
     task = asyncio.create_task(writer.run())
     try:
         assert await writer.wait_ready()

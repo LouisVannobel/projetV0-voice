@@ -334,7 +334,8 @@ async def test_terminal_historical_seven_migrates_atomically_with_unknown_accoun
     from projetv0_voice.persistence.writer import PersistenceWriter
 
     refused = PersistenceWriter(failed, CryptoKeyring({1: KEY}, active_version=1),
-                                contract_version=2, failpoint=fail_upgrade)
+                                contract_version=2, failpoint=fail_upgrade,
+                                process_agent_id="agent-a", process_deployment_id="agent-a")
     task = asyncio.create_task(refused.run())
     ready = await refused.wait_ready()
     if ready:
@@ -349,7 +350,8 @@ async def test_terminal_historical_seven_migrates_atomically_with_unknown_accoun
         db.execute("CREATE TABLE owned_unexpected(value INTEGER)")
     frozen = altered.read_bytes()
     refused = PersistenceWriter(
-        altered, CryptoKeyring({1: KEY}, active_version=1), contract_version=2
+        altered, CryptoKeyring({1: KEY}, active_version=1), contract_version=2,
+        process_agent_id="agent-a", process_deployment_id="agent-a",
     )
     task = asyncio.create_task(refused.run())
     assert not await refused.wait_ready()

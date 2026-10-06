@@ -1160,7 +1160,9 @@ async def _local_choice_case(tmp_path, *, policy="local_30d", available=True, st
     identity = replace(_identity(), routing=routing, begin_snapshot=pin,
                        retention_until=pin.retention_until, stream_id="stream-one")
     writer = PersistenceWriter(path, CryptoKeyring({1: bytes(range(32))}, active_version=1),
-                               contract_version=2, utcnow=lambda: clock.utc, failpoint=hold_commit)
+                               contract_version=2, utcnow=lambda: clock.utc, failpoint=hold_commit,
+                               process_agent_id=identity.deployment_id,
+                               process_deployment_id=identity.deployment_id)
     writer_task = asyncio.create_task(writer.run())
     controller = runtime = runner_task = None
     legacy = _Recording(session_module.RecordingStartResult(

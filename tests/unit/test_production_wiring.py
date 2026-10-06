@@ -988,3 +988,44 @@ def test_linux_kernel_accepts_real_task11_export_without_importing_producer() ->
         factories = build_production_factories(settings)
         factories.validate_artifacts(settings)
         assert factories.load_manifest(settings).agent_id == "agent-a"
+
+
+@pytest.mark.skipif(not PRIVILEGED_FILES, reason="privileged Linux descriptor gate")
+def test_linux_kernel_old_profile_cannot_authorize_new_explicit2_owned_bundle() -> None:
+    """Real file/profile loaders; rejection is not positive V2 release qualification."""
+    from test_config import manifest_data, write_bundle
+
+    from projetv0_voice.config import load_agent_manifest
+    from projetv0_voice.production_wiring import _bundle_digest, build_production_factories
+
+    fixture = Path("tests/fixtures/qualified-deployment-profile-v1.json").read_bytes()
+    old_profile = QualifiedDeploymentProfileV1.model_validate_json(fixture)
+    with tempfile.TemporaryDirectory(dir="/root", prefix="voice-old-profile-v2-") as raw:
+        trusted = Path(raw)
+        profile_path = trusted / "qualified-v1.json"
+        profile_path.write_bytes(fixture)
+        profile_path.chmod(0o600)
+        bundle = write_bundle(trusted / "bundle", manifest_data(
+            max_concurrent_calls=1, transcript_retention_days=30,
+            sparra={"schema_version": 1, "connection_id": "fixture",
+                "original_forward_line_e164": None,
+                "qualified_transfer_destination_e164": None,
+                "operation_contract_version": 2},
+        ))
+        manifest = load_agent_manifest(bundle, host_max_concurrent_calls=1)
+        leaves, _total = _walk_real_bundle(bundle)
+        new_bundle_hash = _bundle_digest(tuple(leaves))
+        assert new_bundle_hash != old_profile.agent_bundle_sha256
+        settings = replace(
+            _settings(agent_bundle_path=PurePosixPath(str(bundle)),
+                runtime_sha256=old_profile.runtime_contract_sha256,
+                bundle_sha256=new_bundle_hash),
+            qualified_profile_path=PurePosixPath(str(profile_path)),
+            image_digest=old_profile.image_digest,
+            inference_profile_sha256=old_profile.inference_profile_sha256,
+        )
+        factories = build_production_factories(settings)
+        with pytest.raises(ValueError, match="^profile agent_bundle_sha256 does not match"):
+            factories.load_profile(settings, manifest, datetime(2026, 10, 6, tzinfo=UTC))
+        assert profile_path.read_bytes() == fixture
+        assert manifest.sparra.operation_contract_version == 2

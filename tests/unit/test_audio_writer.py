@@ -119,6 +119,9 @@ async def authenticate_audio(
 @asynccontextmanager
 async def owned(path, *, utcnow=lambda: NOW, **options):
     keyring = CryptoKeyring({1: KEY}, active_version=1)
+    if options.get("contract_version") == 2:
+        options.setdefault("process_agent_id", "agent-a")
+        options.setdefault("process_deployment_id", "agent-a")
     writer = PersistenceWriter(path, keyring, utcnow=utcnow, **options)
     task = asyncio.create_task(writer.run())
     try:
@@ -230,7 +233,10 @@ async def test_fixed_v2_refuses_legacy_outbox_before_mutation_and_default_v1_rep
         await writer.commit_control(PersistenceCommand("outbox", {"operation": legacy}, None))
     before = path.read_bytes()
     keyring = CryptoKeyring({1: KEY}, active_version=1)
-    refused = PersistenceWriter(path, keyring, utcnow=lambda: NOW, contract_version=2)
+    refused = PersistenceWriter(
+        path, keyring, utcnow=lambda: NOW, contract_version=2,
+        process_agent_id="agent-a", process_deployment_id="agent-a",
+    )
     task = asyncio.create_task(refused.run())
     assert await refused.wait_ready() is False
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
@@ -442,7 +448,8 @@ async def test_fixed_v2_provenance_refusal_never_repairs_or_mutates_database(tmp
                        else "CREATE TABLE owned_unexpected(value INTEGER)")
     before = path.read_bytes()
     refused = PersistenceWriter(path, keyring, utcnow=lambda: NOW,
-                                contract_version=1 if tamper == "default-v1" else 2)
+                                contract_version=1 if tamper == "default-v1" else 2,
+                                process_agent_id="agent-a", process_deployment_id="agent-a")
     task = asyncio.create_task(refused.run())
     assert await refused.wait_ready() is False
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)

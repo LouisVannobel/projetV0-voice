@@ -108,7 +108,8 @@ async def capture_case(
     path = tmp_path / "capture.sqlite"
     keyring = CryptoKeyring({1: bytes(range(32))}, active_version=1)
     writer = PersistenceWriter(path, keyring, contract_version=2, utcnow=lambda: NOW,
-                               failpoint=failpoint)
+                               failpoint=failpoint, process_agent_id="capture-deploy",
+                               process_deployment_id="capture-deploy")
     writer_task = asyncio.create_task(writer.run())
     runtime = controller = capture = runner = None
     try:
