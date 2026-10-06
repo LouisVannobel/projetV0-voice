@@ -13,6 +13,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    StrictBool,
     StrictStr,
     field_serializer,
     field_validator,
@@ -21,12 +22,14 @@ from pydantic import (
 
 from projetv0_voice.models import (
     BusinessInstant,
+    BusinessKnowledgeV1,
     CallUpsertPayloadV1,
     CanonicalUUID,
     PositiveInt,
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     _business_utc,
+    _e164,
     _require_exact_int,
     _StrictFrozenModel,
     validate_deployment_id,
@@ -50,6 +53,60 @@ class _AudioModel(_StrictFrozenModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
 
+def _canonical_audio_expiry(value: object) -> object:
+    if isinstance(value, str) and _UTC_MILLISECONDS.fullmatch(value) is None:
+        raise ValueError("audio_expiry_not_canonical")
+    if isinstance(value, datetime) and (
+        value.tzinfo is None
+        or value.utcoffset() != UTC.utcoffset(None)
+        or value.microsecond % 1000
+    ):
+        raise ValueError("audio_expiry_not_canonical")
+    return value
+
+
+class BeginCallSnapshotV2(_AudioModel):
+    """Pinned local-audio availability, separate from the provider V1 policy."""
+
+    schema_version: SchemaVersionV2
+    workspace_id: CanonicalUUID
+    call_id: CanonicalUUID
+    configuration_revision: Annotated[PositiveInt, Field(le=2_147_483_647)]
+    knowledge: BusinessKnowledgeV1 = Field(repr=False)
+    transfer_destination: StrictStr | None = Field(repr=False)
+    retention_until: BusinessInstant
+    recording_policy: Literal["off", "local_30d"]
+    recording_contact_phone: StrictStr | None = Field(repr=False)
+    audio_available: StrictBool
+    recording_id: CanonicalUUID | None
+
+    _canonical_retention = field_validator("retention_until", mode="before")(
+        _canonical_audio_expiry
+    )
+    _normalize_retention = field_validator("retention_until")(_business_utc)
+
+    @field_serializer("retention_until")
+    def serialize_retention(self, value: datetime) -> str:
+        return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    @field_validator("transfer_destination", "recording_contact_phone")
+    @classmethod
+    def canonical_phone(cls, value: str | None) -> str | None:
+        return None if value is None else _e164(value)
+
+    @model_validator(mode="after")
+    def local_policy_matches_available_identity(self) -> Self:
+        if self.recording_policy == "off":
+            if self.audio_available or self.recording_id is not None:
+                raise ValueError("audio_off_has_no_recording")
+        elif (
+            self.recording_contact_phone is None
+            or self.audio_available != (self.recording_id is not None)
+        ):
+            raise ValueError("audio_policy_identity_mismatch")
+        return self
+
+
 class _AudioIdentityV2(_AudioModel):
     schema_version: SchemaVersionV2
     workspace_id: CanonicalUUID
@@ -60,15 +117,7 @@ class _AudioIdentityV2(_AudioModel):
     @field_validator("retention_until", mode="before")
     @classmethod
     def canonical_original_expiry(cls, value: object) -> object:
-        if isinstance(value, str) and _UTC_MILLISECONDS.fullmatch(value) is None:
-            raise ValueError("audio_expiry_not_canonical")
-        if isinstance(value, datetime) and (
-            value.tzinfo is None
-            or value.utcoffset() != UTC.utcoffset(None)
-            or value.microsecond % 1000
-        ):
-            raise ValueError("audio_expiry_not_canonical")
-        return value
+        return _canonical_audio_expiry(value)
 
     _normalize_retention = field_validator("retention_until")(_business_utc)
 
