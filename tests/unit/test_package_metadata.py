@@ -25,7 +25,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
     "opentelemetry-api==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.44.0",
     "opentelemetry-sdk==1.44.0",
-    "pipecat-ai[openai,openrouter,silero,websocket]==1.7.0",
+    "pipecat-ai[openai,openrouter,silero,websocket]==1.12.0",
     "psycopg[binary,pool]==3.3.4",
     "pydantic==2.13.4",
     "pynacl==1.6.2",
@@ -37,7 +37,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
 EXPECTED_DEVELOPMENT_DEPENDENCIES = [
     "jsonschema==4.25.1",
     "mypy==2.3.1",
-    "pipecat-ai[evals]==1.7.0",
+    "pipecat-ai[evals]==1.12.0",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "respx==0.23.1",
@@ -405,8 +405,8 @@ server.main({})
     }
 
 
-def test_pipecat_is_pinned_to_1_7_0() -> None:
-    assert version("pipecat-ai") == "1.7.0"
+def test_pipecat_is_pinned_to_1_12_0() -> None:
+    assert version("pipecat-ai") == "1.12.0"
 
 
 def test_telnyx_is_pinned_to_4_176_0() -> None:
@@ -690,7 +690,7 @@ def test_task11_docs_record_artifact_release_and_live_boundaries() -> None:
         "PROJETV0_CONTAINER_SMOKE=1",
         "main-only manual release",
         "secrets.GITHUB_TOKEN",
-        "pipecat-ai[cli]==1.7.0",
+        "pipecat-ai[cli]==1.12.0",
         "outside the lock, image, and CI",
         "No live key or provider call belongs to Task 11",
         "Telnyx webhook public key",

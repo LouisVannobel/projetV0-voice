@@ -7,7 +7,13 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from pipecat.frames.frames import Frame, InputAudioRawFrame, InputTransportMessageFrame
+from pipecat.frames.frames import (
+    Frame,
+    InputAudioRawFrame,
+    InputTransportMessageFrame,
+    OutputTransportMessageFrame,
+    OutputTransportMessageUrgentFrame,
+)
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 
 from projetv0_voice.telnyx.frames import (
@@ -147,6 +153,10 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        # Native 1.12 forwards generic messages; only our validated mark owns
+        # this project's outbound extension authority.
+        if isinstance(frame, (OutputTransportMessageFrame, OutputTransportMessageUrgentFrame)):
+            return None
         return await super().serialize(frame)
 
     async def deserialize(self, data: str | bytes) -> Frame | None:

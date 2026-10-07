@@ -563,7 +563,7 @@ class ProcessSessionFactory:
 
     @staticmethod
     async def _close_llm_client(llm: FrameProcessor) -> None:
-        if version("pipecat-ai") != "1.7.0":
+        if version("pipecat-ai") != "1.12.0":
             return
         client = getattr(llm, "_client", None)
         close = getattr(client, "close", None)

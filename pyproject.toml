@@ -17,7 +17,7 @@ dependencies = [
   "opentelemetry-api==1.44.0",
   "opentelemetry-exporter-otlp-proto-http==1.44.0",
   "opentelemetry-sdk==1.44.0",
-  "pipecat-ai[openai,openrouter,silero,websocket]==1.7.0",
+  "pipecat-ai[openai,openrouter,silero,websocket]==1.12.0",
   "psycopg[binary,pool]==3.3.4",
   "pydantic==2.13.4",
   "pynacl==1.6.2",
@@ -31,7 +31,7 @@ dependencies = [
 dev = [
   "jsonschema==4.25.1",
   "mypy==2.3.1",
-  "pipecat-ai[evals]==1.7.0",
+  "pipecat-ai[evals]==1.12.0",
   "pytest==9.1.1",
   "pytest-asyncio==1.4.0",
   "respx==0.23.1",

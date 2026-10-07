@@ -13,15 +13,16 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSTextFrame,
 )
-from pipecat.services.settings import TTSSettings, assert_given
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import assert_given
 from pydantic import SecretStr
 
 from projetv0_voice.qualified_profile import InferenceProfileV1
 
 _TTS_ENDPOINT = "https://openrouter.ai/api/v1/audio/speech"
-# OpenRouter PCM and Pipecat 1.7.0 share a fixed signed little-endian 16-bit invariant.
+# OpenRouter PCM and Pipecat share a fixed signed little-endian 16-bit invariant.
 
 _HTTP_STATUS_ERROR = "openrouter_tts_http_status"
 _CONTENT_TYPE_ERROR = "openrouter_tts_content_type"
@@ -168,7 +169,7 @@ class OpenRouterTTSService(TTSService):
                         )
                         async for frame in frames:
                             if isinstance(frame, TTSAudioRawFrame):
-                                # Pipecat 1.7.0 omits context_id only on its padded leftover.
+                                # Preserve the context on native padded leftovers too.
                                 if frame.context_id is None:
                                     frame.context_id = context_id
                                 audio_emitted = True

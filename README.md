@@ -42,12 +42,12 @@ rescanning the image.
 The Pipecat Context Hub is optional workstation documentation tooling:
 
 ```powershell
-uv tool install "pipecat-ai[cli]==1.7.0" --with pipecat-ai-context-hub
+uv tool install "pipecat-ai[cli]==1.12.0" --with pipecat-ai-context-hub
 pipecat context-hub install --client codex
-pipecat context-hub refresh --framework-version v1.7.0
+pipecat context-hub refresh --framework-version v1.12.0
 ```
 
-It remains outside the lock, image, and CI and does not replace the pinned 1.7.0
+It remains outside the lock, image, and CI and does not replace the pinned 1.12.0
 contract fixtures.
 
 ## Live qualification boundary
