@@ -3151,9 +3151,67 @@ class Scenario:
         assert not any(path.endswith("/record_start") for path in self.peers.actions), (
             "native_transfer_no_provider_recording"
         )
+        entry = self.graph.registry._by_call_id.get(self.call_id)
+        assert entry is not None, "native_transfer_original_entry_present"
+        self.audio_transfer_reader_entry = entry
+        self.audio_transfer_reader_generation = entry.generation
+        self.audio_transfer_reader_actions = tuple(self.peers.actions)
         self.evidence["checks"].append("native-transfer-real-tool-tail-joined-before-intent-and-sdk")
         return {**admitted, "capture_joined": True, "phone_live": True,
                 "checks": ["native-transfer-real-tool-tail-joined-before-intent-and-sdk"]}
+
+    async def audio_transfer_reader_live(self):
+        """Observe the original native call after the App's compiled Range reads."""
+        assert self.request.get("audio_transfer_fixture") is True, (
+            "native_reader_transfer_fixture_opt_in"
+        )
+        entry = self.graph.registry._by_call_id.get(self.call_id)
+        assert entry is self.audio_transfer_reader_entry, (
+            "native_reader_original_registry_entry_preserved"
+        )
+        assert entry.generation == self.audio_transfer_reader_generation, (
+            "native_reader_original_registry_generation_preserved"
+        )
+        assert entry.call_id == self.call_id and entry.session is self.session, (
+            "native_reader_original_call_and_session_preserved"
+        )
+        assert not entry.capacity_released and entry.terminal_event is None, (
+            "native_reader_original_phone_has_no_terminal_event"
+        )
+        live_call_count = await self.graph.registry.live_call_count()
+        assert live_call_count == 1, "native_reader_original_phone_capacity_held"
+        facts = await self.graph.writer.read_call_lifecycle(self.call_id)
+        assert facts is not None and entry.transfer_facts is not None, (
+            "native_reader_actual_transfer_lifecycle_present"
+        )
+        bridge_seen = (
+            facts.qualified_line_bridged_at is not None
+            or facts.bridge_operation_id is not None
+            or entry.transfer_facts.qualified_line_bridged_at is not None
+            or entry.transfer_facts.bridge_operation_id is not None
+            or entry.bridge_publication is not None
+        )
+        original_end_seen = facts.original_ended_at is not None
+        actions = tuple(self.peers.actions)
+        result = {
+            "call_id": str(self.call_id),
+            "live_call_count": live_call_count,
+            "answer_actions": sum(path.endswith("/actions/answer") for path in actions),
+            "transfer_actions": sum(path.endswith("/actions/transfer") for path in actions),
+            "hangup_actions": sum(path.endswith("/actions/hangup") for path in actions),
+            "bridge_seen": bridge_seen,
+            "original_end_seen": original_end_seen,
+            "provider_actions_unchanged": actions == self.audio_transfer_reader_actions,
+        }
+        assert not bridge_seen and not original_end_seen, (
+            "native_reader_does_not_infer_bridge_or_original_end"
+        )
+        assert result["provider_actions_unchanged"], (
+            "native_reader_does_not_dispatch_new_phone_action"
+        )
+        self.evidence["audio_transfer_reader"] = result
+        self.evidence["checks"].append("native-transfer-live-phone-after-compiled-ranges")
+        return result
 
     async def audio_complete(self):
         return await self.audio_finish(normal_completion=True)
