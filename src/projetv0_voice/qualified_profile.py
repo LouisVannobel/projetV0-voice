@@ -109,6 +109,9 @@ class InferenceProfileV1(_StrictFrozenProfile):
     tts_voice: str = Field(min_length=1)
     tts_pcm_sample_rate: PositiveInt
     tts_pcm_channels: MonoChannel
+    tts_speed: float | None = Field(
+        default=None, ge=0.5, le=2.0, strict=True, exclude_if=lambda value: value is None
+    )
     llm_provider_policy: Mapping[str, JsonValue] = Field(
         json_schema_extra={
             "properties": {"allow_fallbacks": {"type": "boolean"}},

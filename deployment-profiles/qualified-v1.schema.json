@@ -86,6 +86,20 @@
           "title": "Tts Provider Options",
           "type": "object"
         },
+        "tts_speed": {
+          "anyOf": [
+            {
+              "maximum": 2.0,
+              "minimum": 0.5,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tts Speed"
+        },
         "tts_voice": {
           "minLength": 1,
           "title": "Tts Voice",

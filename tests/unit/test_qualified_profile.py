@@ -201,6 +201,160 @@ def test_inference_hash_matches_independent_literal_witness() -> None:
     )
 
 
+@pytest.mark.parametrize("speed", [None, 0.5, 1.0, 1.15, 2.0])
+def test_tts_speed_accepts_only_optional_bounded_numbers(speed: float | None) -> None:
+    profile = InferenceProfileV1.model_validate({**inference_data(), "tts_speed": speed})
+
+    assert profile.tts_speed == speed
+    restored = InferenceProfileV1.model_validate_json(profile.model_dump_json())
+    assert restored.tts_speed == speed
+
+
+@pytest.mark.parametrize(
+    "speed",
+    [
+        True,
+        False,
+        "1.15",
+        "1",
+        b"1.15",
+        0.4999,
+        2.0001,
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_tts_speed_rejects_coercion_nonfinite_and_out_of_range_values(speed: object) -> None:
+    with pytest.raises(ValidationError) as caught:
+        InferenceProfileV1.model_validate({**inference_data(), "tts_speed": speed})
+    assert caught.value.errors()[0]["loc"] == ("tts_speed",)
+
+
+@pytest.mark.parametrize("extra", [{}, {"tts_speed": None}], ids=["absent", "none"])
+def test_tts_speed_unset_preserves_exact_legacy_serialization_and_digest(
+    extra: dict[str, object],
+) -> None:
+    legacy = inference_data()
+    profile = InferenceProfileV1.model_validate({**legacy, **extra})
+    assert profile.tts_speed is None
+    assert profile.model_dump() == legacy
+    assert profile.model_dump(mode="json") == legacy
+    assert profile.model_dump_json() == json.dumps(
+        legacy, ensure_ascii=False, separators=(",", ":")
+    )
+    canonical = json.dumps(
+        profile.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    witness = (REPOSITORY_ROOT / "tests/fixtures/inference-profile-v1.json").read_bytes().strip()
+    assert canonical == witness
+    assert canonical_inference_profile_sha256(profile) == (
+        "a452d4b5d530f36f13a3bbd63a5f5aafb7c76b3a9cfba3d9bfac1ab066d4edda"
+    )
+
+
+def test_tts_speed_explicit_is_bound_to_an_independent_canonical_digest() -> None:
+    profile = InferenceProfileV1.model_validate({**inference_data(), "tts_speed": 1.15})
+    assert profile.model_dump(mode="json")["tts_speed"] == 1.15
+    assert canonical_inference_profile_sha256(profile) == (
+        "467b88e4e48ee6954e605f34a4eb464842d1f7939b6fb7336c9a33432e7acb7c"
+    )
+    restored = InferenceProfileV1.model_validate_json(profile.model_dump_json())
+    assert restored == profile
+    assert canonical_inference_profile_sha256(restored) == (
+        "467b88e4e48ee6954e605f34a4eb464842d1f7939b6fb7336c9a33432e7acb7c"
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "filename"),
+    [
+        (QualifiedDeploymentProfileV1, "qualified-deployment-profile-v1.json"),
+        (QualificationCandidateProfileV1, "qualification-candidate-v1.json"),
+    ],
+)
+def test_tts_speed_none_preserves_nested_profile_legacy_bytes(
+    model: type[QualifiedDeploymentProfileV1] | type[QualificationCandidateProfileV1],
+    filename: str,
+) -> None:
+    witness = (REPOSITORY_ROOT / "tests/fixtures" / filename).read_bytes().strip()
+    legacy = json.loads(witness)
+    profile = model.model_validate(
+        {**legacy, "inference": {**legacy["inference"], "tts_speed": None}}
+    )
+    assert profile.inference.tts_speed is None
+    assert profile.model_dump(mode="json") == legacy
+    assert json.loads(profile.model_dump_json()) == legacy
+    assert json.dumps(
+        profile.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") == witness
+
+
+@pytest.mark.parametrize("candidate", [False, True], ids=["qualified", "candidate"])
+def test_tts_speed_explicit_round_trips_through_bound_nested_profile_loader(
+    candidate: bool, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    data = candidate_data(now) if candidate else qualified_data(now)
+    data["inference"] = {**inference_data(), "tts_speed": 1.15}
+    data["inference_profile_sha256"] = (
+        "467b88e4e48ee6954e605f34a4eb464842d1f7939b6fb7336c9a33432e7acb7c"
+    )
+    bindings = {
+        **expected_hashes(),
+        "expected_inference_profile_sha256": (
+            "467b88e4e48ee6954e605f34a4eb464842d1f7939b6fb7336c9a33432e7acb7c"
+        ),
+    }
+    path = write_json(tmp_path / "speed-profile.json", data)
+    path.chmod(0o600)
+    if candidate:
+        profile = load_qualification_candidate_profile(
+            path,
+            qualification_mode=True,
+            expected_run_id=RUN_ID,
+            expected_benchmark_did_hash=HEX_C,
+            manifest=manifest(),
+            now=now,
+            **bindings,
+        )
+        restored = QualificationCandidateProfileV1.model_validate_json(profile.model_dump_json())
+    else:
+        profile = load_qualified_deployment_profile(path, **bindings)
+        restored = QualifiedDeploymentProfileV1.model_validate_json(profile.model_dump_json())
+    assert profile.inference.tts_speed == 1.15
+    assert restored == profile
+    assert canonical_inference_profile_sha256(restored.inference) == (
+        "467b88e4e48ee6954e605f34a4eb464842d1f7939b6fb7336c9a33432e7acb7c"
+    )
+
+
+@pytest.mark.parametrize("model", [QualifiedDeploymentProfileV1, QualificationCandidateProfileV1])
+def test_nested_profile_schema_expresses_optional_tts_speed_bounds(
+    model: type[QualifiedDeploymentProfileV1] | type[QualificationCandidateProfileV1],
+) -> None:
+    schema = model.model_json_schema()
+    inference_schema = schema["$defs"]["InferenceProfileV1"]
+    assert "tts_speed" not in inference_schema["required"]
+    validator = Draft202012Validator(schema)
+    legacy = qualified_data() if model is QualifiedDeploymentProfileV1 else candidate_data()
+    for speed in (None, 0.5, 1.15, 2.0):
+        validator.validate({**legacy, "inference": {**inference_data(), "tts_speed": speed}})
+    for speed in (True, "1.15", 0.4999, 2.0001):
+        with pytest.raises(JsonSchemaValidationError):
+            validator.validate({**legacy, "inference": {**inference_data(), "tts_speed": speed}})
+
+
 def test_inference_provider_policy_is_deeply_immutable_and_round_trips() -> None:
     data = inference_data()
     data["llm_provider_policy"] = {

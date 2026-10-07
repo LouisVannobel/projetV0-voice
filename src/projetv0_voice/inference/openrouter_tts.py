@@ -60,6 +60,7 @@ class OpenRouterTTSService(TTSService):
             dict[str, dict[str, Any]], dumped["tts_provider_options"]
         )
         self._input_sample_rate = profile.tts_pcm_sample_rate
+        self._speed = profile.tts_speed
         self._api_key = api_key
         self._client = http_client or httpx.AsyncClient(trust_env=False)
         self._owns_client = http_client is None
@@ -79,6 +80,8 @@ class OpenRouterTTSService(TTSService):
         }
         if self._provider_options:
             body["provider"] = {"options": self._provider_options}
+        if self._speed is not None:
+            body["speed"] = self._speed
         return body
 
     @staticmethod
