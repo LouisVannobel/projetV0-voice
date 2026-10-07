@@ -149,7 +149,7 @@ class CallIdentity:
             self.begin_snapshot.call_id != self.call_id
             or self.begin_snapshot.retention_until != self.retention_until
             or self.routing is not None and (
-                self.routing.admitted_at != self.started_at
+                self.routing.admitted_at > self.started_at + timedelta(seconds=30)
                 or self.routing.admitted_at + timedelta(days=30) != self.retention_until
                 or self.routing.telnyx_call_control_id != self.telnyx_call_control_id
                 or self.routing.telnyx_call_leg_id != self.telnyx_call_leg_id
