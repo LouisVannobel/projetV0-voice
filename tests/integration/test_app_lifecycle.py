@@ -1592,6 +1592,16 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         native_constructor = graph.session_factory._session_factory
         native_pipeline = session_module.build_pipeline
         sessions = []
+        delivery_acknowledged = asyncio.Event()
+        native_ack_outbox = graph.writer.ack_outbox
+
+        async def observe_known_ack(*, queue_id: int, expected_claim_attempt: int):
+            result = await native_ack_outbox(
+                queue_id=queue_id, expected_claim_attempt=expected_claim_attempt
+            )
+            if result.applied and await graph.writer.oldest_outbox_created_at() is None:
+                delivery_acknowledged.set()
+            return result
 
         def construct(**values):
             session = native_constructor(**values)
@@ -1618,6 +1628,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         graph.session_factory._session_factory = construct
         monkeypatch.setattr(session_module, "build_pipeline", observe_capture_binding)
         monkeypatch.setattr(session_module, "build_runtime", fail_after_owned_pipeline)
+        monkeypatch.setattr(graph.writer, "ack_outbox", observe_known_ack)
         try:
             await graph.supervisor.startup()
             assert graph.writer.contract_version == 2
@@ -1665,7 +1676,11 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
             assert not graph.writer.is_degraded and graph.writer.fatal_fault is None
             assert "hangup" in control_actions
             assert await graph.registry.live_call_count() == 0
-            await graph.relay.run_once()
+            # The process supervisor owns relay execution and durable FIFO ACKs.
+            delivery_acknowledged.clear()
+            async with asyncio.timeout(2.0):
+                if await graph.writer.oldest_outbox_created_at() is not None:
+                    await delivery_acknowledged.wait()
             queries = [call[0] for call in native_connection.calls]
             assert "SELECT voice.begin_call_v2(%s,%s,%s::jsonb)" in queries
             assert "SELECT voice.ingest_operation_v2(%s::jsonb)" in queries

@@ -2331,7 +2331,8 @@ class PersistenceWriter:
                 return None
             facts = await self._read_call_lifecycle(snapshot.call_id)
             cursor = await connection.execute(
-                "SELECT tenant_id,agent_id,state,call_control_id FROM call_leases WHERE call_id=?",
+                "SELECT tenant_id,agent_id,state,call_control_id,created_at "
+                "FROM call_leases WHERE call_id=?",
                 (str(snapshot.call_id),),
             )
             leases = list(await cursor.fetchall())
@@ -2344,9 +2345,11 @@ class PersistenceWriter:
                 or len(leases) != 1 or leases[0][0] != str(snapshot.workspace_id)
                 or leases[0][1] != self._process_agent_id
                 or leases[0][2] not in {"pending", "active"}
-                or not await self._original_admission_matches(leases[0][3], facts.admitted_at)
             ):
                 return None
+            original_admission = await self._original_admission_matches(
+                leases[0][3], facts.admitted_at
+            )
             deployment_id = self._process_deployment_id
             if deployment_id is None:
                 return None
@@ -2361,7 +2364,29 @@ class PersistenceWriter:
                                   choice_occurred_at=None, input_gate_opened=False,
                                   committed_last_sequence=None, committed_total_samples=0,
                                   terminal_finished=False)
-                return existing_pin if context == bound_pin else None
+                if context != bound_pin:
+                    return None
+                if not original_admission:
+                    # Qualified historical V7 pins migrated with UNKNOWN
+                    # accounting retain only their existing refusal/purge
+                    # obligation. They cannot authorize new chunks or finish.
+                    if (
+                        existing_pin.committed_last_sequence is not None
+                        or existing_pin.committed_total_samples is not None
+                        or _parse_datetime(leases[0][4]) != facts.admitted_at
+                    ):
+                        return None
+                    cursor = await connection.execute(
+                        "SELECT 1 FROM webhook_receipts WHERE event_type='call.initiated' "
+                        "AND call_control_id=? LIMIT 1", (leases[0][3],),
+                    )
+                    receipt_exists = await cursor.fetchone() is not None
+                    await cursor.close()
+                    if receipt_exists:
+                        return None
+                return existing_pin
+            if not original_admission:
+                return None
             cursor = await connection.execute(
                 "SELECT 1 FROM local_audio_pin WHERE call_id=?", (str(snapshot.call_id),)
             )
