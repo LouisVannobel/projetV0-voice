@@ -31,7 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from nacl.signing import SigningKey
 from openai import DefaultAsyncHttpxClient
-from pipecat.frames.frames import TranscriptionFrame
+from pipecat.frames.frames import InputAudioRawFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection
 from psycopg_pool import AsyncConnectionPool
 from pydantic import SecretStr
@@ -77,6 +77,7 @@ from projetv0_voice.telnyx.recordings import (
     build_recording_correlation,
     encode_recording_correlation,
 )
+from projetv0_voice.telnyx.serializer import ProjetV0TelnyxFrameSerializer
 
 _lose_begin_reply = ContextVar("owned_connected_begin_reply", default=False)
 
@@ -2992,6 +2993,256 @@ class Scenario:
 
     async def audio_complete(self):
         return await self.audio_finish(normal_completion=True)
+
+    async def audio_opposition_prime(self):
+        admitted = await self.audio_admit()
+        await self._audio_wait_active_delivery()
+        self.audio_opposition_sequence = 2
+        self.audio_opposition_chunk_ids = set()
+        chunk_acked = asyncio.Event()
+        native_ack = self.graph.writer.ack_outbox
+
+        async def observed_chunk_ack(**values):
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                queued = database.execute(
+                    "SELECT op_id FROM outbox WHERE queue_id=? "
+                    "AND kind='audio.chunk' AND call_id=?",
+                    (values["queue_id"], str(self.call_id)),
+                ).fetchone()
+            result = await native_ack(**values)
+            if result.applied and queued is not None:
+                assert len(self.audio_opposition_chunk_ids) < 8, (
+                    "native_opposition_ack_bound"
+                )
+                self.audio_opposition_chunk_ids.add(queued[0])
+                chunk_acked.set()
+            return result
+
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        with patch.object(self.graph.writer, "ack_outbox", observed_chunk_ack):
+            try:
+                for sequence in range(3, 35):
+                    if chunk_acked.is_set():
+                        break
+                    assert self.audio_capture.tap.state == "recording", (
+                        "native_opposition_capture_active"
+                    )
+                    self.audio_opposition_sequence = sequence
+                    await self.media.input({
+                        "event": "media", "stream_id": self.media.stream,
+                        "sequence_number": str(sequence),
+                        "media": {
+                            "payload": base64.b64encode(b"\x9e" * 800).decode(),
+                            "track": "inbound",
+                        },
+                    })
+                    # Existing bounded synthetic wire pacing; success needs ACK.
+                    await asyncio.sleep(0.005)
+                await asyncio.wait_for(chunk_acked.wait(), 5)
+                await eventually(
+                    delivered, "native_opposition_chunk_delivery_joined", 5
+                )
+            finally:
+                chunk_acked.clear()
+        assert self.audio_opposition_chunk_ids <= {
+            str(operation_id) for operation_id in self.audio_seen
+        }, "native_opposition_ack_after_real_ingest"
+        assert self.audio_capture.holder.summary.committed_samples >= 8000, (
+            "native_opposition_at_least_one_real_chunk"
+        )
+        return {
+            **admitted,
+            "total_samples": self.audio_capture.holder.summary.committed_samples,
+            "audio_chunks": len(self.audio_opposition_chunk_ids),
+        }
+
+    async def audio_opposition_revoke(self):
+        self.audio_opposition_sequence += 1
+        await self.media.input({
+            "event": "dtmf", "stream_id": self.media.stream,
+            "sequence_number": str(self.audio_opposition_sequence),
+            "occurred_at": now().isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "dtmf": {"digit": "2"},
+        })
+
+        def choice_off():
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                choice = database.execute(
+                    "SELECT choice_state FROM local_audio_pin WHERE call_id=?",
+                    (str(self.call_id),),
+                ).fetchone()
+            return choice == ("off",)
+
+        await eventually(choice_off, "native_opposition_caller_two_must_commit_off", 5)
+
+        async def delivered():
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                terminal = database.execute(
+                    "SELECT acked FROM local_audio_terminal "
+                    "WHERE call_id=? AND kind='audio.revoke'", (str(self.call_id),)
+                ).fetchone()
+            return (
+                terminal == (1,)
+                and await self.graph.writer.oldest_outbox_created_at() is None
+            )
+
+        await eventually(delivered, "native_opposition_revoke_ack_joined", 5)
+        assert (
+            not self.audio_capture.tap.pending_join
+            and not self.audio_capture.holder.summary.pending
+        ), "native_opposition_capture_joined"
+        assert self.session._controller.is_active(), (
+            "native_opposition_conversation_live"
+        )
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_opposition_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_opposition_no_phone_hangup"
+        )
+        self.audio_opposition_closed_samples = (
+            self.audio_capture.holder.summary.committed_samples
+        )
+        self.audio_opposition_closed_chunks = len(self.audio_seen)
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            self.audio_opposition_terminal = database.execute(
+                "SELECT op_id,fingerprint,acked FROM local_audio_terminal "
+                "WHERE call_id=? AND kind='audio.revoke'", (str(self.call_id),)
+            ).fetchone()
+        assert self.audio_opposition_terminal is not None, (
+            "native_opposition_terminal_known"
+        )
+        return {"choice_off": True, "capture_joined": True, "phone_live": True}
+
+    async def audio_opposition_late(self):
+        late_sequence = self.audio_opposition_sequence + 1
+        sequences = {
+            str(value) for value in range(late_sequence + 1, late_sequence + 9)
+        }
+        decoded, processed = {}, set()
+        wire_done, keypad_done = asyncio.Event(), asyncio.Event()
+        native_deserialize = ProjetV0TelnyxFrameSerializer.deserialize
+        native_process = self.audio_capture.tap.process_frame
+        native_keypad = self.session._controller.accept_dtmf
+
+        async def observed_deserialize(serializer, data):
+            frame = await native_deserialize(serializer, data)
+            message = json.loads(data)
+            if (
+                message.get("event") == "media"
+                and message.get("stream_id") == self.media.stream
+                and message.get("sequence_number") in sequences
+            ):
+                assert isinstance(frame, InputAudioRawFrame), (
+                    "native_late_wire_real_pcm_frame"
+                )
+                assert len(decoded) < 8, "native_late_wire_frame_bound"
+                assert frame.id not in decoded, "native_late_wire_unique_frame"
+                decoded[frame.id] = message["sequence_number"]
+            return frame
+
+        async def observed_process(frame, direction):
+            await native_process(frame, direction)
+            if (
+                isinstance(frame, InputAudioRawFrame)
+                and direction is FrameDirection.DOWNSTREAM
+                and frame.id in decoded
+            ):
+                assert frame.id not in processed, "native_late_pcm_processed_once"
+                processed.add(frame.id)
+                if len(processed) == 8:
+                    wire_done.set()
+
+        async def observed_keypad(frame):
+            handled = await native_keypad(frame)
+            if frame.button.value == "1" and frame.sequence_number == late_sequence:
+                assert handled is True and frame.occurred_at is not None, (
+                    "native_late_caller_one_handled"
+                )
+                keypad_done.set()
+            return handled
+
+        with ExitStack() as observers:
+            observers.enter_context(patch.object(
+                ProjetV0TelnyxFrameSerializer, "deserialize", observed_deserialize
+            ))
+            observers.enter_context(patch.object(
+                self.audio_capture.tap, "process_frame", observed_process
+            ))
+            observers.enter_context(patch.object(
+                self.session._controller, "accept_dtmf", observed_keypad
+            ))
+            try:
+                await self.media.input({
+                    "event": "dtmf", "stream_id": self.media.stream,
+                    "sequence_number": str(late_sequence),
+                    "occurred_at": now().isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    ),
+                    "dtmf": {"digit": "1"},
+                })
+                for sequence in range(late_sequence + 1, late_sequence + 9):
+                    await self.media.input({
+                        "event": "media", "stream_id": self.media.stream,
+                        "sequence_number": str(sequence),
+                        "media": {
+                            "payload": base64.b64encode(b"\x8e" * 800).decode(),
+                            "track": "inbound",
+                        },
+                    })
+                await asyncio.wait_for(
+                    asyncio.gather(wire_done.wait(), keypad_done.wait()), 2
+                )
+                assert (
+                    set(decoded.values()) == sequences and processed == set(decoded)
+                ), "native_late_wire_all_exact_frames_processed"
+                processed_count = len(processed)
+            finally:
+                wire_done.clear()
+                keypad_done.clear()
+                decoded.clear()
+                processed.clear()
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            choice = database.execute(
+                "SELECT choice_state,denied_at IS NOT NULL FROM local_audio_pin "
+                "WHERE call_id=?",
+                (str(self.call_id),),
+            ).fetchone()
+            terminal = database.execute(
+                "SELECT op_id,fingerprint,acked FROM local_audio_terminal "
+                "WHERE call_id=? AND kind='audio.revoke'", (str(self.call_id),)
+            ).fetchone()
+        assert choice == ("off", 1), "native_late_choice_stays_off"
+        assert terminal == self.audio_opposition_terminal, (
+            "native_late_terminal_unchanged"
+        )
+        assert self.audio_capture.holder.summary.committed_samples == (
+            self.audio_opposition_closed_samples
+        ), "native_late_pcm_cannot_rearm_samples"
+        assert len(self.audio_seen) == self.audio_opposition_closed_chunks, (
+            "native_late_pcm_cannot_publish_chunks"
+        )
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_late_audio_delivery_joined", 5)
+        assert (
+            not self.audio_capture.tap.pending_join
+            and not self.audio_capture.holder.summary.pending
+        ), "native_late_audio_capture_still_joined"
+        assert self.session._controller.is_active(), (
+            "native_late_audio_conversation_live"
+        )
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_late_audio_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_late_audio_no_phone_hangup"
+        )
+        return {"late_dtmf_handled": True, "late_pcm_processed": processed_count,
+                "choice_off": True, "capture_joined": True, "phone_live": True}
 
     async def audio_finish(self, *, normal_completion=False):
         self.candidate_phase("audio-finish-entered")
