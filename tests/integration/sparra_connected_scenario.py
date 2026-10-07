@@ -14,7 +14,7 @@ import ssl
 import sys
 import time
 import traceback
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, closing
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -3620,6 +3620,15 @@ class Scenario:
         return {"cleaned": True, "ack_before_scrub": False}
 
 
+def candidate_consumption_receipt(path, run_id):
+    uri = "file:" + path.as_posix() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as database:
+        return database.execute(
+            "SELECT run_id,consumed_at FROM qualification_runs WHERE run_id=?",
+            (str(run_id),),
+        ).fetchone()
+
+
 async def connected(request):
     directory = Path(request["state_path"])
     assert directory.parent.resolve() == Path(request["keyring_path"]).parent.resolve()
@@ -3637,8 +3646,63 @@ async def connected(request):
                     scenario.request["fixture_close_failure"] = True
                 stopped = True
                 break
-            method = getattr(scenario, scenario.phase.replace("-", "_"))
-            result = await method()
+            if scenario.phase == "audio-next-candidate":
+                # Reconstruct only the owned fixture, after its actual close.
+                # Native one-use flags and the consumed SQLite row stay intact.
+                assert scenario.audio_candidate, "native_next_candidate_mode"
+                assert (
+                    scenario.audio_original_pin.recording_policy == "off"
+                    and scenario.audio_original_pin.call_id == scenario.call_id
+                ), "native_next_candidate_original_off_pin"
+                previous_run = scenario.audio_run
+                assert await scenario.graph.writer.qualification_run_consumed(previous_run), (
+                    "native_next_candidate_previous_consumed"
+                )
+                sqlite_path = scenario.settings.sqlite_path
+                previous_receipt = await asyncio.to_thread(
+                    candidate_consumption_receipt, sqlite_path, previous_run
+                )
+                assert previous_receipt is not None, "native_next_candidate_receipt_present"
+                await scenario.close()
+                previous_closed = (
+                    scenario.graph.supervisor._closed
+                    and scenario.graph.supervisor._writer_task.done()
+                    and scenario.graph.writer._closed_event.is_set()
+                    and scenario.graph.writer.fatal_fault is None
+                    and scenario.app.state.runtime_graph is None
+                    and scenario.server_task.done()
+                    and not scenario.server.server_state.connections
+                    and not scenario.server.server_state.tasks
+                    and scenario.http.is_closed
+                    and scenario.media.task.done()
+                )
+                assert previous_closed, "native_next_candidate_previous_joined"
+                # Assign before setup: failure/EOF closes the new actual owner.
+                scenario = Scenario(dict(request), directory)
+                await scenario.setup()
+                assert scenario.audio_run != previous_run, "native_next_candidate_fresh_run"
+                previous_consumed = await scenario.graph.writer.qualification_run_consumed(
+                    previous_run
+                )
+                current_consumed = await scenario.graph.writer.qualification_run_consumed(
+                    scenario.audio_run
+                )
+                previous_run_preserved = previous_receipt == await asyncio.to_thread(
+                    candidate_consumption_receipt, scenario.settings.sqlite_path, previous_run
+                )
+                assert (
+                    previous_consumed and not current_consumed and previous_run_preserved
+                ), "native_next_candidate_consumption_preserved"
+                result = {
+                    "previous_run_id": str(previous_run),
+                    "run_id": str(scenario.audio_run),
+                    "previous_consumed": previous_consumed,
+                    "current_consumed": current_consumed,
+                    "previous_run_preserved": previous_run_preserved,
+                    "previous_closed": previous_closed,
+                }
+            else:
+                result = await getattr(scenario, scenario.phase.replace("-", "_"))()
             await asyncio.to_thread(
                 Path(request["evidence_path"], "native.json").write_text,
                 json.dumps(scenario.evidence, indent=2),
