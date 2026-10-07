@@ -462,6 +462,8 @@ class Scenario:
         self.audio_capture = None
         self.audio_pcm_digest = hashlib.sha256()
         self.audio_seen = set()
+        self.audio_gate_ingested = {}
+        self.audio_gate_acked = {}
         self.audio_ack_entered, self.audio_ack_release = asyncio.Event(), asyncio.Event()
         self.audio_ack_hold = False
         self.audio_ack_refusal = None
@@ -730,6 +732,20 @@ class Scenario:
                 async def observed_ingest(operation):
                     await native_ingest(operation)
                     if (
+                        operation.kind == "call.upsert" and operation.payload.status == "active"
+                        and operation.payload.disclosure_evidence is not None
+                        and operation.payload.disclosure_evidence.input_gate_opened_at is not None
+                    ):
+                        with sqlite3.connect(self.settings.sqlite_path) as database:
+                            queued = database.execute(
+                                "SELECT queue_id FROM outbox WHERE op_id=?",
+                                (str(operation.operation_id),),
+                            ).fetchone()
+                        assert queued is not None, "native_audio_active_operation_still_owned"
+                        self.audio_gate_ingested[queued[0]] = (
+                            operation.call_id, operation.operation_id
+                        )
+                    if (
                         operation.kind == "audio.chunk"
                         and operation.operation_id not in self.audio_seen
                     ):
@@ -806,6 +822,18 @@ class Scenario:
             from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
 
             native_capture = native_session.LocalAudioCapture
+            native_ack = self.graph.writer.ack_outbox
+
+            async def observed_ack(**values):
+                result = await native_ack(**values)
+                if result.applied:
+                    delivered = self.audio_gate_ingested.pop(values["queue_id"], None)
+                    if delivered is not None:
+                        call_id, operation_id = delivered
+                        self.audio_gate_acked[call_id] = operation_id
+                return result
+
+            self.graph.writer.ack_outbox = observed_ack
 
             def observed_capture(**values):
                 capture = native_capture(**values)
@@ -1455,7 +1483,12 @@ class Scenario:
 
         self.session = await eventually(active_session, "native_disclosure_gate", 20)
         self.candidate_phase("controller-choice-ready")
-        if self.audio_candidate:
+        snapshot = self.session._identity.begin_snapshot
+        local_audio = (
+            self.audio_candidate and snapshot.audio_available
+            and snapshot.recording_policy == "local_30d"
+        )
+        if local_audio:
             assert self.audio_capture is not None, "native_audio_capture_constructor"
             assert self.audio_capture.holder.summary.committed_samples == 0, (
                 "native_audio_no_prechoice_capture"
@@ -1468,12 +1501,15 @@ class Scenario:
                     "stream_id": self.media.stream,
                     "sequence_number": "2",
                     "occurred_at": now().isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-                    "dtmf": {"digit": "1"},
+                    "dtmf": {"digit": getattr(self, "audio_caller_choice", "1")},
                 }
             )
             self.candidate_phase("dtmf-one-sent")
             await eventually(self.session._controller.is_active, "native_audio_caller_one_gate", 5)
             self.candidate_phase("input-gate-active")
+        elif self.audio_candidate:
+            assert self.audio_capture is None, "native_audio_off_has_no_capture"
+            assert self.session._controller.is_active(), "native_audio_off_gate_active"
         assert self.session._identity.routing.from_e164 is None
         assert self.session._identity.begin_snapshot.knowledge.business_name == (
             "Native capture fixture" if self.audio_candidate else "Garage connecté"
@@ -2839,6 +2875,120 @@ class Scenario:
                 "+00:00", "Z"
             ),
         }
+
+    async def _audio_wait_active_delivery(self):
+        async def delivered():
+            return (
+                self.call_id in self.audio_gate_acked
+                and await self.graph.writer.oldest_outbox_created_at() is None
+            )
+
+        await eventually(delivered, "native_audio_active_operation_ack_joined", 5)
+
+    async def audio_off_admit(self):
+        assert self.audio_candidate, "native_audio_candidate_mode"
+        admitted = await self.open_call("audio-off-original")
+        snapshot = self.session._identity.begin_snapshot
+        assert snapshot.recording_policy == "off", "native_audio_owner_off_policy"
+        assert not snapshot.audio_available and snapshot.recording_id is None, (
+            "native_audio_off_has_no_identity"
+        )
+        assert self.audio_capture is None, "native_audio_off_has_no_capture"
+        await self._audio_wait_active_delivery()
+        self.audio_original_pin = snapshot
+        return {
+            **admitted,
+            "recording_id": None,
+            "recording_policy": snapshot.recording_policy,
+            "audio_available": snapshot.audio_available,
+            "retention_until": snapshot.retention_until.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    async def audio_off_replay(self):
+        snapshot = self.session._identity.begin_snapshot
+        replay = await self.graph.sink.begin_call_v2(
+            self.settings.deployment_id, self.call_id, self.session._identity.routing
+        )
+        assert snapshot == self.audio_original_pin == replay, "native_audio_off_pin_immutable"
+        assert self.audio_capture is None, "native_audio_off_stays_without_capture"
+        for sequence in range(3, 19):
+            await self.media.input({
+                "event": "media", "stream_id": self.media.stream,
+                "sequence_number": str(sequence),
+                "media": {"payload": base64.b64encode(b"\x9e" * 800).decode(), "track": "inbound"},
+            })
+        await self.graph.writer.read_retained_call(self.call_id)
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_audio_off_control_delivery", 5)
+        assert not self.audio_seen, "native_audio_off_no_chunk_delivery"
+        assert self.session._controller.is_active(), "native_audio_off_conversation_live"
+        assert await self.graph.registry.live_call_count() == 1, "native_audio_off_phone_live"
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_audio_off_no_phone_hangup"
+        )
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            terminals = database.execute(
+                "SELECT count(*) FROM local_audio_terminal WHERE call_id=?", (str(self.call_id),)
+            ).fetchone()
+        assert terminals == (0,), "native_audio_off_no_terminal_operation"
+        return {"original_pin": True, "capture_owned": False, "audio_chunks": 0, "phone_live": True}
+
+    async def audio_decline_admit(self):
+        assert self.audio_candidate, "native_audio_candidate_mode"
+        self.audio_caller_choice = "2"
+        admitted = await self.open_call("audio-declined-original")
+        snapshot = self.session._identity.begin_snapshot
+        assert snapshot.audio_available and snapshot.recording_id is not None, (
+            "native_audio_decline_offer_available"
+        )
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            choice = database.execute(
+                "SELECT choice_state FROM local_audio_pin WHERE call_id=?", (str(self.call_id),)
+            ).fetchone()
+        assert choice == ("off",), "native_audio_caller_two_must_commit_off"
+        assert self.audio_capture is not None, "native_audio_decline_capture_owned"
+        assert self.audio_capture.holder.summary.committed_samples == 0, (
+            "native_audio_decline_no_pcm"
+        )
+        await self._audio_wait_active_delivery()
+        return {
+            **admitted,
+            "recording_id": str(snapshot.recording_id),
+            "retention_until": snapshot.retention_until.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    async def audio_decline_check(self):
+        async def delivered():
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                terminal = database.execute(
+                    "SELECT acked FROM local_audio_terminal "
+                    "WHERE call_id=? AND kind='audio.revoke'",
+                    (str(self.call_id),),
+                ).fetchone()
+            return terminal == (1,) and await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_audio_caller_two_revoke_ack", 5)
+        assert (
+            not self.audio_capture.tap.pending_join
+            and not self.audio_capture.holder.summary.pending
+        ), "native_audio_caller_two_capture_joined"
+        assert self.audio_capture.holder.summary.committed_samples == 0 and not self.audio_seen, (
+            "native_audio_caller_two_no_pcm_or_chunks"
+        )
+        assert self.session._controller.is_active(), "native_audio_caller_two_conversation_live"
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_audio_caller_two_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_audio_caller_two_no_phone_hangup"
+        )
+        return {"choice_off": True, "audio_chunks": 0, "phone_live": True, "capture_joined": True}
 
     async def audio_complete(self):
         return await self.audio_finish(normal_completion=True)
