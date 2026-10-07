@@ -2840,7 +2840,10 @@ class Scenario:
             ),
         }
 
-    async def audio_finish(self):
+    async def audio_complete(self):
+        return await self.audio_finish(normal_completion=True)
+
+    async def audio_finish(self, *, normal_completion=False):
         self.candidate_phase("audio-finish-entered")
         assert self.audio_candidate and self.audio_capture is not None, "native_audio_capture_owned"
         # Controlled wire PCM traverses the actual serializer, STT passthrough,
@@ -2865,8 +2868,34 @@ class Scenario:
         assert self.audio_capture.holder.summary.committed_samples >= 512_000, (
             "native_audio_actual_sample_threshold"
         )
-        await self.event("call.hangup", "audio-original")
-        self.candidate_phase("audio-hangup-accepted")
+        if normal_completion:
+            # Pipecat's public graceful stop queues EndFrame; CallSession owns
+            # controller/capture completion and the native terminal publication.
+            # Do not inject a provider hangup or call capture.finish ourselves.
+            worker = self.session._active_runtime.worker
+            owner = self.session._registry_terminalizer._owner
+            assert owner is not None and owner._task is not None, "native_audio_normal_owner"
+            assert not worker.has_finished(), "native_audio_normal_worker_active"
+            assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+                "native_audio_normal_no_prior_hangup"
+            )
+            await worker.stop_when_done()
+            await eventually(
+                lambda: owner._closed.is_set() and owner._task.done(),
+                "native_audio_normal_owner_joined",
+                5,
+            )
+            assert worker.has_finished(), "native_audio_normal_worker_joined"
+            assert self.session._terminal_outcome.reason == "closed", (
+                "native_audio_normal_session_closed"
+            )
+            assert not self.audio_capture.holder.summary.partial, "native_audio_normal_not_partial"
+            assert self.audio_capture.holder.summary.reason == "complete", (
+                "native_audio_normal_capture_complete"
+            )
+        else:
+            await self.event("call.hangup", "audio-original")
+            self.candidate_phase("audio-hangup-accepted")
         self.candidate_phase("audio-media-close-start")
         await self.media.close()
         self.candidate_phase("audio-media-close-completed")
@@ -2887,14 +2916,20 @@ class Scenario:
         )
         # A provider hangup drains the actual session conservatively. Its native
         # partial state remains partial after the event and receipt are joined.
-        # This gate qualifies that path; normal ON/ready is a separate scenario.
+        # The separate normal action requires graceful, non-partial completion.
         await eventually(
             lambda: (
-                self.audio_capture.tap.state in {"partial", "stopped"}
+                (
+                    self.audio_capture.tap.state == "stopped"
+                    if normal_completion
+                    else self.audio_capture.tap.state in {"partial", "stopped"}
+                )
                 and not self.audio_capture.tap.pending_join
                 and not self.audio_capture.holder.summary.pending
             ),
-            "native_audio_partial_capture_joined",
+            "native_audio_normal_capture_joined"
+            if normal_completion
+            else "native_audio_partial_capture_joined",
             5,
         )
         self.candidate_phase("audio-capture-stopped")
@@ -2921,12 +2956,18 @@ class Scenario:
             "native_audio_capture_joined"
         )
         assert self.audio_seen, "native_audio_actual_chunks_ingested"
-        self.evidence["checks"].append("native-partial-hangup-capture-real-pgbouncer-delivery")
+        self.evidence["checks"].append(
+            "native-normal-endframe-capture-real-pgbouncer-delivery"
+            if normal_completion
+            else "native-partial-hangup-capture-real-pgbouncer-delivery"
+        )
         self.evidence["capture"] = {
             "committed_samples": summary.committed_samples,
             "last_sequence": summary.last_sequence,
             "operations": len(self.audio_seen),
-            "scope": "synthetic-wire-media-partial-provider-hangup",
+            "scope": "synthetic-wire-media-normal-endframe"
+            if normal_completion
+            else "synthetic-wire-media-partial-provider-hangup",
         }
         self.candidate_phase("audio-finish-completed")
         return {
