@@ -2209,7 +2209,7 @@ class PersistenceWriter:
         payload = operation.payload
         connection = self._require_owner_connection()
         cursor = await connection.execute(
-            "SELECT call_control_id,tenant_id,agent_id,created_at FROM call_leases WHERE call_id=?",
+            "SELECT call_control_id,tenant_id,agent_id FROM call_leases WHERE call_id=?",
             (str(call_id),),
         )
         leases = list(await cursor.fetchall())
@@ -2221,7 +2221,7 @@ class PersistenceWriter:
             or leases[0][0] != payload.telnyx_call_control_id
             or leases[0][1] != str(pin.workspace_id)
             or leases[0][2] != self._process_agent_id
-            or _parse_datetime(leases[0][3]) != facts.admitted_at
+            or not await self._original_admission_matches(leases[0][0], facts.admitted_at)
             or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
             or payload.telnyx_call_session_id != facts.telnyx_call_session_id
             or operation.occurred_at < facts.admitted_at
@@ -2331,7 +2331,7 @@ class PersistenceWriter:
                 return None
             facts = await self._read_call_lifecycle(snapshot.call_id)
             cursor = await connection.execute(
-                "SELECT tenant_id,agent_id,state,created_at FROM call_leases WHERE call_id=?",
+                "SELECT tenant_id,agent_id,state,call_control_id FROM call_leases WHERE call_id=?",
                 (str(snapshot.call_id),),
             )
             leases = list(await cursor.fetchall())
@@ -2344,7 +2344,7 @@ class PersistenceWriter:
                 or len(leases) != 1 or leases[0][0] != str(snapshot.workspace_id)
                 or leases[0][1] != self._process_agent_id
                 or leases[0][2] not in {"pending", "active"}
-                or _parse_datetime(leases[0][3]) != facts.admitted_at
+                or not await self._original_admission_matches(leases[0][3], facts.admitted_at)
             ):
                 return None
             deployment_id = self._process_deployment_id
@@ -2915,6 +2915,20 @@ class PersistenceWriter:
             )
         return LocalCallLifecycleFacts(**values)
 
+    async def _original_admission_matches(
+        self, call_control_id: str, admitted_at: datetime
+    ) -> bool:
+        # The signed provider occurrence anchors the business timeline. Lease
+        # creation and webhook reception are later local-clock observations.
+        cursor = await self._require_owner_connection().execute(
+            "SELECT 1 FROM webhook_receipts WHERE event_type='call.initiated' "
+            "AND call_control_id=? AND occurred_at=? LIMIT 1",
+            (call_control_id, _iso(admitted_at)),
+        )
+        matched = await cursor.fetchone() is not None
+        await cursor.close()
+        return matched
+
     async def _store_lifecycle(self, facts: LocalCallLifecycleFacts) -> None:
         if await self._content_fenced(facts.call_id):
             facts = replace(facts, disclosure_evidence=None, content_erased=True)
@@ -3093,7 +3107,7 @@ class PersistenceWriter:
         pin = await self._read_audio_pin(operation.call_id)
         connection = self._require_owner_connection()
         cursor = await connection.execute(
-            "SELECT call_control_id,tenant_id,agent_id,created_at FROM call_leases WHERE call_id=?",
+            "SELECT call_control_id,tenant_id,agent_id FROM call_leases WHERE call_id=?",
             (str(operation.call_id),),
         )
         leases = list(await cursor.fetchall())
@@ -3109,7 +3123,7 @@ class PersistenceWriter:
             or leases[0][0] != payload.telnyx_call_control_id
             or leases[0][1] != str(pin.workspace_id)
             or leases[0][2] != self._process_agent_id
-            or _parse_datetime(leases[0][3]) != facts.admitted_at
+            or not await self._original_admission_matches(leases[0][0], facts.admitted_at)
             or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
             or payload.telnyx_call_session_id != facts.telnyx_call_session_id
         ):
@@ -4023,7 +4037,9 @@ class PersistenceWriter:
                 if self._contract_version == 2 and operation is None:
                     if (
                         admission.admission_generation is None
-                        or admission.admitted_at != lease.get("created_at")
+                        or receipt.get("event_type") != "call.initiated"
+                        or receipt.get("call_control_id") != lease.get("call_control_id")
+                        or admission.admitted_at != receipt.get("occurred_at")
                         or admission.retention_until != admission.admitted_at + timedelta(days=30)
                     ):
                         raise CommandConflictError("local_admission_identity_conflict")
