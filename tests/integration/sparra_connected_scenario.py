@@ -233,6 +233,7 @@ class Peers:
         self.recordings = {}
         self.tool_arguments = None
         self.transfer = None
+        self.before_transfer = None
 
     async def http(self, request):
         path = request.url.path
@@ -241,6 +242,8 @@ class Peers:
                 self.stream = json.loads(request.content)
             if path.endswith("/actions/transfer"):
                 self.transfer = json.loads(request.content)
+                if self.before_transfer is not None:
+                    await self.before_transfer(self.transfer)
             if request.method == "DELETE":
                 self.deleted.append(path)
                 recording = path.rsplit("/", 1)[-1]
@@ -605,7 +608,10 @@ class Scenario:
                     "agent_id": "audio-fixture-agent",
                     "sparra": {
                         **self.manifest.sparra.model_dump(mode="python"),
-                        "qualified_transfer_destination_e164": None,
+                        "qualified_transfer_destination_e164": (
+                            "+33102030406"
+                            if self.request.get("audio_transfer_fixture") is True else None
+                        ),
                         "operation_contract_version": 2,
                     },
                 }
@@ -2990,6 +2996,164 @@ class Scenario:
             "native_audio_caller_two_no_phone_hangup"
         )
         return {"choice_off": True, "audio_chunks": 0, "phone_live": True, "capture_joined": True}
+
+    def _audio_transfer_boundary(self):
+        capture = self.audio_capture
+        snapshot = self.session._identity.begin_snapshot
+        summary = capture.holder.summary
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            row = database.execute(
+                "SELECT op_id,deployment_id,fingerprint,key_version,nonce,ciphertext "
+                "FROM local_audio_terminal WHERE call_id=? AND kind='audio.finish'",
+                (str(self.call_id),),
+            ).fetchone()
+        finished = False
+        if row is not None:
+            plaintext = bytearray(self.graph.keyring.decrypt(
+                EncryptedValue(row[3], row[4], row[5]),
+                aad=operation_aad_from_metadata(dict(
+                    schema_version=2, call_id=str(self.call_id), kind="audio.finish",
+                    operation_id=row[0], deployment_id=row[1],
+                )),
+            ))
+            try:
+                operation = decode_operation_v2(bytes(plaintext))
+                payload = operation.payload
+                finished = (
+                    isinstance(payload, AudioFinishPayloadV2)
+                    and operation.call_id == self.call_id
+                    and operation.operation_id == UUID(row[0])
+                    and operation.deployment_id == self.settings.deployment_id
+                    and payload.workspace_id == snapshot.workspace_id
+                    and payload.recording_id == snapshot.recording_id
+                    and payload.configuration_revision == snapshot.configuration_revision
+                    and payload.retention_until == snapshot.retention_until
+                    and payload.reason == "transfer"
+                    and payload.last_sequence == summary.last_sequence
+                    and payload.total_samples == summary.committed_samples
+                    and hashlib.sha256(canonical_operation_bytes(operation)).digest() == row[2]
+                )
+            finally:
+                plaintext[:] = b"\0" * len(plaintext)
+        return {
+            "admission_closed": capture.tap.state in {"stopped", "partial"},
+            "event_joined": not capture.tap.pending_join,
+            "receipt_joined": not summary.pending,
+            "tail_committed": summary.committed_samples >= self.audio_transfer_before_tail + 800,
+            "submitted_committed": summary.submitted_samples == summary.committed_samples,
+            "finish_transfer_committed": finished,
+            "original_retention": snapshot.retention_until
+            == self.session._identity.routing.admitted_at + timedelta(days=30),
+        }
+
+    async def audio_transfer_boundary(self):
+        assert self.request.get("audio_transfer_fixture") is True, (
+            "native_transfer_fixed_fixture_opt_in"
+        )
+        admitted = await self.audio_admit()
+        await self._audio_wait_active_delivery()
+        assert self.session._identity.begin_snapshot.transfer_destination == "+33102030406", (
+            "native_transfer_actual_owner_and_manifest_target"
+        )
+        sequence = 2
+        payload = base64.b64encode(b"\x9e" * 800).decode()
+        for sequence in range(3, 35):
+            if self.audio_seen:
+                break
+            assert self.audio_capture.tap.state == "recording", (
+                "native_transfer_capture_active_before_request"
+            )
+            await self.media.input({
+                "event": "media", "stream_id": self.media.stream,
+                "sequence_number": str(sequence),
+                "media": {"payload": payload, "track": "inbound"},
+            })
+            await asyncio.sleep(0.005)
+
+        async def chunk_delivered():
+            return (
+                bool(self.audio_seen)
+                and await self.graph.writer.oldest_outbox_created_at() is None
+            )
+
+        await eventually(chunk_delivered, "native_transfer_real_chunk_ack", 5)
+        await eventually(lambda: not self.audio_capture.tap.pending_join
+                         and not self.audio_capture.holder.summary.pending,
+                         "native_transfer_prime_event_and_receipt_joined", 5)
+        assert self.audio_capture.holder.summary.committed_samples >= 8000, (
+            "native_transfer_real_committed_chunk"
+        )
+        self.audio_transfer_before_tail = self.audio_capture.holder.summary.committed_samples
+        assert self.audio_capture.tap.state == "recording", (
+            "native_transfer_capture_active_before_tail"
+        )
+        tail_processed = asyncio.Event()
+        native_frame = self.audio_capture.tap.process_frame
+
+        async def observed_frame(frame, direction):
+            await native_frame(frame, direction)
+            if isinstance(frame, InputAudioRawFrame):
+                tail_processed.set()
+
+        before_intent = None
+        sdk_entry = None
+        intent_command = None
+        native_intent = self.graph.writer.commit_transfer_intent
+
+        async def observed_intent(facts):
+            nonlocal before_intent, intent_command
+            before_intent = self._audio_transfer_boundary()
+            await native_intent(facts)
+            intent_command = str(facts.transfer_command_id)
+
+        async def observed_sdk(transfer):
+            nonlocal sdk_entry
+            sdk_entry = {
+                **self._audio_transfer_boundary(),
+                "intent_committed": intent_command == transfer["command_id"],
+                "fixed_target": transfer["to"] == "+33102030406",
+            }
+
+        with patch.object(self.audio_capture.tap, "process_frame", observed_frame), patch.object(
+            self.graph.writer, "commit_transfer_intent", observed_intent
+        ), patch.object(self.peers, "before_transfer", observed_sdk):
+            await self.media.input({
+                "event": "media", "stream_id": self.media.stream,
+                "sequence_number": str(sequence + 1),
+                "media": {"payload": payload, "track": "inbound"},
+            })
+            await asyncio.wait_for(tail_processed.wait(), 5)
+            self.peers.tool_arguments = {}
+            await self.captured("Pouvez-vous me passer la ligne qualifiée ?")
+            await eventually(lambda: sdk_entry is not None, "native_transfer_actual_sdk_entry", 5)
+            await eventually(lambda: any(
+                message.get("role") == "tool" and "ringing" in str(message.get("content"))
+                for message in self.aggregator.context.get_messages()
+            ), "native_transfer_native_tool_result_after_sdk", 5)
+
+        # Assert outside SDK MockTransport: an assertion there becomes a provider
+        # exception and could be swallowed as outcome_unknown by native control.
+        assert before_intent is not None and sdk_entry is not None, (
+            "native_transfer_observations_present"
+        )
+        self.evidence["transfer_boundary"] = {
+            "before_intent": before_intent, "sdk_entry": sdk_entry
+        }
+        emit({"transfer_boundary": self.evidence["transfer_boundary"]})
+        assert all(before_intent.values()), "native_transfer_audio_join_before_intent"
+        assert all(sdk_entry.values()), "native_transfer_audio_join_before_sdk_dispatch"
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_transfer_original_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_transfer_no_original_hangup"
+        )
+        assert not any(path.endswith("/record_start") for path in self.peers.actions), (
+            "native_transfer_no_provider_recording"
+        )
+        self.evidence["checks"].append("native-transfer-real-tool-tail-joined-before-intent-and-sdk")
+        return {**admitted, "capture_joined": True, "phone_live": True,
+                "checks": ["native-transfer-real-tool-tail-joined-before-intent-and-sdk"]}
 
     async def audio_complete(self):
         return await self.audio_finish(normal_completion=True)

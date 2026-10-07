@@ -175,6 +175,7 @@ async def capture_case(
         terminal_callbacks = {
             "local_audio_revoke": capture.revoke,
             "local_audio_finish": capture.finish,
+            "local_audio_transfer_ready": capture.ready_for_transfer,
         } if terminal_publication else {}
         controller = session_module.DisclosureController(
             identity=identity, writer=writer, first_failure=failure,
@@ -446,3 +447,249 @@ async def test_local_capture_normal_controller_retirement_preserves_complete_tai
         assert await case.capture.quiesce() == summary
         facts = await case.writer.read_call_lifecycle(CALL)
         assert facts.original_ended_at is None and not facts.content_erased
+
+
+@pytest.mark.asyncio
+async def test_transfer_capture_closes_synchronously_and_persists_native_tail(tmp_path):
+    async with capture_case(tmp_path, terminal_publication=True) as case:
+        await accept_local(case)
+        expected = await caller_frames(case, 1, samples=80)
+        assert case.capture.tap.state == "recording"
+        assert case.controller.close_local_audio_for_transfer() is True
+        assert case.capture.tap.state == "stopped"
+        assert case.controller.is_active()
+        # An actual late pipeline frame still reaches native STT but cannot join capture.
+        await caller_frames(case, 2, samples=80)
+        assert await case.controller.prepare_audio_for_transfer() is True
+        assert track(captured_pcm(case), 0) == expected
+        summary = case.capture.holder.summary
+        assert summary.submitted_samples == summary.committed_samples == 80
+        assert not summary.pending and not case.capture.tap.pending_join
+        with sqlite3.connect(case.path) as db:
+            first = db.execute(
+                "SELECT op_id,fingerprint FROM local_audio_terminal WHERE kind='audio.finish'"
+            ).fetchone()
+        assert first is not None
+        facts = await case.writer.read_call_lifecycle(CALL)
+        assert not facts.transfer_fenced and facts.original_ended_at is None
+        assert facts.retention_until == case.pin.retention_until
+        assert await case.controller.prepare_audio_for_transfer() is True
+        await case.controller.cleanup_termination("qualified_line_connected")
+        with sqlite3.connect(case.path) as db:
+            assert db.execute(
+                "SELECT op_id,fingerprint FROM local_audio_terminal WHERE kind='audio.finish'"
+            ).fetchall() == [first]
+
+
+@pytest.mark.asyncio
+async def test_transfer_capture_waits_native_tail_receipt_before_returning(tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(name):
+        if name == "after_mutation_before_commit" and armed:
+            entered.set()
+            await release.wait()
+
+    armed = False
+    async with capture_case(tmp_path, terminal_publication=True, failpoint=hold) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        assert case.controller.close_local_audio_for_transfer() is True
+        armed = True
+        prepared = asyncio.create_task(case.controller.prepare_audio_for_transfer())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not prepared.done()
+            assert case.capture.tap.state == "stopped"
+            assert case.controller.is_active()
+            assert case.capture.holder.summary.pending
+        finally:
+            armed = False
+            release.set()
+            assert await asyncio.wait_for(prepared, 2) is True
+
+
+@pytest.mark.asyncio
+async def test_transfer_capture_missing_native_finish_is_unavailable(tmp_path):
+    # Actual native recorder/writer; the deliberately missing finish composition is the fault.
+    async with capture_case(tmp_path, terminal_publication=False) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        assert case.controller.close_local_audio_for_transfer() is True
+        assert await case.controller.prepare_audio_for_transfer() is False
+        assert case.controller.is_active()
+        assert case.capture.tap.state == "stopped"
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT count(*) FROM local_audio_terminal").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_transfer_capture_does_not_certify_existing_call_failure(tmp_path):
+    async with capture_case(tmp_path, terminal_publication=True) as case:
+        await accept_local(case)
+        case.failure.signal("pipeline_task_failed")
+        assert case.controller.close_local_audio_for_transfer() is False
+        assert case.capture.tap.state == "stopped"
+        assert await case.controller.prepare_audio_for_transfer() is False
+
+
+@pytest.mark.asyncio
+async def test_transfer_capture_opposition_during_actual_finish_joins_real_revoke(tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+    remaining = 0
+
+    async def hold_finish(name):
+        nonlocal remaining
+        if name == "after_mutation_before_commit" and remaining:
+            remaining -= 1
+            if remaining == 0:
+                entered.set()
+                await release.wait()
+
+    async with capture_case(tmp_path, terminal_publication=True, failpoint=hold_finish) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        assert case.controller.close_local_audio_for_transfer() is True
+        # The actual first transaction commits the flushed tail; the second is audio.finish.
+        remaining = 2
+        prepared = asyncio.create_task(case.controller.prepare_audio_for_transfer())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not prepared.done()
+            assert case.capture.holder.summary.committed_samples == 80
+            frame = await case.serializer.deserialize(json.dumps({
+                "event": "dtmf", "stream_id": "capture-stream", "sequence_number": "2",
+                "occurred_at": NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "dtmf": {"digit": "2"},
+            }))
+            await case.runtime.worker.queue_frame(frame)
+            await _local_choice_wait(lambda: case.controller._local_revoke_requested)
+            assert not prepared.done() and case.controller.is_active()
+        finally:
+            release.set()
+        assert await asyncio.wait_for(prepared, 2) is True
+        await case.controller.join_continuations()
+        assert not case.capture.tap.pending_join and not case.capture.holder.summary.pending
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+            assert db.execute(
+                "SELECT kind FROM outbox WHERE kind IN "
+                "('audio.chunk','audio.finish','audio.revoke')"
+            ).fetchall() == [("audio.revoke",)]
+            assert db.execute(
+                "SELECT count(*) FROM local_audio_terminal WHERE kind='audio.revoke'"
+            ).fetchone()[0] == 1
+        assert (await case.writer.read_call_lifecycle(CALL)).original_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_partial_capture_does_not_certify_normal_tail(tmp_path):
+    async with capture_case(tmp_path, terminal_publication=True) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        case.capture.refuse()
+        assert case.capture.tap.state == "partial"
+        assert await case.controller.prepare_audio_for_transfer() is False
+        assert not case.capture.ready_for_transfer()
+        assert not case.controller.audio_ready_for_transfer()
+        assert not case.capture.tap.pending_join and not case.capture.holder.summary.pending
+        assert case.capture.holder.summary.partial
+        assert (await case.writer.read_call_lifecycle(CALL)).original_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_earlier_frozen_limit_does_not_become_transfer(tmp_path):
+    async with capture_case(tmp_path, terminal_publication=True) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        assert not (await case.capture.finish("limit")).pending
+        with sqlite3.connect(case.path) as db:
+            original = db.execute(
+                "SELECT op_id,fingerprint FROM local_audio_terminal WHERE kind='audio.finish'"
+            ).fetchone()
+        assert original is not None
+        assert await case.controller.prepare_audio_for_transfer() is False
+        assert not case.capture.ready_for_transfer()
+        with sqlite3.connect(case.path) as db:
+            assert db.execute(
+                "SELECT op_id,fingerprint FROM local_audio_terminal WHERE kind='audio.finish'"
+            ).fetchall() == [original]
+        assert (await case.writer.read_call_lifecycle(CALL)).original_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_readiness_invalidates_before_held_denial_lock(tmp_path):
+    async with capture_case(tmp_path, terminal_publication=True) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        assert await case.controller.prepare_audio_for_transfer() is True
+        assert case.controller.audio_ready_for_transfer()
+        frame = await case.serializer.deserialize(json.dumps({
+            "event": "dtmf", "stream_id": "capture-stream", "sequence_number": "2",
+            "occurred_at": NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "dtmf": {"digit": "2"},
+        }))
+        await case.controller._lock.acquire()
+        denial = asyncio.create_task(case.controller.accept_dtmf(frame))
+        try:
+            await _local_choice_wait(lambda: case.controller._local_revoke_requested)
+            assert not denial.done()
+            assert case.controller.pending_task_count == 0
+            assert not case.controller.audio_ready_for_transfer()
+        finally:
+            case.controller._lock.release()
+        assert await asyncio.wait_for(denial, 2)
+        await case.controller.join_continuations()
+        assert case.controller.audio_ready_for_transfer()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transfer_waiter_preserves_real_owned_denial(tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+    armed = False
+
+    async def hold(name):
+        if name == "after_mutation_before_commit" and armed:
+            entered.set()
+            await release.wait()
+
+    async with capture_case(tmp_path, terminal_publication=True, failpoint=hold) as case:
+        await accept_local(case)
+        await caller_frames(case, 1, samples=80)
+        armed = True
+        frame = await case.serializer.deserialize(json.dumps({
+            "event": "dtmf", "stream_id": "capture-stream", "sequence_number": "2",
+            "occurred_at": NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "dtmf": {"digit": "2"},
+        }))
+        await case.runtime.worker.queue_frame(frame)
+        await asyncio.wait_for(entered.wait(), 2)
+        owned = case.controller._local_denial_task
+        assert owned is not None and not owned.done()
+        joined = asyncio.Event()
+        original_join = case.controller._join_audio_transfer_continuations
+
+        async def observe_join():
+            joined.set()
+            await original_join()
+
+        case.controller._join_audio_transfer_continuations = observe_join
+        prepared = asyncio.create_task(case.controller.prepare_audio_for_transfer())
+        try:
+            await asyncio.wait_for(joined.wait(), 2)
+            prepared.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await prepared
+            assert not owned.done() and owned.cancelling() == 0
+            assert not case.controller.audio_ready_for_transfer()
+        finally:
+            armed = False
+            release.set()
+        await case.controller.join_continuations()
+        assert not owned.cancelled() and owned.exception() is None
+        assert case.controller.audio_ready_for_transfer()
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+            assert db.execute(
+                "SELECT count(*) FROM local_audio_terminal WHERE kind='audio.revoke'"
+            ).fetchone()[0] == 1

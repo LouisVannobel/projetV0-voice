@@ -34,6 +34,7 @@ from projetv0_voice.audio_contract import (
     AUDIO_CHUNK_AAD_DOMAIN,
     MAX_AUDIO_AAD_BYTES,
     AudioChunkPayloadV2,
+    AudioFinishPayloadV2,
     BeginCallSnapshotV2,
     VoiceOperationV2,
     canonical_audio_chunk_aad,
@@ -511,6 +512,20 @@ class LocalAudioCapture:
         self._available = snapshot.audio_available and snapshot.recording_policy == "local_30d"
         self._quiesce_lock = asyncio.Lock()
         self._closed = False
+
+    def ready_for_transfer(self) -> bool:
+        summary = self.holder.summary
+        if not self._closed or self.tap.pending_join or summary.pending:
+            return False
+        if self._revoke_operation is not None:
+            return not self._revoke_pending
+        operation = self._finish_operation
+        return (
+            operation is not None and not self._finish_pending
+            and isinstance(operation.payload, AudioFinishPayloadV2)
+            and operation.payload.reason == "transfer" and not summary.partial
+            and summary.submitted_samples == summary.committed_samples
+        )
 
     async def start(self) -> bool:
         if self._closed or not self._available:

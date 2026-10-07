@@ -689,6 +689,31 @@ class CallSession:
         if self._result_inference_task is not None:
             self._result_inference_task.cancel()
 
+    def close_audio_for_transfer(self) -> bool:
+        """Close optional capture without closing ordinary phone input."""
+        pin = self._identity.begin_snapshot
+        if not isinstance(pin, BeginCallSnapshotV2) or not (
+            pin.audio_available and pin.recording_policy == "local_30d"
+        ):
+            return True
+        return self._controller is not None and self._controller.close_local_audio_for_transfer()
+
+    async def prepare_audio_for_transfer(self) -> bool:
+        pin = self._identity.begin_snapshot
+        if not isinstance(pin, BeginCallSnapshotV2) or not (
+            pin.audio_available and pin.recording_policy == "local_30d"
+        ):
+            return True
+        return self._controller is not None and await self._controller.prepare_audio_for_transfer()
+
+    def audio_ready_for_transfer(self) -> bool:
+        pin = self._identity.begin_snapshot
+        if not isinstance(pin, BeginCallSnapshotV2) or not (
+            pin.audio_available and pin.recording_policy == "local_30d"
+        ):
+            return True
+        return self._controller is not None and self._controller.audio_ready_for_transfer()
+
     async def _prepare_partial_result(self) -> None:
         if self._identity.routing is None:
             return
@@ -814,6 +839,9 @@ class CallSession:
             local_audio_quiesce=None if local_capture is None else quiesce_local_capture,
             local_audio_finish=None if local_capture is None else local_capture.finish,
             local_audio_revoke=None if local_capture is None else local_capture.revoke,
+            local_audio_transfer_ready=(
+                None if local_capture is None else local_capture.ready_for_transfer
+            ),
         )
         recorder = TurnRecorder(
             identity=self._identity,
@@ -1562,6 +1590,7 @@ class DisclosureController:
             Callable[[AudioFinishReason], Awaitable[AudioCaptureSummary]] | None
         ) = None,
         local_audio_revoke: Callable[[], Awaitable[AudioCaptureSummary]] | None = None,
+        local_audio_transfer_ready: Callable[[], bool] | None = None,
     ) -> None:
         if isinstance(identity.begin_snapshot, BeginCallSnapshotV1):
             recording_enabled = identity.begin_snapshot.recording_enabled
@@ -1606,6 +1635,7 @@ class DisclosureController:
         self._local_audio_quiesce = local_audio_quiesce
         self._local_audio_finish = local_audio_finish
         self._local_audio_revoke = local_audio_revoke
+        self._local_audio_transfer_ready = local_audio_transfer_ready
         self._local_revoke_requested = False
         self._local_choice_off = False
         self._local_refused = False
@@ -1845,6 +1875,8 @@ class DisclosureController:
         if digit == "2":
             # Close the concrete capture offer latch before any lock/SQL await.
             self._refuse_local_audio()
+            if not self._local_revoke_requested:
+                self._local_quiesced = False
             self._local_revoke_requested = True
             self._cancel_choice_timeout()
             async with self._lock:
@@ -2077,6 +2109,66 @@ class DisclosureController:
             await self.cancel_and_join_continuations()
         else:
             await self.join_continuations()
+
+    def close_local_audio_for_transfer(self) -> bool:
+        if not self._local_enabled:
+            return self._first_failure.code is None
+        self._local_refused = True
+        self._cancel_choice_timeout()
+        if self._local_audio_close is None:
+            return False
+        try:
+            self._local_audio_close()
+        except Exception:
+            return False
+        return self._first_failure.code is None
+
+    def audio_ready_for_transfer(self) -> bool:
+        if self._first_failure.code is not None or self._input_closed:
+            return False
+        if not self._local_enabled:
+            return True
+        if (
+            self.state is not DisclosureState.ACTIVE or not self._local_start_done.is_set()
+            or self.pending_task_count or not self._local_quiesced
+            or self._local_audio_transfer_ready is None
+        ):
+            return False
+        try:
+            return self._local_audio_transfer_ready() is True
+        except Exception:
+            return False
+
+    async def prepare_audio_for_transfer(self) -> bool:
+        if not self.close_local_audio_for_transfer():
+            return False
+        if not self._local_enabled:
+            return True
+        try:
+            await self._join_audio_transfer_continuations()
+            await self._local_start_done.wait()
+            if self._local_revoke_requested or self._local_choice_off:
+                await self._revoke_local_audio()
+            else:
+                if self._local_audio_finish is None:
+                    return False
+                summary = await self._local_audio_finish("transfer")
+                if self._local_revoke_requested or self._local_choice_off:
+                    await self._revoke_local_audio()
+                else:
+                    self._local_quiesced = not summary.pending
+            await self._join_audio_transfer_continuations()
+            return self.audio_ready_for_transfer()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
+    async def _join_audio_transfer_continuations(self) -> None:
+        while pending := [task for task in self._continuations if not task.done()]:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending), return_exceptions=True
+            )
 
     async def cleanup_termination(self, reason: str) -> None:
         try:

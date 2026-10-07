@@ -1544,3 +1544,40 @@ async def test_local_choice_oracle_choice_timeout_and_two_share_one_held_quiesce
             case.probe.release.set()
             case.probe.quiesce_release.set()
             await case.controller.join_continuations()
+
+
+@pytest.mark.asyncio
+async def test_transfer_prepare_does_not_pass_failed_start_event_before_real_off_commit(tmp_path):
+    """Actual controller/pipeline/SQLite; only the existing local-start callback is controlled."""
+    async with _local_choice_case(tmp_path, start_success=False) as case:
+        case.probe.block_start = True
+        case.controller._local_audio_close = lambda: setattr(case.probe, "allows_offers", False)
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        await _local_choice_digit(case, "1", case.clock.utc)
+        await asyncio.wait_for(case.probe.start_entered.wait(), 2)
+        case.probe.remaining = 1
+        case.probe.start_release.set()
+        await asyncio.wait_for(case.probe.entered.wait(), 2)
+        assert case.controller._local_start_done.is_set()
+        assert case.controller.pending_task_count > 0
+        joined = asyncio.Event()
+        original_join = case.controller._join_audio_transfer_continuations
+
+        async def observe_join():
+            joined.set()
+            await original_join()
+
+        case.controller._join_audio_transfer_continuations = observe_join
+        prepared = asyncio.create_task(case.controller.prepare_audio_for_transfer())
+        try:
+            await asyncio.wait_for(joined.wait(), 2)
+            assert not prepared.done()
+            assert not case.controller.audio_ready_for_transfer()
+        finally:
+            case.probe.release.set()
+        # This fixture intentionally has no native finish/readiness callbacks.
+        assert await asyncio.wait_for(prepared, 2) is False
+        await case.controller.join_continuations()
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+        assert case.probe.starts == 1 and not case.probe.allows_offers

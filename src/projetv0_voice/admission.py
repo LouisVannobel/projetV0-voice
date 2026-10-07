@@ -1407,6 +1407,13 @@ class CallRegistry:
                 stop_result = getattr(entry.session, "stop_result_inference", None)
                 if stop_result is not None:
                     stop_result()
+                pin = entry.begin_snapshot
+                if isinstance(pin, BeginCallSnapshotV2) and (
+                    pin.audio_available and pin.recording_policy == "local_30d"
+                ):
+                    close_audio = getattr(entry.session, "close_audio_for_transfer", None)
+                    if not callable(close_audio) or close_audio() is not True:
+                        return "unavailable_collect_message"
                 assert entry.routing is not None
                 command_id = uuid4()
                 correlation = base64.b64encode(uuid4().bytes + command_id.bytes).decode("ascii")
@@ -1455,7 +1462,49 @@ class CallRegistry:
         facts = entry.transfer_facts
         assert facts is not None and facts.transfer_command_id is not None
         assert facts.transfer_correlation is not None
-        await cast(Any, self._writer).commit_transfer_intent(facts)
+        pin = entry.begin_snapshot
+        requires_local_audio = isinstance(pin, BeginCallSnapshotV2) and (
+            pin.audio_available and pin.recording_policy == "local_30d"
+        )
+        commit_entered = False
+        try:
+            if requires_local_audio:
+                prepare_audio = getattr(entry.session, "prepare_audio_for_transfer", None)
+                if not callable(prepare_audio):
+                    return "unavailable_collect_message"
+                try:
+                    prepared = await prepare_audio()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return "unavailable_collect_message"
+                if prepared is not True:
+                    return "unavailable_collect_message"
+                async with self._lock:
+                    if (
+                        self._by_control.get(entry.call_control_id) is not entry
+                        or entry.transfer_facts is not facts
+                        or entry.terminal_authority is not None
+                        or entry.terminal_event is not None
+                        or entry.cleanup_hangup_started
+                        or entry.drain_intent
+                        or self._draining
+                    ):
+                        return "unavailable_collect_message"
+                    audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
+                    if not callable(audio_ready) or audio_ready() is not True:
+                        return "unavailable_collect_message"
+            commit_entered = True
+            await cast(Any, self._writer).commit_transfer_intent(facts)
+        finally:
+            if not commit_entered:
+                async with self._lock:
+                    if (
+                        self._by_control.get(entry.call_control_id) is entry
+                        and entry.transfer_facts is facts
+                        and entry.terminal_authority is None
+                    ):
+                        entry.transfer_facts = None
         async with self._lock:
             if (
                 self._by_control.get(entry.call_control_id) is not entry
@@ -1464,6 +1513,15 @@ class CallRegistry:
                 or not getattr(self._call_control, "dispatch_available", True)
             ):
                 return "unavailable_collect_message"
+            if requires_local_audio:
+                if (
+                    entry.terminal_authority is not None or entry.terminal_event is not None
+                    or entry.cleanup_hangup_started or entry.drain_intent or self._draining
+                ):
+                    return "unavailable_collect_message"
+                audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
+                if not callable(audio_ready) or audio_ready() is not True:
+                    return "unavailable_collect_message"
         # A durable pending intent fences cleanup even after local failure/drain.
         try:
             result = await cast(Any, self._call_control).transfer(
