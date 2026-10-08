@@ -3475,19 +3475,64 @@ class Scenario:
         # PCMU expands to s16le: 800 encoded samples become 1600 decoded
         # mono bytes, the native tap's supported per-frame bound.
         payload = base64.b64encode(b"\x9e" * 800).decode()
-        for sequence in range(3, 803):
-            if self.audio_capture.holder.summary.committed_samples >= 512_000:
-                break
-            assert self.audio_capture.tap.state == "recording", "native_audio_capture_not_refused"
-            await self.media.input(
-                {
-                    "event": "media",
-                    "stream_id": self.media.stream,
-                    "sequence_number": str(sequence),
-                    "media": {"payload": payload, "track": "inbound"},
-                }
-            )
-            await asyncio.sleep(0.005)
+        processed = asyncio.Event()
+        pending_sequence = pending_frame_id = None
+        native_deserialize = ProjetV0TelnyxFrameSerializer.deserialize
+
+        async def observed_deserialize(serializer, data):
+            nonlocal pending_frame_id
+            frame = await native_deserialize(serializer, data)
+            if not isinstance(frame, InputAudioRawFrame):
+                return frame
+            message = json.loads(data)
+            if (
+                message.get("event") == "media"
+                and message.get("stream_id") == self.media.stream
+                and message.get("sequence_number") == pending_sequence
+                and pending_frame_id is None
+            ):
+                pending_frame_id = frame.id
+            return frame
+
+        def after_push(_tap, frame):
+            if isinstance(frame, InputAudioRawFrame) and frame.id == pending_frame_id:
+                processed.set()
+
+        tap = self.audio_capture.tap
+        tap.add_event_handler("on_after_push_frame", after_push)
+        try:
+            with patch.object(
+                ProjetV0TelnyxFrameSerializer, "deserialize", observed_deserialize
+            ):
+                for sequence in range(3, 803):
+                    if self.audio_capture.holder.summary.committed_samples >= 512_000:
+                        break
+                    assert tap.state == "recording", "native_audio_capture_not_refused"
+                    processed.clear()
+                    pending_sequence, pending_frame_id = str(sequence), None
+                    await self.media.input(
+                        {
+                            "event": "media",
+                            "stream_id": self.media.stream,
+                            "sequence_number": pending_sequence,
+                            "media": {"payload": payload, "track": "inbound"},
+                        }
+                    )
+                    await asyncio.wait_for(processed.wait(), 5)
+                    # A wire send is not native frame/event/receipt completion.
+                    # Keep the synthetic yield and let the actual owner join its
+                    # native event and exact SQLite receipt before the next send.
+                    await asyncio.sleep(0.005)
+                    await eventually(
+                        lambda: not tap.pending_join
+                        and not self.audio_capture.holder.summary.pending,
+                        "native_audio_peer_event_and_receipt_joined",
+                        5,
+                    )
+        finally:
+            tap.remove_event_handler("on_after_push_frame", after_push)
+            pending_sequence = pending_frame_id = None
+            processed.clear()
         assert self.audio_capture.holder.summary.committed_samples >= 512_000, (
             "native_audio_actual_sample_threshold"
         )
