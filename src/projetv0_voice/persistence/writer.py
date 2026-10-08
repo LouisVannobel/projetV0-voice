@@ -50,6 +50,7 @@ from projetv0_voice.models import (
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
+    _canonical_milliseconds,
     validate_deployment_id,
 )
 from projetv0_voice.persistence.business_contract import encrypt_message_result, validate_turn_text
@@ -2959,13 +2960,18 @@ class PersistenceWriter:
         # The signed provider occurrence anchors the business timeline. Lease
         # creation and webhook reception are later local-clock observations.
         cursor = await self._require_owner_connection().execute(
-            "SELECT 1 FROM webhook_receipts WHERE event_type='call.initiated' "
-            "AND call_control_id=? AND occurred_at=? LIMIT 1",
-            (call_control_id, _iso(admitted_at)),
+            "SELECT occurred_at FROM webhook_receipts WHERE event_type='call.initiated' "
+            "AND call_control_id=?",
+            (call_control_id,),
         )
-        matched = await cursor.fetchone() is not None
-        await cursor.close()
-        return matched
+        try:
+            async for row in cursor:
+                # RoutingV1 floors admission to milliseconds; signed receipts stay raw.
+                if _canonical_milliseconds(_parse_datetime(row[0])) == admitted_at:
+                    return True
+            return False
+        finally:
+            await cursor.close()
 
     async def _store_lifecycle(self, facts: LocalCallLifecycleFacts) -> None:
         if await self._content_fenced(facts.call_id):
@@ -4118,7 +4124,9 @@ class PersistenceWriter:
                     admission.admission_generation is None
                     or receipt.get("event_type") != "call.initiated"
                     or receipt.get("call_control_id") != lease.get("call_control_id")
-                    or admission.admitted_at != receipt.get("occurred_at")
+                    or admission.admitted_at != _canonical_milliseconds(
+                        self._required_datetime(receipt, "occurred_at")
+                    )
                     or admission.retention_until != admission.admitted_at + timedelta(days=30)
                 ):
                     raise CommandConflictError("local_admission_identity_conflict")

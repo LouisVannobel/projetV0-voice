@@ -27,6 +27,7 @@ from projetv0_voice.models import (
     DisclosureEvidenceV1,
     RoutingV1,
     VoiceOperationV1,
+    _canonical_milliseconds,
 )
 from projetv0_voice.persistence.commands import PersistenceCommand, PersistenceError
 from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguousError
@@ -1944,7 +1945,11 @@ class CallRegistry:
                     entry.call_leg_id != event.call_leg_id
                     or entry.call_session_id != event.call_session_id
                     or event.event_type == "call.initiated"
-                    and entry.initiated_at != event.occurred_at.astimezone(UTC)
+                    and entry.initiated_at != (
+                        _canonical_milliseconds(event.occurred_at)
+                        if entry.routing is not None
+                        else event.occurred_at.astimezone(UTC)
+                    )
                 ):
                     raise CallAdmissionRejected("call_identity_conflict")
                 if entry.terminal_event is not None:
