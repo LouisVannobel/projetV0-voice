@@ -645,6 +645,7 @@ class RuntimeMetricsObserver(BaseObserver):
     async def on_push_frame(self, data: FramePushed) -> None:
         if (
             data.source is self._stt
+            and data.first_push is True
             and type(data.frame) is FatalErrorFrame
             and data.frame.processor is self._stt
             and data.frame.exception is None

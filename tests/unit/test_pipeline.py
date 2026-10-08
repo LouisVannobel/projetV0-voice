@@ -40,7 +40,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.metrics.metrics import ProcessingMetricsData, TTFBMetricsData
-from pipecat.observers.base_observer import FramePushed
+from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -1036,6 +1036,49 @@ async def test_runtime_metrics_observer_ignores_foreign_raw_unknown_cancel_and_t
         assert "provider-private-secret" not in repr(_metric_map(owner))
         assert owner.failure_code is None
     finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stt_native_replay_before_first_producer_failure_does_not_spend_diagnostic():
+    from projetv0_voice.inference.services import build_stt
+
+    stt = build_stt(_diagnostic_stt_profile(), SecretStr("offline-unit-key"), language="fr-FR")
+    llm, tts = FrameProcessor(name="llm"), FrameProcessor(name="tts")
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner, stt=stt, llm=llm, tts=tts
+    )
+    frame = stt._fail_batch("openrouter_stt_timeout")  # noqa: SLF001
+    assert isinstance(frame, FatalErrorFrame)
+    native_hops = []
+
+    class NativePushes(BaseObserver):
+        async def on_push_frame(self, data: FramePushed):
+            if data.frame is frame:
+                native_hops.append(
+                    (data.source is stt, data.first_push, data.frame.processor is stt)
+                )
+
+    try:
+        _, upstream = await asyncio.wait_for(
+            run_test(
+                Pipeline([pipeline_module.InferenceErrorBoundary(stt=stt, llm=llm, tts=tts), stt]),
+                frames_to_send=[frame], frames_to_send_direction=FrameDirection.UPSTREAM,
+                observers=[observer, NativePushes()],
+            ),
+            timeout=5,
+        )
+        # Native first_push, rather than the one-shot latch, distinguishes transit before a cause.
+        assert (False, True, True) in native_hops
+        assert (True, False, True) in native_hops
+        assert "projetv0.voice.stt.failures" not in _metric_map(owner)
+        errors = [item for item in upstream if isinstance(item, ErrorFrame)]
+        assert len(errors) == 1 and errors[0].error == "stt_failed"
+        assert errors[0].exception is None and errors[0].processor is None
+        assert owner.failure_code is None
+    finally:
+        await stt._client.close()  # noqa: SLF001
         await owner.aclose()
 
 
