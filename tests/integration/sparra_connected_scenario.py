@@ -68,6 +68,7 @@ from projetv0_voice.qualified_profile import (
     InferenceProfileV1,
     QualificationCandidateProfileV1,
     QualifiedDeploymentProfileV1,
+    canonical_candidate_profile_sha256,
     canonical_inference_profile_sha256,
 )
 from projetv0_voice.runtime_config import capture_runtime_environment, parse_runtime_settings
@@ -645,6 +646,8 @@ class Scenario:
                     "disclosure_mark_timeout_ms": 10000,
                 }
             )
+            self.audio_profile = profile
+            self.audio_profile_sha256 = bytes.fromhex(canonical_candidate_profile_sha256(profile))
         else:
             profile = QualifiedDeploymentProfileV1.model_validate(
                 {
@@ -3727,7 +3730,8 @@ def candidate_consumption_receipt(path, run_id):
     uri = "file:" + path.as_posix() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as database:
         return database.execute(
-            "SELECT run_id,consumed_at FROM qualification_runs WHERE run_id=?",
+            "SELECT run_id,consumed_at,profile_sha256,total_calls,used_calls "
+            "FROM qualification_runs WHERE run_id=?",
             (str(run_id),),
         ).fetchone()
 
@@ -3758,9 +3762,12 @@ async def connected(request):
                     and scenario.audio_original_pin.call_id == scenario.call_id
                 ), "native_next_candidate_original_off_pin"
                 previous_run = scenario.audio_run
-                assert await scenario.graph.writer.qualification_run_consumed(previous_run), (
-                    "native_next_candidate_previous_consumed"
-                )
+                previous_profile = scenario.audio_profile
+                previous_profile_sha256 = scenario.audio_profile_sha256
+                assert await scenario.graph.writer.qualification_run_consumed(
+                    previous_run, total_calls=previous_profile.total_calls,
+                    profile_sha256=previous_profile_sha256,
+                ), "native_next_candidate_previous_consumed"
                 sqlite_path = scenario.settings.sqlite_path
                 previous_receipt = await asyncio.to_thread(
                     candidate_consumption_receipt, sqlite_path, previous_run
@@ -3785,10 +3792,12 @@ async def connected(request):
                 await scenario.setup()
                 assert scenario.audio_run != previous_run, "native_next_candidate_fresh_run"
                 previous_consumed = await scenario.graph.writer.qualification_run_consumed(
-                    previous_run
+                    previous_run, total_calls=previous_profile.total_calls,
+                    profile_sha256=previous_profile_sha256,
                 )
                 current_consumed = await scenario.graph.writer.qualification_run_consumed(
-                    scenario.audio_run
+                    scenario.audio_run, total_calls=scenario.audio_profile.total_calls,
+                    profile_sha256=scenario.audio_profile_sha256,
                 )
                 previous_run_preserved = previous_receipt == await asyncio.to_thread(
                     candidate_consumption_receipt, scenario.settings.sqlite_path, previous_run
