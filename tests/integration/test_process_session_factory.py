@@ -290,6 +290,33 @@ class _Llm(_Processor):
         self._client = _LlmClient(events)
 
 
+class _PassingProcessor(_Processor):
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+
+
+class _PassingLlm(_PassingProcessor):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__("llm", events)
+        self._client = _LlmClient(events)
+
+
+class _PassingTts(_PassingProcessor):
+    async def process_frame(self, frame, direction):
+        from pipecat.frames.frames import TTSAudioRawFrame, TTSSpeakFrame, TTSStoppedFrame
+
+        if isinstance(frame, TTSSpeakFrame):
+            await FrameProcessor.process_frame(self, frame, direction)
+            await self.push_frame(TTSAudioRawFrame(
+                audio=b"\x01\x00" * 80, sample_rate=8000, num_channels=1,
+                context_id="disclosure",
+            ), direction)
+            await self.push_frame(TTSStoppedFrame(context_id="disclosure"), direction)
+            return
+        await super().process_frame(frame, direction)
+
+
 class _Recording:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -578,7 +605,9 @@ def _real_process_factory(
     metrics: RuntimeMetrics,
     events: list[str],
     registrar: _Registrar | None = None,
+    pass_frames: bool = False,
 ) -> ProcessSessionFactory:
+    processor = _PassingProcessor if pass_frames else _Processor
     return ProcessSessionFactory(
         registry=registry,
         registrar=registrar or _Registrar(),
@@ -592,9 +621,11 @@ def _real_process_factory(
             nonce_factory=lambda size: b"n" * size,
         ),
         stt_http_client_factory=lambda: _SttClient(events),
-        stt_factory=lambda _client: _Processor("stt", events),
-        llm_factory=lambda: _Llm(events),
-        tts_factory=lambda: _Processor("tts", events),
+        stt_factory=lambda _client: processor("stt", events),
+        llm_factory=lambda: _PassingLlm(events) if pass_frames else _Llm(events),
+        tts_factory=lambda: (
+            _PassingTts("tts", events) if pass_frames else _Processor("tts", events)
+        ),
         recording_factory=lambda _identity: _Recording(events),
         idle_timeout_seconds=30.0,
     )
@@ -1616,6 +1647,75 @@ async def test_required_drain_cancels_constructing_owner_without_local_hangup(
     total = _metric_points(metrics, "projetv0.voice.calls.total")
     assert total[0].attributes["session"] == "failed"
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_native_session_timeout_uses_one_owned_hangup_and_releases_lease() -> None:
+    from pipecat.transports.websocket.fastapi import (
+        FastAPIWebsocketParams,
+        FastAPIWebsocketTransport,
+    )
+    from starlette.websockets import WebSocket, WebSocketState
+
+    from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
+
+    writer = _RealWriter()
+    control = _RealControl()
+    registry, claim = await _real_claim(writer, control)
+    hangup_command_id = registry._by_control["control-a"].hangup_command_id  # noqa: SLF001
+    events: list[str] = []
+    metrics = RuntimeMetrics.in_memory()
+    factory = _real_process_factory(
+        registry=registry, writer=writer, metrics=metrics, events=events,
+        pass_frames=True,
+    )
+    never = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        await never.wait()
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send(_message: dict[str, object]) -> None:
+        return None
+
+    websocket = WebSocket(
+        {"type": "websocket", "asgi": {"version": "3.0"}, "scheme": "wss",
+         "server": ("voice.invalid", 443), "client": ("127.0.0.1", 12345),
+         "root_path": "", "path": "/media", "raw_path": b"/media",
+         "query_string": b"", "headers": [], "subprotocols": []},
+        receive=receive, send=send,
+    )
+    websocket.application_state = WebSocketState.CONNECTED
+    websocket.client_state = WebSocketState.CONNECTED
+    admission = AudioAdmission()
+    transport = FastAPIWebsocketTransport(websocket, FastAPIWebsocketParams(
+        audio_in_enabled=True, audio_out_enabled=True, session_timeout=1,
+        serializer=ProjetV0TelnyxFrameSerializer(
+            "stream-a", expected_call_control_id="control-a", audio_admission=admission,
+        ),
+    ))
+    handshake = AuthenticatedTelnyxHandshake(
+        call_data=TelnyxCallData(stream_id="stream-a", call_id="control-a",
+                                outbound_encoding="PCMU"),
+        token_locator_id="telnyx-header-connected-v1", lease_claim=claim,
+        transport=transport, audio_admission=admission,
+    )
+    try:
+        await asyncio.wait_for(factory.run(handshake), timeout=3)
+
+        terminal = [command.payload["operation"] for command in writer.control_commits
+                    if command.payload["operation"].kind == "call.upsert"
+                    and command.payload["operation"].payload.status == "failed"]
+        assert len(terminal) == 1
+        assert terminal[0].payload.end_reason == "transport_session_timeout"
+        assert control.hangups == [("control-a", hangup_command_id)]
+        assert await registry.snapshot("control-a") is None
+        assert [commit["state"] for commit in writer.lease_commits] == ["active", "terminal"]
+        assert admission.allows_audio() is False
+        assert "recording-cleanup" in events
+        assert "stt-client-close" in events and "llm-client-close" in events
+    finally:
+        await metrics.aclose()
 
 
 @pytest.mark.asyncio

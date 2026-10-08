@@ -1229,7 +1229,7 @@ async def test_shutdown_deadline_bounds_each_dependency_close(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("company_case", ["on", "candidate", "override"])
+@pytest.mark.parametrize("company_case", ["on", "candidate", "override", "linked"])
 async def test_production_composition_builds_ordered_graph_with_one_measured_control(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1299,7 +1299,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
                 ),
                 "VOICE_AGENT_BUNDLE_SHA256": "b" * 64,
                 "VOICE_INFERENCE_PROFILE_SHA256": inference_hash,
-                "VOICE_DEPLOYMENT_MAX_CALLS": "10",
+                "VOICE_DEPLOYMENT_MAX_CALLS": "1" if company_case == "linked" else "10",
                 "VOICE_HANDSHAKE_TIMEOUT_SECONDS": "5",
                 "VOICE_CALL_IDLE_TIMEOUT_SECONDS": "300",
                 "VOICE_CALL_CLEANUP_PHASE_TIMEOUT_SECONDS": "10",
@@ -1343,6 +1343,19 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
             "recording_play_beep": False,
         }
     )
+    if company_case == "linked":
+        from projetv0_voice.config import SparraManifestV1
+
+        manifest = manifest.model_copy(update={
+            "max_concurrent_calls": 1,
+            "transcript_retention_days": 30,
+            "recording_mode": "off",
+            "recording_retention_days": None,
+            "sparra": SparraManifestV1(
+                schema_version=1, connection_id="fixture-connection",
+                original_forward_line_e164=None, qualified_transfer_destination_e164=None,
+            ),
+        })
     profile = QualifiedDeploymentProfileV1(
         schema_version=1,
         deployment_id=settings.deployment_id,
@@ -1371,6 +1384,9 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
 
         async def ingest(self, _operation: object) -> None:
             return None
+
+        async def begin_call(self, *_args: object) -> None:
+            raise AssertionError("composition must not start a call")
 
         async def lease_recording_purges(
             self, _worker_id: str, _lease_seconds: int, _batch_size: int
@@ -1495,6 +1511,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     assert graph.recording_call_control_identity is graph.measured_call_control
     assert isinstance(graph.handshake, AuthenticatedTelnyxHandshakeService)
+    assert graph.handshake._session_timeout == (300 if company_case == "linked" else None)
     assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
     from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
     from projetv0_voice.models import BeginCallSnapshotV1
@@ -1588,11 +1605,17 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     try:
         assert len(selected_profiles) == 2 and selected_profiles[-1] is candidate
+        assert candidate_graph.handshake._session_timeout == (
+            300 if company_case == "linked" else None
+        )
         if company_case == "candidate":
             with pytest.raises(ValueError, match="^sparra_recording_unqualified$"):
                 candidate_graph.recording_factory(recording_identity(True))
     finally:
         await candidate_graph.supervisor.aclose()
+
+    if company_case == "linked":
+        return
 
     from projetv0_voice.admission import CallAdmissionRejected
 
