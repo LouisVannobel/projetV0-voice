@@ -1195,7 +1195,7 @@ async def test_candidate_first_commit_closes_distinct_admission_but_keeps_duplic
     registry, _ = _registry(capacity=2, candidate_run_id=run_id)
     first = await registry.resolve_webhook(_initiated())
     await registry.reconcile_after_commit(
-        _initiated(), first, WebhookCommitResult("first", "applied")
+        _initiated(), first, WebhookCommitResult("first", "applied", qualification_exhausted=True)
     )
 
     duplicate = await registry.resolve_webhook(_initiated())

@@ -439,7 +439,7 @@ async def test_real_v1_migration_redelivery_accepts_only_verified_fingerprint_se
     await writer.drain(2)
     await writer_task
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         assert connection.execute(
             "SELECT semantic_fingerprint_sha256 FROM webhook_receipts"
         ).fetchone() == (legacy_fingerprint,)

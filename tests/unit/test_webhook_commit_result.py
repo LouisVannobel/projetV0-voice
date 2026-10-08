@@ -23,6 +23,364 @@ NOW = datetime(2026, 8, 29, 10, tzinfo=UTC)
 RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
+def _candidate_admission(writer: PersistenceWriter, number: int, **extra: object):
+    control = f"candidate-{number}"
+    return writer.submit_webhook(
+        receipt={**_receipt(f"candidate-event-{number}"), "call_control_id": control},
+        lease={**_lease(), "call_control_id": control, "call_id": UUID(int=number)},
+        operation=None,
+        qualification_run_id=RUN_ID,
+        qualification_total_calls=3,
+        qualification_profile_sha256=b"p" * 32,
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_finite_candidate_counts_commits_durably_and_refuses_fourth_before_any_effect(
+    tmp_path,
+):
+    database = tmp_path / "finite.sqlite"
+    writer, owner = await _start_writer(database)
+    first_consumed_at = None
+    try:
+        for number in (1, 2):
+            result = await _candidate_admission(writer, number).wait()
+            assert result.qualification_exhausted is False
+            assert (
+                await writer.qualification_run_consumed(
+                    RUN_ID, total_calls=3, profile_sha256=b"p" * 32
+                )
+                is False
+            )
+            with sqlite3.connect(database) as connection:
+                stamp = connection.execute("SELECT consumed_at FROM qualification_runs").fetchone()
+                if first_consumed_at is None:
+                    first_consumed_at = stamp
+                assert stamp == first_consumed_at
+    finally:
+        await _stop_writer(writer, owner)
+    writer, owner = await _start_writer(database)
+    try:
+        final = await _candidate_admission(writer, 3).wait()
+        assert final.qualification_exhausted is True
+        rejected = await _candidate_admission(writer, 4).wait()
+        assert type(rejected).__name__ == "QualificationRunConsumed"
+    finally:
+        await _stop_writer(writer, owner)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT profile_sha256,total_calls,used_calls FROM qualification_runs"
+        ).fetchall() == [(b"p" * 32, 3, 3)]
+        assert (
+            connection.execute("SELECT consumed_at FROM qualification_runs").fetchone()
+            == first_consumed_at
+        )
+        assert connection.execute("SELECT count(*) FROM call_leases").fetchone() == (3,)
+        assert connection.execute("SELECT count(*) FROM webhook_receipts").fetchone() == (3,)
+        assert connection.execute("SELECT count(*) FROM outbox").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "active", "terminal"])
+async def test_candidate_new_event_same_admitted_lease_never_uses_another_unit(tmp_path, state):
+    database = tmp_path / "replay.sqlite"
+    writer, owner = await _start_writer(database)
+    try:
+        await _candidate_admission(writer, 1).wait()
+        await writer.commit_control(
+            PersistenceCommand(
+                "lease",
+                {**_lease(state), "call_control_id": "candidate-1", "call_id": UUID(int=1)},
+                None,
+            )
+        )
+        replay = await writer.submit_webhook(
+            receipt={**_receipt("new-id"), "call_control_id": "candidate-1"},
+            lease={**_lease(), "call_control_id": "candidate-1", "call_id": UUID(int=1)},
+            operation=None,
+            qualification_run_id=RUN_ID,
+            qualification_total_calls=3,
+            qualification_profile_sha256=b"p" * 32,
+        ).wait()
+        assert replay.effect == ("existing_terminal" if state == "terminal" else "duplicate")
+    finally:
+        await _stop_writer(writer, owner)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (1,)
+        assert connection.execute("SELECT state FROM call_leases").fetchone() == (state,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_limit_and_profile_are_immutable_after_first_use(tmp_path):
+    database = tmp_path / "immutable.sqlite"
+    writer, owner = await _start_writer(database)
+    await _candidate_admission(writer, 1).wait()
+    with pytest.raises(CommandConflictError, match="qualification_run_conflict"):
+        await writer.qualification_run_consumed(RUN_ID, total_calls=4, profile_sha256=b"p" * 32)
+    await owner
+    writer, owner = await _start_writer(database)
+    with pytest.raises(CommandConflictError, match="qualification_run_conflict"):
+        await writer.qualification_run_consumed(RUN_ID, total_calls=3, profile_sha256=b"q" * 32)
+    await owner
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT total_calls,used_calls FROM qualification_runs"
+        ).fetchone() == (3, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [2, 3, 4, 5])
+async def test_candidate_migration_preserves_consumed_history_without_inventing_fingerprint(
+    tmp_path, version
+):
+    from projetv0_voice.persistence import schema
+
+    database = tmp_path / "legacy-candidate.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(getattr(schema, f"V{version}_SCHEMA_SQL"))
+        connection.execute(
+            "INSERT INTO qualification_runs VALUES (?,?)", (str(RUN_ID), "old-first-use")
+        )
+    writer, owner = await _start_writer(database)
+    try:
+        assert (
+            await writer.qualification_run_consumed(RUN_ID, total_calls=3, profile_sha256=b"p" * 32)
+            is True
+        )
+        assert (
+            type(await _candidate_admission(writer, 1).wait()).__name__
+            == "QualificationRunConsumed"
+        )
+    finally:
+        await _stop_writer(writer, owner)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT * FROM qualification_runs").fetchall() == [
+            (str(RUN_ID), "old-first-use", None, 1, 1)
+        ]
+        assert connection.execute("SELECT count(*) FROM call_leases").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_rollback_keeps_all_units_and_receipts_absent(tmp_path):
+    database = tmp_path / "rollback-allowance.sqlite"
+
+    def failpoint(name):
+        if name == "after_mutation_before_commit":
+            raise OSError("offline-rollback")
+
+    writer = PersistenceWriter(
+        database, CryptoKeyring({1: KEY}, active_version=1), failpoint=failpoint
+    )
+    owner = asyncio.create_task(writer.run())
+    assert await writer.wait_ready()
+    with pytest.raises(FatalPersistenceError):
+        await _candidate_admission(writer, 1).wait()
+    await owner
+    with sqlite3.connect(database) as connection:
+        for table in ("qualification_runs", "call_leases", "webhook_receipts", "outbox"):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_concurrent_submissions_admit_exactly_the_remaining_units(tmp_path):
+    database = tmp_path / "concurrent-allowance.sqlite"
+    writer, owner = await _start_writer(database)
+    try:
+        results = await asyncio.gather(*[
+            _candidate_admission(writer, number).wait() for number in range(1, 5)
+        ])
+        assert [type(result).__name__ for result in results] == [
+            "WebhookCommitResult", "WebhookCommitResult", "WebhookCommitResult",
+            "QualificationRunConsumed",
+        ]
+        assert [result.qualification_exhausted for result in results[:3]] == [False, False, True]
+    finally:
+        await _stop_writer(writer, owner)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (3,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_late_commit_keeps_ownership_and_spends_once_after_waiter_cancel(tmp_path):
+    database = tmp_path / "late-allowance.sqlite"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def failpoint(name):
+        if name == "after_mutation_before_commit":
+            entered.set()
+            await release.wait()
+
+    writer = PersistenceWriter(
+        database, CryptoKeyring({1: KEY}, active_version=1), failpoint=failpoint
+    )
+    owner = asyncio.create_task(writer.run())
+    assert await writer.wait_ready()
+    ticket = _candidate_admission(writer, 1)
+    waiter = asyncio.create_task(ticket.wait())
+    await entered.wait()
+    assert not ticket.done()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT count(*) FROM qualification_runs").fetchone() == (0,)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    assert (await ticket.wait()).qualification_exhausted is False
+    await _stop_writer(writer, owner)
+    writer, owner = await _start_writer(database)
+    try:
+        replay = await _candidate_admission(writer, 1).wait()
+        assert replay.receipt == "duplicate"
+    finally:
+        await _stop_writer(writer, owner)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_lost_commit_response_never_refunds_committed_admission(
+    tmp_path, monkeypatch
+):
+    import aiosqlite
+
+    database = tmp_path / "lost-commit.sqlite"
+    writer, owner = await _start_writer(database)
+    native_commit = aiosqlite.Connection.commit
+
+    async def commit_then_lose_response(connection):
+        await native_commit(connection)
+        raise OSError("offline-lost-commit-response")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "commit", commit_then_lose_response)
+        with pytest.raises(FatalPersistenceError):
+            await _candidate_admission(writer, 1).wait()
+        await owner
+    writer, owner = await _start_writer(database)
+    try:
+        assert await writer.qualification_run_consumed(
+            RUN_ID, total_calls=3, profile_sha256=b"p" * 32
+        ) is False
+        assert (await _candidate_admission(writer, 1).wait()).receipt == "duplicate"
+        assert (await _candidate_admission(writer, 2).wait()).qualification_exhausted is False
+        assert (await _candidate_admission(writer, 3).wait()).qualification_exhausted is True
+    finally:
+        await _stop_writer(writer, owner)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (3,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_new_event_replay_rejects_divergent_lease_without_spending(tmp_path):
+    database = tmp_path / "divergent.sqlite"
+    writer, owner = await _start_writer(database)
+    await _candidate_admission(writer, 1).wait()
+    with pytest.raises(CommandConflictError, match="lease_identity_conflict"):
+        await writer.submit_webhook(
+            receipt={**_receipt("divergent"), "call_control_id": "candidate-1"},
+            lease={**_lease(), "call_control_id": "candidate-1", "call_id": UUID(int=2)},
+            operation=None, qualification_run_id=RUN_ID,
+            qualification_total_calls=3, qualification_profile_sha256=b"p" * 32,
+        ).wait()
+    await owner
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM webhook_receipts").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_new_event_replay_retains_native_admission_fact_identity_checks(tmp_path):
+    from dataclasses import replace
+
+    from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
+
+    database = tmp_path / "divergent-facts.sqlite"
+    writer, owner = await _start_writer(database)
+    operation = _operation().model_copy(update={
+        "payload": _operation().payload.model_copy(
+            update={"retention_until": NOW + timedelta(days=30)}
+        )
+    })
+    facts = LocalCallAdmissionFacts(operation.call_id, NOW, NOW + timedelta(days=30), None, None)
+    await writer.submit_webhook(
+        receipt=_receipt("initial"), lease=_lease(), operation=operation,
+        admission_facts=facts, qualification_run_id=RUN_ID,
+        qualification_total_calls=3, qualification_profile_sha256=b"p" * 32,
+    ).wait()
+    with pytest.raises(CommandConflictError, match="local_admission_identity_conflict"):
+        await writer.submit_webhook(
+            receipt=_receipt("different-facts"), lease=_lease(),
+            operation=operation.model_copy(update={
+                "payload": operation.payload.model_copy(update={"telnyx_call_leg_id": "different"})
+            }),
+            admission_facts=replace(facts, telnyx_call_leg_id="different"),
+            qualification_run_id=RUN_ID,
+            qualification_total_calls=3, qualification_profile_sha256=b"p" * 32,
+        ).wait()
+    await owner
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM webhook_receipts").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_candidate_pending_replay_preserves_exact_lease_deadline_guard(tmp_path):
+    database = tmp_path / "changed-deadline.sqlite"
+    writer, owner = await _start_writer(database)
+    await _candidate_admission(writer, 1).wait()
+    with pytest.raises(CommandConflictError, match="lease_transition_conflict"):
+        await writer.submit_webhook(
+            receipt={**_receipt("changed-deadline"), "call_control_id": "candidate-1"},
+            lease={**_lease(), "call_control_id": "candidate-1", "call_id": UUID(int=1),
+                   "expires_at": NOW + timedelta(seconds=40)},
+            operation=None, qualification_run_id=RUN_ID,
+            qualification_total_calls=3, qualification_profile_sha256=b"p" * 32,
+        ).wait()
+    await owner
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT used_calls FROM qualification_runs").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("migration_fails", [False, True])
+async def test_v5_six_consumed_runs_migrate_or_roll_back_as_one_authority(
+    tmp_path, migration_fails
+):
+    from projetv0_voice.persistence.schema import V5_SCHEMA_SQL
+
+    database = tmp_path / "six-historical-runs.sqlite"
+    history = [(str(UUID(int=number)), f"historical-first-use-{number}") for number in range(1, 7)]
+    with sqlite3.connect(database) as connection:
+        connection.executescript(V5_SCHEMA_SQL)
+        connection.executemany("INSERT INTO qualification_runs VALUES (?,?)", history)
+
+    def failpoint(name):
+        if migration_fails and name == "after_v1_migration_before_commit":
+            raise OSError("offline-migration-rollback")
+
+    writer = PersistenceWriter(
+        database, CryptoKeyring({1: KEY}, active_version=1), failpoint=failpoint
+    )
+    owner = asyncio.create_task(writer.run())
+    assert await writer.wait_ready() is not migration_fails
+    if not migration_fails:
+        await _stop_writer(writer, owner)
+    else:
+        await owner
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT run_id,consumed_at FROM qualification_runs"
+        ).fetchall() == history
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            (5,) if migration_fails else (6,)
+        )
+        if not migration_fails:
+            assert connection.execute(
+                "SELECT profile_sha256,total_calls,used_calls FROM qualification_runs"
+            ).fetchall() == [(None, 1, 1)] * 6
+
+
 async def _start_writer(path: Path) -> tuple[PersistenceWriter, asyncio.Task[None]]:
     writer = PersistenceWriter(path, CryptoKeyring({1: KEY}, active_version=1))
     task = asyncio.create_task(writer.run())
@@ -85,7 +443,7 @@ def _operation(operation_id: int = 1) -> VoiceOperationV1:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_writer_establishes_exact_sqlite_v5_before_readiness(
+async def test_writer_establishes_exact_sqlite_v6_before_readiness(
     tmp_path: Path, legacy: bool
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -106,7 +464,7 @@ async def test_writer_establishes_exact_sqlite_v5_before_readiness(
             )
         }
 
-    assert version == (5,)
+    assert version == (6,)
     assert objects == {
         ("index", "outbox_due_fifo_idx"),
         ("table", "call_leases"),

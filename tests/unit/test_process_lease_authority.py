@@ -204,11 +204,13 @@ async def test_failed_entry_construction_burns_allocated_call_identifier() -> No
     assert resolution.effect.lease["call_id"] == _encoded_call_id(7, 1)
 
 
-async def _durable_waiting_wss(registry: Any) -> None:
+async def _durable_waiting_wss(registry: Any, *, qualification_exhausted: bool = False) -> None:
     initiated = _event("call.initiated", "event-a")
     resolution = await registry.resolve_webhook(initiated)
     await registry.reconcile_after_commit(
-        initiated, resolution, WebhookCommitResult("first", "applied")
+        initiated,
+        resolution,
+        WebhookCommitResult("first", "applied", qualification_exhausted=qualification_exhausted),
     )
     answered = _event("call.answered", "event-b")
     resolution = await registry.resolve_webhook(answered)
@@ -300,7 +302,7 @@ async def test_candidate_consumption_closes_readiness_but_keeps_accepted_claim()
         qualification_observer=transitions.append,
     )
 
-    await _durable_waiting_wss(registry)
+    await _durable_waiting_wss(registry, qualification_exhausted=True)
     snapshot = await registry.snapshot("control-a")
     assert snapshot is not None
     claim = await ProcessLeaseAuthority(registry).claim_once(

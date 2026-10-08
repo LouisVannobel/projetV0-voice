@@ -48,6 +48,7 @@ from projetv0_voice.qualified_profile import (
     QualificationOverrideV1,
     QualifiedDeploymentProfileV1,
     RuntimeDeploymentProfileV1,
+    canonical_candidate_profile_sha256,
     canonical_inference_profile_sha256,
     canonical_qualified_profile_sha256,
 )
@@ -640,6 +641,8 @@ class RuntimeSupervisor:
         | None = None,
         archive: RecordingArchive | None = None,
         candidate_run_id: UUID | None = None,
+        candidate_total_calls: int = 1,
+        candidate_profile_sha256: bytes | None = None,
         deployment_id: str = "projetv0-voice",
         retention_days: int = 7,
         sparra_enabled: bool = False,
@@ -671,6 +674,11 @@ class RuntimeSupervisor:
             or not isinstance(deployment_id, str)
             or not deployment_id
             or not callable(hard_exit)
+            or type(candidate_total_calls) is not int
+            or not 1 <= candidate_total_calls <= 10
+            or candidate_profile_sha256 is not None
+            and (type(candidate_profile_sha256) is not bytes or len(candidate_profile_sha256) != 32)
+            or candidate_total_calls != 1 and candidate_profile_sha256 is None
         ):
             raise ValueError("runtime_supervisor_config_invalid") from None
         selected_phase_timeouts = dict(startup_phase_timeouts or {})
@@ -711,6 +719,8 @@ class RuntimeSupervisor:
         self._recording_after_commit = recording_after_commit
         self._archive = archive
         self._candidate_run_id = candidate_run_id
+        self._candidate_total_calls = candidate_total_calls
+        self._candidate_profile_sha256 = candidate_profile_sha256
         self._deployment_id = deployment_id
         self._retention_days = retention_days
         self._sparra_enabled = sparra_enabled
@@ -776,11 +786,18 @@ class RuntimeSupervisor:
                         await archive.prepare()
 
                 await self._startup_await(prepare_archive(), code="writer_startup_failed")
-            if self._candidate_run_id is not None and await self._startup_await(
-                self._writer.qualification_run_consumed(self._candidate_run_id),
-                code="qualification_status_failed",
-            ):
-                raise RuntimeError("qualification_run_consumed")
+            if self._candidate_run_id is not None:
+                candidate_status = (
+                    self._writer.qualification_run_consumed(self._candidate_run_id)
+                    if self._candidate_profile_sha256 is None else
+                    self._writer.qualification_run_consumed(
+                        self._candidate_run_id,
+                        total_calls=self._candidate_total_calls,
+                        profile_sha256=self._candidate_profile_sha256,
+                    )
+                )
+                if await self._startup_await(candidate_status, code="qualification_status_failed"):
+                    raise RuntimeError("qualification_run_consumed")
             self._qualification_valid = True
             if self._sparra_enabled:
                 await self._startup_await(
@@ -1080,6 +1097,8 @@ class RuntimeSupervisor:
                     and resolution.effect.lease.get("state") == "pending"
                     else None
                 ),
+                qualification_total_calls=self._candidate_total_calls,
+                qualification_profile_sha256=self._candidate_profile_sha256,
             )
         except BaseException:
             if resolution.reservation is not None:
@@ -1830,6 +1849,14 @@ async def build_production_runtime(
             archive=archive,
             metrics=metrics,
             candidate_run_id=candidate_run_id,
+            candidate_total_calls=(
+                selection.profile.total_calls
+                if isinstance(selection.profile, QualificationCandidateProfileV1) else 1
+            ),
+            candidate_profile_sha256=(
+                bytes.fromhex(canonical_candidate_profile_sha256(selection.profile))
+                if isinstance(selection.profile, QualificationCandidateProfileV1) else None
+            ),
             deployment_id=settings.deployment_id,
             retention_days=manifest.transcript_retention_days,
             sparra_enabled=manifest.sparra is not None,

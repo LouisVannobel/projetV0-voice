@@ -201,6 +201,13 @@
       "const": "telnyx-header-connected-v1",
       "title": "Token Locator Id",
       "type": "string"
+    },
+    "total_calls": {
+      "default": 1,
+      "maximum": 10,
+      "minimum": 1,
+      "title": "Total Calls",
+      "type": "integer"
     }
   },
   "required": [
