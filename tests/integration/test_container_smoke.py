@@ -2,19 +2,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib.util
-import io
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import time
 import uuid
-import zipfile
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import pytest
@@ -35,122 +30,55 @@ POSTGRES_IMAGE = (
     "@sha256:bb3e1a57e5407e0a5280b4211980a5e537f4abd234a87014ac979849a78dd825"
 )
 SMOKE_ENABLED = os.environ.get("PROJETV0_CONTAINER_SMOKE") == "1"
-TOKENIZER_FILES = (
-    "punkt_tab/english/collocations.tab",
-    "punkt_tab/english/sent_starters.txt",
-    "punkt_tab/english/abbrev_types.txt",
-    "punkt_tab/english/ortho_context.tab",
-    "punkt_tab/french/collocations.tab",
-    "punkt_tab/french/sent_starters.txt",
-    "punkt_tab/french/abbrev_types.txt",
-    "punkt_tab/french/ortho_context.tab",
-)
+SENTENCE_TOKENIZATION_PROGRAM = """
+import os
+import socket
+import sys
 
+def reject_network(*args, **kwargs):
+    raise AssertionError("sentence tokenization attempted runtime network access")
 
-@pytest.fixture
-def tokenizer_preparation() -> ModuleType:
-    specification = importlib.util.spec_from_file_location(
-        "prepare_tokenizers", REPO_ROOT / "scripts/prepare_tokenizers.py"
-    )
-    assert specification is not None and specification.loader is not None
-    module = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(module)
-    return module
+socket.socket.connect = reject_network
+socket.socket.connect_ex = reject_network
 
+def reject_writes(event, args):
+    if event == "open":
+        _, mode, flags = args
+        if (mode and any(value in mode for value in "wax+")) or flags & (
+            os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+        ):
+            raise AssertionError("sentence tokenization attempted runtime filesystem writes")
+    elif event in ("os.mkdir", "os.remove", "os.rename", "os.rmdir", "os.truncate"):
+        raise AssertionError("sentence tokenization attempted runtime filesystem writes")
 
-def _tokenizer_archive(
-    entries: list[tuple[str, bytes, int]],
-) -> bytes:
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, "w") as archive:
-        for name, data, mode in entries:
-            entry = zipfile.ZipInfo(name)
-            entry.create_system = 3
-            entry.compress_type = zipfile.ZIP_DEFLATED
-            entry.external_attr = mode << 16
-            archive.writestr(entry, data)
-    return stream.getvalue()
+sys.addaudithook(reject_writes)
 
+from pipecat.utils.string import match_endofsentence
 
-def test_tokenizer_preparation_extracts_only_required_languages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tokenizer_preparation: ModuleType
-) -> None:
-    entries = [(name, b"fixture", stat.S_IFREG | 0o600) for name in TOKENIZER_FILES]
-    entries.append(("punkt_tab/german/abbrev_types.txt", b"unused", stat.S_IFREG | 0o600))
-    archive = _tokenizer_archive(entries)
-    monkeypatch.setattr(
-        tokenizer_preparation, "ARCHIVE_SHA256", hashlib.sha256(archive).hexdigest()
-    )
-    destination = tmp_path / "nltk_data"
-
-    tokenizer_preparation.extract_tokenizers(archive, destination)
-
-    assert sorted(
-        path.relative_to(destination).as_posix()
-        for path in destination.rglob("*")
-        if path.is_file()
-    ) == sorted(f"tokenizers/{name}" for name in TOKENIZER_FILES)
-    assert all(path.read_bytes() == b"fixture" for path in destination.rglob("*") if path.is_file())
-
-
-@pytest.mark.parametrize(
-    "fault", ["checksum", "missing", "duplicate", "symlink", "archive_bound", "data_bound"]
-)
-def test_tokenizer_preparation_refuses_invalid_archives_before_writing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    tokenizer_preparation: ModuleType,
-    fault: str,
-) -> None:
-    entries = [(name, b"fixture", stat.S_IFREG | 0o600) for name in TOKENIZER_FILES]
-    if fault == "missing":
-        entries.pop()
-    elif fault == "duplicate":
-        entries.append(entries[0])
-    elif fault == "symlink":
-        entries[0] = (entries[0][0], b"/outside", stat.S_IFLNK | 0o777)
-    elif fault == "data_bound":
-        entries = [(name, b"x" * 1024, mode) for name, _, mode in entries]
-    if fault == "duplicate":
-        with pytest.warns(UserWarning, match="Duplicate name"):
-            archive = _tokenizer_archive(entries)
-    else:
-        archive = _tokenizer_archive(entries)
-    if fault == "archive_bound":
-        archive = b"x" * 4097
-    monkeypatch.setattr(tokenizer_preparation, "MAX_BYTES", 4096)
-    monkeypatch.setattr(
-        tokenizer_preparation,
-        "ARCHIVE_SHA256",
-        "0" * 64 if fault == "checksum" else hashlib.sha256(archive).hexdigest(),
-    )
-    destination = tmp_path / "nltk_data"
-
-    with pytest.raises(ValueError):
-        tokenizer_preparation.extract_tokenizers(archive, destination)
-
-    assert not destination.exists()
-
-
-def test_tokenizer_preparation_refuses_existing_destination(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tokenizer_preparation: ModuleType
-) -> None:
-    archive = _tokenizer_archive(
-        [(name, b"fixture", stat.S_IFREG | 0o600) for name in TOKENIZER_FILES]
-    )
-    monkeypatch.setattr(
-        tokenizer_preparation, "ARCHIVE_SHA256", hashlib.sha256(archive).hexdigest()
-    )
-    destination = tmp_path / "nltk_data"
-    destination.mkdir()
-    sentinel = destination / "preserve"
-    sentinel.write_bytes(b"owned")
-
-    with pytest.raises(ValueError):
-        tokenizer_preparation.extract_tokenizers(archive, destination)
-
-    assert list(destination.iterdir()) == [sentinel]
-    assert sentinel.read_bytes() == b"owned"
+for language, text, expected_sentences in (
+    ("en", "Hello. I can help you.", ["Hello.", "I can help you."]),
+    ("fr", "Bonjour. Je peux vous aider.", ["Bonjour.", "Je peux vous aider."]),
+    (
+        "en",
+        "Dr. Smith can help. The price is 2.50 euros.",
+        ["Dr. Smith can help.", "The price is 2.50 euros."],
+    ),
+    (
+        "fr",
+        "Le prix est de 2.50 euros. Je peux vous aider.",
+        ["Le prix est de 2.50 euros.", "Je peux vous aider."],
+    ),
+):
+    sentences = []
+    while text:
+        boundary = match_endofsentence(text, language=language)
+        assert boundary > 0
+        sentences.append(text[:boundary])
+        text = text[boundary:].lstrip()
+    assert sentences == expected_sentences
+    assert match_endofsentence("unfinished sentence", language=language) == 0
+print("native sentence tokenization passed offline")
+"""
 
 
 def _run(
@@ -179,60 +107,53 @@ def _output(result: subprocess.CompletedProcess[bytes]) -> str:
     return result.stdout.decode("utf-8", errors="replace")
 
 
+def test_native_sentence_tokenization_uses_embedded_rules_offline(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", SENTENCE_TOKENIZATION_PROGRAM],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, _output(result)
+    assert "native sentence tokenization passed offline" in _output(result)
+
+
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        ("socket.socket().connect(('127.0.0.1', 9))", "runtime network access"),
+        ("socket.socket().connect_ex(('127.0.0.1', 9))", "runtime network access"),
+        ("open('runtime-write', 'wb')", "runtime filesystem writes"),
+    ],
+)
+def test_sentence_tokenization_rejects_runtime_network_and_writes(
+    tmp_path: Path, operation: str, message: str
+) -> None:
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", SENTENCE_TOKENIZATION_PROGRAM + "\n" + operation],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert message in _output(result)
+    assert list(tmp_path.iterdir()) == []
+
+
 def _assert_image_sentence_tokenization(image: str) -> None:
     program = """
 import os
 import resource
-import socket
-import stat
-from pathlib import Path
-
-import nltk
 
 assert (os.getuid(), os.getgid()) == (10001, 10001)
 assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
-
-def reject_network(*args, **kwargs):
-    raise AssertionError("sentence tokenization attempted runtime network access")
-
-socket.socket.connect = reject_network
-socket.socket.connect_ex = reject_network
-nltk.download = reject_network
-
-for language in ("english", "french"):
-    nltk.data.find(f"tokenizers/punkt_tab/{language}/")
-
-root = Path("/opt/projetv0-voice/nltk_data")
-assert os.environ.get("NLTK_DATA") == str(root)
-expected = {
-    f"tokenizers/punkt_tab/{language}/{name}"
-    for language in ("english", "french")
-    for name in ("collocations.tab", "sent_starters.txt", "abbrev_types.txt", "ortho_context.tab")
-}
-paths = [root, *root.rglob("*")]
-assert {str(path.relative_to(root)) for path in paths if path.is_file()} == expected
-for path in paths:
-    metadata = path.lstat()
-    assert not path.is_symlink()
-    assert (metadata.st_uid, metadata.st_gid) == (0, 10001)
-    assert stat.S_IMODE(metadata.st_mode) == (0o550 if path.is_dir() else 0o440)
-
-from pipecat.utils.string import match_endofsentence
-
-for language, text, expected_sentences in (
-    ("english", "Hello. I can help you.", ["Hello.", "I can help you."]),
-    ("french", "Bonjour. Je peux vous aider.", ["Bonjour.", "Je peux vous aider."]),
-):
-    assert nltk.sent_tokenize(text, language=language) == expected_sentences
-    sentences = []
-    while text:
-        boundary = match_endofsentence(text)
-        assert boundary > 0
-        sentences.append(text[:boundary])
-        text = text[boundary:].lstrip()
-    assert sentences == expected_sentences
-print("native sentence tokenization passed offline")
-"""
+""" + SENTENCE_TOKENIZATION_PROGRAM
     result = _docker(
         "run",
         "--rm",
@@ -260,8 +181,10 @@ print("native sentence tokenization passed offline")
         "-B",
         "-c",
         program,
+        check=False,
         timeout=30,
     )
+    assert result.returncode == 0, _output(result)
     assert "native sentence tokenization passed offline" in _output(result)
 
 
@@ -456,7 +379,6 @@ def test_dockerfile_generates_the_contract_without_a_dist_context() -> None:
     assert "rm -rf /var/lib/apt/lists/*" in source
     assert "COPY --from=builder /opt/projetv0-voice/.venv" in source
     assert "COPY scripts/export_runtime_contract.py ./scripts/export_runtime_contract.py" in source
-    assert "COPY scripts/prepare_tokenizers.py ./scripts/prepare_tokenizers.py" in source
     assert "COPY agents/agent-a/ ./agents/agent-a/" in source
     assert "COPY deployment-profiles/ ./deployment-profiles/" in source
     assert "python scripts/export_runtime_contract.py" in source
@@ -488,7 +410,6 @@ def test_dockerignore_is_a_minimal_allowlist() -> None:
         "!src/**",
         "!scripts/",
         "!scripts/export_runtime_contract.py",
-        "!scripts/prepare_tokenizers.py",
         "!agents/",
         "!agents/agent-a/",
         "!agents/agent-a/**",
@@ -545,8 +466,10 @@ def test_container_smoke(tmp_path: Path) -> None:
             shutil.copy2(REPO_ROOT / name, context / name)
         shutil.copytree(REPO_ROOT / "src", context / "src")
         (context / "scripts").mkdir()
-        for script in ("export_runtime_contract.py", "prepare_tokenizers.py"):
-            shutil.copy2(REPO_ROOT / "scripts" / script, context / "scripts" / script)
+        shutil.copy2(
+            REPO_ROOT / "scripts/export_runtime_contract.py",
+            context / "scripts/export_runtime_contract.py",
+        )
         shutil.copytree(REPO_ROOT / "agents/agent-a", context / "agents/agent-a")
         shutil.copytree(REPO_ROOT / "deployment-profiles", context / "deployment-profiles")
         output_dir = tmp_path / "host-artifacts"
