@@ -60,7 +60,6 @@ from projetv0_voice.inference.completion_strategy import (
     STT_USER_TURN_WATCHDOG_SECONDS,
     CompletionAwareTurnStopStrategy,
 )
-from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
@@ -856,6 +855,9 @@ def build_pipeline(
     on_user_turn_started: Callable[[], None] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
+
+    # Concrete provider types load during assembly, after logging configuration.
+    from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 
     input_gate = build_input_gate(
         controller=controller, first_failure=first_failure, end_call_playback=end_call_playback
