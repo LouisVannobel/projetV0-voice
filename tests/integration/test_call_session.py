@@ -19,12 +19,15 @@ import pytest
 from openai import AsyncOpenAI
 from pipecat.bus.bus import WorkerBus
 from pipecat.frames.frames import (
+    AggregatedTextFrame,
+    AggregationType,
     EndFrame,
     ErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    LLMContextFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -34,6 +37,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.worker import PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.registry.registry import WorkerRegistry
@@ -1290,6 +1294,8 @@ class _OpeningPeers:
         self.invitation_release = asyncio.Event()
         self.invitation_cancelled = asyncio.Event()
         self.llm_status = 200
+        self.end_call = False
+        self.duplicate_end_call = False
         self.llm_requested = asyncio.Event()
         self.llm_release = asyncio.Event()
 
@@ -1327,9 +1333,22 @@ class _OpeningPeers:
                 "content": "Le garage est ouvert de 8 h à 18 h.",
             }, "finish_reason": None}],
         }
+        if self.end_call:
+            chunk["choices"][0]["delta"] = {"tool_calls": [{
+                "index": 0, "id": "offline-end-call", "type": "function",
+                "function": {"name": "end_call", "arguments": "{}"},
+            }]}
+            chunk["choices"][0]["finish_reason"] = "tool_calls"
+        chunks = [chunk]
+        if self.end_call and self.duplicate_end_call:
+            chunks.append({**chunk, "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 1, "id": "offline-end-call-two", "type": "function",
+                "function": {"name": "end_call", "arguments": "{}"},
+            }]}, "finish_reason": "tool_calls"}]})
         return httpx.Response(
             200, headers={"Content-Type": "text/event-stream"},
-            content=("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode(),
+            content=("".join("data: " + json.dumps(item) + "\n\n" for item in chunks)
+                     + "data: [DONE]\n\n").encode(),
         )
 
 
@@ -1362,12 +1381,13 @@ def _opening_plaintext(operation: VoiceOperationV1) -> str:
 
 
 @asynccontextmanager
-async def _native_sparra_opening():
+async def _native_sparra_opening(*, ack_end_call: bool = True):
     events: list[str] = []
     writer = _OpeningWriter(events)
     peers = _OpeningPeers(writer)
     incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
     sent: list[dict[str, object]] = []
+    final_mark_sent = asyncio.Event()
 
     async def receive() -> dict[str, object]:
         return await incoming.get()
@@ -1377,6 +1397,10 @@ async def _native_sparra_opening():
             wire = json.loads(message["text"])
             sent.append(wire)
             if wire.get("event") == "mark":
+                if wire["mark"]["name"].startswith("pv0-end-call-"):
+                    final_mark_sent.set()
+                    if not ack_end_call:
+                        return
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
                     **wire, "stream_id": "stream-1",
                 })})
@@ -1447,6 +1471,8 @@ async def _native_sparra_opening():
         session=session, running=running, writer=writer, peers=peers,
         transport=transport, incoming=incoming, sent=sent, admission=admission,
         serializer=serializer, llm=services.llm,
+        tts=services.tts,
+        events=events, final_mark_sent=final_mark_sent,
     )
     try:
         try:
@@ -1486,6 +1512,214 @@ async def test_sparra_opening_fixture_reaches_authenticated_ack_before_release()
         assert not fixture.session._controller.is_active()
         assert fixture.peers.texts == [pipeline_module.SPARRA_DISCLOSURE]
         assert len([wire for wire in fixture.sent if wire.get("event") == "mark"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate, old_context", [(False, False), (True, False), (False, True)])
+async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
+    duplicate, old_context,
+) -> None:
+    async with _native_sparra_opening(ack_end_call=False) as fixture:
+        fixture.writer.ack_release.set()
+        fixture.writer.gate_release.set()
+        await fixture.session._controller.join_continuations()
+        await _opening_event(fixture.peers.invitation, "opening did not invite the caller")
+        for _ in range(300):
+            if fixture.writer.turns:
+                break
+            await asyncio.sleep(0.01)
+        fixture.peers.end_call = True
+        fixture.peers.duplicate_end_call = duplicate
+        worker = fixture.session._active_runtime.worker
+        finished: list[Frame] = []
+        old_ignored = asyncio.Event()
+
+        async def inject_old_before_native_context(_tts, frame):
+            playback = fixture.session._end_call_playback
+            attempt = playback._attempt
+            if attempt is None or frame is not attempt.speak_frame:
+                return
+            barrier = fixture.session._active_runtime.pipeline.processors[9]
+            old = AggregatedTextFrame(
+                pipeline_module.END_CALL_GOODBYE, AggregationType.SENTENCE,
+                context_id="OLD", raw_text=pipeline_module.END_CALL_GOODBYE,
+            )
+            old.will_be_spoken = True
+            old.append_to_context = False
+            await barrier.queue_frame(old)
+            await barrier.queue_frame(TTSAudioRawFrame(
+                audio=b"\x01\x00" * 160, sample_rate=8000, num_channels=1, context_id="OLD",
+            ))
+            await barrier.queue_frame(TTSStoppedFrame(context_id="OLD"))
+            assert attempt.context_id is None and not attempt.audio_observed
+            old_ignored.set()
+
+        if old_context:
+            fixture.tts.add_event_handler(
+                "on_before_process_frame", inject_old_before_native_context,
+            )
+
+        async def observe_finish(_worker, frame):
+            finished.append(frame)
+
+        worker.add_event_handler("on_pipeline_finished", observe_finish)
+        await worker.queue_frame(TranscriptionFrame(
+            text="Non merci, au revoir.", user_id="", timestamp=NOW.isoformat(),
+            language=Language.FR, finalized=True,
+        ))
+        await asyncio.wait_for(fixture.peers.llm_requested.wait(), timeout=8)
+        await _opening_event(fixture.final_mark_sent, "no final playback mark was sent")
+        assert not fixture.running.done()
+        assert finished == []
+        assert "lease-attempt" not in fixture.events
+        assert fixture.peers.texts[-1] == "Bonne journée, au revoir."
+        assert len(fixture.peers.conversations) == 1
+        final_mark = fixture.sent[-1]
+        assert final_mark["event"] == "mark"
+        assert final_mark != fixture.sent[0]
+        assert fixture.sent[-2]["event"] == "media"
+        assert len([wire for wire in fixture.sent if wire["event"] == "mark"]) == 2
+        assert fixture.peers.texts.count("Bonne journée, au revoir.") == 1
+        if old_context:
+            assert old_ignored.is_set()
+            assert fixture.session._end_call_playback._attempt.context_id != "OLD"
+        guarded = LLMContextFrame(LLMContext(messages=[{"role": "user", "content": "late input"}]))
+        gate_processed = asyncio.Event()
+
+        def after_gate(_gate, frame):
+            if frame is guarded:
+                gate_processed.set()
+
+        fixture.session._active_runtime.pipeline.processors[6].add_event_handler(
+            "on_after_process_frame", after_gate,
+        )
+        await worker.queue_frame(guarded)
+        await _opening_event(gate_processed, "inference gate did not consume queued late input")
+        assert len(fixture.peers.conversations) == 1
+        tools = fixture.peers.conversations[0]["tools"]
+        assert [tool["function"]["name"] for tool in tools] == ["end_call"]
+        assert tools[0]["function"]["parameters"]["properties"] == {}
+        await fixture.incoming.put({"type": "websocket.receive", "text": json.dumps({
+            **final_mark, "stream_id": "stream-1",
+        })})
+        await asyncio.wait_for(fixture.running, timeout=3)
+        assert len(finished) == 1 and isinstance(finished[0], EndFrame)
+        assert finished[0].reason == "conversation_ended"
+        terminal = fixture.writer.commands[-1]
+        assert terminal.payload.status == "closed"
+        assert terminal.payload.end_reason == "conversation_ended"
+        assert _opening_plaintext(fixture.writer.turns[-1]) == "Bonne journée, au revoir."
+        assert len(fixture.peers.conversations) == 1
+        assert fixture.session._controller.pending_task_count == 0
+        assert not fixture.session._end_call_playback.pending
+
+
+async def _start_native_end_call(fixture):
+    fixture.writer.ack_release.set()
+    fixture.writer.gate_release.set()
+    await fixture.session._controller.join_continuations()
+    await _opening_event(fixture.peers.invitation, "opening did not invite the caller")
+    for _ in range(300):
+        if fixture.writer.turns:
+            break
+        await asyncio.sleep(0.01)
+    fixture.peers.end_call = True
+    worker = fixture.session._active_runtime.worker
+    await worker.queue_frame(TranscriptionFrame(
+        text="Au revoir.", user_id="", timestamp=NOW.isoformat(),
+        language=Language.FR, finalized=True,
+    ))
+    await asyncio.wait_for(fixture.peers.llm_requested.wait(), timeout=8)
+    await _opening_event(fixture.final_mark_sent, "no final playback mark was sent")
+    return worker
+
+
+@pytest.mark.asyncio
+async def test_native_end_call_interruption_invalidates_late_ack_and_allows_next_turn() -> None:
+    async with _native_sparra_opening(ack_end_call=False) as fixture:
+        worker = await _start_native_end_call(fixture)
+        final_mark = fixture.sent[-1]
+        cancelled = asyncio.Event()
+
+        async def on_cancelled(_llm, _items):
+            cancelled.set()
+
+        fixture.llm.add_event_handler("on_function_calls_cancelled", on_cancelled)
+        # Exercise native cancellation while the settled handler is still
+        # awaiting playback, without the earlier call input gate waking it.
+        await fixture.llm.queue_frame(InterruptionFrame())
+        await _opening_event(cancelled, "interruption did not cancel the settled tool handler")
+        assert not fixture.session._end_call_playback.pending
+        await fixture.incoming.put({"type": "websocket.receive", "text": json.dumps({
+            **final_mark, "stream_id": "stream-1",
+        })})
+        fixture.peers.end_call = False
+        fixture.peers.llm_requested.clear()
+        await worker.queue_frame(TranscriptionFrame(
+            text="Encore une question sur vos horaires.", user_id="", timestamp=NOW.isoformat(),
+            language=Language.FR, finalized=True,
+        ))
+        await asyncio.wait_for(fixture.peers.llm_requested.wait(), timeout=8)
+        assert not fixture.running.done()
+        assert len(fixture.peers.conversations) == 2
+        assert fixture.session._terminal_outcome.reason == "closed"
+        assert fixture.peers.texts.count("Bonne journée, au revoir.") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["missing_ack", "cancel", "disconnect"])
+async def test_native_end_call_never_relabels_failed_or_cancelled_departure(termination) -> None:
+    async with _native_sparra_opening(ack_end_call=False) as fixture:
+        await _start_native_end_call(fixture)
+        if termination == "cancel":
+            await fixture.session.request_drain("external_cancel")
+            reason = "external_cancel"
+        elif termination == "disconnect":
+            await fixture.incoming.put({"type": "websocket.disconnect", "code": 1000})
+            reason = "transport_disconnected"
+        else:
+            reason = "end_call_timeout"
+        with pytest.raises(session_module.CallSessionError, match=f"^{reason}$"):
+            await asyncio.wait_for(fixture.running, timeout=12)
+        terminal = fixture.writer.commands[-1]
+        assert terminal.payload.status == "failed"
+        assert terminal.payload.end_reason == reason
+        assert not fixture.session._end_call_playback.pending
+        assert len(fixture.peers.conversations) == 1
+        assert not fixture.session._controller.is_active()
+
+
+@pytest.mark.parametrize("arguments", [None, [], {"destination": "forbidden"}])
+@pytest.mark.asyncio
+async def test_end_call_handler_rejects_model_arguments_before_any_output(arguments) -> None:
+    session, *_ = _session(events=[])
+    session._controller = SimpleNamespace(is_active=lambda: True)
+    session._end_call_playback = pipeline_module.EndCallPlayback(
+        generation=UUID(int=1), first_failure=pipeline_module.FirstFailure(),
+    )
+    results = []
+
+    async def result_callback(result, *, properties):
+        results.append((result, properties.run_llm))
+
+    await session._end_call_tool(SimpleNamespace(
+        arguments=arguments, result_callback=result_callback,
+    ))
+    assert results == [({"success": False}, False)]
+    assert not session._end_call_playback.pending
+
+
+def test_end_call_success_uses_owned_hangup_and_failure_remains_prioritized() -> None:
+    proposal = session_module.CallSession._terminal_proposal("conversation_ended")
+    assert proposal.status == "closed" and proposal.metric_class == "closed"
+    assert proposal.cleanup_hangup is True
+    outcome = session_module._TerminalOutcome("conversation_ended")
+    outcome.promote_failure("writer_failed")
+    assert outcome.freeze().status == "failed"
+    assert outcome.reason == "writer_failed"
+    cancelled = session_module._TerminalOutcome("conversation_ended")
+    cancelled.note_caller_cancellation()
+    assert cancelled.reason == "external_cancel"
 
 
 @pytest.mark.asyncio
@@ -1607,7 +1841,9 @@ async def test_sparra_native_question_response_is_retained_without_silence_infer
             "assistant", "user", "assistant",
         ]
         assert len(fixture.peers.conversations[0]["messages"]) == 4
-        assert not fixture.peers.conversations[0].get("tools")
+        assert [tool["function"]["name"] for tool in fixture.peers.conversations[0]["tools"]] == [
+            "end_call",
+        ]
         assert "request_human" not in fixture.peers.conversations[0]["messages"][0]["content"]
         assert fixture.peers.conversations[0]["messages"][-2:] == [
             {"role": "assistant", "content": "Comment puis-je vous aider ?"},

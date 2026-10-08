@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any, cast
 
 import httpx
@@ -65,6 +65,16 @@ class OpenRouterTTSService(TTSService):
         self._client = http_client or httpx.AsyncClient(trust_env=False)
         self._owns_client = http_client is None
         self._failed_contexts: dict[str, str] = {}
+        self._end_call_context_binder: Callable[[str], None] | None = None
+
+    def bind_end_call_context(self, binder: Callable[[str], None]) -> None:
+        """Bind final playback through the native context-creation hook."""
+        self._end_call_context_binder = binder
+
+    async def on_turn_context_created(self, context_id: str) -> None:
+        await super().on_turn_context_created(context_id)
+        if self._end_call_context_binder is not None:
+            self._end_call_context_binder(context_id)
 
     def can_generate_metrics(self) -> bool:
         """Return true because the adapter participates in native TTS metrics."""

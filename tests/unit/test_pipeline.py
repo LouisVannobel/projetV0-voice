@@ -9,6 +9,7 @@ from dataclasses import FrozenInstanceError
 from importlib import import_module
 from importlib.metadata import version
 from types import SimpleNamespace
+from uuid import UUID
 
 import httpx
 import pytest
@@ -65,6 +66,91 @@ from projetv0_voice.qualified_profile import InferenceProfileV1
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 
 pipeline_module = import_module("projetv0_voice.pipeline")
+
+
+@pytest.mark.asyncio
+async def test_end_call_playback_requires_current_audio_wire_send_and_ack() -> None:
+    failure = pipeline_module.FirstFailure()
+    playback = pipeline_module.EndCallPlayback(generation=UUID(int=1), first_failure=failure)
+    attempt = playback.begin()
+    assert attempt is not None and playback.begin() is None
+    playback.accept_mark(attempt.mark_name)
+    assert not playback.acknowledged
+    playback.before_tts_frame(attempt.speak_frame)
+    playback.bind_context("final")
+    playback.after_tts_frame(attempt.speak_frame)
+    playback.note_audio("previous-tts")
+    assert not attempt.audio_observed
+    playback.note_audio("final")
+    assert playback.arm_mark(attempt.mark_name)
+    waiting = asyncio.create_task(playback.wait_for_ack(attempt, phase_timeout=0.5))
+    playback.accept_mark("previous-call-marker")
+    assert not playback.acknowledged
+    playback.accept_mark(attempt.mark_name)
+    await asyncio.sleep(0)
+    assert not waiting.done(), "an ACK cannot replace proof of the native wire send"
+    playback.mark_forwarded(attempt.mark_name)
+    assert await waiting
+    assert failure.code is None
+
+
+@pytest.mark.asyncio
+async def test_end_call_playback_invalidated_generation_cannot_complete_new_attempt() -> None:
+    failure = pipeline_module.FirstFailure()
+    playback = pipeline_module.EndCallPlayback(generation=UUID(int=1), first_failure=failure)
+    first = playback.begin()
+    waiting = asyncio.create_task(playback.wait_for_ack(first, phase_timeout=0.5))
+    playback.invalidate()
+    assert await waiting is False
+    second = playback.begin()
+    assert first.mark_name != second.mark_name
+    playback.before_tts_frame(second.speak_frame)
+    playback.bind_context("new")
+    playback.after_tts_frame(second.speak_frame)
+    playback.note_audio("new")
+    assert playback.arm_mark(second.mark_name)
+    playback.mark_forwarded(second.mark_name)
+    playback.accept_mark(first.mark_name)
+    assert not playback.acknowledged
+    failure.signal("writer_failed")
+    playback.accept_mark(second.mark_name)
+    assert not playback.acknowledged
+    playback.invalidate()
+    assert not playback.pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", [False, True])
+async def test_end_call_playback_bounds_both_dispatch_and_missing_ack(sent) -> None:
+    failure = pipeline_module.FirstFailure()
+    playback = pipeline_module.EndCallPlayback(generation=UUID(int=1), first_failure=failure)
+    attempt = playback.begin()
+    if sent:
+        playback.before_tts_frame(attempt.speak_frame)
+        playback.bind_context("final")
+        playback.after_tts_frame(attempt.speak_frame)
+        playback.note_audio("final")
+        assert playback.arm_mark(attempt.mark_name)
+        playback.mark_forwarded(attempt.mark_name)
+    assert await playback.wait_for_ack(attempt, phase_timeout=0.02) is False
+    assert failure.code == "end_call_timeout"
+    assert not playback.pending
+
+
+def test_end_call_playback_never_arms_without_pcm_from_the_final_context() -> None:
+    failure = pipeline_module.FirstFailure()
+    playback = pipeline_module.EndCallPlayback(generation=UUID(int=1), first_failure=failure)
+    attempt = playback.begin()
+    playback.before_tts_frame(TTSSpeakFrame(pipeline_module.END_CALL_GOODBYE))
+    playback.bind_context("prior")
+    playback.note_audio("prior")
+    assert attempt.context_id is None and not attempt.audio_observed
+    playback.before_tts_frame(attempt.speak_frame)
+    playback.bind_context("final")
+    playback.after_tts_frame(attempt.speak_frame)
+    assert playback.arm_mark(attempt.mark_name) is False
+    assert failure.code == "end_call_failed"
+    assert not playback.pending
 
 
 def _metric_map(owner: RuntimeMetrics) -> dict[str, object]:
