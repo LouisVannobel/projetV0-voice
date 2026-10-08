@@ -8,6 +8,7 @@ from contextlib import suppress
 from dataclasses import FrozenInstanceError
 from importlib import import_module
 from importlib.metadata import version
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ErrorFrame,
+    FatalErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
@@ -38,7 +40,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.metrics.metrics import ProcessingMetricsData, TTFBMetricsData
-from pipecat.observers.base_observer import FramePushed
+from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
@@ -943,6 +945,140 @@ async def test_runtime_metrics_observer_counts_native_ttfb_only_at_its_origin() 
         ]
         assert owner.failure_code is None
     finally:
+        await owner.aclose()
+
+
+def _diagnostic_stt_profile() -> InferenceProfileV1:
+    return InferenceProfileV1.model_validate_json(
+        (Path(__file__).resolve().parents[1] / "fixtures/inference-profile-v1.json").read_text()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "timeout", "transport", "segment_limit", "text_limit", "text_invalid", "drain_timeout"
+])
+async def test_runtime_metrics_observer_records_native_stt_failure_once_before_sanitization(reason):
+    from projetv0_voice.inference.services import build_stt
+    stt = build_stt(_diagnostic_stt_profile(), SecretStr("offline-unit-key"), language="fr-FR")
+    llm, tts = FrameProcessor(name="llm"), FrameProcessor(name="tts")
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner, stt=stt, llm=llm, tts=tts
+    )
+    try:
+        frame = stt._fail_batch(f"openrouter_stt_{reason}")  # noqa: SLF001
+        assert isinstance(frame, FatalErrorFrame)
+        assert frame.processor is stt
+        direction = (
+            FrameDirection.DOWNSTREAM if reason in {"segment_limit", "drain_timeout"}
+            else FrameDirection.UPSTREAM
+        )
+        data = FramePushed(stt, llm, frame, direction, 1)
+        await observer.on_push_frame(data)
+        # The producer has a terminal fence and the observer must ignore repeated transit.
+        assert stt._fail_batch(f"openrouter_stt_{reason}") is None  # noqa: SLF001
+        await observer.on_push_frame(data)
+        points = list(_metric_map(owner)["projetv0.voice.stt.failures"].data.data_points)
+        assert [(dict(point.attributes), point.value) for point in points] == [
+            ({"reason": reason}, 1)
+        ]
+        _, upstream = await run_test(
+            pipeline_module.InferenceErrorBoundary(stt=stt, llm=llm, tts=tts),
+            frames_to_send=[frame], frames_to_send_direction=FrameDirection.UPSTREAM,
+            expected_up_frames=[ErrorFrame],
+        )
+        assert upstream[0].error == "stt_failed"
+        assert upstream[0].fatal is True
+        assert upstream[0].exception is None and upstream[0].processor is None
+        assert owner.failure_code is None
+    finally:
+        await stt._client.close()  # noqa: SLF001
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_metrics_observer_ignores_foreign_raw_unknown_cancel_and_transit_stt_errors():
+    stt, llm, tts = (
+        FrameProcessor(name="stt"), FrameProcessor(name="llm"), FrameProcessor(name="tts")
+    )
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner, stt=stt, llm=llm, tts=tts
+    )
+    frames = [
+        FramePushed(llm, stt, FatalErrorFrame(error="openrouter_stt_timeout", processor=stt),
+                    FrameDirection.UPSTREAM, 1),
+        FramePushed(stt, llm, FatalErrorFrame(error="openrouter_stt_timeout", processor=llm),
+                    FrameDirection.DOWNSTREAM, 2),
+        FramePushed(stt, llm, FatalErrorFrame(error="openrouter_stt_timeout"),
+                    FrameDirection.UPSTREAM, 3),
+        FramePushed(stt, llm, ErrorFrame(error="openrouter_stt_timeout", processor=stt),
+                    FrameDirection.UPSTREAM, 4),
+        FramePushed(stt, llm, FatalErrorFrame(error="provider-private-secret", processor=stt),
+                    FrameDirection.UPSTREAM, 5),
+        FramePushed(stt, llm, FatalErrorFrame(error="openrouter_stt_unknown", processor=stt),
+                    FrameDirection.UPSTREAM, 6),
+        FramePushed(stt, llm, FatalErrorFrame(error="stt_failed", processor=stt),
+                    FrameDirection.UPSTREAM, 7),
+        FramePushed(stt, llm, CancelFrame(), FrameDirection.DOWNSTREAM, 8),
+        FramePushed(stt, llm,
+                    FatalErrorFrame(error="openrouter_stt_timeout", processor=stt,
+                                    exception=RuntimeError("raw-private-secret")),
+                    FrameDirection.UPSTREAM, 9),
+        FramePushed(stt, llm, FatalErrorFrame(error="openrouter_stt_timeout", processor=stt),
+                    "invalid-direction", 10),
+    ]
+    try:
+        for data in frames:
+            await observer.on_push_frame(data)
+        assert "projetv0.voice.stt.failures" not in _metric_map(owner)
+        assert "provider-private-secret" not in repr(_metric_map(owner))
+        assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stt_native_replay_before_first_producer_failure_does_not_spend_diagnostic():
+    from projetv0_voice.inference.services import build_stt
+
+    stt = build_stt(_diagnostic_stt_profile(), SecretStr("offline-unit-key"), language="fr-FR")
+    llm, tts = FrameProcessor(name="llm"), FrameProcessor(name="tts")
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner, stt=stt, llm=llm, tts=tts
+    )
+    frame = stt._fail_batch("openrouter_stt_timeout")  # noqa: SLF001
+    assert isinstance(frame, FatalErrorFrame)
+    native_hops = []
+
+    class NativePushes(BaseObserver):
+        async def on_push_frame(self, data: FramePushed):
+            if data.frame is frame:
+                native_hops.append(
+                    (data.source is stt, data.first_push, data.frame.processor is stt)
+                )
+
+    try:
+        _, upstream = await asyncio.wait_for(
+            run_test(
+                Pipeline([pipeline_module.InferenceErrorBoundary(stt=stt, llm=llm, tts=tts), stt]),
+                frames_to_send=[frame], frames_to_send_direction=FrameDirection.UPSTREAM,
+                observers=[observer, NativePushes()],
+            ),
+            timeout=5,
+        )
+        # Native first_push, rather than the one-shot latch, distinguishes transit before a cause.
+        assert (False, True, True) in native_hops
+        assert (True, False, True) in native_hops
+        assert "projetv0.voice.stt.failures" not in _metric_map(owner)
+        errors = [item for item in upstream if isinstance(item, ErrorFrame)]
+        assert len(errors) == 1 and errors[0].error == "stt_failed"
+        assert errors[0].exception is None and errors[0].processor is None
+        assert owner.failure_code is None
+    finally:
+        await stt._client.close()  # noqa: SLF001
         await owner.aclose()
 
 

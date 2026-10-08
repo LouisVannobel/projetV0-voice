@@ -893,7 +893,7 @@ async def test_normal_answer_and_early_streaming_share_one_begin_future(tmp_path
 
 
 def test_manifest_extension_is_strict_and_legacy_serialization_omits_absence():
-    from test_config import manifest_data
+    from tests.unit.test_config import manifest_data
 
     legacy = config.AgentManifestV1.model_validate(manifest_data())
     assert "sparra" not in legacy.model_dump()
@@ -1171,7 +1171,7 @@ async def test_bound_target_failure_is_distinct_and_wrong_leg_cannot_take_over(t
 async def test_real_signed_webhook_extracts_binding_and_nullable_caller_before_admission(
     tmp_path, monkeypatch, caller
 ):
-    from test_telnyx_webhooks import event_body, verifier_for
+    from tests.unit.test_telnyx_webhooks import event_body, verifier_for
 
     body = event_body(
         occurred_at=NOW.isoformat(),
@@ -1316,6 +1316,370 @@ async def test_departed_owner_target_failure_preserves_actual_original_hangup(tm
     finally:
         provider.transfer_release.set()
         await asyncio.gather(requested, return_exceptions=True)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["false", "raise", "cancel", "missing"])
+async def test_transfer_audio_boundary_failure_releases_only_unpublished_intent(tmp_path, mode):
+    """Registry/SQLite boundary; session preparation is controlled, not capture qualification."""
+    from types import SimpleNamespace
+
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+    registry, writer, worker, provider = await start(tmp_path)
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        entry.begin_snapshot = BeginCallSnapshotV2.model_validate({
+            **entry.begin_snapshot.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(uuid4()), "recording_policy": "local_30d",
+            "recording_contact_phone": DID, "audio_available": True,
+            "recording_id": str(uuid4()),
+        })
+        entered, release = asyncio.Event(), asyncio.Event()
+        closes = []
+
+        async def prepare():
+            entered.set()
+            await release.wait()
+            if mode == "raise":
+                raise RuntimeError("controlled transfer preparation failure")
+            if mode == "cancel":
+                raise asyncio.CancelledError()
+            return False
+
+        entry.session = SimpleNamespace(
+            stop_result_inference=lambda: None,
+            close_audio_for_transfer=lambda: closes.append(True) or True,
+            **({"prepare_audio_for_transfer": prepare} if mode != "missing" else {}),
+        )
+        generation = await registry.generation_handle("original")
+        requested = asyncio.create_task(registry.request_human(generation))
+        if mode != "missing":
+            await asyncio.wait_for(entered.wait(), 2)
+            assert closes == [True] and registry._transfer_fenced(entry)
+            assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
+        release.set()
+        if mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(requested, 2)
+        else:
+            assert await asyncio.wait_for(requested, 2) == "unavailable_collect_message"
+            assert await registry.request_human(generation) == "unavailable_collect_message"
+        assert entry.transfer_facts is None and not registry._transfer_fenced(entry)
+        assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
+        assert not any(item[0] == "transfer" for item in provider.actions)
+        assert await registry.live_call_count() == 1
+        assert registry._permits_used == 1
+    finally:
+        provider.transfer_release.set()
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_transfer_audio_on_missing_concrete_session_refuses_before_reservation(tmp_path):
+    """Registry policy boundary only; no native capture/qualification is manufactured."""
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+    registry, writer, worker, provider = await start(tmp_path)
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        entry.begin_snapshot = BeginCallSnapshotV2.model_validate({
+            **entry.begin_snapshot.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(uuid4()), "recording_policy": "local_30d",
+            "recording_contact_phone": DID, "audio_available": True,
+            "recording_id": str(uuid4()),
+        })
+        assert entry.session is None
+        generation = await registry.generation_handle("original")
+        assert await registry.request_human(generation) == "unavailable_collect_message"
+        assert entry.transfer_task is None and entry.transfer_facts is None
+        assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
+        assert not any(item[0] == "transfer" for item in provider.actions)
+        assert await registry.live_call_count() == 1 and registry._permits_used == 1
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_transfer_entered_real_commit_unknown_keeps_fence_without_dispatch_or_retry(tmp_path):
+    """Real SQLite COMMIT then lost response; existing V1 has no capture obligation."""
+    registry, writer, worker, provider = await start(tmp_path)
+    commits = []
+    native_commit = writer.commit_transfer_intent
+
+    async def lose_after_commit(facts):
+        await native_commit(facts)
+        commits.append(facts.transfer_command_id)
+        raise RuntimeError("controlled committed response loss")
+
+    writer.commit_transfer_intent = lose_after_commit
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        generation = await registry.generation_handle("original")
+        with pytest.raises(RuntimeError, match="^controlled committed response loss$"):
+            await registry.request_human(generation)
+        assert entry.transfer_facts is not None and registry._transfer_fenced(entry)
+        facts = await writer.read_call_lifecycle(entry.call_id)
+        assert facts.transfer_fenced
+        assert facts.transfer_command_id == entry.transfer_facts.transfer_command_id
+        with pytest.raises(RuntimeError, match="^controlled committed response loss$"):
+            await registry.request_human(generation)
+        assert commits == [facts.transfer_command_id]
+        assert not any(item[0] == "transfer" for item in provider.actions)
+        assert await registry.live_call_count() == 1 and registry._permits_used == 1
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["off", "local_30d"])
+async def test_transfer_audio_off_and_unavailable_do_not_require_capture_callback(tmp_path, policy):
+    """Existing provider/SQLite path with a metadata-only V2 pin; no capture claim."""
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+    registry, writer, worker, provider = await start(tmp_path)
+    requested = None
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        entry.begin_snapshot = BeginCallSnapshotV2.model_validate({
+            **entry.begin_snapshot.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(uuid4()), "recording_policy": policy,
+            "recording_contact_phone": DID if policy == "local_30d" else None,
+            "audio_available": False, "recording_id": None,
+        })
+        assert entry.session is None
+        generation = await registry.generation_handle("original")
+        requested = asyncio.create_task(registry.request_human(generation))
+        await asyncio.wait_for(provider.transfer_entered.wait(), 2)
+        provider.transfer_release.set()
+        assert await requested == "ringing"
+        assert (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
+    finally:
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.gather(requested, return_exceptions=True)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared_result", [False, True])
+async def test_terminal_authority_during_audio_prepare_keeps_consumed_fence_without_dispatch(
+    tmp_path, prepared_result
+):
+    """Real registry grant/terminal authority and SQLite; controlled session prep only."""
+    from types import SimpleNamespace
+
+    from projetv0_voice.admission import TerminalProposal
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+    registry, writer, worker, provider = await start(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+    requested = None
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        entry.begin_snapshot = BeginCallSnapshotV2.model_validate({
+            **entry.begin_snapshot.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(uuid4()), "recording_policy": "local_30d",
+            "recording_contact_phone": DID, "audio_available": True,
+            "recording_id": str(uuid4()),
+        })
+        snapshot = await registry.snapshot("original")
+        claim = await registry.claim_once(
+            call_control_id="original", token_digest=snapshot.token_digest,
+            abort_target_publisher=lambda target: True, abort_target_clearer=lambda target: None,
+        )
+
+        async def wait():
+            pass
+
+        owner = SimpleNamespace(
+            _task=asyncio.current_task(), _phase="constructing", _session=None,
+            _terminal_capability=None, request_drain=lambda cause: None, wait=wait,
+        )
+        grant = await registry.consume_claim_for_construction(claim, "stream", owner, owner._task)
+        assert grant is not None
+
+        async def prepare():
+            entered.set()
+            await release.wait()
+            return prepared_result
+
+        entry.session = SimpleNamespace(
+            stop_result_inference=lambda: None, close_audio_for_transfer=lambda: True,
+            prepare_audio_for_transfer=prepare,
+        )
+        requested = asyncio.create_task(registry.request_human(grant.generation))
+        await asyncio.wait_for(entered.wait(), 2)
+        reserved = entry.transfer_facts
+        assert reserved is not None
+        authority = await registry.reserve_or_read_terminal(
+            grant, owner._terminal_capability,
+            TerminalProposal(status="failed", reason="pipeline_failed", metric_class="failed",
+                             cleanup_hangup=True),
+        )
+        assert authority.status == "closing" and not authority.cleanup_hangup
+        release.set()
+        assert await asyncio.wait_for(requested, 2) == "unavailable_collect_message"
+        assert entry.transfer_facts is reserved and registry._transfer_fenced(entry)
+        assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
+        assert not any(item[0] in {"transfer", "hangup"} for item in provider.actions)
+        assert await registry.live_call_count() == 1 and registry._permits_used == 1
+        assert await registry.complete_reserved_terminal(authority)
+        assert await registry.live_call_count() == 1 and registry._permits_used == 1
+        assert (await writer.read_call_lifecycle(grant.call_id)).original_ended_at is None
+    finally:
+        release.set()
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.gather(requested, return_exceptions=True)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+
+@pytest.mark.asyncio
+async def test_transfer_rechecks_live_audio_after_contended_registry_lock_before_intent(tmp_path):
+    """Registry/SQLite ordering; controlled session readiness models synchronous invalidation."""
+    from types import SimpleNamespace
+
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+    registry, writer, worker, provider = await start(tmp_path)
+    entered, release, returned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    ready = True
+    requested = None
+    locked = False
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        entry.begin_snapshot = BeginCallSnapshotV2.model_validate({
+            **entry.begin_snapshot.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(uuid4()), "recording_policy": "local_30d",
+            "recording_contact_phone": DID, "audio_available": True,
+            "recording_id": str(uuid4()),
+        })
+
+        async def prepare():
+            entered.set()
+            await release.wait()
+            returned.set()
+            return True
+
+        entry.session = SimpleNamespace(
+            stop_result_inference=lambda: None, close_audio_for_transfer=lambda: True,
+            prepare_audio_for_transfer=prepare, audio_ready_for_transfer=lambda: ready,
+        )
+        generation = await registry.generation_handle("original")
+        requested = asyncio.create_task(registry.request_human(generation))
+        await asyncio.wait_for(entered.wait(), 2)
+        await registry._lock.acquire()
+        locked = True
+        release.set()
+        await asyncio.wait_for(returned.wait(), 2)
+        assert not requested.done()
+        ready = False
+        registry._lock.release()
+        locked = False
+        assert await asyncio.wait_for(requested, 2) == "unavailable_collect_message"
+        assert entry.transfer_facts is None
+        assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
+        assert not any(item[0] in {"transfer", "hangup"} for item in provider.actions)
+        assert await registry.live_call_count() == 1 and registry._permits_used == 1
+    finally:
+        if locked:
+            registry._lock.release()
+        release.set()
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.gather(requested, return_exceptions=True)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidated", ["opposition", "process-draining"])
+async def test_transfer_live_audio_readiness_is_rechecked_after_real_intent_commit(
+    tmp_path, invalidated
+):
+    """Real registry/SQLite COMMIT; session readiness is a controlled owner boundary."""
+    from types import SimpleNamespace
+
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+    registry, writer, worker, provider = await start(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+    ready = True
+    requested = None
+    native_commit = writer.commit_transfer_intent
+
+    async def hold_after_commit(facts):
+        await native_commit(facts)
+        entered.set()
+        await release.wait()
+
+    writer.commit_transfer_intent = hold_after_commit
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        entry = registry._by_control["original"]
+        entry.begin_snapshot = BeginCallSnapshotV2.model_validate({
+            **entry.begin_snapshot.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(uuid4()), "recording_policy": "local_30d",
+            "recording_contact_phone": DID, "audio_available": True,
+            "recording_id": str(uuid4()),
+        })
+
+        async def prepare():
+            return True
+
+        entry.session = SimpleNamespace(
+            stop_result_inference=lambda: None, close_audio_for_transfer=lambda: True,
+            prepare_audio_for_transfer=prepare, audio_ready_for_transfer=lambda: ready,
+        )
+        generation = await registry.generation_handle("original")
+        requested = asyncio.create_task(registry.request_human(generation))
+        await asyncio.wait_for(entered.wait(), 2)
+        if invalidated == "opposition":
+            ready = False
+        else:
+            await registry.begin_drain()
+            assert ready
+        release.set()
+        assert await asyncio.wait_for(requested, 2) == "unavailable_collect_message"
+        facts = await writer.read_call_lifecycle(entry.call_id)
+        assert facts.transfer_fenced and registry._transfer_fenced(entry)
+        assert facts.transfer_command_id == entry.transfer_facts.transfer_command_id
+        assert facts.retention_until == entry.begin_snapshot.retention_until
+        assert not any(item[0] in {"transfer", "hangup"} for item in provider.actions)
+        assert await registry.live_call_count() == 1 and registry._permits_used == 1
+    finally:
+        release.set()
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.gather(requested, return_exceptions=True)
         await registry.wait_background()
         await writer.drain(2)
         await worker

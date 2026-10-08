@@ -2037,7 +2037,7 @@ async def test_company_pin_drives_native_session_notice_and_recording_after_comm
         assert session._controller.is_active()
         assert len(requests) == int(enabled)
         assert len(texts) == 2
-        assert "assistant vocal automatisé" in texts[0]
+        assert "assistant vocal IA" in texts[0]
         assert "texte est conservé trente jours" in texts[0]
         assert texts[1] == "Comment puis-je vous aider ?"
         if enabled:

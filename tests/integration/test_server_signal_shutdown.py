@@ -2610,7 +2610,6 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
     from uuid import UUID
 
     from nacl.signing import SigningKey
-    from test_call_session import _OfflineTts, _PassProcessor
     from websockets.asyncio.client import connect
 
     from projetv0_voice.admission import (
@@ -2636,6 +2635,7 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
         TelnyxWebhookVerifier,
         VerifiedWebhook,
     )
+    from tests.integration.test_call_session import _OfflineTts, _PassProcessor
 
     class SttClient:
         async def aclose(self) -> None:

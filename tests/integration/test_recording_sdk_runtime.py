@@ -6,11 +6,11 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from test_recording_archive import NOW, URL
-from test_recording_archive_ownership import owned
 
 from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguousError
 from projetv0_voice.persistence.relay import OutboxRelay
+from tests.integration.test_recording_archive import NOW, URL
+from tests.integration.test_recording_archive_ownership import owned
 
 
 @pytest.mark.asyncio

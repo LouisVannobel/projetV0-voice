@@ -101,6 +101,7 @@ EXPECTED_INSTRUMENTS = {
     "sessions.duration": ("_Histogram", "s"),
     "user_bot_latency": ("_Histogram", "s"),
     "service_ttfb": ("_Histogram", "s"),
+    "stt.failures": ("_Counter", ""),
     "disclosure.mark_ack": ("_Histogram", "s"),
     "disclosure.timeouts": ("_Counter", ""),
     "relay.runs": ("_Counter", ""),
@@ -335,7 +336,7 @@ async def test_in_memory_provider_has_exact_resource_scope_filter_and_inventory(
     assert meter._instrumentation_scope.name == "projetv0.voice"  # noqa: SLF001
     assert meter._instrumentation_scope.version is None  # noqa: SLF001
     instruments = list(meter._instrument_id_instrument.values())  # noqa: SLF001
-    assert len(instruments) == 21
+    assert len(instruments) == 22
     assert {
         instrument.name.removeprefix(PREFIX): (
             type(instrument).__name__,
@@ -832,6 +833,52 @@ async def test_instrument_fault_is_fail_open_constant_safe_and_has_no_generic_su
     assert not hasattr(owner, "meter")
     assert not hasattr(owner, "instruments")
     await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "timeout", "transport", "segment_limit", "text_limit", "text_invalid", "drain_timeout"
+])
+async def test_stt_failure_counter_accepts_only_fixed_reason_attribute(reason):
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        owner.record_stt_failure(reason)
+        values = _points(_metric_map(owner)[PREFIX + "stt.failures"])
+        assert set(values) == {(("reason", reason),)}
+        assert values[(("reason", reason),)].value == 1
+        assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["provider-private-secret", "stt_failed", None, True, [], 8])
+async def test_stt_failure_counter_rejects_raw_or_unknown_values_with_existing_safe_latch(reason):
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        owner.record_stt_failure(reason)
+        assert owner.failure_code == "metrics_record_failed"
+        assert PREFIX + "stt.failures" not in _metric_map(owner)
+        assert "provider-private-secret" not in repr(_metric_map(owner))
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stt_failure_counter_instrument_fault_uses_existing_constant_safe_latch():
+    owner = metrics_module.RuntimeMetrics.in_memory()
+
+    class FailedCounter:
+        def add(self, _value, _attributes):
+            raise RuntimeError("metric-instrument-private-secret")
+
+    owner._stt_failures = FailedCounter()  # noqa: SLF001
+    try:
+        owner.record_stt_failure("timeout")
+        assert owner.failure_code == "metrics_record_failed"
+        assert "metric-instrument-private-secret" not in repr(owner)
+    finally:
+        await owner.aclose()
 
 
 class _FakeInstrument:

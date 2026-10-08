@@ -78,7 +78,7 @@ class _BoundedOpenAISTTService(OpenAISTTService):
             return None
         self._terminal = True
         self._discard_batch()
-        return FatalErrorFrame(error=code)
+        return FatalErrorFrame(error=code, processor=self)
 
     def _take_completed_batch(self) -> TranscriptionFrame | None:
         if self._pending_segments or self._caller_speaking or self._terminal:

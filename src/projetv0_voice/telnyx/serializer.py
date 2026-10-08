@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
+    InputDTMFFrame,
     InputTransportMessageFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
@@ -18,6 +21,7 @@ from pipecat.serializers.telnyx import TelnyxFrameSerializer
 
 from projetv0_voice.telnyx.frames import (
     MAX_MARK_NAME_BYTES,
+    TelnyxInputDTMFFrame,
     TelnyxMarkFrame,
     TelnyxSerializerError,
     bounded_utf8_text,
@@ -29,6 +33,12 @@ MAX_STREAM_ID_BYTES = 1_024
 MAX_CALL_CONTROL_ID_BYTES = 1_024
 MAX_ERROR_FIELD_BYTES = 256
 MAX_ERROR_CODE = 2_147_483_647
+MAX_DTMF_TIMESTAMP_BYTES = 32
+MAX_DTMF_SEQUENCE_DIGITS = 16
+MAX_DTMF_SEQUENCE = 9_007_199_254_740_991
+_DTMF_UTC_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z"
+)
 
 
 class _InvalidJson(ValueError):
@@ -108,6 +118,35 @@ def _require_mapping(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TelnyxSerializerError("telnyx_serializer_invalid")
     return value
+
+
+def _dtmf_metadata(message: dict[str, Any]) -> tuple[datetime | None, int | None]:
+    """Project bounds qualify timing; unknown timing preserves ordinary keypad input."""
+    timestamp = message.get("occurred_at")
+    sequence = message.get("sequence_number")
+    if not isinstance(timestamp, str) or not isinstance(sequence, str):
+        return None, None
+    if (
+        not 1 <= len(sequence) <= MAX_DTMF_SEQUENCE_DIGITS
+        or not sequence.isascii() or not sequence.isdecimal()
+        or len(sequence) > 1 and sequence[0] == "0"
+    ):
+        return None, None
+    try:
+        if len(timestamp.encode("utf-8")) > MAX_DTMF_TIMESTAMP_BYTES:
+            return None, None
+    except UnicodeEncodeError:
+        return None, None
+    if _DTMF_UTC_TIMESTAMP.fullmatch(timestamp) is None:
+        return None, None
+    number = int(sequence)
+    if number > MAX_DTMF_SEQUENCE:
+        return None, None
+    try:
+        occurred_at = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None, None
+    return occurred_at, number
 
 
 class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
@@ -191,12 +230,24 @@ class ProjetV0TelnyxFrameSerializer(TelnyxFrameSerializer):
             if not allowed:
                 return None
 
+        if initial.get("event") == "dtmf":
+            stream_id = bounded_utf8_text(
+                initial.get("stream_id"), maximum_bytes=MAX_STREAM_ID_BYTES
+            )
+            if stream_id != self._stream_id:
+                raise TelnyxSerializerError("telnyx_serializer_invalid")
+
         if initial.get("event") not in {
             "mark",
             "stop",
             "error",
         }:
             frame = await super().deserialize(data)
+            if initial.get("event") == "dtmf" and isinstance(frame, InputDTMFFrame):
+                occurred_at, sequence_number = _dtmf_metadata(initial)
+                return TelnyxInputDTMFFrame(
+                    button=frame.button, occurred_at=occurred_at, sequence_number=sequence_number
+                )
             if isinstance(frame, InputAudioRawFrame):
                 try:
                     return frame if self.audio_admission.allows_audio() else None

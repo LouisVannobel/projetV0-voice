@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 from collections.abc import Callable, Coroutine, Sequence
+from contextlib import suppress
 from contextvars import Context
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
 from typing import Any, Protocol, cast
@@ -20,6 +21,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ErrorFrame,
+    FatalErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputDTMFFrame,
@@ -56,13 +58,15 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.audio_capture import BoundedAudioBufferTap
+from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.inference.completion_strategy import (
     STT_USER_TURN_WATCHDOG_SECONDS,
     CompletionAwareTurnStopStrategy,
 )
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
-from projetv0_voice.telnyx.frames import TelnyxMarkFrame
+from projetv0_voice.telnyx.frames import TelnyxInputDTMFFrame, TelnyxMarkFrame
 
 
 class FirstFailure:
@@ -268,6 +272,8 @@ class GateController(Protocol):
 
     async def mark_forwarded(self) -> None: ...
 
+    async def accept_dtmf(self, frame: TelnyxInputDTMFFrame) -> bool: ...
+
 
 @dataclass(slots=True)
 class _EndCallAttempt:
@@ -431,6 +437,11 @@ def build_input_gate(
                 if isinstance(frame, (CancelFrame, ErrorFrame)) and end_call_playback is not None:
                     end_call_playback.invalidate()
                 return True
+            if (
+                isinstance(frame, TelnyxInputDTMFFrame) and hasattr(controller, "accept_dtmf")
+                and await controller.accept_dtmf(frame)
+            ):
+                return False
             if isinstance(frame, InputTransportMessageFrame):
                 message = frame.message
                 if not isinstance(message, dict):
@@ -564,10 +575,10 @@ class _RuntimeMetricsObserverBinding:
 
 
 class RuntimeMetricsObserver(BaseObserver):
-    """Forward only identity-bound native service TTFB measurements."""
+    """Forward identity-bound service TTFB and one terminal STT producer cause."""
 
     __binding: _RuntimeMetricsObserverBinding
-    __slots__ = ("__binding",)
+    __slots__ = ("__binding", "__stt_failure_recorded")
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in (
@@ -608,6 +619,7 @@ class RuntimeMetricsObserver(BaseObserver):
         ):
             raise ValueError("runtime_metrics_observer_invalid") from None
         super().__init__()
+        self.__stt_failure_recorded = False
         object.__setattr__(
             self,
             "_RuntimeMetricsObserver__binding",
@@ -640,6 +652,30 @@ class RuntimeMetricsObserver(BaseObserver):
         return self.__binding.tts
 
     async def on_push_frame(self, data: FramePushed) -> None:
+        if (
+            data.source is self._stt
+            and data.first_push is True
+            and type(data.frame) is FatalErrorFrame
+            and data.frame.processor is self._stt
+            and data.frame.exception is None
+            and data.direction in (FrameDirection.UPSTREAM, FrameDirection.DOWNSTREAM)
+        ):
+            reason = (
+                {
+                    "openrouter_stt_timeout": "timeout",
+                    "openrouter_stt_transport": "transport",
+                    "openrouter_stt_segment_limit": "segment_limit",
+                    "openrouter_stt_text_limit": "text_limit",
+                    "openrouter_stt_text_invalid": "text_invalid",
+                    "openrouter_stt_drain_timeout": "drain_timeout",
+                }.get(data.frame.error)
+                if type(data.frame.error) is str else None
+            )
+            if reason is not None and not self.__stt_failure_recorded:
+                self.__stt_failure_recorded = True
+                with suppress(Exception):  # Preserve the existing observer forwarding policy.
+                    self._runtime_metrics.record_stt_failure(reason)
+            return
         if data.direction is not FrameDirection.DOWNSTREAM or type(data.frame) is not MetricsFrame:
             return
         if data.source is self._stt:
@@ -800,11 +836,11 @@ class PipelineTurnRecorder(Protocol):
 
 
 SPARRA_DISCLOSURE = (
-    "Bonjour. Je suis un assistant vocal automatisé. Je peux prendre un message pour "
+    "Bonjour. Je suis un assistant vocal IA. Je peux prendre un message pour "
     "l'établissement. L'audio n'est pas enregistré ; le texte est conservé trente jours."
 )
 SPARRA_RECORDING_DISCLOSURE = (
-    "Bonjour. Je suis un assistant vocal automatisé. Je peux prendre un message pour "
+    "Bonjour. Je suis un assistant vocal IA. Je peux prendre un message pour "
     "l'établissement. L'audio est conservé trente jours en France ; Telnyx le traite "
     "temporairement. Le texte est conservé trente jours."
 )
@@ -848,7 +884,8 @@ def build_pipeline(
     controller: GateController,
     turn_recorder: PipelineTurnRecorder,
     first_failure: FirstFailure,
-    begin_snapshot: BeginCallSnapshotV1 | None = None,
+    begin_snapshot: BeginCallSnapshotV1 | BeginCallSnapshotV2 | None = None,
+    capture_tap: BoundedAudioBufferTap | None = None,
     transfer_handler: FunctionCallHandler | None = None,
     end_call_handler: FunctionCallHandler | None = None,
     end_call_playback: EndCallPlayback | None = None,
@@ -1082,6 +1119,7 @@ def build_pipeline(
             services.tts,
             barrier,
             output,
+            *([capture_tap] if capture_tap is not None else []),
             assistant_aggregator,
         ],
         first_failure=first_failure,

@@ -4,7 +4,6 @@ from datetime import timedelta
 from uuid import UUID
 
 import pytest
-from test_postgres_sink import NOW, SqlstateError, operation, sink_with_rows
 
 from projetv0_voice import models
 from projetv0_voice.persistence import postgres_sink as sink_module
@@ -14,6 +13,7 @@ from projetv0_voice.persistence.postgres_sink import (
     OperationSinkPermanentError,
     OperationSinkStaleLeaseError,
 )
+from tests.contract.test_postgres_sink import NOW, SqlstateError, operation, sink_with_rows
 
 
 def routing():

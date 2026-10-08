@@ -17,6 +17,7 @@ from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     FatalErrorFrame,
     Frame,
     InputAudioRawFrame,
@@ -49,7 +50,8 @@ from projetv0_voice.inference.completion_strategy import (
     STT_USER_TURN_WATCHDOG_SECONDS,
     CompletionAwareTurnStopStrategy,
 )
-from projetv0_voice.pipeline import FirstFailure
+from projetv0_voice.metrics import RuntimeMetrics
+from projetv0_voice.pipeline import FirstFailure, InferenceErrorBoundary, RuntimeMetricsObserver
 from projetv0_voice.qualified_profile import InferenceProfileV1
 
 
@@ -86,6 +88,7 @@ async def _collect_stt(service: Any, frames: list[object]) -> None:
 
 async def _start_native_stt_worker(
     *processors: FrameProcessor,
+    observers: list[Any] | None = None,
 ) -> tuple[PipelineWorker, asyncio.Task[None]]:
     started = asyncio.Event()
     worker = PipelineWorker(
@@ -93,6 +96,7 @@ async def _start_native_stt_worker(
         params=PipelineParams(audio_in_sample_rate=8000, audio_out_sample_rate=8000),
         enable_rtvi=False,
         cancel_on_idle_timeout=False,
+        observers=observers or [],
     )
 
     async def note_started(_worker: PipelineWorker, _frame: StartFrame) -> None:
@@ -109,6 +113,81 @@ async def _start_native_stt_worker(
         await asyncio.wait_for(run_task, timeout=2)
         raise
     return worker, run_task
+
+
+def _stt_failure_points(metrics: RuntimeMetrics):
+    collected = metrics._metric_reader.get_metrics_data()  # noqa: SLF001
+    return [
+        (dict(point.attributes), point.value)
+        for resource in collected.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name == "projetv0.voice.stt.failures"
+        for point in metric.data.data_points
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["timeout", "transport", "text_limit", "text_invalid"])
+async def test_stt_native_http_failure_reaches_safe_counter_and_unchanged_public_error(
+    reason, monkeypatch
+):
+    module = import_module("projetv0_voice.inference.services")
+    release = asyncio.Event()
+    fail = False
+
+    async def handler(_request):
+        if not fail:
+            return httpx.Response(200, json={"text": ""})
+        if reason == "timeout":
+            await release.wait()
+        if reason == "transport":
+            return httpx.Response(
+                400, json={"error": {"message": "offline-private-provider-error"}}
+            )
+        if reason == "text_invalid":
+            return httpx.Response(200, content=b'{"text":"\\ud800"}')
+        text = "é" * 16385 if reason == "text_limit" else ""
+        return httpx.Response(200, json={"text": text})
+
+    metrics = RuntimeMetrics.in_memory()
+    observed: asyncio.Queue[Frame] = asyncio.Queue()
+    async with DefaultAsyncHttpxClient(transport=httpx.MockTransport(handler)) as client:
+        service = module.build_stt(
+            _profile(), SecretStr("unit-secret"), language="fr-FR", http_client=client
+        )
+        await _collect_stt(service, [])  # Native SDK discovery is completed offline.
+        fail = True
+        monkeypatch.setattr(module, "_STT_TIMEOUT_SECONDS", 0.03)
+        llm, tts = FrameProcessor(name="llm"), FrameProcessor(name="tts")
+        observer = RuntimeMetricsObserver(runtime_metrics=metrics, stt=service, llm=llm, tts=tts)
+        boundary = InferenceErrorBoundary(stt=service, llm=llm, tts=tts)
+        collector = QueuedFrameProcessor(queue=observed, queue_direction=FrameDirection.UPSTREAM)
+        sink = QueuedFrameProcessor(
+            queue=asyncio.Queue(), queue_direction=FrameDirection.DOWNSTREAM
+        )
+        worker, task = await _start_native_stt_worker(
+            collector, boundary, service, sink, observers=[observer]
+        )
+        try:
+            await worker.queue_frames([
+                VADUserStartedSpeakingFrame(), InputAudioRawFrame(b"\x01\x00" * 800, 8000, 1),
+                VADUserStoppedSpeakingFrame(),
+            ])
+            await asyncio.wait_for(task, timeout=2)
+            assert _stt_failure_points(metrics) == [({"reason": reason}, 1)]
+            errors = [observed.get_nowait() for _ in range(observed.qsize())]
+            errors = [frame for frame in errors if isinstance(frame, ErrorFrame)]
+            assert len(errors) == 1
+            assert errors[0].error == "stt_failed" and errors[0].fatal
+            assert errors[0].exception is None and errors[0].processor is None
+            assert "offline-private-provider-error" not in repr(_stt_failure_points(metrics))
+        finally:
+            release.set()
+            if not task.done():
+                await worker.queue_frame(CancelFrame())
+            await asyncio.wait_for(task, timeout=2)
+            await metrics.aclose()
 
 
 class _CompletePauseAnalyzer(BaseSmartTurn):
@@ -899,7 +978,10 @@ async def test_stt_terminal_discards_or_flushes_text_held_during_resumed_speech(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text, expected_error", [("é" * 16384, None), ("é" * 16385, "limit")])
+@pytest.mark.parametrize(
+    "text, expected_error", [("é" * 16384, None), ("é" * 16385, "limit")],
+    ids=["at-32-kib", "over-32-kib"],
+)
 async def test_stt_batch_text_budget_is_32_kib_of_utf8_bytes(
     text: str, expected_error: str | None
 ) -> None:
@@ -1030,6 +1112,7 @@ async def test_stt_pending_segment_limit_cancels_native_worker_without_transcrip
     cancelled = asyncio.Event()
     received: asyncio.Queue[Frame] = asyncio.Queue()
     requests: list[httpx.Request] = []
+    metrics = RuntimeMetrics.in_memory()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -1046,7 +1129,11 @@ async def test_stt_pending_segment_limit_cancels_native_worker_without_transcrip
             _profile(), SecretStr("unit-secret"), language="fr-FR", http_client=client
         )
         sink = QueuedFrameProcessor(queue=received, queue_direction=FrameDirection.DOWNSTREAM)
-        worker, run_task = await _start_native_stt_worker(service, sink)
+        observer = RuntimeMetricsObserver(
+            runtime_metrics=metrics, stt=service,
+            llm=FrameProcessor(name="llm"), tts=FrameProcessor(name="tts")
+        )
+        worker, run_task = await _start_native_stt_worker(service, sink, observers=[observer])
         try:
             for index in range(5):
                 await worker.queue_frames(
@@ -1064,11 +1151,14 @@ async def test_stt_pending_segment_limit_cancels_native_worker_without_transcrip
             if not run_task.done():
                 await worker.queue_frame(CancelFrame())
             await asyncio.wait_for(run_task, timeout=2)
+            diagnostic = _stt_failure_points(metrics)
+            await metrics.aclose()
         assert [frame async for frame in service.run_stt(_wav())] == []
 
     observed = [received.get_nowait() for _ in range(received.qsize())]
     assert len(requests) == 1
     assert cancelled.is_set()
+    assert diagnostic == [({"reason": "segment_limit"}, 1)]
     assert [frame.error for frame in observed if isinstance(frame, FatalErrorFrame)] == [
         "openrouter_stt_segment_limit"
     ]
@@ -1084,6 +1174,7 @@ async def test_stt_end_drain_deadline_cancels_http_without_late_transcript(
     release = asyncio.Event()
     cancelled = asyncio.Event()
     received: asyncio.Queue[Frame] = asyncio.Queue()
+    metrics = RuntimeMetrics.in_memory()
 
     async def handler(_request: httpx.Request) -> httpx.Response:
         entered.set()
@@ -1099,7 +1190,11 @@ async def test_stt_end_drain_deadline_cancels_http_without_late_transcript(
             _profile(), SecretStr("unit-secret"), language="fr-FR", http_client=client
         )
         sink = QueuedFrameProcessor(queue=received, queue_direction=FrameDirection.DOWNSTREAM)
-        worker, run_task = await _start_native_stt_worker(service, sink)
+        observer = RuntimeMetricsObserver(
+            runtime_metrics=metrics, stt=service,
+            llm=FrameProcessor(name="llm"), tts=FrameProcessor(name="tts")
+        )
+        worker, run_task = await _start_native_stt_worker(service, sink, observers=[observer])
         try:
             await worker.queue_frames(
                 [
@@ -1117,10 +1212,13 @@ async def test_stt_end_drain_deadline_cancels_http_without_late_transcript(
             if not run_task.done():
                 await worker.queue_frame(CancelFrame())
             await asyncio.wait_for(run_task, timeout=2)
+            diagnostic = _stt_failure_points(metrics)
+            await metrics.aclose()
         assert [frame async for frame in service.run_stt(_wav())] == []
 
     observed = [received.get_nowait() for _ in range(received.qsize())]
     assert cancelled.is_set()
+    assert diagnostic == [({"reason": "drain_timeout"}, 1)]
     assert [frame.error for frame in observed if isinstance(frame, FatalErrorFrame)] == [
         "openrouter_stt_drain_timeout"
     ]

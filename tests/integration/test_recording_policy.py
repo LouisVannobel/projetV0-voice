@@ -9,7 +9,11 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-from test_recording_archive import (
+
+from projetv0_voice.models import BeginCallSnapshotV1, CallUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.persistence.commands import PersistenceError
+from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
+from tests.integration.test_recording_archive import (
     CALL_ID,
     DEADLINE,
     NOW,
@@ -18,12 +22,8 @@ from test_recording_archive import (
     queue_saved,
     saved_event,
 )
-from test_recording_archive_ownership import owned as history_owned
-from test_recording_archive_ownership import restart
-
-from projetv0_voice.models import BeginCallSnapshotV1, CallUpsertPayloadV1, VoiceOperationV1
-from projetv0_voice.persistence.commands import PersistenceError
-from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
+from tests.integration.test_recording_archive_ownership import owned as history_owned
+from tests.integration.test_recording_archive_ownership import restart
 
 
 @asynccontextmanager

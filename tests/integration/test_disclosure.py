@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sqlite3
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
@@ -14,6 +16,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InputAudioRawFrame,
+    InputDTMFFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
     OutputAudioRawFrame,
@@ -36,9 +39,12 @@ from pipecat.transports.websocket.fastapi import (
 from starlette.websockets import WebSocket, WebSocketState
 
 from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
+from projetv0_voice.audio_contract import BeginCallSnapshotV2
+from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1, RoutingV1
 from projetv0_voice.persistence.commands import PersistenceCommand
+from projetv0_voice.persistence.writer import LocalCallAdmissionFacts, PersistenceWriter
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 from projetv0_voice.telnyx.serializer import AudioAdmission, ProjetV0TelnyxFrameSerializer
 
@@ -194,11 +200,17 @@ class _DisclosureRelay(FrameProcessor):
         super().__init__(enable_direct_mode=True)
         self.synthesize = synthesize
         self.input_audio: list[InputAudioRawFrame] = []
+        self.input_dtmf: list[InputDTMFFrame] = []
+        self.spoken: list[str] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame):
             self.input_audio.append(frame)
+        if isinstance(frame, InputDTMFFrame):
+            self.input_dtmf.append(frame)
+        if isinstance(frame, TTSSpeakFrame):
+            self.spoken.append(frame.text)
         if self.synthesize and isinstance(frame, TTSSpeakFrame):
             await self.push_frame(
                 TTSAudioRawFrame(
@@ -262,7 +274,7 @@ class _PacedDisclosureOutput(BaseOutputTransport):
             self.mark_sent.set()
 
 
-def _paced_disclosure_runtime(controller, failure, output):
+def _paced_disclosure_runtime(controller, failure, output, *, greeting=None, begin_snapshot=None):
     input_processor = _DisclosureRelay()
     services = SimpleNamespace(
         stt=_DisclosureRelay(),
@@ -279,11 +291,12 @@ def _paced_disclosure_runtime(controller, failure, output):
             record_assistant=lambda *_args: None,
         ),
         first_failure=failure,
+        begin_snapshot=begin_snapshot,
     )
     runtime = pipeline_module.build_runtime(
         pipeline=pipeline,
         first_failure=failure,
-        greeting=pipeline_module.SPARRA_DISCLOSURE,
+        greeting=pipeline_module.SPARRA_DISCLOSURE if greeting is None else greeting,
         mark_name=controller.mark_name,
         idle_timeout_seconds=60.0,
         observers=pipeline_module._CallObservers(  # noqa: SLF001
@@ -1088,3 +1101,493 @@ async def test_pre_active_interruption_aborts_then_reaches_real_telnyx_clear() -
     assert await controller.accept_mark(controller.mark_name) is False
     assert writer.commands == []
     assert sum(isinstance(frame, InterruptionFrame) for frame in downstream) == 1
+
+
+async def _local_choice_wait(predicate):
+    reached = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    handle = None
+
+    def observe():
+        nonlocal handle
+        if predicate():
+            reached.set()
+        else:
+            handle = loop.call_later(0.001, observe)
+
+    handle = loop.call_soon(observe)
+    try:
+        await asyncio.wait_for(reached.wait(), 2)
+    finally:
+        handle.cancel()
+
+
+@asynccontextmanager
+async def _local_choice_case(tmp_path, *, policy="local_30d", available=True, start_success=True):
+    """Real writer/pipeline; local start/refusal/quiesce callbacks are test doubles."""
+    clock = SimpleNamespace(utc=NOW + timedelta(seconds=1), mono=10.0)
+    path = tmp_path / "local-choice.sqlite"
+    probe = SimpleNamespace(
+        remaining=0, entered=asyncio.Event(), release=asyncio.Event(), starts=0,
+        refusals=0, quiesces=0, allows_offers=False, active=asyncio.Event(), activations=0,
+        start_entered=asyncio.Event(), start_release=asyncio.Event(), block_start=False,
+        quiesce_entered=asyncio.Event(), quiesce_release=asyncio.Event(), block_quiesce=False,
+        quiesce_active=0, quiesce_peak=0,
+    )
+
+    async def hold_commit(name):
+        if name == "after_mutation_before_commit" and probe.remaining:
+            probe.remaining -= 1
+            if probe.remaining == 0:
+                probe.entered.set()
+                await probe.release.wait()
+
+    pin = BeginCallSnapshotV2.model_validate({
+        "schema_version": 2, "workspace_id": str(UUID(int=2)), "call_id": str(UUID(int=1)),
+        "configuration_revision": 7, "knowledge": {"business_name": "Garage local fixture",
+            "sector": "garage", "opening_hours": "", "services": "", "prices": "",
+            "faq": "", "instructions": ""}, "transfer_destination": None,
+        "retention_until": (NOW + timedelta(days=30)).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z"),
+        "recording_policy": policy,
+        "recording_contact_phone": "+33102030405" if policy == "local_30d" else None,
+        "audio_available": available, "recording_id": str(UUID(int=3)) if available else None,
+    })
+    routing = RoutingV1(schema_version=1, direction="incoming", connection_id="fixture",
+        to_e164="+33102030405", from_e164=None, telnyx_call_control_id="call-control-1",
+        telnyx_call_leg_id="call-leg-1", telnyx_call_session_id="call-session-1", admitted_at=NOW)
+    identity = replace(_identity(), routing=routing, begin_snapshot=pin,
+                       retention_until=pin.retention_until, stream_id="stream-one")
+    writer = PersistenceWriter(path, CryptoKeyring({1: bytes(range(32))}, active_version=1),
+                               contract_version=2, utcnow=lambda: clock.utc, failpoint=hold_commit,
+                               process_agent_id=identity.deployment_id,
+                               process_deployment_id=identity.deployment_id)
+    writer_task = asyncio.create_task(writer.run())
+    controller = runtime = runner_task = None
+    legacy = _Recording(session_module.RecordingStartResult(
+        session_module.RecordingStartState.DEFINITELY_NOT_STARTED
+    ))
+    try:
+        assert await writer.wait_ready()
+        ticket = writer.submit_webhook(
+            receipt={"event_id": "local-choice-admission", "event_type": "call.initiated",
+                "call_control_id": identity.telnyx_call_control_id, "occurred_at": NOW,
+                "received_at": NOW, "semantic_fingerprint_sha256": b"l" * 32},
+            lease={"action": "upsert", "call_control_id": identity.telnyx_call_control_id,
+                "call_id": identity.call_id, "tenant_id": str(pin.workspace_id),
+                "agent_id": identity.deployment_id, "state": "pending", "token_hash": b"k" * 32,
+                "created_at": NOW, "expires_at": NOW + timedelta(hours=1), "closed_at": None},
+            operation=None, admission_facts=LocalCallAdmissionFacts(
+                identity.call_id, NOW, pin.retention_until, "call-leg-1", "call-session-1",
+                admission_generation=identity.generation.generation),
+        )
+        await ticket.wait()
+        await writer.bind_audio_snapshot(pin, generation=identity.generation.generation)
+
+        async def start_local():
+            probe.starts += 1
+            facts = await writer.read_call_lifecycle(identity.call_id)
+            with sqlite3.connect(path) as db:
+                assert db.execute(
+                    "SELECT choice_state FROM local_audio_pin"
+                ).fetchone()[0] == "accepted"
+            assert facts.disclosure_evidence.input_gate_opened_at is not None
+            probe.start_entered.set()
+            if probe.block_start:
+                await probe.start_release.wait()
+            probe.allows_offers = start_success
+            return start_success
+
+        def refuse_local():
+            probe.refusals += 1
+            probe.allows_offers = False
+
+        async def quiesce_local():
+            probe.quiesces += 1
+            probe.quiesce_active += 1
+            probe.quiesce_peak = max(probe.quiesce_peak, probe.quiesce_active)
+            probe.quiesce_entered.set()
+            try:
+                if probe.block_quiesce:
+                    await probe.quiesce_release.wait()
+                probe.allows_offers = False
+            finally:
+                probe.quiesce_active -= 1
+
+        async def active():
+            probe.activations += 1
+            probe.active.set()
+
+        failure = pipeline_module.FirstFailure()
+        controller = session_module.DisclosureController(
+            identity=identity, writer=writer, first_failure=failure, recording=legacy,
+            recording_enabled=True, recording_required=True, mark_timeout_seconds=2,
+            runtime_metrics=_TEST_RUNTIME_METRICS, monotonic=lambda: clock.mono,
+            utcnow=lambda: clock.utc, uuid_factory=_uuids(500), on_active=active,
+            local_audio_start=start_local, local_audio_refuse=refuse_local,
+            local_audio_quiesce=quiesce_local,
+        )
+        admission = AudioAdmission()
+        admission.bind(controller.is_active)
+        serializer = ProjetV0TelnyxFrameSerializer("stream-one",
+            expected_call_control_id=identity.telnyx_call_control_id, audio_admission=admission)
+        await serializer.setup(StartFrame(audio_in_sample_rate=8000))
+        output = _PacedDisclosureOutput(ack_during_send=controller)
+        runtime, services = _paced_disclosure_runtime(controller, failure, output,
+            greeting=controller.announcement_text, begin_snapshot=pin)
+        await runtime.runner.add_workers(runtime.worker)
+        runner_task = asyncio.create_task(runtime.runner.run(auto_end=True))
+        yield SimpleNamespace(writer=writer, path=path, probe=probe, clock=clock,
+            controller=controller, identity=identity, pin=pin, legacy=legacy, failure=failure,
+            serializer=serializer, runtime=runtime, services=services, output=output)
+    finally:
+        probe.release.set()
+        probe.start_release.set()
+        probe.quiesce_release.set()
+        if controller is not None:
+            await controller.terminalize_and_join(cancel_continuations=True)
+        if runner_task is not None and not runner_task.done():
+            await runtime.runner.cancel(reason="local_choice_test_cleanup")
+            await asyncio.wait_for(runner_task, 2)
+        if writer.is_degraded:
+            await asyncio.wait_for(asyncio.gather(writer_task, return_exceptions=True), 2)
+        else:
+            await writer.drain(2)
+            await asyncio.wait_for(writer_task, 2)
+
+
+async def _local_choice_digit(case, digit, occurred_at, *, sequence="1"):
+    payload = {"event": "dtmf", "stream_id": "stream-one", "sequence_number": sequence,
+               "dtmf": {"digit": digit}}
+    if occurred_at is not None:
+        payload["occurred_at"] = occurred_at.isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+    frame = await case.serializer.deserialize(json.dumps(payload))
+    assert isinstance(frame, InputDTMFFrame)
+    await case.runtime.worker.queue_frame(frame)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy, available", [("off", False), ("local_30d", True)])
+async def test_sparra_notice_explicitly_announces_ia_for_off_and_local_on(
+    tmp_path, policy, available,
+):
+    async with _local_choice_case(tmp_path, policy=policy, available=available) as case:
+        assert "un assistant vocal IA." in case.controller.announcement_text
+        assert "un assistant vocal IA." in pipeline_module.SPARRA_RECORDING_DISCLOSURE
+
+
+@pytest.mark.asyncio
+async def test_local_choice_paced_ack_keeps_input_closed_until_disclosure_commit(tmp_path):
+    async with _local_choice_case(tmp_path) as case:
+        case.probe.remaining = 1
+        await asyncio.wait_for(case.output.mark_enqueued.wait(), 2)
+        assert not case.output.mark_sent.is_set()
+        await asyncio.wait_for(case.probe.entered.wait(), 2)
+        assert case.output.mark_sent.is_set() and len(case.output.audio_written) == 3840
+        assert not case.controller.is_active() and case.probe.starts == 0
+        assert await case.serializer.deserialize(_media(1)) is None
+        await _local_choice_digit(case, "1", case.clock.utc)
+        await case.runtime.worker.queue_frame(InputAudioRawFrame(b"\x02\x00" * 80, 8000, 1))
+        await asyncio.sleep(0.01)
+        assert case.services.stt.input_audio == [] and case.probe.starts == 0
+        case.clock.mono += 4
+        case.clock.utc += timedelta(seconds=4)
+        case.probe.release.set()
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        assert not case.controller.is_active() and case.legacy.starts == 0
+        facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+        assert facts.disclosure_evidence.completed_at == NOW + timedelta(seconds=1)
+        assert facts.disclosure_evidence.input_gate_opened_at is None
+        assert facts.retention_until == NOW + timedelta(days=30)
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT schema_version,kind FROM outbox").fetchall() == [
+                (2, "call.upsert")
+            ]
+        spoken = case.services.tts.spoken[0]
+        assert "Garage local fixture" in spoken and "+33102030405" in spoken
+        assert "30" in spoken and "2" in spoken
+        assert (
+            "Le texte de cet échange est conservé trente jours, même sans enregistrement audio."
+            in spoken
+        )
+        assert "Sans choix, l'appel continue sans enregistrement." in spoken
+        assert "Pendant l'appel, tapez 2 pour arrêter l'enregistrement." in spoken
+        assert spoken.endswith(
+            "Après cette annonce, tapez 1 pour accepter l'enregistrement audio, "
+            "ou 2 pour continuer sans."
+        )
+        assert "supprimer" not in spoken
+
+
+@pytest.mark.asyncio
+async def test_local_choice_rejects_early_unknown_late_one_and_latches_early_two(tmp_path):
+    async with _local_choice_case(tmp_path / "one") as case:
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        await _local_choice_digit(case, "1", NOW)
+        await _local_choice_digit(case, "1", None, sequence="2")
+        await asyncio.sleep(0.01)
+        assert case.probe.starts == 0 and not case.controller.is_active()
+        case.clock.mono += 5.1
+        case.clock.utc += timedelta(seconds=5.1)
+        await _local_choice_digit(case, "1", NOW + timedelta(seconds=2), sequence="3")
+        await asyncio.wait_for(case.probe.active.wait(), 2)
+        assert case.probe.starts == 0 and case.legacy.starts == 0
+        assert case.services.stt.input_dtmf == []
+    async with _local_choice_case(tmp_path / "two") as case:
+        await _local_choice_digit(case, "2", None)
+        await _local_choice_wait(lambda: case.probe.refusals > 0)
+        assert not case.controller.is_active() and case.probe.starts == 0
+        await asyncio.wait_for(case.probe.active.wait(), 2)
+        await _local_choice_digit(case, "1", case.clock.utc, sequence="2")
+        await asyncio.sleep(0.01)
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+        assert case.probe.starts == 0 and case.services.stt.input_dtmf == []
+        facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+        assert facts.original_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_local_choice_valid_one_waits_for_choice_and_gate_before_local_start(tmp_path):
+    async with _local_choice_case(tmp_path) as case:
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        case.probe.remaining = 1
+        await _local_choice_digit(case, "1", case.clock.utc)
+        await asyncio.wait_for(case.probe.entered.wait(), 2)
+        assert case.controller.state.name == "CHOICE_COMMITTING"
+        assert case.probe.starts == 0 and not case.controller.is_active()
+        assert await case.serializer.deserialize(_media(1)) is None
+        case.probe.entered.clear()
+        case.probe.remaining = 1
+        case.probe.release.set()
+        await _local_choice_wait(lambda: case.controller.state.name == "GATE_COMMITTING")
+        case.probe.release.clear()
+        await asyncio.wait_for(case.probe.entered.wait(), 2)
+        assert case.probe.starts == 0 and not case.controller.is_active()
+        case.probe.release.set()
+        await asyncio.wait_for(case.probe.active.wait(), 2)
+        assert case.probe.starts == 1 and case.probe.allows_offers and case.legacy.starts == 0
+        frame = await case.serializer.deserialize(_media(2))
+        assert isinstance(frame, InputAudioRawFrame)
+        await case.runtime.worker.queue_frame(frame)
+        await _local_choice_wait(lambda: len(case.services.stt.input_audio) == 1)
+        assert case.services.stt.input_dtmf == []
+        facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+        assert facts.admission_generation == case.identity.generation.generation
+        assert facts.retention_until == case.pin.retention_until and facts.original_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_local_choice_timeout_off_unavailable_and_failed_start_keep_ordinary_phone_input(
+    tmp_path,
+):
+    for label in ("silence", "unknown", "off", "unavailable", "failed-start"):
+        async with _local_choice_case(tmp_path / label,
+            policy="off" if label == "off" else "local_30d",
+            available=label not in {"off", "unavailable"},
+            start_success=label != "failed-start",
+        ) as case:
+            if label == "silence":
+                case.probe.remaining = 1
+                await asyncio.wait_for(case.probe.entered.wait(), 2)
+                case.clock.mono += 5.1
+                case.clock.utc += timedelta(seconds=5.1)
+                case.probe.release.set()
+            elif label in {"unknown", "failed-start"}:
+                await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+                await _local_choice_digit(case, "9" if label == "unknown" else "1", case.clock.utc)
+            await asyncio.wait_for(case.probe.active.wait(), 2)
+            with sqlite3.connect(case.path) as db:
+                assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+            assert case.probe.starts == (1 if label == "failed-start" else 0)
+            assert not case.probe.allows_offers and case.legacy.starts == 0
+            assert case.failure.code is None
+            frame = await case.serializer.deserialize(_media(2))
+            assert isinstance(frame, InputAudioRawFrame)
+            await case.runtime.worker.queue_frame(frame)
+            await _local_choice_wait(lambda: len(case.services.stt.input_audio) == 1)
+
+
+@pytest.mark.asyncio
+async def test_local_choice_two_refuses_before_denial_commit_and_never_resurrects_capture(tmp_path):
+    for stage in ("choice", "gate", "start", "active"):
+        async with _local_choice_case(tmp_path / stage) as case:
+            await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+            if stage in {"choice", "gate"}:
+                case.probe.remaining = 1 if stage == "choice" else 2
+            if stage == "start":
+                case.probe.block_start = True
+            await _local_choice_digit(case, "1", case.clock.utc)
+            if stage in {"choice", "gate"}:
+                await asyncio.wait_for(case.probe.entered.wait(), 2)
+            elif stage == "start":
+                await asyncio.wait_for(case.probe.start_entered.wait(), 2)
+            else:
+                await asyncio.wait_for(case.probe.active.wait(), 2)
+                case.probe.remaining = 1
+                case.probe.entered.clear()
+                case.probe.release.clear()
+            frame = await case.serializer.deserialize(json.dumps({
+                "event": "dtmf", "stream_id": "stream-one", "sequence_number": "2",
+                "dtmf": {"digit": "2"},
+            }))
+            assert await case.controller.accept_dtmf(frame) is True
+            assert case.probe.refusals >= 1 and not case.probe.allows_offers
+            if stage == "active":
+                await asyncio.wait_for(case.probe.entered.wait(), 2)
+                assert case.controller.is_active()
+            case.probe.release.set()
+            case.probe.start_release.set()
+            await asyncio.wait_for(case.probe.active.wait(), 2)
+            await case.controller.join_continuations()
+            assert not case.probe.allows_offers and case.probe.quiesces == 1
+            with sqlite3.connect(case.path) as db:
+                assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+            facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+            assert not facts.content_erased and facts.original_ended_at is None
+            assert case.legacy.starts == 0 and case.services.stt.input_dtmf == []
+            await case.controller.terminalize_and_join(cancel_continuations=True)
+            assert case.controller.pending_task_count == 0
+
+
+@pytest.mark.asyncio
+async def test_local_choice_post_terminal_two_cannot_create_denial_sql_or_owned_work(tmp_path):
+    async with _local_choice_case(tmp_path) as case:
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        await _local_choice_digit(case, "1", case.clock.utc)
+        await asyncio.wait_for(case.probe.active.wait(), 2)
+        assert case.probe.starts == 1 and case.probe.allows_offers
+        await case.controller.terminalize_and_join(cancel_continuations=True)
+        assert case.controller.pending_task_count == 0
+        assert not case.controller.is_active() and not case.probe.allows_offers
+        with sqlite3.connect(case.path) as db:
+            before = db.execute(
+                "SELECT choice_state,choice_occurred_at,denied_at FROM local_audio_pin"
+            ).fetchone()
+        assert before[0] == "accepted" and before[2] is None
+        case.probe.entered.clear()
+        case.probe.release.clear()
+        case.probe.remaining = 1
+        try:
+            # The real runner is still alive; metadata/control bypasses audio admission.
+            await _local_choice_digit(case, "2", None, sequence="2")
+            with suppress(TimeoutError):
+                await asyncio.wait_for(case.probe.entered.wait(), 0.2)
+            assert not case.probe.entered.is_set(), "terminal controller queued denial SQL"
+            assert case.controller.pending_task_count == 0
+            with sqlite3.connect(case.path) as db:
+                assert db.execute(
+                    "SELECT choice_state,choice_occurred_at,denied_at FROM local_audio_pin"
+                ).fetchone() == before
+            case.probe.remaining = 0
+            facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+            assert facts.original_ended_at is None
+        finally:
+            case.probe.release.set()
+            await case.controller.join_continuations()
+
+
+@pytest.mark.asyncio
+async def test_local_choice_oracle_choice_waiting_two_opens_ordinary_input_without_another_digit(
+    tmp_path,
+):
+    async with _local_choice_case(tmp_path) as case:
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        assert case.controller.disclosure_completed and not case.controller.is_active()
+        await _local_choice_digit(case, "2", None)
+        await _local_choice_wait(lambda: case.probe.quiesces == 1)
+        await case.writer.wait_until_idle()
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+        await asyncio.wait_for(case.probe.active.wait(), 2)
+        assert case.controller.is_active() and case.probe.starts == case.legacy.starts == 0
+        assert case.probe.activations == 1
+        assert not case.probe.allows_offers and case.probe.quiesces == 1
+        frame = await case.serializer.deserialize(_media(2))
+        assert isinstance(frame, InputAudioRawFrame)
+        await case.runtime.worker.queue_frame(frame)
+        await _local_choice_wait(lambda: len(case.services.stt.input_audio) == 1)
+        assert case.services.stt.input_dtmf == []
+        facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+        assert not facts.content_erased and facts.original_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_local_choice_oracle_choice_timeout_and_two_share_one_held_quiesce(tmp_path):
+    async with _local_choice_case(tmp_path) as case:
+        case.probe.block_quiesce = True
+        case.probe.remaining = 1
+        try:
+            await asyncio.wait_for(case.probe.entered.wait(), 2)
+            case.clock.mono += 5.1
+            case.clock.utc += timedelta(seconds=5.1)
+            case.probe.release.set()
+            await asyncio.wait_for(case.probe.quiesce_entered.wait(), 2)
+            assert case.probe.quiesces == case.probe.quiesce_active == case.probe.quiesce_peak == 1
+            assert not case.controller.is_active()
+            case.probe.entered.clear()
+            case.probe.release.clear()
+            case.probe.remaining = 1
+            await _local_choice_digit(case, "2", None)
+            await asyncio.wait_for(case.probe.entered.wait(), 2)
+            case.probe.release.set()
+            assert await case.writer.quick_check()  # Queued behind the actual denial COMMIT.
+            await case.writer.wait_until_idle()
+            await asyncio.sleep(0)
+            assert case.probe.quiesces == 1
+            assert case.probe.quiesce_active == case.probe.quiesce_peak == 1
+            case.probe.quiesce_release.set()
+            await asyncio.wait_for(case.probe.active.wait(), 2)
+            await case.controller.join_continuations()
+            assert case.probe.quiesces == 1 and case.probe.quiesce_active == 0
+            assert not case.probe.allows_offers and case.probe.starts == case.legacy.starts == 0
+            with sqlite3.connect(case.path) as db:
+                assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+            await case.controller.terminalize_and_join(cancel_continuations=True)
+            assert case.controller.pending_task_count == 0
+            facts = await case.writer.read_call_lifecycle(case.identity.call_id)
+            assert facts.original_ended_at is None
+        finally:
+            case.probe.release.set()
+            case.probe.quiesce_release.set()
+            await case.controller.join_continuations()
+
+
+@pytest.mark.asyncio
+async def test_transfer_prepare_does_not_pass_failed_start_event_before_real_off_commit(tmp_path):
+    """Actual controller/pipeline/SQLite; only the existing local-start callback is controlled."""
+    async with _local_choice_case(tmp_path, start_success=False) as case:
+        case.probe.block_start = True
+        case.controller._local_audio_close = lambda: setattr(case.probe, "allows_offers", False)
+        await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
+        await _local_choice_digit(case, "1", case.clock.utc)
+        await asyncio.wait_for(case.probe.start_entered.wait(), 2)
+        case.probe.remaining = 1
+        case.probe.start_release.set()
+        await asyncio.wait_for(case.probe.entered.wait(), 2)
+        assert case.controller._local_start_done.is_set()
+        assert case.controller.pending_task_count > 0
+        joined = asyncio.Event()
+        original_join = case.controller._join_audio_transfer_continuations
+
+        async def observe_join():
+            joined.set()
+            await original_join()
+
+        case.controller._join_audio_transfer_continuations = observe_join
+        prepared = asyncio.create_task(case.controller.prepare_audio_for_transfer())
+        try:
+            await asyncio.wait_for(joined.wait(), 2)
+            assert not prepared.done()
+            assert not case.controller.audio_ready_for_transfer()
+        finally:
+            case.probe.release.set()
+        # This fixture intentionally has no native finish/readiness callbacks.
+        assert await asyncio.wait_for(prepared, 2) is False
+        await case.controller.join_continuations()
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT choice_state FROM local_audio_pin").fetchone()[0] == "off"
+        assert case.probe.starts == 1 and not case.probe.allows_offers

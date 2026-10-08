@@ -60,6 +60,9 @@ _OUTCOMES = frozenset(
 )
 _LATENCY_KINDS = frozenset({"turn", "first_speech"})
 _SERVICES = frozenset({"stt", "llm", "tts"})
+_STT_FAILURE_REASONS = frozenset(
+    {"timeout", "transport", "segment_limit", "text_limit", "text_invalid", "drain_timeout"}
+)
 _RELAY_STATUSES = frozenset(
     {
         "empty",
@@ -264,6 +267,9 @@ class RuntimeMetrics:
         )
         self._service_ttfb = self._meter.create_histogram(
             _PREFIX + "service_ttfb", description="", unit="s"
+        )
+        self._stt_failures = self._meter.create_counter(
+            _PREFIX + "stt.failures", description="", unit=""
         )
         self._disclosure_mark_ack = self._meter.create_histogram(
             _PREFIX + "disclosure.mark_ack", description="", unit="s"
@@ -476,6 +482,12 @@ class RuntimeMetrics:
             self._latch_failure()
             return
         self._record(self._service_ttfb, value, {"service": service})
+
+    def record_stt_failure(self, reason: object) -> None:
+        if not _closed(reason, _STT_FAILURE_REASONS):
+            self._latch_failure()
+            return
+        self._add(self._stt_failures, {"reason": reason})
 
     def record_disclosure_ack(self, seconds: object) -> None:
         value = _nonnegative_number(seconds)

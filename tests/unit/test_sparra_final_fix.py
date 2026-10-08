@@ -7,7 +7,8 @@ from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
-from test_sparra_admission import NOW, TARGET, committed, event, start
+
+from tests.unit.test_sparra_admission import NOW, TARGET, committed, event, start
 
 
 @pytest.mark.asyncio
@@ -122,9 +123,8 @@ async def test_original_termination_fact_is_durable_and_stale_transfer_cannot_cl
 
 @pytest.mark.asyncio
 async def test_sparra_missing_admission_never_accepts_late_capture_or_frozen_result(tmp_path):
-    from test_sparra_result import capture
-
     from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
+    from tests.unit.test_sparra_result import capture
 
     registry, writer, worker, _ = await start(tmp_path)
     try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import ipaddress
 import json
 import socket
@@ -13,7 +14,7 @@ import ssl
 import sys
 import time
 import traceback
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, closing
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -30,7 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from nacl.signing import SigningKey
 from openai import DefaultAsyncHttpxClient
-from pipecat.frames.frames import TranscriptionFrame
+from pipecat.frames.frames import InputAudioRawFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection
 from psycopg_pool import AsyncConnectionPool
 from pydantic import SecretStr
@@ -38,6 +39,11 @@ from websockets.asyncio.client import connect
 
 from projetv0_voice.admission import CallAdmissionRejected
 from projetv0_voice.app import create_app
+from projetv0_voice.audio_contract import (
+    AudioFinishPayloadV2,
+    AudioRevokePayloadV2,
+    canonical_audio_chunk_aad,
+)
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import EncryptedValue
 from projetv0_voice.inference import services as native_services
@@ -53,12 +59,14 @@ from projetv0_voice.models import RoutingV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import (
     canonical_operation_bytes,
     decode_operation,
+    decode_operation_v2,
     operation_aad_from_metadata,
 )
 from projetv0_voice.persistence.postgres_sink import PsycopgOperationSink
 from projetv0_voice.production_wiring import _decode_keyring_value
 from projetv0_voice.qualified_profile import (
     InferenceProfileV1,
+    QualificationCandidateProfileV1,
     QualifiedDeploymentProfileV1,
     canonical_inference_profile_sha256,
 )
@@ -69,6 +77,7 @@ from projetv0_voice.telnyx.recordings import (
     build_recording_correlation,
     encode_recording_correlation,
 )
+from projetv0_voice.telnyx.serializer import ProjetV0TelnyxFrameSerializer
 
 _lose_begin_reply = ContextVar("owned_connected_begin_reply", default=False)
 
@@ -96,12 +105,16 @@ def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
-def observe_native_startup(supervisor, patches, diagnostic):
+def observe_native_startup(supervisor, patches, diagnostic, report=None):
     """Test-only observation; the original owns scheduling, budgets and exceptions."""
     original = supervisor._startup_await
     phases = {
-        "writer_startup_failed", "writer_quick_check_failed", "qualification_status_failed",
-        "operation_sink_open_failed", "stale_recovery_failed", "runtime_publication_failed",
+        "writer_startup_failed",
+        "writer_quick_check_failed",
+        "qualification_status_failed",
+        "operation_sink_open_failed",
+        "stale_recovery_failed",
+        "runtime_publication_failed",
         "runtime_begin_drain_failed",
     }
 
@@ -110,11 +123,14 @@ def observe_native_startup(supervisor, patches, diagnostic):
             code if type(code) is str and code in phases else "other_safe_failure"
         )
         diagnostic["outcome"] = "other"
+        if report is not None:
+            report(diagnostic["last_phase"])
         try:
             return await original(awaitable, code=code)
         except BaseException:
             diagnostic["outcome"] = (
-                "native_timeout" if supervisor._startup_phase_timed_out is True
+                "native_timeout"
+                if supervisor._startup_phase_timed_out is True
                 else "native_exception"
             )
             raise
@@ -125,13 +141,21 @@ def observe_native_startup(supervisor, patches, diagnostic):
 def safe_startup_diagnostic(error, diagnostic, recovery_case):
     """Closed public fields only: never stringify exceptions, locals or source lines."""
     terminal_codes = {
-        "runtime_startup_invalid", "stale_recovery_failed", "qualification_run_consumed",
-        "writer_startup_failed", "writer_quick_check_failed", "owned_task_registration_failed",
+        "runtime_startup_invalid",
+        "stale_recovery_failed",
+        "qualification_run_consumed",
+        "writer_startup_failed",
+        "writer_quick_check_failed",
+        "owned_task_registration_failed",
         "runtime_startup_failed",
     }
     phases = {
-        "writer_startup_failed", "writer_quick_check_failed", "qualification_status_failed",
-        "operation_sink_open_failed", "stale_recovery_failed", "runtime_publication_failed",
+        "writer_startup_failed",
+        "writer_quick_check_failed",
+        "qualification_status_failed",
+        "operation_sink_open_failed",
+        "stale_recovery_failed",
+        "runtime_publication_failed",
         "runtime_begin_drain_failed",
     }
     terminal_code = "other_safe_failure"
@@ -141,11 +165,21 @@ def safe_startup_diagnostic(error, diagnostic, recovery_case):
             terminal_code = argument
     phase = diagnostic.get("last_phase")
     outcome = diagnostic.get("outcome")
-    classes = {RuntimeError: "RuntimeError", AssertionError: "AssertionError",
-               TimeoutError: "TimeoutError", asyncio.CancelledError: "CancelledError"}
+    classes = {
+        RuntimeError: "RuntimeError",
+        AssertionError: "AssertionError",
+        TimeoutError: "TimeoutError",
+        asyncio.CancelledError: "CancelledError",
+    }
     frame_names = {
-        "setup", "startup", "_startup_await", "_recover_stale_leases", "prepare_before_fifo",
-        "maintain_call_content", "observed_restore", "restore_transfer_fence",
+        "setup",
+        "startup",
+        "_startup_await",
+        "_recover_stale_leases",
+        "prepare_before_fifo",
+        "maintain_call_content",
+        "observed_restore",
+        "restore_transfer_fence",
         "_finish_startup_unwind",
     }
     frames = []
@@ -160,10 +194,13 @@ def safe_startup_diagnostic(error, diagnostic, recovery_case):
     return {
         "terminal_code": terminal_code,
         "last_phase": phase if type(phase) is str and phase in phases else "other_safe_failure",
-        "outcome": outcome if type(outcome) is str
-        and outcome in {"native_timeout", "native_exception"} else "other",
-        "recovery_case": recovery_case if type(recovery_case) is str
-        and recovery_case in {"held", "backlog", "final-fix", "replay"} else "other",
+        "outcome": outcome
+        if type(outcome) is str and outcome in {"native_timeout", "native_exception"}
+        else "other",
+        "recovery_case": recovery_case
+        if type(recovery_case) is str
+        and recovery_case in {"held", "backlog", "final-fix", "replay"}
+        else "other",
         "error_class": classes.get(type(error), "OtherException"),
         "frames": frames[-8:],
     }
@@ -196,6 +233,7 @@ class Peers:
         self.recordings = {}
         self.tool_arguments = None
         self.transfer = None
+        self.before_transfer = None
 
     async def http(self, request):
         path = request.url.path
@@ -204,6 +242,8 @@ class Peers:
                 self.stream = json.loads(request.content)
             if path.endswith("/actions/transfer"):
                 self.transfer = json.loads(request.content)
+                if self.before_transfer is not None:
+                    await self.before_transfer(self.transfer)
             if request.method == "DELETE":
                 self.deleted.append(path)
                 recording = path.rsplit("/", 1)[-1]
@@ -406,6 +446,7 @@ class Scenario:
         self.evidence = {"controlled_peers": True, "checks": []}
         self.media = None
         self.graph = None
+        self.call_id = None
         self.app = None
         self.phase = "setup"
         self.patches = ExitStack()
@@ -421,8 +462,48 @@ class Scenario:
         self.begin_release = asyncio.Event()
         self.begin_cancelled = asyncio.Event()
         self.race_begin_entered = asyncio.Event()
+        self.audio_candidate = request.get("audio_candidate") is True
+        self.audio_capture = None
+        self.audio_pcm_digest = hashlib.sha256()
+        self.audio_seen = set()
+        self.audio_gate_ingested = {}
+        self.audio_gate_acked = {}
+        self.audio_ack_entered, self.audio_ack_release = asyncio.Event(), asyncio.Event()
+        self.audio_ack_hold = False
+        self.audio_ack_refusal = None
+        self.audio_ack_attempts = 0
+        self.audio_erasure_lease_token = None
+        self.audio_cleanup_pending = 0
+        self.audio_cleanup_commit_entered = asyncio.Event()
+        self.audio_cleanup_commit_release = asyncio.Event()
+        self.audio_cleanup_commit_completed = False
+        self.audio_cleanup_commit_action = None
+        self.audio_cleanup_commit_fence = None
+        self.audio_phase_epoch = time.monotonic()
+
+    def candidate_phase(self, phase):
+        if self.audio_candidate:
+            memory = {}
+            if sys.platform == "linux":
+                import resource
+
+                memory["peak_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            emit(
+                {
+                    "phase": phase,
+                    "elapsed_ms": int((time.monotonic() - self.audio_phase_epoch) * 1000),
+                    **memory,
+                }
+            )
+
+    def fixture_metrics(self, _cls, _token, **_kwargs):
+        self.candidate_phase("metrics-build")
+        metrics = RuntimeMetrics.in_memory()
+        self.candidate_phase("metrics-built")
+        return metrics
 
     async def setup(self):
+        self.candidate_phase("candidate-setup")
         key = SecretStr("owned-" + uuid4().hex)
         inference = InferenceProfileV1.model_validate(
             {
@@ -465,6 +546,17 @@ class Scenario:
             "VOICE_BIND_HOST": "127.0.0.1",
             "VOICE_BIND_PORT": "8080",
         }
+        if self.audio_candidate:
+            self.audio_run = uuid4()
+            env.pop("VOICE_QUALIFIED_PROFILE_PATH")
+            env.update(
+                {
+                    "VOICE_RUNTIME_MODE": "qualification_candidate",
+                    "VOICE_QUALIFICATION_CANDIDATE_PATH": "/srv/projetv0/candidate.json",
+                    "VOICE_QUALIFICATION_RUN_ID": str(self.audio_run),
+                    "VOICE_BENCHMARK_DID_SHA256": hashlib.sha256(b"+33123456789").hexdigest(),
+                }
+            )
         parsed_settings = parse_runtime_settings(
             capture_runtime_environment(env), geteuid=lambda: 10001, getegid=lambda: 10001
         )
@@ -472,6 +564,7 @@ class Scenario:
             parsed_settings,
             sqlite_path=PurePosixPath((self.directory / "voice.sqlite").as_posix()),
         )
+        self.candidate_phase("settings-valid")
         # Relocate only owned fixture storage; retain the native parser-issued token.
         object.__setattr__(
             self.settings, "_observability_token", parsed_settings.observability_token()
@@ -506,7 +599,24 @@ class Scenario:
                 },
             }
         )
-        profile = QualifiedDeploymentProfileV1(
+        if self.audio_candidate:
+            workspace = UUID(self.request["workspace_id"])
+            self.manifest = AgentManifestV1.model_validate(
+                {
+                    **self.manifest.model_dump(mode="python"),
+                    "tenant_id": str(workspace),
+                    "agent_id": "audio-fixture-agent",
+                    "sparra": {
+                        **self.manifest.sparra.model_dump(mode="python"),
+                        "qualified_transfer_destination_e164": (
+                            "+33102030406"
+                            if self.request.get("audio_transfer_fixture") is True else None
+                        ),
+                        "operation_contract_version": 2,
+                    },
+                }
+            )
+        profile_fields = dict(
             schema_version=1,
             deployment_id="fixture-a",
             runtime_contract_sha256=self.settings.runtime_contract_sha256,
@@ -516,14 +626,34 @@ class Scenario:
             inference=inference,
             token_locator_id="telnyx-header-connected-v1",
             telnyx_api_key_sha256=hashlib.sha256(key.get_secret_value().encode()).hexdigest(),
-            telnyx_data_locality="EU",
             telnyx_handshake_fixture_sha256=hashlib.sha256(
                 _redacted_fixture(token_byte_length=43, from_number=None, to_number="+33123456789")
             ).hexdigest(),
             disclosure_mark_timeout_ms=5000,
             call_lease_ttl_seconds=30,
-            qualified_at=now() - timedelta(days=1),
         )
+        if self.audio_candidate:
+            # Explicitly unqualified native constructor; the actual graph still
+            # enforces candidate mode/bindings/expiry and the one-call limit.
+            profile = QualificationCandidateProfileV1.model_validate(
+                {
+                    **profile_fields,
+                    "run_id": self.audio_run,
+                    "expires_at": now() + timedelta(minutes=2),
+                    "benchmark_did_hash": self.settings.benchmark_did_sha256,
+                    "max_concurrent_calls": 1,
+                    "disclosure_mark_timeout_ms": 10000,
+                }
+            )
+        else:
+            profile = QualifiedDeploymentProfileV1.model_validate(
+                {
+                    **profile_fields,
+                    "telnyx_data_locality": "EU",
+                    "qualified_at": now() - timedelta(days=1),
+                }
+            )
+        self.candidate_phase("profile-valid")
         material = {
             str(self.settings.telnyx_api_key_file): key,
             str(self.settings.telnyx_webhook_public_key_file): SecretStr(
@@ -536,7 +666,7 @@ class Scenario:
             patch.object(
                 RuntimeMetrics,
                 "production",
-                classmethod(lambda _cls, _token, **_kwargs: RuntimeMetrics.in_memory()),
+                classmethod(self.fixture_metrics),
             )
         )
         self.patches.enter_context(
@@ -561,13 +691,20 @@ class Scenario:
         keyring = _decode_keyring_value(
             await asyncio.to_thread(Path(self.request["keyring_path"]).read_text)
         )
+        self.candidate_phase("keyring-valid")
         self.begin_identities = []
 
         def native_sink(dsn):
-            sink = PsycopgOperationSink(dsn.get_secret_value(), pool_factory=LostBeginReplyPool)
-            original_begin = sink.begin_call
+            self.candidate_phase("sink-build")
+            sink = (
+                PsycopgOperationSink(dsn.get_secret_value())
+                if self.audio_candidate
+                else PsycopgOperationSink(dsn.get_secret_value(), pool_factory=LostBeginReplyPool)
+            )
+            original_begin = sink.begin_call_v2 if self.audio_candidate else sink.begin_call
 
             async def observed_begin(deployment, call_id, routing):
+                self.candidate_phase("begin-rpc-entered")
                 self.evidence.pop("begin_failure", None)
                 if routing.telnyx_call_control_id == "race-original":
                     self.race_begin_entered.set()
@@ -580,7 +717,9 @@ class Scenario:
                 try:
                     try:
                         result = await original_begin(deployment, call_id, routing)
+                        self.candidate_phase("begin-rpc-returned")
                     except Exception as error:
+                        self.candidate_phase("begin-rpc-failed")
                         self.evidence["begin_failure"] = type(error).__name__
                         raise
                     if routing.telnyx_call_control_id == self.hold_begin:
@@ -593,20 +732,66 @@ class Scenario:
                 finally:
                     _lose_begin_reply.reset(token)
 
-            sink.begin_call = observed_begin
+            if self.audio_candidate:
+                sink.begin_call_v2 = observed_begin
+                native_ingest = sink.ingest_v2
+
+                async def observed_ingest(operation):
+                    await native_ingest(operation)
+                    if (
+                        operation.kind == "call.upsert" and operation.payload.status == "active"
+                        and operation.payload.disclosure_evidence is not None
+                        and operation.payload.disclosure_evidence.input_gate_opened_at is not None
+                    ):
+                        with sqlite3.connect(self.settings.sqlite_path) as database:
+                            queued = database.execute(
+                                "SELECT queue_id FROM outbox WHERE op_id=?",
+                                (str(operation.operation_id),),
+                            ).fetchone()
+                        assert queued is not None, "native_audio_active_operation_still_owned"
+                        self.audio_gate_ingested[queued[0]] = (
+                            operation.call_id, operation.operation_id
+                        )
+                    if (
+                        operation.kind == "audio.chunk"
+                        and operation.operation_id not in self.audio_seen
+                    ):
+                        assert len(self.audio_seen) < 200, "native_audio_operation_bound"
+                        payload = operation.payload
+                        plaintext = bytearray(
+                            keyring.decrypt(
+                                EncryptedValue(
+                                    payload.key_version,
+                                    base64.b64decode(payload.nonce_b64),
+                                    base64.b64decode(payload.ciphertext_b64),
+                                ),
+                                aad=canonical_audio_chunk_aad(operation),
+                            )
+                        )
+                        try:
+                            assert len(plaintext) <= 32000, "native_audio_observation_bound"
+                            self.audio_pcm_digest.update(plaintext)
+                        finally:
+                            plaintext[:] = b"\0" * len(plaintext)
+                        self.audio_seen.add(operation.operation_id)
+
+                sink.ingest_v2 = observed_ingest
+            else:
+                sink.begin_call = observed_begin
+            self.candidate_phase("sink-built")
             return sink
 
-        factories = RuntimeProductionFactories(
-            validate_artifacts=lambda _settings: None,
-            load_manifest=lambda _settings: self.manifest,
-            load_profile=lambda _settings, _manifest, _time: RuntimeProfileSelection(profile, None),
-            read_secret=lambda path: material[str(path)],
-            load_keyring=lambda _settings: keyring,
-            sink_factory=native_sink,
-            call_control_factory=lambda secret, _profile: native_control.CallControlClient(
+        def native_control_factory(secret, _profile):
+            self.candidate_phase("control-build")
+            client = native_control.CallControlClient(
                 api_key=secret.get_secret_value(), api_region="EU"
-            ),
-            inference_factory=lambda secret, _profile, language: RuntimeInferenceFactories(
+            )
+            self.candidate_phase("control-built")
+            return client
+
+        def native_inference_factory(secret, _profile, language):
+            self.candidate_phase("inference-factories-build")
+            factories = RuntimeInferenceFactories(
                 stt_http_client_factory=lambda: DefaultAsyncHttpxClient(
                     trust_env=False, transport=httpx.MockTransport(self.peers.http)
                 ),
@@ -621,22 +806,95 @@ class Scenario:
                         trust_env=False, transport=httpx.MockTransport(self.peers.http)
                     ),
                 ),
-            ),
+            )
+            self.candidate_phase("inference-factories-built")
+            return factories
+
+        factories = RuntimeProductionFactories(
+            validate_artifacts=lambda _settings: None,
+            load_manifest=lambda _settings: self.manifest,
+            load_profile=lambda _settings, _manifest, _time: RuntimeProfileSelection(profile, None),
+            read_secret=lambda path: material[str(path)],
+            load_keyring=lambda _settings: keyring,
+            sink_factory=native_sink,
+            call_control_factory=native_control_factory,
+            inference_factory=native_inference_factory,
         )
 
+        self.candidate_phase("graph-build")
         self.graph = await build_production_runtime(self.settings, factories=factories)
-        observe_native_startup(self.graph.supervisor, self.patches, self.startup_diagnostic)
+        self.candidate_phase("graph-built")
+        if self.audio_candidate:
+            from projetv0_voice import session as native_session
+            from projetv0_voice.persistence.writer import LocalCallAdmissionFacts
+
+            native_capture = native_session.LocalAudioCapture
+            native_ack = self.graph.writer.ack_outbox
+
+            async def observed_ack(**values):
+                result = await native_ack(**values)
+                if result.applied:
+                    delivered = self.audio_gate_ingested.pop(values["queue_id"], None)
+                    if delivered is not None:
+                        call_id, operation_id = delivered
+                        self.audio_gate_acked[call_id] = operation_id
+                return result
+
+            self.graph.writer.ack_outbox = observed_ack
+
+            def observed_capture(**values):
+                capture = native_capture(**values)
+                self.audio_capture = capture
+                return capture
+
+            self.patches.enter_context(
+                patch.object(native_session, "LocalAudioCapture", observed_capture)
+            )
+            native_webhook = self.graph.writer.submit_webhook
+
+            def observed_webhook(**values):
+                facts, lease = values.get("admission_facts"), values.get("lease")
+                if isinstance(facts, LocalCallAdmissionFacts) and isinstance(lease, dict):
+                    emit(
+                        {
+                            "admission_guard": {
+                                "same_call_id": facts.call_id == lease.get("call_id"),
+                                "generation_present": facts.admission_generation is not None,
+                                "same_admitted_created": facts.admitted_at
+                                == lease.get("created_at"),
+                                "retention_30d": facts.retention_until
+                                == facts.admitted_at + timedelta(days=30),
+                            }
+                        }
+                    )
+                return native_webhook(**values)
+
+            self.graph.writer.submit_webhook = observed_webhook
+        observe_native_startup(
+            self.graph.supervisor,
+            self.patches,
+            self.startup_diagnostic,
+            self.candidate_phase if self.audio_candidate else None,
+        )
         self.captures = []
-        native_enqueue = self.graph.writer.try_enqueue_turn
+        native_enqueue = (
+            self.graph.writer.try_enqueue_turn_v2
+            if self.audio_candidate
+            else self.graph.writer.try_enqueue_turn
+        )
 
         def observed_enqueue(operation, **kwargs):
             self.captures.append(operation)
             return native_enqueue(operation, **kwargs)
 
-        self.graph.writer.try_enqueue_turn = observed_enqueue
+        if self.audio_candidate:
+            self.graph.writer.try_enqueue_turn_v2 = observed_enqueue
+        else:
+            self.graph.writer.try_enqueue_turn = observed_enqueue
         original_resolve = self.graph.registry.resolve_webhook
 
         async def resolve(event):
+            self.candidate_phase("registry-resolve-entered")
             label = (
                 event.call_control_id
                 if event.call_control_id in {"human-original", "human-target"}
@@ -644,7 +902,9 @@ class Scenario:
             )
             try:
                 value = await original_resolve(event)
+                self.candidate_phase("registry-resolve-returned")
             except CallAdmissionRejected as error:
+                self.candidate_phase("registry-resolve-rejected")
                 code = (
                     error.args[0]
                     if error.args
@@ -667,7 +927,11 @@ class Scenario:
         original_call_ack = self.graph.sink.ack_call_erasure
         original_recording_ack = self.graph.sink.ack_recording_purge
 
-        async def call_ack(call_id, token, occurred_at):
+        async def checked_call_ack(call_id, token, occurred_at, entry_snapshot):
+            # These booleans were read synchronously at callback entry. An
+            # observer await must not allow cleanup to repair an earlier defect.
+            for condition, satisfied in entry_snapshot.items():
+                assert satisfied, condition
             entry = self.graph.registry._by_call_id.get(call_id)
             if entry is not None and entry.lease_state != "terminal":
                 assert entry.routing is None and entry.begin_snapshot is None, (
@@ -681,9 +945,8 @@ class Scenario:
                 )
                 self.evidence["bridge_cache_ack_boundary"] = {
                     "cache_absent": entry.bridge_publication is None,
-                    "disclosure_absent": entry.bridge_publication is None or (
-                        entry.bridge_publication.payload.disclosure_evidence is None
-                    ),
+                    "disclosure_absent": entry.bridge_publication is None
+                    or (entry.bridge_publication.payload.disclosure_evidence is None),
                 }
                 assert entry.bridge_publication is None, "native_bridge_cache_scrub_before_ack"
                 assert entry.transfer_facts is None or (
@@ -693,6 +956,85 @@ class Scenario:
             assert (await self.graph.writer.read_retained_call(call_id)).erased, (
                 "native_content_removed_before_ack"
             )
+            if self.audio_candidate and self.audio_ack_hold and call_id == self.call_id:
+                def local_audio_content():
+                    uri = "file:" + self.settings.sqlite_path.as_posix() + "?mode=ro"
+                    with sqlite3.connect(uri, uri=True) as database:
+                        pending = database.execute(
+                            "SELECT count(*) FROM outbox WHERE call_id=?", (str(call_id),)
+                        ).fetchone()[0]
+                        rows = database.execute(
+                            "SELECT kind,op_id,deployment_id,fingerprint,key_version,nonce,"
+                            "ciphertext,acked FROM local_audio_terminal WHERE call_id=? LIMIT 3",
+                            (str(call_id),),
+                        ).fetchall()
+                        pin = database.execute(
+                            "SELECT generation FROM local_audio_pin WHERE call_id=?",
+                            (str(call_id),),
+                        ).fetchone()
+                    identity = self.session._identity
+                    snapshot = identity.begin_snapshot
+                    guard = {
+                        "outbox_empty": pending == 0,
+                        "terminal_present": bool(rows),
+                        "terminal_bounded": len(rows) <= 2,
+                        "terminal_known_acked": all(row[7] == 1 for row in rows),
+                        "terminal_cipher_present": all(row[6] is not None for row in rows),
+                        "terminal_metadata_only": True,
+                        "terminal_identity_exact": pin is not None
+                        and pin[0] == str(identity.generation.generation),
+                        "retention_original_30d": snapshot.retention_until
+                        == identity.routing.admitted_at + timedelta(days=30),
+                    }
+                    for row in rows:
+                        assert len(row[6]) <= 65536, "native_audio_terminal_observation_bound"
+                        plaintext = bytearray(
+                            self.graph.keyring.decrypt(
+                                EncryptedValue(row[4], row[5], row[6]),
+                                aad=operation_aad_from_metadata(
+                                    dict(
+                                        schema_version=2,
+                                        call_id=str(call_id),
+                                        kind=row[0],
+                                        operation_id=row[1],
+                                        deployment_id=row[2],
+                                    )
+                                ),
+                            )
+                        )
+                        try:
+                            operation = decode_operation_v2(bytes(plaintext))
+                            payload = operation.payload
+                            guard["terminal_metadata_only"] &= isinstance(
+                                payload, (AudioFinishPayloadV2, AudioRevokePayloadV2)
+                            )
+                            guard["terminal_identity_exact"] &= (
+                                operation.call_id == call_id
+                                and operation.operation_id == UUID(row[1])
+                                and operation.deployment_id == self.settings.deployment_id
+                                and isinstance(
+                                    payload, (AudioFinishPayloadV2, AudioRevokePayloadV2)
+                                )
+                                and payload.workspace_id == snapshot.workspace_id
+                                and payload.recording_id == snapshot.recording_id
+                                and payload.configuration_revision
+                                == snapshot.configuration_revision
+                                and payload.retention_until == snapshot.retention_until
+                                and hashlib.sha256(canonical_operation_bytes(operation)).digest()
+                                == row[3]
+                            )
+                        finally:
+                            plaintext[:] = b"\0" * len(plaintext)
+                    emit({"audio_terminal_guard": guard})
+                    return pending, len(rows), guard
+
+                pending, count, terminal_guard = await asyncio.to_thread(local_audio_content)
+                assert pending == 0 and 1 <= count <= 2 and all(terminal_guard.values()), (
+                    "native_audio_content_removed_known_metadata_before_ack"
+                )
+                self.audio_ack_entered.set()
+                self.candidate_phase("audio-ack-held-entered")
+                await self.audio_ack_release.wait()
             if getattr(self, "erasure_turn", None) is not None and (
                 call_id == self.erasure_turn.call_id
             ):
@@ -704,16 +1046,17 @@ class Scenario:
                 )
                 self.evidence["erasure_queue"]["removed_before_ack"] = True
             await original_call_ack(call_id, token, occurred_at)
-            async with await psycopg.AsyncConnection.connect(
-                self.request["url"], prepare_threshold=None
-            ) as connection:
-                row = await (
-                    await connection.execute(
-                        "SELECT voice.ack_call_erasure_v1(%s,%s,%s) IS NULL",
-                        (call_id, token, occurred_at),
-                    )
-                ).fetchone()
-            assert row == (True,), "native_call_ack_sql_null"
+            if not self.audio_candidate:
+                async with await psycopg.AsyncConnection.connect(
+                    self.request["url"], prepare_threshold=None
+                ) as connection:
+                    row = await (
+                        await connection.execute(
+                            "SELECT voice.ack_call_erasure_v1(%s,%s,%s) IS NULL",
+                            (call_id, token, occurred_at),
+                        )
+                    ).fetchone()
+                assert row == (True,), "native_call_ack_sql_null"
             self.local_acks.append(call_id)
 
         async def recording_ack(recording_id, token, outcome, occurred_at):
@@ -732,8 +1075,175 @@ class Scenario:
             assert row == (True,), "native_recording_ack_sql_null"
             self.remote_acks.append(recording_id)
 
+        async def call_ack(call_id, token, occurred_at):
+            entry_snapshot = {}
+            if self.audio_candidate and self.audio_ack_hold and call_id == self.call_id:
+                self.audio_ack_attempts += 1
+                entry = self.graph.registry._by_call_id.get(call_id)
+                live_entry = entry is not None and entry.lease_state != "terminal"
+                capture = self.audio_capture
+                # Capture and native holders are sampled before the first await.
+                entry_snapshot = {
+                    "native_memory_scrub_before_ack": not live_entry
+                    or (entry.routing is None and entry.begin_snapshot is None),
+                    "native_begin_holder_scrub_before_ack": not live_entry
+                    or (entry.begin_future is None and entry.begin_task is None),
+                    "native_owner_scrub_before_ack": not live_entry
+                    or (entry.lifecycle_owner is None and entry.session is None),
+                    "native_bridge_cache_scrub_before_ack": not live_entry
+                    or entry.bridge_publication is None,
+                    "native_bridge_facts_scrub_before_ack": not live_entry
+                    or entry.transfer_facts is None
+                    or entry.transfer_facts.disclosure_evidence is None,
+                    "native_capture_owned_before_ack": capture is not None,
+                    "native_capture_terminal_before_ack": capture is not None
+                    and capture.tap.state in {"partial", "stopped"},
+                    "native_capture_event_joined_before_ack": capture is not None
+                    and not capture.tap.pending_join,
+                    "native_capture_receipts_joined_before_ack": capture is not None
+                    and not capture.holder.summary.pending,
+                    "native_cleanup_commit_joined_before_ack": self.audio_cleanup_pending == 0
+                    and self.audio_cleanup_commit_completed,
+                }
+            self.candidate_phase("audio-ack-callback-entered")
+            try:
+                await checked_call_ack(call_id, token, occurred_at, entry_snapshot)
+            except Exception as error:
+                if self.audio_candidate:
+                    conditions = {
+                        "native_memory_scrub_before_ack",
+                        "native_begin_holder_scrub_before_ack",
+                        "native_owner_scrub_before_ack",
+                        "native_bridge_cache_scrub_before_ack",
+                        "native_bridge_facts_scrub_before_ack",
+                        "native_content_removed_before_ack",
+                        "native_capture_owned_before_ack",
+                        "native_capture_terminal_before_ack",
+                        "native_capture_event_joined_before_ack",
+                        "native_capture_receipts_joined_before_ack",
+                        "native_cleanup_commit_joined_before_ack",
+                        "native_audio_ciphertext_removed_before_ack",
+                        "native_audio_content_removed_known_metadata_before_ack",
+                        "native_audio_terminal_observation_bound",
+                    }
+                    condition = (
+                        error.args[0] if isinstance(error, AssertionError) and error.args else ""
+                    )
+                    error_class = type(error).__name__
+                    classes = {
+                        "AssertionError",
+                        "RuntimeError",
+                        "PersistenceError",
+                        "CommandSerializationError",
+                        "OperationSinkContractError",
+                        "OperationSinkPermanentError",
+                        "TimeoutError",
+                    }
+                    self.audio_ack_refusal = self.audio_ack_refusal or (
+                        condition if condition in conditions else "native_ack_failure"
+                    )
+                    emit(
+                        {
+                            "audio_ack_refusal": {
+                                "condition": condition
+                                if condition in conditions
+                                else "native_ack_failure",
+                                "error_class": error_class
+                                if error_class in classes
+                                else "OtherException",
+                            }
+                        }
+                    )
+                raise
+
         self.graph.sink.ack_call_erasure = call_ack
         self.graph.sink.ack_recording_purge = recording_ack
+        if self.audio_candidate:
+            native_leases = self.graph.sink.lease_call_erasures
+            native_stop = self.graph.session_factory.erase_call_by_id
+            native_erase = self.graph.writer.erase_call_content
+            native_content = self.graph.writer._apply_content_command
+
+            async def observed_content(values):
+                result = await native_content(values)
+                if (
+                    values.get("action") in {"erase", "audio_erase_complete"}
+                    and values.get("call_id") == self.call_id
+                    and self.audio_erasure_lease_token is not None
+                    and values.get("lease_token") == self.audio_erasure_lease_token
+                    and self.audio_ack_hold
+                    and isinstance(result, datetime)
+                ):
+                    # The native branch has mutated its actual owner transaction.
+                    # Hold its real COMMIT, whether erase completed directly or
+                    # native archive cleanup required audio_erase_complete.
+                    connection = self.graph.writer._require_owner_connection()
+                    cursor = await connection.execute(
+                        "SELECT lease_token,lease_cleaned_at,lease_acked,lease_settled "
+                        "FROM sparra_content_fences WHERE call_id=?",
+                        (str(self.call_id),),
+                    )
+                    fence = await cursor.fetchone()
+                    await cursor.close()
+                    self.audio_cleanup_commit_fence = (
+                        fence is not None
+                        and fence[0] == str(self.audio_erasure_lease_token)
+                        and fence[1] is not None
+                        and fence[2:] == (0, 0)
+                    )
+                    self.audio_cleanup_commit_action = values["action"]
+                    self.audio_cleanup_commit_entered.set()
+                    await self.audio_cleanup_commit_release.wait()
+                return result
+
+            async def observed_leases(*args):
+                try:
+                    leases = await native_leases(*args)
+                except Exception:
+                    self.candidate_phase("audio-erase-lease-failed")
+                    raise
+                for lease in leases:
+                    if lease.call_id == self.call_id:
+                        self.audio_erasure_lease_token = lease.lease_token
+                        self.candidate_phase("audio-erase-lease-acquired")
+                return leases
+
+            async def observed_stop(call_id):
+                self.candidate_phase("audio-erase-stop-start")
+                try:
+                    await native_stop(call_id)
+                    self.candidate_phase("audio-erase-stop-completed")
+                except Exception:
+                    self.candidate_phase("audio-erase-stop-failed")
+                    raise
+
+            async def observed_erase(*args, **kwargs):
+                self.candidate_phase("audio-erase-writer-start")
+                owned = (args[0] if args else kwargs.get("call_id")) == self.call_id
+                if owned:
+                    self.audio_cleanup_pending += 1
+                try:
+                    result = await native_erase(*args, **kwargs)
+                    if (
+                        owned
+                        and kwargs.get("lease_token") == self.audio_erasure_lease_token
+                        and self.audio_cleanup_commit_entered.is_set()
+                    ):
+                        # Native erase returns after its actual writer COMMIT.
+                        self.audio_cleanup_commit_completed = True
+                    self.candidate_phase("audio-erase-writer-completed")
+                    return result
+                except Exception:
+                    self.candidate_phase("audio-erase-writer-failed")
+                    raise
+                finally:
+                    if owned:
+                        self.audio_cleanup_pending -= 1
+
+            self.graph.sink.lease_call_erasures = observed_leases
+            self.graph.session_factory.erase_call_by_id = observed_stop
+            self.graph.writer.erase_call_content = observed_erase
+            self.graph.writer._apply_content_command = observed_content
         self.restore_verified = False
         if self.request.get("recovery_case"):
             self.recovery_case = self.request["recovery_case"]
@@ -776,7 +1286,9 @@ class Scenario:
             self.graph.registry.restore_transfer_fence = observed_restore
         self.app = create_app(self.settings, Coordinator(self.graph))
         self.lifespan = self.app.router.lifespan_context(self.app)
+        self.candidate_phase("lifespan-start")
         await self.lifespan.__aenter__()
+        self.candidate_phase("network-start")
         await self.start_network()
         async with await psycopg.AsyncConnection.connect(
             self.request["url"], prepare_threshold=None
@@ -786,6 +1298,7 @@ class Scenario:
             ).fetchone()
         assert identity == ("sparra_voice_a", "sparra_voice_a"), "native_session_user"
         self.evidence["checks"].append("native-session-user-pgbouncer")
+        self.candidate_phase("scenario-ready")
 
     async def start_network(self):
         def certificate():
@@ -834,7 +1347,8 @@ class Scenario:
         self.media_url = f"wss://127.0.0.1:{port}"
         self.server = uvicorn.Server(
             uvicorn.Config(
-                self.app,
+                self.observed_asgi if self.audio_candidate else self.app,
+                interface="asgi3" if self.audio_candidate else "auto",
                 host="127.0.0.1",
                 port=port,
                 lifespan="off",
@@ -847,6 +1361,16 @@ class Scenario:
         self.server_task = asyncio.create_task(self.server.serve(sockets=[listener]))
         await eventually(lambda: self.server.started, "native_owned_tls_server")
         self.http = httpx.AsyncClient(base_url=self.base_url, verify=self.tls, trust_env=False)
+
+    async def observed_asgi(self, scope, receive, send):
+        observed = scope.get("type") == "http" and scope.get("path") == "/telnyx/events"
+        if observed:
+            self.candidate_phase("asgi-webhook-entered")
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if observed:
+                self.candidate_phase("asgi-webhook-retired")
 
     async def event(self, kind, control="connected-original", expected_status=200, **updates):
         payload = {
@@ -917,36 +1441,86 @@ class Scenario:
         self.evidence.pop("begin_failure", None)
         self.peers.stream = None
         self.control = control
+        self.candidate_phase("webhook-initiated-send")
         await self.event("call.initiated", control)
+        self.candidate_phase("webhook-initiated-accepted")
         snapshot = await eventually(
             lambda: self.graph.registry.snapshot(control), "native_admission"
         )
         self.call_id = snapshot.call_id
+        self.candidate_phase("registry-admitted")
         await self.event("call.answered", control)
+        self.candidate_phase("webhook-answered-accepted")
         return await self.attach_media(control)
 
     async def attach_media(self, control):
+        self.candidate_phase("stream-command-wait")
         await eventually(lambda: self.peers.stream, "provider_streaming_command")
+        self.candidate_phase("stream-command-seen")
         token = self.peers.stream["stream_auth_token"]
         self.media = MediaPeer(self.media_url, self.tls, control, control + "-stream")
         await self.media.open(token)
+        self.candidate_phase("media-connected")
+        seen_session = False
+        seen_mark = False
 
         async def active_session():
+            nonlocal seen_session, seen_mark
+            if self.audio_candidate and not seen_mark and "mark" in self.media.messages:
+                seen_mark = True
+                self.candidate_phase("disclosure-mark-echoed")
             for entry in self.graph.registry._by_control.values():
                 if entry.call_control_id != control:
                     continue
                 owner = entry.lifecycle_owner
                 session = None if owner is None else owner._session
+                if self.audio_candidate and session is not None and not seen_session:
+                    seen_session = True
+                    self.candidate_phase("session-constructed")
                 if (
                     session is not None
                     and session._controller is not None
-                    and session._controller.is_active()
+                    and (
+                        session._controller.is_active()
+                        or self.audio_candidate
+                        and session._controller.state.name == "WAITING_CHOICE"
+                    )
                 ):
                     return session
 
         self.session = await eventually(active_session, "native_disclosure_gate", 20)
+        self.candidate_phase("controller-choice-ready")
+        snapshot = self.session._identity.begin_snapshot
+        local_audio = (
+            self.audio_candidate and snapshot.audio_available
+            and snapshot.recording_policy == "local_30d"
+        )
+        if local_audio:
+            assert self.audio_capture is not None, "native_audio_capture_constructor"
+            assert self.audio_capture.holder.summary.committed_samples == 0, (
+                "native_audio_no_prechoice_capture"
+            )
+            assert "mark" in self.media.messages, "native_audio_disclosure_mark_before_choice"
+            self.candidate_phase("dtmf-one-send")
+            await self.media.input(
+                {
+                    "event": "dtmf",
+                    "stream_id": self.media.stream,
+                    "sequence_number": "2",
+                    "occurred_at": now().isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    "dtmf": {"digit": getattr(self, "audio_caller_choice", "1")},
+                }
+            )
+            self.candidate_phase("dtmf-one-sent")
+            await eventually(self.session._controller.is_active, "native_audio_caller_one_gate", 5)
+            self.candidate_phase("input-gate-active")
+        elif self.audio_candidate:
+            assert self.audio_capture is None, "native_audio_off_has_no_capture"
+            assert self.session._controller.is_active(), "native_audio_off_gate_active"
         assert self.session._identity.routing.from_e164 is None
-        assert self.session._identity.begin_snapshot.knowledge.business_name == "Garage connecté"
+        assert self.session._identity.begin_snapshot.knowledge.business_name == (
+            "Native capture fixture" if self.audio_candidate else "Garage connecté"
+        )
         assert "mark" in self.media.messages
         self.evidence["checks"].extend(
             [
@@ -1733,6 +2307,7 @@ class Scenario:
             ]
         )
         return {"stable": True}
+
     async def final_fix_prepare_unsettled(self):
         await self.open_call("unsettled-original")
         await self.captured("Une demande avec nettoyage natif encore en attente.")
@@ -1926,6 +2501,7 @@ class Scenario:
             "actual-disclosure-holder-shape-committed-intent-normal-departure-sdk-dispatch"
         )
         return {"stable": True, "no_hangup": True}
+
     async def final_fix_finish_bridge_race(self):
         await eventually(
             lambda: self.call_id in self.local_acks, "native_inflight_bridge_actual_ack", 20
@@ -1953,9 +2529,7 @@ class Scenario:
             call_id=str(entry.call_id),
             generation=str(entry.generation),
             eligible_call_id=str(self.final_fix_eligible),
-            retention=max(
-                self.final_fix_retention, self.final_fix_unsettled_retention
-            ).isoformat(),
+            retention=max(self.final_fix_retention, self.final_fix_unsettled_retention).isoformat(),
             late=self.final_fix_late.model_dump(mode="json"),
             additional_eligible=str(self.final_fix_unsettled_call),
             unrelated=str(self.final_fix_unrelated),
@@ -2049,6 +2623,7 @@ class Scenario:
         await self.event("call.hangup", "human-race-original")
         assert await self.graph.registry.live_call_count() == 0
         return {"cleaned": True, "stable": True, "no_hangup": True}
+
     async def human_hangup(self):
         await self.event("call.hangup", "human-original")
         return {}
@@ -2155,21 +2730,961 @@ class Scenario:
         return {"cleaned": True, "no_hangup": True}
 
     async def close(self):
+        self.candidate_phase("native-close-entered")
+        self.audio_ack_release.set()
+        self.audio_cleanup_commit_release.set()
         if hasattr(self, "final_fix_read_release"):
             self.final_fix_read_release.set()
         if hasattr(self, "final_fix_bridge"):
             await asyncio.gather(self.final_fix_bridge, return_exceptions=True)
         if self.media is not None:
+            self.candidate_phase("native-close-media-start")
             await self.media.close()
+            self.candidate_phase("native-close-media-joined")
+        if hasattr(self, "http"):
+            self.candidate_phase("native-close-http-start")
+            await self.http.aclose()
+            self.candidate_phase("native-close-http-joined")
         if self.server is not None:
+            if self.audio_candidate:
+                terminalizer = getattr(
+                    getattr(self, "session", None), "_registry_terminalizer", None
+                )
+                owner = getattr(terminalizer, "_owner", None)
+                owner_task = getattr(owner, "_task", None)
+                stacks = []
+                connection_states = []
+                for connection in tuple(self.server.server_state.connections)[:8]:
+                    protocol = type(connection).__name__
+                    transport = connection.transport
+                    connection_states.append(
+                        {
+                            "protocol": protocol
+                            if protocol
+                            in {
+                                "H11Protocol",
+                                "HttpToolsProtocol",
+                                "WebSocketProtocol",
+                                "WebSocketsSansIOProtocol",
+                                "WSProtocol",
+                            }
+                            else "other",
+                            "closing": transport.is_closing(),
+                            "write_buffer_bytes": transport.get_write_buffer_size(),
+                            "tls": transport.get_extra_info("ssl_object") is not None,
+                        }
+                    )
+                allowed_files = {
+                    "server.py",
+                    "websockets_impl.py",
+                    "websockets_sansio_impl.py",
+                    "wsproto_impl.py",
+                    "h11_impl.py",
+                    "httptools_impl.py",
+                    "proxy_headers.py",
+                    "app.py",
+                    "applications.py",
+                    "routing.py",
+                    "errors.py",
+                    "exceptions.py",
+                    "base.py",
+                    "session.py",
+                    "session_factory.py",
+                    "handshake.py",
+                    "sparra_connected_scenario.py",
+                    "locks.py",
+                }
+                for task in tuple(self.server.server_state.tasks)[:8]:
+                    coroutine = task.get_coro()
+                    frames = []
+                    for _ in range(16):
+                        if not inspect.iscoroutine(coroutine):
+                            break
+                        code, frame = coroutine.cr_code, coroutine.cr_frame
+                        filename = Path(code.co_filename).name
+                        frames.append(
+                            {
+                                "file": filename if filename in allowed_files else "native-code",
+                                "function": code.co_name
+                                if code.co_name.isidentifier() and len(code.co_name) <= 128
+                                else "native-code",
+                                "line": frame.f_lineno if frame is not None else 0,
+                            }
+                        )
+                        coroutine = coroutine.cr_await
+                    stacks.append({"done": task.done(), "frames": frames})
+                phase = getattr(owner, "_phase", "absent")
+                emit(
+                    {
+                        "server_join_guard": {
+                            "connections": len(self.server.server_state.connections),
+                            "tasks": len(self.server.server_state.tasks),
+                            "owner_present": owner is not None,
+                            "owner_closed": owner is not None and owner._closed.is_set(),
+                            "owner_task_done": owner_task is not None and owner_task.done(),
+                            "owner_phase": phase
+                            if phase
+                            in {
+                                "absent",
+                                "gated",
+                                "constructing",
+                                "preactivated",
+                                "finishing",
+                                "done",
+                            }
+                            else "other",
+                            "stacks": stacks,
+                            "connection_states": connection_states,
+                        }
+                    }
+                )
             self.server.should_exit = True
         if self.server_task is not None:
+            self.candidate_phase("native-close-server-start")
             await asyncio.wait_for(self.server_task, 15)
+            self.candidate_phase("native-close-server-joined")
         if self.lifespan is not None:
+            self.candidate_phase("native-close-runtime-start")
             await self.lifespan.__aexit__(None, None, None)
-        if hasattr(self, "http"):
-            await self.http.aclose()
+            self.candidate_phase("native-close-runtime-joined")
         self.patches.close()
+        self.candidate_phase("native-close-completed")
+        if self.audio_candidate and self.request.get("fixture_close_failure"):
+            # CLI refusal witness after the real close, not a runtime/ACK substitute.
+            raise RuntimeError("native_fixture_close_failure")
+        assert self.audio_ack_refusal is None, "native_audio_ack_refusal_latched"
+
+    async def audio_admit(self):
+        self.candidate_phase("audio-admit-entered")
+        assert self.audio_candidate, "native_audio_candidate_mode"
+        admitted = await self.open_call("audio-original")
+        snapshot = self.session._identity.begin_snapshot
+        assert self.graph.writer.contract_version == 2, "native_audio_fixed2_writer"
+        assert self.manifest.agent_id != self.settings.deployment_id, (
+            "native_audio_distinct_process_ids"
+        )
+        assert snapshot.audio_available and snapshot.recording_id is not None, (
+            "native_audio_actual_begin_available"
+        )
+        self.evidence["checks"].extend(
+            [
+                "native-unqualified-audio-candidate",
+                "native-fixed2-distinct-process-ids",
+                "native-actual-begin-snapshot",
+                "native-disclosure-mark-then-dtmf-one",
+            ]
+        )
+        self.candidate_phase("audio-admit-completed")
+        return {
+            **admitted,
+            "recording_id": str(snapshot.recording_id),
+            "retention_until": snapshot.retention_until.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    async def _audio_wait_active_delivery(self):
+        async def delivered():
+            return (
+                self.call_id in self.audio_gate_acked
+                and await self.graph.writer.oldest_outbox_created_at() is None
+            )
+
+        await eventually(delivered, "native_audio_active_operation_ack_joined", 5)
+
+    async def audio_off_admit(self):
+        assert self.audio_candidate, "native_audio_candidate_mode"
+        admitted = await self.open_call("audio-off-original")
+        snapshot = self.session._identity.begin_snapshot
+        assert snapshot.recording_policy == "off", "native_audio_owner_off_policy"
+        assert not snapshot.audio_available and snapshot.recording_id is None, (
+            "native_audio_off_has_no_identity"
+        )
+        assert self.audio_capture is None, "native_audio_off_has_no_capture"
+        await self._audio_wait_active_delivery()
+        self.audio_original_pin = snapshot
+        return {
+            **admitted,
+            "recording_id": None,
+            "recording_policy": snapshot.recording_policy,
+            "audio_available": snapshot.audio_available,
+            "retention_until": snapshot.retention_until.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    async def audio_off_replay(self):
+        snapshot = self.session._identity.begin_snapshot
+        replay = await self.graph.sink.begin_call_v2(
+            self.settings.deployment_id, self.call_id, self.session._identity.routing
+        )
+        assert snapshot == self.audio_original_pin == replay, "native_audio_off_pin_immutable"
+        assert self.audio_capture is None, "native_audio_off_stays_without_capture"
+        for sequence in range(3, 19):
+            await self.media.input({
+                "event": "media", "stream_id": self.media.stream,
+                "sequence_number": str(sequence),
+                "media": {"payload": base64.b64encode(b"\x9e" * 800).decode(), "track": "inbound"},
+            })
+        await self.graph.writer.read_retained_call(self.call_id)
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_audio_off_control_delivery", 5)
+        assert not self.audio_seen, "native_audio_off_no_chunk_delivery"
+        assert self.session._controller.is_active(), "native_audio_off_conversation_live"
+        assert await self.graph.registry.live_call_count() == 1, "native_audio_off_phone_live"
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_audio_off_no_phone_hangup"
+        )
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            terminals = database.execute(
+                "SELECT count(*) FROM local_audio_terminal WHERE call_id=?", (str(self.call_id),)
+            ).fetchone()
+        assert terminals == (0,), "native_audio_off_no_terminal_operation"
+        return {"original_pin": True, "capture_owned": False, "audio_chunks": 0, "phone_live": True}
+
+    async def audio_decline_admit(self):
+        assert self.audio_candidate, "native_audio_candidate_mode"
+        self.audio_caller_choice = "2"
+        admitted = await self.open_call("audio-declined-original")
+        snapshot = self.session._identity.begin_snapshot
+        assert snapshot.audio_available and snapshot.recording_id is not None, (
+            "native_audio_decline_offer_available"
+        )
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            choice = database.execute(
+                "SELECT choice_state FROM local_audio_pin WHERE call_id=?", (str(self.call_id),)
+            ).fetchone()
+        assert choice == ("off",), "native_audio_caller_two_must_commit_off"
+        assert self.audio_capture is not None, "native_audio_decline_capture_owned"
+        assert self.audio_capture.holder.summary.committed_samples == 0, (
+            "native_audio_decline_no_pcm"
+        )
+        await self._audio_wait_active_delivery()
+        return {
+            **admitted,
+            "recording_id": str(snapshot.recording_id),
+            "retention_until": snapshot.retention_until.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+
+    async def audio_decline_check(self):
+        async def delivered():
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                terminal = database.execute(
+                    "SELECT acked FROM local_audio_terminal "
+                    "WHERE call_id=? AND kind='audio.revoke'",
+                    (str(self.call_id),),
+                ).fetchone()
+            return terminal == (1,) and await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_audio_caller_two_revoke_ack", 5)
+        assert (
+            not self.audio_capture.tap.pending_join
+            and not self.audio_capture.holder.summary.pending
+        ), "native_audio_caller_two_capture_joined"
+        assert self.audio_capture.holder.summary.committed_samples == 0 and not self.audio_seen, (
+            "native_audio_caller_two_no_pcm_or_chunks"
+        )
+        assert self.session._controller.is_active(), "native_audio_caller_two_conversation_live"
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_audio_caller_two_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_audio_caller_two_no_phone_hangup"
+        )
+        return {"choice_off": True, "audio_chunks": 0, "phone_live": True, "capture_joined": True}
+
+    def _audio_transfer_boundary(self):
+        capture = self.audio_capture
+        snapshot = self.session._identity.begin_snapshot
+        summary = capture.holder.summary
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            row = database.execute(
+                "SELECT op_id,deployment_id,fingerprint,key_version,nonce,ciphertext "
+                "FROM local_audio_terminal WHERE call_id=? AND kind='audio.finish'",
+                (str(self.call_id),),
+            ).fetchone()
+        finished = False
+        if row is not None:
+            plaintext = bytearray(self.graph.keyring.decrypt(
+                EncryptedValue(row[3], row[4], row[5]),
+                aad=operation_aad_from_metadata(dict(
+                    schema_version=2, call_id=str(self.call_id), kind="audio.finish",
+                    operation_id=row[0], deployment_id=row[1],
+                )),
+            ))
+            try:
+                operation = decode_operation_v2(bytes(plaintext))
+                payload = operation.payload
+                finished = (
+                    isinstance(payload, AudioFinishPayloadV2)
+                    and operation.call_id == self.call_id
+                    and operation.operation_id == UUID(row[0])
+                    and operation.deployment_id == self.settings.deployment_id
+                    and payload.workspace_id == snapshot.workspace_id
+                    and payload.recording_id == snapshot.recording_id
+                    and payload.configuration_revision == snapshot.configuration_revision
+                    and payload.retention_until == snapshot.retention_until
+                    and payload.reason == "transfer"
+                    and payload.last_sequence == summary.last_sequence
+                    and payload.total_samples == summary.committed_samples
+                    and hashlib.sha256(canonical_operation_bytes(operation)).digest() == row[2]
+                )
+            finally:
+                plaintext[:] = b"\0" * len(plaintext)
+        return {
+            "admission_closed": capture.tap.state in {"stopped", "partial"},
+            "event_joined": not capture.tap.pending_join,
+            "receipt_joined": not summary.pending,
+            "tail_committed": summary.committed_samples >= self.audio_transfer_before_tail + 800,
+            "submitted_committed": summary.submitted_samples == summary.committed_samples,
+            "finish_transfer_committed": finished,
+            "original_retention": snapshot.retention_until
+            == self.session._identity.routing.admitted_at + timedelta(days=30),
+        }
+
+    async def audio_transfer_boundary(self):
+        assert self.request.get("audio_transfer_fixture") is True, (
+            "native_transfer_fixed_fixture_opt_in"
+        )
+        admitted = await self.audio_admit()
+        await self._audio_wait_active_delivery()
+        assert self.session._identity.begin_snapshot.transfer_destination == "+33102030406", (
+            "native_transfer_actual_owner_and_manifest_target"
+        )
+        sequence = 2
+        payload = base64.b64encode(b"\x9e" * 800).decode()
+        for sequence in range(3, 35):
+            if self.audio_seen:
+                break
+            assert self.audio_capture.tap.state == "recording", (
+                "native_transfer_capture_active_before_request"
+            )
+            await self.media.input({
+                "event": "media", "stream_id": self.media.stream,
+                "sequence_number": str(sequence),
+                "media": {"payload": payload, "track": "inbound"},
+            })
+            await asyncio.sleep(0.005)
+
+        async def chunk_delivered():
+            return (
+                bool(self.audio_seen)
+                and await self.graph.writer.oldest_outbox_created_at() is None
+            )
+
+        await eventually(chunk_delivered, "native_transfer_real_chunk_ack", 5)
+        await eventually(lambda: not self.audio_capture.tap.pending_join
+                         and not self.audio_capture.holder.summary.pending,
+                         "native_transfer_prime_event_and_receipt_joined", 5)
+        assert self.audio_capture.holder.summary.committed_samples >= 8000, (
+            "native_transfer_real_committed_chunk"
+        )
+        self.audio_transfer_before_tail = self.audio_capture.holder.summary.committed_samples
+        assert self.audio_capture.tap.state == "recording", (
+            "native_transfer_capture_active_before_tail"
+        )
+        tail_processed = asyncio.Event()
+        native_frame = self.audio_capture.tap.process_frame
+
+        async def observed_frame(frame, direction):
+            await native_frame(frame, direction)
+            if isinstance(frame, InputAudioRawFrame):
+                tail_processed.set()
+
+        before_intent = None
+        sdk_entry = None
+        intent_command = None
+        native_intent = self.graph.writer.commit_transfer_intent
+
+        async def observed_intent(facts):
+            nonlocal before_intent, intent_command
+            before_intent = self._audio_transfer_boundary()
+            await native_intent(facts)
+            intent_command = str(facts.transfer_command_id)
+
+        async def observed_sdk(transfer):
+            nonlocal sdk_entry
+            sdk_entry = {
+                **self._audio_transfer_boundary(),
+                "intent_committed": intent_command == transfer["command_id"],
+                "fixed_target": transfer["to"] == "+33102030406",
+            }
+
+        with patch.object(self.audio_capture.tap, "process_frame", observed_frame), patch.object(
+            self.graph.writer, "commit_transfer_intent", observed_intent
+        ), patch.object(self.peers, "before_transfer", observed_sdk):
+            await self.media.input({
+                "event": "media", "stream_id": self.media.stream,
+                "sequence_number": str(sequence + 1),
+                "media": {"payload": payload, "track": "inbound"},
+            })
+            await asyncio.wait_for(tail_processed.wait(), 5)
+            self.peers.tool_arguments = {}
+            await self.captured("Pouvez-vous me passer la ligne qualifiée ?")
+            await eventually(lambda: sdk_entry is not None, "native_transfer_actual_sdk_entry", 5)
+            await eventually(lambda: any(
+                message.get("role") == "tool" and "ringing" in str(message.get("content"))
+                for message in self.aggregator.context.get_messages()
+            ), "native_transfer_native_tool_result_after_sdk", 5)
+
+        # Assert outside SDK MockTransport: an assertion there becomes a provider
+        # exception and could be swallowed as outcome_unknown by native control.
+        assert before_intent is not None and sdk_entry is not None, (
+            "native_transfer_observations_present"
+        )
+        self.evidence["transfer_boundary"] = {
+            "before_intent": before_intent, "sdk_entry": sdk_entry
+        }
+        emit({"transfer_boundary": self.evidence["transfer_boundary"]})
+        assert all(before_intent.values()), "native_transfer_audio_join_before_intent"
+        assert all(sdk_entry.values()), "native_transfer_audio_join_before_sdk_dispatch"
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_transfer_original_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_transfer_no_original_hangup"
+        )
+        assert not any(path.endswith("/record_start") for path in self.peers.actions), (
+            "native_transfer_no_provider_recording"
+        )
+        entry = self.graph.registry._by_call_id.get(self.call_id)
+        assert entry is not None, "native_transfer_original_entry_present"
+        self.audio_transfer_reader_entry = entry
+        self.audio_transfer_reader_generation = entry.generation
+        self.audio_transfer_reader_actions = tuple(self.peers.actions)
+        self.evidence["checks"].append("native-transfer-real-tool-tail-joined-before-intent-and-sdk")
+        return {**admitted, "capture_joined": True, "phone_live": True,
+                "checks": ["native-transfer-real-tool-tail-joined-before-intent-and-sdk"]}
+
+    async def audio_transfer_reader_live(self):
+        """Observe the original native call after the App's compiled Range reads."""
+        assert self.request.get("audio_transfer_fixture") is True, (
+            "native_reader_transfer_fixture_opt_in"
+        )
+        entry = self.graph.registry._by_call_id.get(self.call_id)
+        assert entry is self.audio_transfer_reader_entry, (
+            "native_reader_original_registry_entry_preserved"
+        )
+        assert entry.generation == self.audio_transfer_reader_generation, (
+            "native_reader_original_registry_generation_preserved"
+        )
+        assert entry.call_id == self.call_id and entry.session is self.session, (
+            "native_reader_original_call_and_session_preserved"
+        )
+        assert not entry.capacity_released and entry.terminal_event is None, (
+            "native_reader_original_phone_has_no_terminal_event"
+        )
+        live_call_count = await self.graph.registry.live_call_count()
+        assert live_call_count == 1, "native_reader_original_phone_capacity_held"
+        facts = await self.graph.writer.read_call_lifecycle(self.call_id)
+        assert facts is not None and entry.transfer_facts is not None, (
+            "native_reader_actual_transfer_lifecycle_present"
+        )
+        bridge_seen = (
+            facts.qualified_line_bridged_at is not None
+            or facts.bridge_operation_id is not None
+            or entry.transfer_facts.qualified_line_bridged_at is not None
+            or entry.transfer_facts.bridge_operation_id is not None
+            or entry.bridge_publication is not None
+        )
+        original_end_seen = facts.original_ended_at is not None
+        actions = tuple(self.peers.actions)
+        result = {
+            "call_id": str(self.call_id),
+            "live_call_count": live_call_count,
+            "answer_actions": sum(path.endswith("/actions/answer") for path in actions),
+            "transfer_actions": sum(path.endswith("/actions/transfer") for path in actions),
+            "hangup_actions": sum(path.endswith("/actions/hangup") for path in actions),
+            "bridge_seen": bridge_seen,
+            "original_end_seen": original_end_seen,
+            "provider_actions_unchanged": actions == self.audio_transfer_reader_actions,
+        }
+        assert not bridge_seen and not original_end_seen, (
+            "native_reader_does_not_infer_bridge_or_original_end"
+        )
+        assert result["provider_actions_unchanged"], (
+            "native_reader_does_not_dispatch_new_phone_action"
+        )
+        self.evidence["audio_transfer_reader"] = result
+        self.evidence["checks"].append("native-transfer-live-phone-after-compiled-ranges")
+        return result
+
+    async def audio_complete(self):
+        return await self.audio_finish(normal_completion=True)
+
+    async def audio_opposition_prime(self):
+        admitted = await self.audio_admit()
+        await self._audio_wait_active_delivery()
+        self.audio_opposition_sequence = 2
+        self.audio_opposition_chunk_ids = set()
+        chunk_acked = asyncio.Event()
+        native_ack = self.graph.writer.ack_outbox
+
+        async def observed_chunk_ack(**values):
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                queued = database.execute(
+                    "SELECT op_id FROM outbox WHERE queue_id=? "
+                    "AND kind='audio.chunk' AND call_id=?",
+                    (values["queue_id"], str(self.call_id)),
+                ).fetchone()
+            result = await native_ack(**values)
+            if result.applied and queued is not None:
+                assert len(self.audio_opposition_chunk_ids) < 8, (
+                    "native_opposition_ack_bound"
+                )
+                self.audio_opposition_chunk_ids.add(queued[0])
+                chunk_acked.set()
+            return result
+
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        with patch.object(self.graph.writer, "ack_outbox", observed_chunk_ack):
+            try:
+                for sequence in range(3, 35):
+                    if chunk_acked.is_set():
+                        break
+                    assert self.audio_capture.tap.state == "recording", (
+                        "native_opposition_capture_active"
+                    )
+                    self.audio_opposition_sequence = sequence
+                    await self.media.input({
+                        "event": "media", "stream_id": self.media.stream,
+                        "sequence_number": str(sequence),
+                        "media": {
+                            "payload": base64.b64encode(b"\x9e" * 800).decode(),
+                            "track": "inbound",
+                        },
+                    })
+                    # Existing bounded synthetic wire pacing; success needs ACK.
+                    await asyncio.sleep(0.005)
+                await asyncio.wait_for(chunk_acked.wait(), 5)
+                await eventually(
+                    delivered, "native_opposition_chunk_delivery_joined", 5
+                )
+            finally:
+                chunk_acked.clear()
+        assert self.audio_opposition_chunk_ids <= {
+            str(operation_id) for operation_id in self.audio_seen
+        }, "native_opposition_ack_after_real_ingest"
+        assert self.audio_capture.holder.summary.committed_samples >= 8000, (
+            "native_opposition_at_least_one_real_chunk"
+        )
+        return {
+            **admitted,
+            "total_samples": self.audio_capture.holder.summary.committed_samples,
+            "audio_chunks": len(self.audio_opposition_chunk_ids),
+        }
+
+    async def audio_opposition_revoke(self):
+        self.audio_opposition_sequence += 1
+        await self.media.input({
+            "event": "dtmf", "stream_id": self.media.stream,
+            "sequence_number": str(self.audio_opposition_sequence),
+            "occurred_at": now().isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "dtmf": {"digit": "2"},
+        })
+
+        def choice_off():
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                choice = database.execute(
+                    "SELECT choice_state FROM local_audio_pin WHERE call_id=?",
+                    (str(self.call_id),),
+                ).fetchone()
+            return choice == ("off",)
+
+        await eventually(choice_off, "native_opposition_caller_two_must_commit_off", 5)
+
+        async def delivered():
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                terminal = database.execute(
+                    "SELECT acked FROM local_audio_terminal "
+                    "WHERE call_id=? AND kind='audio.revoke'", (str(self.call_id),)
+                ).fetchone()
+            return (
+                terminal == (1,)
+                and await self.graph.writer.oldest_outbox_created_at() is None
+            )
+
+        await eventually(delivered, "native_opposition_revoke_ack_joined", 5)
+        assert (
+            not self.audio_capture.tap.pending_join
+            and not self.audio_capture.holder.summary.pending
+        ), "native_opposition_capture_joined"
+        assert self.session._controller.is_active(), (
+            "native_opposition_conversation_live"
+        )
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_opposition_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_opposition_no_phone_hangup"
+        )
+        self.audio_opposition_closed_samples = (
+            self.audio_capture.holder.summary.committed_samples
+        )
+        self.audio_opposition_closed_chunks = len(self.audio_seen)
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            self.audio_opposition_terminal = database.execute(
+                "SELECT op_id,fingerprint,acked FROM local_audio_terminal "
+                "WHERE call_id=? AND kind='audio.revoke'", (str(self.call_id),)
+            ).fetchone()
+        assert self.audio_opposition_terminal is not None, (
+            "native_opposition_terminal_known"
+        )
+        return {"choice_off": True, "capture_joined": True, "phone_live": True}
+
+    async def audio_opposition_late(self):
+        late_sequence = self.audio_opposition_sequence + 1
+        sequences = {
+            str(value) for value in range(late_sequence + 1, late_sequence + 9)
+        }
+        decoded, processed = {}, set()
+        wire_done, keypad_done = asyncio.Event(), asyncio.Event()
+        native_deserialize = ProjetV0TelnyxFrameSerializer.deserialize
+        native_process = self.audio_capture.tap.process_frame
+        native_keypad = self.session._controller.accept_dtmf
+
+        async def observed_deserialize(serializer, data):
+            frame = await native_deserialize(serializer, data)
+            message = json.loads(data)
+            if (
+                message.get("event") == "media"
+                and message.get("stream_id") == self.media.stream
+                and message.get("sequence_number") in sequences
+            ):
+                assert isinstance(frame, InputAudioRawFrame), (
+                    "native_late_wire_real_pcm_frame"
+                )
+                assert len(decoded) < 8, "native_late_wire_frame_bound"
+                assert frame.id not in decoded, "native_late_wire_unique_frame"
+                decoded[frame.id] = message["sequence_number"]
+            return frame
+
+        async def observed_process(frame, direction):
+            await native_process(frame, direction)
+            if (
+                isinstance(frame, InputAudioRawFrame)
+                and direction is FrameDirection.DOWNSTREAM
+                and frame.id in decoded
+            ):
+                assert frame.id not in processed, "native_late_pcm_processed_once"
+                processed.add(frame.id)
+                if len(processed) == 8:
+                    wire_done.set()
+
+        async def observed_keypad(frame):
+            handled = await native_keypad(frame)
+            if frame.button.value == "1" and frame.sequence_number == late_sequence:
+                assert handled is True and frame.occurred_at is not None, (
+                    "native_late_caller_one_handled"
+                )
+                keypad_done.set()
+            return handled
+
+        with ExitStack() as observers:
+            observers.enter_context(patch.object(
+                ProjetV0TelnyxFrameSerializer, "deserialize", observed_deserialize
+            ))
+            observers.enter_context(patch.object(
+                self.audio_capture.tap, "process_frame", observed_process
+            ))
+            observers.enter_context(patch.object(
+                self.session._controller, "accept_dtmf", observed_keypad
+            ))
+            try:
+                await self.media.input({
+                    "event": "dtmf", "stream_id": self.media.stream,
+                    "sequence_number": str(late_sequence),
+                    "occurred_at": now().isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    ),
+                    "dtmf": {"digit": "1"},
+                })
+                for sequence in range(late_sequence + 1, late_sequence + 9):
+                    await self.media.input({
+                        "event": "media", "stream_id": self.media.stream,
+                        "sequence_number": str(sequence),
+                        "media": {
+                            "payload": base64.b64encode(b"\x8e" * 800).decode(),
+                            "track": "inbound",
+                        },
+                    })
+                await asyncio.wait_for(
+                    asyncio.gather(wire_done.wait(), keypad_done.wait()), 2
+                )
+                assert (
+                    set(decoded.values()) == sequences and processed == set(decoded)
+                ), "native_late_wire_all_exact_frames_processed"
+                processed_count = len(processed)
+            finally:
+                wire_done.clear()
+                keypad_done.clear()
+                decoded.clear()
+                processed.clear()
+        with sqlite3.connect(self.settings.sqlite_path) as database:
+            choice = database.execute(
+                "SELECT choice_state,denied_at IS NOT NULL FROM local_audio_pin "
+                "WHERE call_id=?",
+                (str(self.call_id),),
+            ).fetchone()
+            terminal = database.execute(
+                "SELECT op_id,fingerprint,acked FROM local_audio_terminal "
+                "WHERE call_id=? AND kind='audio.revoke'", (str(self.call_id),)
+            ).fetchone()
+        assert choice == ("off", 1), "native_late_choice_stays_off"
+        assert terminal == self.audio_opposition_terminal, (
+            "native_late_terminal_unchanged"
+        )
+        assert self.audio_capture.holder.summary.committed_samples == (
+            self.audio_opposition_closed_samples
+        ), "native_late_pcm_cannot_rearm_samples"
+        assert len(self.audio_seen) == self.audio_opposition_closed_chunks, (
+            "native_late_pcm_cannot_publish_chunks"
+        )
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_late_audio_delivery_joined", 5)
+        assert (
+            not self.audio_capture.tap.pending_join
+            and not self.audio_capture.holder.summary.pending
+        ), "native_late_audio_capture_still_joined"
+        assert self.session._controller.is_active(), (
+            "native_late_audio_conversation_live"
+        )
+        assert await self.graph.registry.live_call_count() == 1, (
+            "native_late_audio_phone_live"
+        )
+        assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+            "native_late_audio_no_phone_hangup"
+        )
+        return {"late_dtmf_handled": True, "late_pcm_processed": processed_count,
+                "choice_off": True, "capture_joined": True, "phone_live": True}
+
+    async def audio_finish(self, *, normal_completion=False):
+        self.candidate_phase("audio-finish-entered")
+        assert self.audio_candidate and self.audio_capture is not None, "native_audio_capture_owned"
+        # Controlled wire PCM traverses the actual serializer, STT passthrough,
+        # output tap, native recorder event and one-command durable writer.
+        # Synthetic audio duration is not wall-clock/carrier/latency evidence.
+        # PCMU expands to s16le: 800 encoded samples become 1600 decoded
+        # mono bytes, the native tap's supported per-frame bound.
+        payload = base64.b64encode(b"\x9e" * 800).decode()
+        for sequence in range(3, 803):
+            if self.audio_capture.holder.summary.committed_samples >= 512_000:
+                break
+            assert self.audio_capture.tap.state == "recording", "native_audio_capture_not_refused"
+            await self.media.input(
+                {
+                    "event": "media",
+                    "stream_id": self.media.stream,
+                    "sequence_number": str(sequence),
+                    "media": {"payload": payload, "track": "inbound"},
+                }
+            )
+            await asyncio.sleep(0.005)
+        assert self.audio_capture.holder.summary.committed_samples >= 512_000, (
+            "native_audio_actual_sample_threshold"
+        )
+        if normal_completion:
+            # Pipecat's public graceful stop queues EndFrame; CallSession owns
+            # controller/capture completion and the native terminal publication.
+            # Do not inject a provider hangup or call capture.finish ourselves.
+            worker = self.session._active_runtime.worker
+            owner = self.session._registry_terminalizer._owner
+            assert owner is not None and owner._task is not None, "native_audio_normal_owner"
+            assert not worker.has_finished(), "native_audio_normal_worker_active"
+            assert not any(path.endswith("/hangup") for path in self.peers.actions), (
+                "native_audio_normal_no_prior_hangup"
+            )
+            await worker.stop_when_done()
+            await eventually(
+                lambda: owner._closed.is_set() and owner._task.done(),
+                "native_audio_normal_owner_joined",
+                5,
+            )
+            assert worker.has_finished(), "native_audio_normal_worker_joined"
+            assert self.session._terminal_outcome.reason == "closed", (
+                "native_audio_normal_session_closed"
+            )
+            assert not self.audio_capture.holder.summary.partial, "native_audio_normal_not_partial"
+            assert self.audio_capture.holder.summary.reason == "complete", (
+                "native_audio_normal_capture_complete"
+            )
+        else:
+            await self.event("call.hangup", "audio-original")
+            self.candidate_phase("audio-hangup-accepted")
+        self.candidate_phase("audio-media-close-start")
+        await self.media.close()
+        self.candidate_phase("audio-media-close-completed")
+        capture_state = self.audio_capture.tap.state
+        assert capture_state in {"off", "recording", "partial", "stopped"}, (
+            "native_audio_capture_state_known"
+        )
+        self.candidate_phase("audio-capture-state-" + capture_state)
+        self.candidate_phase(
+            "audio-capture-event-pending"
+            if self.audio_capture.tap.pending_join
+            else "audio-capture-event-joined"
+        )
+        self.candidate_phase(
+            "audio-capture-receipt-pending"
+            if self.audio_capture.holder.summary.pending
+            else "audio-capture-receipt-joined"
+        )
+        # A provider hangup drains the actual session conservatively. Its native
+        # partial state remains partial after the event and receipt are joined.
+        # The separate normal action requires graceful, non-partial completion.
+        await eventually(
+            lambda: (
+                (
+                    self.audio_capture.tap.state == "stopped"
+                    if normal_completion
+                    else self.audio_capture.tap.state in {"partial", "stopped"}
+                )
+                and not self.audio_capture.tap.pending_join
+                and not self.audio_capture.holder.summary.pending
+            ),
+            "native_audio_normal_capture_joined"
+            if normal_completion
+            else "native_audio_partial_capture_joined",
+            5,
+        )
+        self.candidate_phase("audio-capture-stopped")
+        terminal_observation = None
+
+        async def finished_delivered():
+            nonlocal terminal_observation
+            with sqlite3.connect(self.settings.sqlite_path) as database:
+                row = database.execute(
+                    "SELECT acked FROM local_audio_terminal "
+                    "WHERE call_id=? AND kind='audio.finish'",
+                    (str(self.call_id),),
+                ).fetchone()
+            observation = "absent" if row is None else "acked" if row[0] == 1 else "pending"
+            if observation != terminal_observation:
+                terminal_observation = observation
+                self.candidate_phase("audio-terminal-" + observation)
+            empty = await self.graph.writer.oldest_outbox_created_at() is None
+            return row is not None and row[0] == 1 and empty
+
+        await eventually(finished_delivered, "native_audio_actual_terminal_delivery", 6)
+        summary = self.audio_capture.holder.summary
+        assert not summary.pending and not self.audio_capture.tap.pending_join, (
+            "native_audio_capture_joined"
+        )
+        assert self.audio_seen, "native_audio_actual_chunks_ingested"
+        self.evidence["checks"].append(
+            "native-normal-endframe-capture-real-pgbouncer-delivery"
+            if normal_completion
+            else "native-partial-hangup-capture-real-pgbouncer-delivery"
+        )
+        self.evidence["capture"] = {
+            "committed_samples": summary.committed_samples,
+            "last_sequence": summary.last_sequence,
+            "operations": len(self.audio_seen),
+            "scope": "synthetic-wire-media-normal-endframe"
+            if normal_completion
+            else "synthetic-wire-media-partial-provider-hangup",
+        }
+        self.candidate_phase("audio-finish-completed")
+        return {
+            "call_id": str(self.call_id),
+            "total_samples": summary.committed_samples,
+            "pcm_sha256": self.audio_pcm_digest.hexdigest(),
+        }
+
+    async def audio_hold_ack(self):
+        assert self.audio_candidate, "native_audio_candidate_mode"
+        self.audio_ack_hold = True
+        return {"ack_held": True}
+
+    async def audio_erasure_held(self):
+        assert self.audio_ack_hold, "native_audio_erasure_hold_armed"
+        await asyncio.wait_for(self.audio_cleanup_commit_entered.wait(), 6)
+        assert self.audio_cleanup_pending > 0 and not self.audio_cleanup_commit_completed, (
+            "native_audio_cleanup_completion_still_held"
+        )
+        assert self.audio_cleanup_commit_fence is True, (
+            "native_audio_exact_owner_fence_mutation_before_commit"
+        )
+        assert self.audio_ack_attempts == 0 and self.call_id not in self.local_acks, (
+            "native_audio_no_callback_before_cleanup_commit"
+        )
+
+        def completion_fence():
+            uri = "file:" + self.settings.sqlite_path.as_posix() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as database:
+                return database.execute(
+                    "SELECT lease_token,lease_cleaned_at,lease_acked,lease_settled "
+                    "FROM sparra_content_fences WHERE call_id=?",
+                    (str(self.call_id),),
+                ).fetchone()
+
+        fence = await asyncio.to_thread(completion_fence)
+        assert (
+            self.audio_erasure_lease_token is not None
+            and (
+                fence is None
+                or fence[0] != str(self.audio_erasure_lease_token)
+                or fence[1] is None
+            )
+        ), (
+            "native_audio_durable_cleanup_commit_not_completed"
+        )
+        assert self.audio_ack_attempts == 0 and self.audio_ack_refusal is None, (
+            "native_audio_no_callback_while_cleanup_commit_held"
+        )
+        self.audio_cleanup_commit_release.set()
+        await asyncio.wait_for(self.audio_ack_entered.wait(), 6)
+        assert self.audio_ack_refusal is None, "native_audio_ack_refusal_latched"
+        assert self.call_id not in self.local_acks, "native_audio_no_optimistic_ack"
+        assert (await self.graph.writer.read_retained_call(self.call_id)).erased, (
+            "native_audio_local_erasure_before_ack"
+        )
+        assert any(
+            call == self.call_id
+            for call, _token, _at in await self.graph.writer.pending_erasure_acks()
+        ), "native_audio_exact_pending_ack_durable"
+        return {
+            "writer_cleaned": True,
+            "ack_held": True,
+            "cleanup_commit_held": True,
+            "cleanup_command": self.audio_cleanup_commit_action,
+        }
+
+    async def audio_release_ack(self):
+        assert self.audio_ack_refusal is None, "native_audio_ack_refusal_latched"
+        self.audio_ack_release.set()
+        await eventually(
+            lambda: self.call_id in self.local_acks, "native_audio_real_erasure_ack", 5
+        )
+
+        async def ack_joined():
+            return not any(
+                call == self.call_id
+                for call, _token, _at in await self.graph.writer.pending_erasure_acks()
+            )
+
+        await eventually(ack_joined, "native_audio_pending_ack_joined", 5)
+        assert self.audio_ack_refusal is None, "native_audio_ack_refusal_latched"
+        assert not self.peers.recordings, "native_audio_no_provider_archive"
+        self.evidence["checks"].append("native-capture-erasure-real-ack-joined")
+        return {"cleaned": True, "ack_before_scrub": False}
+
+
+def candidate_consumption_receipt(path, run_id):
+    uri = "file:" + path.as_posix() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as database:
+        return database.execute(
+            "SELECT run_id,consumed_at FROM qualification_runs WHERE run_id=?",
+            (str(run_id),),
+        ).fetchone()
 
 
 async def connected(request):
@@ -2177,17 +3692,75 @@ async def connected(request):
     assert directory.parent.resolve() == Path(request["keyring_path"]).parent.resolve()
     await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
     scenario = Scenario(request, directory)
+    stopped = False
     try:
         await scenario.setup()
-        emit({"ready": True})
+        emit({"ready": True, **({"candidate": True} if scenario.audio_candidate else {})})
         while line := await asyncio.to_thread(sys.stdin.readline):
             command = json.loads(line)
             scenario.phase = command["action"]
             if scenario.phase == "stop":
-                emit({"stopped": True})
+                if scenario.audio_candidate and command.get("fixture_close_failure"):
+                    scenario.request["fixture_close_failure"] = True
+                stopped = True
                 break
-            method = getattr(scenario, scenario.phase.replace("-", "_"))
-            result = await method()
+            if scenario.phase == "audio-next-candidate":
+                # Reconstruct only the owned fixture, after its actual close.
+                # Native one-use flags and the consumed SQLite row stay intact.
+                assert scenario.audio_candidate, "native_next_candidate_mode"
+                assert (
+                    scenario.audio_original_pin.recording_policy == "off"
+                    and scenario.audio_original_pin.call_id == scenario.call_id
+                ), "native_next_candidate_original_off_pin"
+                previous_run = scenario.audio_run
+                assert await scenario.graph.writer.qualification_run_consumed(previous_run), (
+                    "native_next_candidate_previous_consumed"
+                )
+                sqlite_path = scenario.settings.sqlite_path
+                previous_receipt = await asyncio.to_thread(
+                    candidate_consumption_receipt, sqlite_path, previous_run
+                )
+                assert previous_receipt is not None, "native_next_candidate_receipt_present"
+                await scenario.close()
+                previous_closed = (
+                    scenario.graph.supervisor._closed
+                    and scenario.graph.supervisor._writer_task.done()
+                    and scenario.graph.writer._closed_event.is_set()
+                    and scenario.graph.writer.fatal_fault is None
+                    and scenario.app.state.runtime_graph is None
+                    and scenario.server_task.done()
+                    and not scenario.server.server_state.connections
+                    and not scenario.server.server_state.tasks
+                    and scenario.http.is_closed
+                    and scenario.media.task.done()
+                )
+                assert previous_closed, "native_next_candidate_previous_joined"
+                # Assign before setup: failure/EOF closes the new actual owner.
+                scenario = Scenario(dict(request), directory)
+                await scenario.setup()
+                assert scenario.audio_run != previous_run, "native_next_candidate_fresh_run"
+                previous_consumed = await scenario.graph.writer.qualification_run_consumed(
+                    previous_run
+                )
+                current_consumed = await scenario.graph.writer.qualification_run_consumed(
+                    scenario.audio_run
+                )
+                previous_run_preserved = previous_receipt == await asyncio.to_thread(
+                    candidate_consumption_receipt, scenario.settings.sqlite_path, previous_run
+                )
+                assert (
+                    previous_consumed and not current_consumed and previous_run_preserved
+                ), "native_next_candidate_consumption_preserved"
+                result = {
+                    "previous_run_id": str(previous_run),
+                    "run_id": str(scenario.audio_run),
+                    "previous_consumed": previous_consumed,
+                    "current_consumed": current_consumed,
+                    "previous_run_preserved": previous_run_preserved,
+                    "previous_closed": previous_closed,
+                }
+            else:
+                result = await getattr(scenario, scenario.phase.replace("-", "_"))()
             await asyncio.to_thread(
                 Path(request["evidence_path"], "native.json").write_text,
                 json.dumps(scenario.evidence, indent=2),
@@ -2216,7 +3789,8 @@ async def connected(request):
             }
         await asyncio.to_thread(
             Path(request["evidence_path"], "native.json").write_text,
-            json.dumps(scenario.evidence, indent=2), encoding="utf-8",
+            json.dumps(scenario.evidence, indent=2),
+            encoding="utf-8",
         )
         frame = traceback.extract_tb(error.__traceback__)[-1]
         label = (
@@ -2235,3 +3809,5 @@ async def connected(request):
         )
     finally:
         await scenario.close()
+    if stopped:
+        emit({"stopped": True})
