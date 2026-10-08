@@ -73,6 +73,7 @@ METRIC_NAMES = [
     "projetv0.voice.runtime.event_loop_lag",
     "projetv0.voice.service_ttfb",
     "projetv0.voice.sessions.duration",
+    "projetv0.voice.stt.failures",
     "projetv0.voice.transcript.turns_lost",
     "projetv0.voice.user_bot_latency",
     "projetv0.voice.webhooks.total",

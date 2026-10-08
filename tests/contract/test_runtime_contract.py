@@ -69,6 +69,7 @@ METRIC_NAMES = [
     "projetv0.voice.runtime.event_loop_lag",
     "projetv0.voice.service_ttfb",
     "projetv0.voice.sessions.duration",
+    "projetv0.voice.stt.failures",
     "projetv0.voice.transcript.turns_lost",
     "projetv0.voice.user_bot_latency",
     "projetv0.voice.webhooks.total",
@@ -262,7 +263,7 @@ def test_runtime_contract_is_the_exact_canonical_v1_object() -> None:
     assert json.loads(observed) == EXPECTED_CONTRACT
     assert len(EXPECTED_CONTRACT["environment_variable_names"]) == 30  # type: ignore[arg-type]
     assert EXPECTED_CONTRACT["metrics"] == sorted(METRIC_NAMES)
-    assert len(METRIC_NAMES) == 21
+    assert len(METRIC_NAMES) == 22
 
 
 def test_golden_exercises_out_of_order_dotfile_and_distinct_nfc_nfd_paths() -> None:

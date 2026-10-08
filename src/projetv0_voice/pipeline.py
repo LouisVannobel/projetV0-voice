@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 from collections.abc import Callable, Coroutine, Sequence
+from contextlib import suppress
 from contextvars import Context
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
 from typing import Any, Protocol, cast
@@ -20,6 +21,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ErrorFrame,
+    FatalErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputDTMFFrame,
@@ -564,10 +566,10 @@ class _RuntimeMetricsObserverBinding:
 
 
 class RuntimeMetricsObserver(BaseObserver):
-    """Forward only identity-bound native service TTFB measurements."""
+    """Forward identity-bound service TTFB and one terminal STT producer cause."""
 
     __binding: _RuntimeMetricsObserverBinding
-    __slots__ = ("__binding",)
+    __slots__ = ("__binding", "__stt_failure_recorded")
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in (
@@ -608,6 +610,7 @@ class RuntimeMetricsObserver(BaseObserver):
         ):
             raise ValueError("runtime_metrics_observer_invalid") from None
         super().__init__()
+        self.__stt_failure_recorded = False
         object.__setattr__(
             self,
             "_RuntimeMetricsObserver__binding",
@@ -640,6 +643,29 @@ class RuntimeMetricsObserver(BaseObserver):
         return self.__binding.tts
 
     async def on_push_frame(self, data: FramePushed) -> None:
+        if (
+            data.source is self._stt
+            and type(data.frame) is FatalErrorFrame
+            and data.frame.processor is self._stt
+            and data.frame.exception is None
+            and data.direction in (FrameDirection.UPSTREAM, FrameDirection.DOWNSTREAM)
+        ):
+            reason = (
+                {
+                    "openrouter_stt_timeout": "timeout",
+                    "openrouter_stt_transport": "transport",
+                    "openrouter_stt_segment_limit": "segment_limit",
+                    "openrouter_stt_text_limit": "text_limit",
+                    "openrouter_stt_text_invalid": "text_invalid",
+                    "openrouter_stt_drain_timeout": "drain_timeout",
+                }.get(data.frame.error)
+                if type(data.frame.error) is str else None
+            )
+            if reason is not None and not self.__stt_failure_recorded:
+                self.__stt_failure_recorded = True
+                with suppress(Exception):  # Preserve the existing observer forwarding policy.
+                    self._runtime_metrics.record_stt_failure(reason)
+            return
         if data.direction is not FrameDirection.DOWNSTREAM or type(data.frame) is not MetricsFrame:
             return
         if data.source is self._stt:
