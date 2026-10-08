@@ -476,8 +476,9 @@ async def test_runtime_supervisor_is_real_webhook_finalizer_owner_and_forwards_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("total_calls", [1, 3])
 async def test_candidate_latch_only_consumes_the_first_pending_initiated_effect(
-    tmp_path: Path,
+    tmp_path: Path, total_calls: int,
 ) -> None:
     from projetv0_voice.admission import CallAdmissionRejected, ProcessLeaseAuthority
     from projetv0_voice.lifecycle import RuntimeSupervisor
@@ -543,12 +544,15 @@ async def test_candidate_latch_only_consumes_the_first_pending_initiated_effect(
         utcnow=lambda: NOW,
         monotonic=lambda: 100.0,
         candidate_run_id=run_id,
+        qualification_observer=lambda state: supervisor.observe_qualification_state(state),
     )
     supervisor = RuntimeSupervisor(
         writer=writer,
         call_control=control,
         registry=registry,
         candidate_run_id=run_id,
+        candidate_total_calls=total_calls,
+        candidate_profile_sha256=b"p" * 32,
         metrics=RuntimeMetrics.in_memory(),
         utcnow=lambda: NOW,
         loop_interval_seconds=0.05,
@@ -572,14 +576,36 @@ async def test_candidate_latch_only_consumes_the_first_pending_initiated_effect(
             await finalize(unsupported, await registry.resolve_webhook(unsupported))
             == WebhookDisposition(200)
         )
-        assert await writer.qualification_run_consumed(run_id) is False
+        assert await writer.qualification_run_consumed(
+            run_id, total_calls=total_calls, profile_sha256=b"p" * 32
+        ) is False
+
+        for number in range(total_calls - 1):
+            earlier = event(f"earlier-{number}", "call.initiated",
+                            call_control_id=f"earlier-control-{number}", call_state="parked")
+            assert (
+                await finalize(earlier, await registry.resolve_webhook(earlier))
+                == WebhookDisposition(200)
+            )
+            assert await registry.qualification_state() == "valid"
+            assert supervisor._qualification_valid is True  # noqa: SLF001
+            ended = event(f"earlier-end-{number}", "call.hangup",
+                          call_control_id=f"earlier-control-{number}")
+            assert (
+                await finalize(ended, await registry.resolve_webhook(ended))
+                == WebhookDisposition(200)
+            )
 
         initiated = event("initiated-first", "call.initiated", call_state="parked")
         assert (
             await finalize(initiated, await registry.resolve_webhook(initiated))
             == WebhookDisposition(200)
         )
-        assert await writer.qualification_run_consumed(run_id) is True
+        assert await writer.qualification_run_consumed(
+            run_id, total_calls=total_calls, profile_sha256=b"p" * 32
+        ) is True
+        assert await registry.qualification_state() == "consumed"
+        assert supervisor._qualification_valid is False  # noqa: SLF001
 
         duplicate = await registry.resolve_duplicate_webhook(initiated)
         assert await finalize(initiated, duplicate, "duplicate") == WebhookDisposition(200)
@@ -1566,6 +1592,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         "expires_at": NOW + timedelta(hours=1),
         "benchmark_did_hash": "b" * 64,
         "max_concurrent_calls": 1,
+        "total_calls": 3,
         "call_lease_ttl_seconds": 30,
         "disclosure_mark_timeout_ms": 10000,
     })
@@ -1605,6 +1632,12 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     try:
         assert len(selected_profiles) == 2 and selected_profiles[-1] is candidate
+        from projetv0_voice.qualified_profile import canonical_candidate_profile_sha256
+
+        assert candidate_graph.supervisor._candidate_total_calls == 3  # noqa: SLF001
+        assert candidate_graph.supervisor._candidate_profile_sha256 == bytes.fromhex(  # noqa: SLF001
+            canonical_candidate_profile_sha256(candidate)
+        )
         assert candidate_graph.handshake._session_timeout == (
             300 if company_case == "linked" else None
         )

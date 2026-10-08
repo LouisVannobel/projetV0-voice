@@ -57,6 +57,7 @@ MonoChannel = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
 CandidateTimeout = Annotated[Literal[10000], BeforeValidator(_require_exact_int)]
 CandidateLeaseTtl = Annotated[Literal[30], BeforeValidator(_require_exact_int)]
 CandidateMaxCalls = Annotated[Literal[1], BeforeValidator(_require_exact_int)]
+CandidateTotalCalls = Annotated[int, Field(ge=1, le=10), BeforeValidator(_require_exact_int)]
 OverrideMaxCalls = Annotated[Literal[15, 20], BeforeValidator(_require_exact_int)]
 StrictLeaseTtl = Annotated[
     int, Field(ge=5, le=300), BeforeValidator(_require_exact_int)
@@ -216,6 +217,7 @@ class QualificationCandidateProfileV1(_StrictFrozenProfile):
     disclosure_mark_timeout_ms: CandidateTimeout
     call_lease_ttl_seconds: CandidateLeaseTtl
     max_concurrent_calls: CandidateMaxCalls
+    total_calls: CandidateTotalCalls = Field(default=1, exclude_if=lambda value: value == 1)
 
     _validate_expires_at_input = field_validator("expires_at", mode="before")(
         _validate_datetime_input
@@ -261,6 +263,17 @@ def canonical_inference_profile_sha256(profile: InferenceProfileV1) -> str:
 
 
 def canonical_qualified_profile_sha256(profile: QualifiedDeploymentProfileV1) -> str:
+    canonical = json.dumps(
+        profile.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def canonical_candidate_profile_sha256(profile: QualificationCandidateProfileV1) -> str:
     canonical = json.dumps(
         profile.model_dump(mode="json"),
         ensure_ascii=False,

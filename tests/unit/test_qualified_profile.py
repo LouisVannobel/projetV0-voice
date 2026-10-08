@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -43,6 +44,34 @@ REJECTED_TOKEN_LOCATORS = (
     "telnyx-start-v1",
     "telnyx-magic-v1",
 )
+
+
+def test_candidate_total_calls_defaults_to_one_without_changing_canonical_bytes() -> None:
+    from projetv0_voice.qualified_profile import canonical_candidate_profile_sha256
+
+    data = json.loads(
+        (REPOSITORY_ROOT / "tests/fixtures/qualification-candidate-v1.json").read_text()
+    )
+    expected = json.dumps(
+        data, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    for value in (data, {**data, "total_calls": 1}):
+        profile = QualificationCandidateProfileV1.model_validate(value)
+        assert profile.total_calls == 1
+        assert "total_calls" not in profile.model_dump(mode="json")
+        assert canonical_candidate_profile_sha256(profile) == hashlib.sha256(expected).hexdigest()
+    multiple = QualificationCandidateProfileV1.model_validate({**data, "total_calls": 3})
+    assert multiple.model_dump(mode="json")["total_calls"] == 3
+    assert canonical_candidate_profile_sha256(multiple) != hashlib.sha256(expected).hexdigest()
+
+
+@pytest.mark.parametrize("value", [0, 11, True, False, "2", 2.0, None])
+def test_candidate_total_calls_rejects_nonexact_or_unbounded_values(value: object) -> None:
+    data = json.loads(
+        (REPOSITORY_ROOT / "tests/fixtures/qualification-candidate-v1.json").read_text()
+    )
+    with pytest.raises(ValidationError):
+        QualificationCandidateProfileV1.model_validate({**data, "total_calls": value})
 
 
 def inference_data() -> dict[str, object]:

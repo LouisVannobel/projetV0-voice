@@ -63,6 +63,7 @@ from projetv0_voice.persistence.commands import (
 )
 from projetv0_voice.persistence.schema import (
     CALL_LIFECYCLE_MIGRATION_SQL,
+    QUALIFICATION_ALLOWANCE_MIGRATION_SQL,
     QUALIFICATION_RUNS_SQL,
     RECORDING_ARCHIVE_SQL,
     SCHEMA_SQL,
@@ -72,6 +73,7 @@ from projetv0_voice.persistence.schema import (
     V2_SCHEMA_SQL,
     V3_SCHEMA_SQL,
     V4_SCHEMA_SQL,
+    V5_SCHEMA_SQL,
 )
 
 PERSISTENCE_QUEUE_MAX_ITEMS = 256
@@ -138,6 +140,7 @@ _EXPECTED_V1_SCHEMA_OBJECTS = _expected_schema_objects(V1_SCHEMA_SQL)
 _EXPECTED_V2_SCHEMA_OBJECTS = _expected_schema_objects(V2_SCHEMA_SQL)
 _EXPECTED_V3_SCHEMA_OBJECTS = _expected_schema_objects(V3_SCHEMA_SQL)
 _EXPECTED_V4_SCHEMA_OBJECTS = _expected_schema_objects(V4_SCHEMA_SQL)
+_EXPECTED_V5_SCHEMA_OBJECTS = _expected_schema_objects(V5_SCHEMA_SQL)
 _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
@@ -309,6 +312,7 @@ WebhookEffectKind = Literal["applied", "duplicate", "existing_terminal"]
 class WebhookCommitResult:
     receipt: WebhookReceiptKind
     effect: WebhookEffectKind
+    qualification_exhausted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +552,8 @@ class PersistenceWriter:
         operation: VoiceOperationV1 | None,
         legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
         qualification_run_id: UUID | None = None,
+        qualification_total_calls: int = 1,
+        qualification_profile_sha256: bytes | None = None,
         admission_facts: LocalCallAdmissionFacts | None = None,
     ) -> WebhookCommitTicket:
         """Synchronously transfer one webhook transaction to the writer owner."""
@@ -569,6 +575,7 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_webhook_receipt")
         if qualification_run_id is not None and not isinstance(qualification_run_id, UUID):
             raise CommandSerializationError("invalid_qualification_run")
+        self._validate_qualification_policy(qualification_total_calls, qualification_profile_sha256)
         result: asyncio.Future[WebhookCommitValue] = asyncio.get_running_loop().create_future()
         command = PersistenceCommand(
             "webhook_effect",
@@ -578,6 +585,8 @@ class PersistenceWriter:
                 "operation": operation,
                 "legacy_v1_semantic_fingerprint_sha256": (legacy_v1_semantic_fingerprint_sha256),
                 "qualification_run_id": qualification_run_id,
+                "qualification_total_calls": qualification_total_calls,
+                "qualification_profile_sha256": qualification_profile_sha256,
                 "admission_facts": admission_facts,
                 "result": result,
             },
@@ -594,15 +603,19 @@ class PersistenceWriter:
         self._track_pending(command)
         return WebhookCommitTicket(result)
 
-    async def qualification_run_consumed(self, run_id: UUID) -> bool:
+    async def qualification_run_consumed(
+        self, run_id: UUID, *, total_calls: int = 1, profile_sha256: bytes | None = None
+    ) -> bool:
         if not isinstance(run_id, UUID):
             raise CommandSerializationError("invalid_qualification_run")
+        self._validate_qualification_policy(total_calls, profile_sha256)
         result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         try:
             await self.commit_control(
                 PersistenceCommand(
                     "qualification_run_status",
-                    {"run_id": run_id, "result": result},
+                    {"run_id": run_id, "total_calls": total_calls,
+                     "profile_sha256": profile_sha256, "result": result},
                     None,
                 )
             )
@@ -2390,6 +2403,7 @@ class PersistenceWriter:
                 or (existing_version == 2 and existing_schema == _EXPECTED_V2_SCHEMA_OBJECTS)
                 or (existing_version == 3 and existing_schema == _EXPECTED_V3_SCHEMA_OBJECTS)
                 or (existing_version == 4 and existing_schema == _EXPECTED_V4_SCHEMA_OBJECTS)
+                or (existing_version == 5 and existing_schema == _EXPECTED_V5_SCHEMA_OBJECTS)
             ):
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -2401,7 +2415,11 @@ class PersistenceWriter:
                         for statement in SPARRA_CONTENT_SQL.split(";"):
                             if statement.strip():
                                 await connection.execute(statement)
-                    for statement in RECORDING_ARCHIVE_SQL.split(";"):
+                    if existing_version < 5:
+                        for statement in RECORDING_ARCHIVE_SQL.split(";"):
+                            if statement.strip():
+                                await connection.execute(statement)
+                    for statement in QUALIFICATION_ALLOWANCE_MIGRATION_SQL.split(";"):
                         if statement.strip():
                             await connection.execute(statement)
                     await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -2813,14 +2831,34 @@ class PersistenceWriter:
             await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
             return WebhookCommitResult("duplicate", "duplicate")
         qualification_run_id = payload.get("qualification_run_id")
+        exhausted = False
         if qualification_run_id is not None:
             if not isinstance(qualification_run_id, UUID):
                 raise CommandSerializationError("invalid_qualification_run")
-            if await self._qualification_run_is_consumed(qualification_run_id):
+            lease = payload.get("lease")
+            if not isinstance(lease, Mapping):
+                raise CommandSerializationError("invalid_lease_command")
+            limit = payload.get("qualification_total_calls", 1)
+            fingerprint = payload.get("qualification_profile_sha256")
+            self._validate_qualification_policy(limit, fingerprint)
+            consumed = await self._qualification_run_is_consumed(
+                qualification_run_id, limit, fingerprint
+            )
+            existing_state = await self._qualification_admitted_identity(lease)
+            if existing_state is not None:
+                await self._apply_admission_facts(
+                    lease, payload.get("operation"), payload.get("admission_facts")
+                )
+                await self._insert_new_receipt(normalized_receipt)
+                return WebhookCommitResult(
+                    "first", "existing_terminal" if existing_state == "terminal" else "duplicate"
+                )
+            if consumed:
                 return QualificationRunConsumed()
+            exhausted = await self._consume_qualification_run(
+                qualification_run_id, limit, fingerprint
+            )
         await self._insert_new_receipt(normalized_receipt)
-        if qualification_run_id is not None:
-            await self._consume_qualification_run(qualification_run_id)
         lease = payload.get("lease")
         operation = payload.get("operation")
         if lease is not None:
@@ -2830,46 +2868,50 @@ class PersistenceWriter:
                 await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
                 return WebhookCommitResult("first", "existing_terminal")
             await self._apply_lease(lease)
-            admission = payload.get("admission_facts")
-            if admission is not None:
-                if not isinstance(
-                    admission, LocalCallAdmissionFacts
-                ) or admission.call_id != lease.get("call_id"):
-                    raise CommandConflictError("local_admission_identity_conflict")
-                if (
-                    not isinstance(operation, VoiceOperationV1)
-                    or not isinstance(operation.payload, CallUpsertPayloadV1)
-                    or operation.call_id != admission.call_id
-                    or operation.payload.retention_until != admission.retention_until
-                    or operation.payload.telnyx_call_leg_id != admission.telnyx_call_leg_id
-                    or operation.payload.telnyx_call_session_id != admission.telnyx_call_session_id
-                ):
-                    raise CommandConflictError("local_admission_identity_conflict")
-                existing = await self._read_call_lifecycle(admission.call_id)
-                facts = LocalCallLifecycleFacts(
-                    admission.call_id,
-                    admission.admitted_at,
-                    admission.retention_until,
-                    admission.telnyx_call_leg_id,
-                    admission.telnyx_call_session_id,
-                    admission_generation=admission.admission_generation,
-                )
-                if existing is not None and (
-                    existing.admitted_at != facts.admitted_at
-                    or existing.retention_until != facts.retention_until
-                    or existing.telnyx_call_leg_id != facts.telnyx_call_leg_id
-                    or existing.telnyx_call_session_id != facts.telnyx_call_session_id
-                    or existing.admission_generation != facts.admission_generation
-                ):
-                    raise CommandConflictError("local_admission_identity_conflict")
-                if existing is None:
-                    await self._store_lifecycle(facts)
+            await self._apply_admission_facts(lease, operation, payload.get("admission_facts"))
         await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
         if operation is not None:
             if not isinstance(operation, VoiceOperationV1):
                 raise CommandSerializationError("invalid_outbox_command")
             await self._insert_outbox(operation)
-        return WebhookCommitResult("first", "applied")
+        return WebhookCommitResult("first", "applied", exhausted)
+
+    async def _apply_admission_facts(
+        self, lease: Mapping[str, object], operation: object, admission: object
+    ) -> None:
+        if admission is not None:
+            if not isinstance(
+                admission, LocalCallAdmissionFacts
+            ) or admission.call_id != lease.get("call_id"):
+                raise CommandConflictError("local_admission_identity_conflict")
+            if (
+                not isinstance(operation, VoiceOperationV1)
+                or not isinstance(operation.payload, CallUpsertPayloadV1)
+                or operation.call_id != admission.call_id
+                or operation.payload.retention_until != admission.retention_until
+                or operation.payload.telnyx_call_leg_id != admission.telnyx_call_leg_id
+                or operation.payload.telnyx_call_session_id != admission.telnyx_call_session_id
+            ):
+                raise CommandConflictError("local_admission_identity_conflict")
+            existing = await self._read_call_lifecycle(admission.call_id)
+            facts = LocalCallLifecycleFacts(
+                admission.call_id,
+                admission.admitted_at,
+                admission.retention_until,
+                admission.telnyx_call_leg_id,
+                admission.telnyx_call_session_id,
+                admission_generation=admission.admission_generation,
+            )
+            if existing is not None and (
+                existing.admitted_at != facts.admitted_at
+                or existing.retention_until != facts.retention_until
+                or existing.telnyx_call_leg_id != facts.telnyx_call_leg_id
+                or existing.telnyx_call_session_id != facts.telnyx_call_session_id
+                or existing.admission_generation != facts.admission_generation
+            ):
+                raise CommandConflictError("local_admission_identity_conflict")
+            if existing is None:
+                await self._store_lifecycle(facts)
 
     async def _record_original_end(
         self,
@@ -2979,32 +3021,89 @@ class PersistenceWriter:
         if not inserted:
             raise CommandConflictError("webhook_identity_conflict")
 
-    async def _qualification_run_is_consumed(self, run_id: UUID) -> bool:
+    @staticmethod
+    def _validate_qualification_policy(total_calls: object, profile_sha256: object) -> None:
+        if (
+            type(total_calls) is not int or not 1 <= total_calls <= 10
+            or profile_sha256 is not None
+            and (type(profile_sha256) is not bytes or len(profile_sha256) != 32)
+            or total_calls != 1 and profile_sha256 is None
+        ):
+            raise CommandSerializationError("invalid_qualification_run")
+
+    async def _qualification_run_is_consumed(
+        self, run_id: UUID, total_calls: object, profile_sha256: object
+    ) -> bool:
         connection = self._require_owner_connection()
         cursor = await connection.execute(
-            "SELECT 1 FROM qualification_runs WHERE run_id = ?",
+            "SELECT profile_sha256,total_calls,used_calls FROM qualification_runs WHERE run_id = ?",
             (str(run_id),),
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return row == (1,)
+        if row is None:
+            return False
+        if row[0] is None:
+            return True  # Historical single-use rows never acquire a new policy or allowance.
+        if row[:2] != (profile_sha256, total_calls):
+            raise CommandConflictError("qualification_run_conflict")
+        return bool(row[2] >= row[1])
 
-    async def _consume_qualification_run(self, run_id: UUID) -> None:
+    async def _consume_qualification_run(
+        self, run_id: UUID, total_calls: object, profile_sha256: object
+    ) -> bool:
         connection = self._require_owner_connection()
         cursor = await connection.execute(
-            "INSERT INTO qualification_runs (run_id, consumed_at) VALUES (?, ?)",
-            (str(run_id), _iso(self._utcnow())),
+            "INSERT INTO qualification_runs "
+            "(run_id,consumed_at,profile_sha256,total_calls,used_calls) VALUES (?,?,?,?,1) "
+            "ON CONFLICT(run_id) DO UPDATE SET used_calls=used_calls+1 "
+            "WHERE profile_sha256=excluded.profile_sha256 "
+            "AND total_calls=excluded.total_calls AND used_calls<total_calls",
+            (str(run_id), _iso(self._utcnow()), profile_sha256, total_calls),
         )
         if cursor.rowcount != 1:
             await cursor.close()
             raise CommandConflictError("qualification_run_conflict")
         await cursor.close()
+        return await self._qualification_run_is_consumed(run_id, total_calls, profile_sha256)
 
     async def _qualification_run_consumed(self, payload: Mapping[str, object]) -> bool:
         run_id = payload.get("run_id")
         if not isinstance(run_id, UUID):
             raise CommandSerializationError("invalid_qualification_run")
-        return await self._qualification_run_is_consumed(run_id)
+        limit = payload.get("total_calls", 1)
+        fingerprint = payload.get("profile_sha256")
+        self._validate_qualification_policy(limit, fingerprint)
+        return await self._qualification_run_is_consumed(run_id, limit, fingerprint)
+
+    async def _qualification_admitted_identity(self, lease: Mapping[str, object]) -> str | None:
+        control_id = self._required_str(lease, "call_control_id")
+        created_at = self._required_datetime(lease, "created_at")
+        expires_at = self._required_datetime(lease, "expires_at")
+        token_hash = lease.get("token_hash")
+        if (
+            lease.get("action") != "upsert" or lease.get("state") != "pending"
+            or lease.get("closed_at") is not None or expires_at <= created_at
+            or type(token_hash) is not bytes or len(token_hash) != 32
+        ):
+            raise CommandSerializationError("invalid_lease_command")
+        identity = (
+            str(self._required_uuid(lease, "call_id")), self._required_str(lease, "tenant_id"),
+            self._required_str(lease, "agent_id"), token_hash, _iso(created_at),
+        )
+        cursor = await self._require_owner_connection().execute(
+            "SELECT call_id,tenant_id,agent_id,token_hash,created_at,state "
+            "FROM call_leases WHERE call_control_id=?", (control_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        if row[:5] != identity:
+            raise CommandConflictError("lease_identity_conflict")
+        if row[5] == "pending":
+            await self._apply_lease(lease)  # Retain the existing exact pending-row guards.
+        return str(row[5])
 
     async def _same_identity_is_terminal(self, lease: Mapping[str, object]) -> bool:
         call_control_id = self._required_str(lease, "call_control_id")

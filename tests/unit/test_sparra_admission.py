@@ -111,7 +111,7 @@ def snapshot(call_id, routing):
 
 async def start(
     tmp_path, begin=None, *, utcnow=None, monotonic=None, failpoint=None,
-    sparra=True, writer_utcnow=None,
+    sparra=True, writer_utcnow=None, candidate_run_id=None,
 ):
     writer = PersistenceWriter(
         tmp_path / "voice.sqlite", CryptoKeyring({1: bytes(range(32))}, active_version=1),
@@ -142,11 +142,12 @@ async def start(
         sparra=policy() if sparra else None,
         called_did=DID if sparra else None,
         begin_call=(begin or default_begin) if sparra else None,
+        candidate_run_id=candidate_run_id,
     )
     return registry, writer, worker, provider
 
 
-async def committed(registry, writer, observed, *, duplicate=False):
+async def committed(registry, writer, observed, *, duplicate=False, candidate_limit=1):
     resolved = await (
         registry.resolve_duplicate_webhook(observed)
         if duplicate
@@ -165,9 +166,77 @@ async def committed(registry, writer, observed, *, duplicate=False):
         lease=None if effect is None else effect.lease,
         operation=None if effect is None else effect.operation,
         admission_facts=None if effect is None else effect.admission_facts,
+        qualification_run_id=(
+            registry.candidate_run_id
+            if observed.event_type == "call.initiated" and not duplicate else None
+        ),
+        qualification_total_calls=candidate_limit,
+        qualification_profile_sha256=b"p" * 32 if registry.candidate_run_id else None,
     )
     result = await ticket.wait()
     return await registry.reconcile_after_commit(observed, resolved, result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("begin_outcome", ["success", "failure"])
+async def test_finite_candidate_rejects_next_call_before_local_intent_begin_or_answer(
+    tmp_path, begin_outcome
+):
+    from projetv0_voice.admission import ProcessLeaseAuthority
+
+    run_id = uuid4()
+    begins = []
+
+    async def begin(deployment, call_id, routing):
+        begins.append(call_id)
+        if begin_outcome == "failure":
+            raise RuntimeError("offline-begin-failed")
+        return snapshot(call_id, routing)
+
+    registry, writer, worker, provider = await start(tmp_path, begin, candidate_run_id=run_id)
+    try:
+        for number in range(2):
+            observed = event(call_control_id=f"finite-{number}")
+            await committed(registry, writer, observed, candidate_limit=2)
+            admitted = await registry.snapshot(f"finite-{number}")
+            if begin_outcome == "success":
+                assert admitted is not None
+                await committed(
+                    registry, writer, event("call.answered", call_control_id=f"finite-{number}")
+                )
+                if number == 1:
+                    # Consumed readiness closes new admission; the last call's media grant survives.
+                    assert await registry.qualification_state() == "consumed"
+                    assert await ProcessLeaseAuthority(registry).claim_once(
+                        call_control_id=f"finite-{number}", token_digest=admitted.token_digest
+                    ) is not None
+                await committed(
+                    registry, writer, event("call.hangup", call_control_id=f"finite-{number}")
+                )
+            else:
+                # A failed begin and carrier end never refund the admitted unit.
+                await committed(
+                    registry, writer, event("call.hangup", call_control_id=f"finite-{number}")
+                )
+                await registry.wait_background()
+        before_actions, before_begins = list(provider.actions), list(begins)
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            before = tuple(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                           for table in ("call_leases", "webhook_receipts", "outbox"))
+        with pytest.raises(CallAdmissionRejected, match="^qualification_run_consumed$"):
+            await registry.resolve_webhook(event(call_control_id="refused-next"))
+        assert provider.actions == before_actions
+        assert begins == before_begins and len(begins) == 2
+        with sqlite3.connect(tmp_path / "voice.sqlite") as connection:
+            assert tuple(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                         for table in ("call_leases", "webhook_receipts", "outbox")) == before
+            assert connection.execute(
+                "SELECT used_calls,total_calls FROM qualification_runs"
+            ).fetchone() == (2, 2)
+    finally:
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
 
 
 async def terminal_publications(writer):

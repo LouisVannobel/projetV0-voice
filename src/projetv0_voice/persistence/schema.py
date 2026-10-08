@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 V1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS call_leases (
@@ -134,6 +134,30 @@ CREATE TABLE recording_archives (
         OR (receipt_json IS NOT NULL AND audio_nonce IS NOT NULL AND receipt_op_id IS NOT NULL))
 );
 """
-SCHEMA_SQL = V4_SCHEMA_SQL.replace(
+V5_SCHEMA_SQL = V4_SCHEMA_SQL.replace(
     "PRAGMA user_version = 4;", RECORDING_ARCHIVE_SQL + "\nPRAGMA user_version = 5;"
+)
+
+QUALIFICATION_ALLOWANCE_MIGRATION_SQL = """
+ALTER TABLE qualification_runs ADD COLUMN profile_sha256 BLOB
+    CHECK (profile_sha256 IS NULL OR length(profile_sha256) = 32);
+ALTER TABLE qualification_runs ADD COLUMN total_calls INTEGER NOT NULL DEFAULT 1
+    CHECK (typeof(total_calls) = 'integer' AND total_calls BETWEEN 1 AND 10);
+ALTER TABLE qualification_runs ADD COLUMN used_calls INTEGER NOT NULL DEFAULT 1
+    CHECK (typeof(used_calls) = 'integer' AND used_calls BETWEEN 1 AND total_calls
+        AND (profile_sha256 IS NOT NULL OR (total_calls = 1 AND used_calls = 1)));
+"""
+QUALIFICATION_ALLOWANCE_SQL = """CREATE TABLE qualification_runs (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    consumed_at TEXT NOT NULL,
+    profile_sha256 BLOB
+        CHECK (profile_sha256 IS NULL OR length(profile_sha256) = 32),
+    total_calls INTEGER NOT NULL DEFAULT 1
+        CHECK (typeof(total_calls) = 'integer' AND total_calls BETWEEN 1 AND 10),
+    used_calls INTEGER NOT NULL DEFAULT 1
+        CHECK (typeof(used_calls) = 'integer' AND used_calls BETWEEN 1 AND total_calls
+            AND (profile_sha256 IS NOT NULL OR (total_calls = 1 AND used_calls = 1)))
+)"""
+SCHEMA_SQL = V5_SCHEMA_SQL.replace(QUALIFICATION_RUNS_SQL, QUALIFICATION_ALLOWANCE_SQL).replace(
+    "PRAGMA user_version = 5;", "PRAGMA user_version = 6;"
 )

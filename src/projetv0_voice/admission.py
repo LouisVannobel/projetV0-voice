@@ -2140,7 +2140,11 @@ class CallRegistry:
             ):
                 entry.durable = True
                 entry.lease_state = "pending"
-                if self._candidate_run_id is not None and not self._candidate_consumed:
+                if (
+                    self._candidate_run_id is not None
+                    and result.qualification_exhausted
+                    and not self._candidate_consumed
+                ):
                     self._candidate_consumed = True
                     qualification_consumed = True
             elif isinstance(result, QualificationRunConsumed) and not self._candidate_consumed:
