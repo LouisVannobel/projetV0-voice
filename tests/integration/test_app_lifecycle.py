@@ -1255,7 +1255,9 @@ async def test_shutdown_deadline_bounds_each_dependency_close(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("company_case", ["on", "candidate", "override", "linked"])
+@pytest.mark.parametrize(
+    "company_case", ["on", "candidate", "override", "linked", "local_audio_v2"]
+)
 async def test_production_composition_builds_ordered_graph_with_one_measured_control(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1291,6 +1293,10 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     from projetv0_voice.telnyx.webhooks import TelnyxWebhookProcessor
 
+    graph_now = NOW
+    if company_case == "local_audio_v2":
+        graph_now = datetime.now(UTC)
+        graph_now = graph_now.replace(microsecond=graph_now.microsecond // 1000 * 1000)
     api_key = "telnyx-api-key-value"
     public_key = base64.b64encode(
         bytes(SigningKey.generate().verify_key)
@@ -1382,6 +1388,20 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
                 original_forward_line_e164=None, qualified_transfer_destination_e164=None,
             ),
         })
+    if company_case == "local_audio_v2":
+        # Controlled topology only: the synthetic profile below is
+        # not a qualified V2 release. The real loader rejection is separate.
+        manifest = AgentManifestV1.model_validate({
+            **manifest.model_dump(mode="python"),
+            "tenant_id": str(UUID(int=22)), "max_concurrent_calls": 1,
+            "transcript_retention_days": 30, "recording_mode": "off",
+            "recording_retention_days": None,
+            "sparra": {"schema_version": 1, "connection_id": "fixture",
+                "original_forward_line_e164": None,
+                "qualified_transfer_destination_e164": None,
+                "operation_contract_version": 2},
+        })
+        (tmp_path / "prompt.md").write_text("Prendre un message.\n", encoding="utf-8")
     profile = QualifiedDeploymentProfileV1(
         schema_version=1,
         deployment_id=settings.deployment_id,
@@ -1396,23 +1416,66 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         telnyx_handshake_fixture_sha256="c" * 64,
         disclosure_mark_timeout_ms=5000,
         call_lease_ttl_seconds=30,
-        qualified_at=NOW - timedelta(days=1),
+        qualified_at=graph_now - timedelta(days=1),
     )
     order: list[str] = []
     recording_requests = []
+    control_actions: list[str] = []
+    from tests.contract.test_postgres_sink import sink_with_rows
+
+    native_sink, native_pool, native_connection, _pool_factory = sink_with_rows([])
 
     class Sink:
         async def open(self) -> None:
             order.append("sink-open")
+            if company_case == "local_audio_v2":
+                await native_sink.open()
 
         async def close(self) -> None:
             order.append("sink-close")
+            if company_case == "local_audio_v2":
+                await native_sink.close()
 
         async def ingest(self, _operation: object) -> None:
+            if company_case == "local_audio_v2":
+                pytest.fail("explicit2 graph dispatched a V1 operation")
             return None
 
         async def begin_call(self, *_args: object) -> None:
             raise AssertionError("composition must not start a call")
+
+        async def begin_call_v2(self, deployment, call_id, routing):
+            from projetv0_voice.audio_contract import BeginCallSnapshotV2
+
+            native_connection.rows = [(BeginCallSnapshotV2.model_validate({
+                "schema_version": 2, "workspace_id": str(UUID(int=22)),
+                "call_id": str(call_id), "configuration_revision": 7,
+                "knowledge": {"business_name": "Graph fixture", "sector": "garage",
+                    "opening_hours": "", "services": "", "prices": "", "faq": "",
+                    "instructions": ""}, "transfer_destination": None,
+                "retention_until": routing.admitted_at + timedelta(days=30),
+                "recording_policy": "local_30d", "recording_contact_phone": manifest.dids[0],
+                "audio_available": True, "recording_id": str(UUID(int=33)),
+            }).model_dump(mode="json"),)]
+            try:
+                return await native_sink.begin_call_v2(deployment, call_id, routing)
+            finally:
+                native_connection.rows = []
+
+        async def ingest_v2(self, operation):
+            from projetv0_voice.persistence.commands import canonical_operation_bytes
+
+            native_connection.rows = [({"schema_version": 2, "status": "applied",
+                "operation_id": str(operation.operation_id), "payload_sha256":
+                hashlib.sha256(canonical_operation_bytes(operation)).hexdigest()},)]
+            try:
+                await native_sink.ingest_v2(operation)
+            finally:
+                native_connection.rows = []
+
+        async def lease_call_erasures(self, *_args):
+            order.append("startup-erasure-lease")
+            return ()
 
         async def lease_recording_purges(
             self, _worker_id: str, _lease_seconds: int, _batch_size: int
@@ -1421,14 +1484,17 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
 
     class Control:
         async def answer(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            control_actions.append("answer")
             return CallControlResult("accepted")
 
         async def start_streaming(
             self, *_args: object, **_kwargs: object
         ) -> CallControlResult:
+            control_actions.append("streaming")
             return CallControlResult("accepted")
 
         async def hangup(self, *_args: object, **_kwargs: object) -> CallControlResult:
+            control_actions.append("hangup")
             return CallControlResult("accepted")
 
         async def start_recording(self, control_id, request, *, command_id):
@@ -1469,6 +1535,24 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         order.append("call-control")
         return Control()
 
+    def inference_factories(_key, _profile, language):
+        order.append(f"inference:{language}")
+        if company_case == "local_audio_v2":
+            from tests.integration.test_process_session_factory import _Llm, _Processor, _SttClient
+
+            return RuntimeInferenceFactories(
+                stt_http_client_factory=lambda: _SttClient(order),
+                stt_factory=lambda _client: _Processor("stt", order),
+                llm_factory=lambda: _Llm(order),
+                tts_factory=lambda: _Processor("tts", order),
+            )
+        return RuntimeInferenceFactories(
+            stt_http_client_factory=lambda: object(),  # type: ignore[arg-type]
+            stt_factory=lambda _client: object(),  # type: ignore[arg-type]
+            llm_factory=lambda: object(),  # type: ignore[arg-type]
+            tts_factory=lambda: object(),  # type: ignore[arg-type]
+        )
+
     factories = RuntimeProductionFactories(
         validate_artifacts=lambda received: order.append(
             "artifacts" if received is settings else "wrong-settings"
@@ -1491,24 +1575,19 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         ),
         sink_factory=lambda _dsn: order.append("sink") or Sink(),
         call_control_factory=build_control,
-        inference_factory=lambda _key, _profile, language: (
-            order.append(f"inference:{language}")
-            or RuntimeInferenceFactories(
-                stt_http_client_factory=lambda: object(),  # type: ignore[arg-type]
-                stt_factory=lambda _client: object(),  # type: ignore[arg-type]
-                llm_factory=lambda: object(),  # type: ignore[arg-type]
-                tts_factory=lambda: object(),  # type: ignore[arg-type]
-            )
-        ),
+        inference_factory=inference_factories,
     )
 
     token = settings.observability_token()
-    settings = replace(settings, sqlite_path=tmp_path / "company-recording.sqlite")
+    settings = replace(
+        settings, sqlite_path=tmp_path / "company-recording.sqlite",
+        deployment_max_calls=1 if company_case in {"linked", "local_audio_v2"} else 10,
+    )
     object.__setattr__(settings, "_observability_token", token)
     graph = await build_production_runtime(
         settings,
         factories=factories,
-        utcnow=lambda: NOW,
+        utcnow=lambda: graph_now,
         monotonic=lambda: 10.0,
         startup_phase_timeout_seconds=2.0,
     )
@@ -1537,8 +1616,127 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     )
     assert graph.recording_call_control_identity is graph.measured_call_control
     assert isinstance(graph.handshake, AuthenticatedTelnyxHandshakeService)
-    assert graph.handshake._session_timeout == (300 if company_case == "linked" else None)
+    assert graph.handshake._session_timeout == (
+        300 if company_case in {"linked", "local_audio_v2"} else None
+    )
     assert isinstance(graph.webhook_processor, TelnyxWebhookProcessor)
+    if company_case == "local_audio_v2":
+        import sqlite3
+
+        from pipecat.runner.types import TelnyxCallData
+
+        from projetv0_voice import session as session_module
+        from projetv0_voice.audio_capture import LocalAudioCapture
+        from projetv0_voice.audio_contract import BeginCallSnapshotV2
+        from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
+        from tests.integration.test_process_session_factory import (
+            _AudioAdmission,
+            _OfflineTransport,
+        )
+        from tests.unit.test_sparra_admission import event
+
+        bound = []
+        native_constructor = graph.session_factory._session_factory
+        native_pipeline = session_module.build_pipeline
+        sessions = []
+        delivery_acknowledged = asyncio.Event()
+        native_ack_outbox = graph.writer.ack_outbox
+
+        async def observe_known_ack(*, queue_id: int, expected_claim_attempt: int):
+            result = await native_ack_outbox(
+                queue_id=queue_id, expected_claim_attempt=expected_claim_attempt
+            )
+            if result.applied and await graph.writer.oldest_outbox_created_at() is None:
+                delivery_acknowledged.set()
+            return result
+
+        def construct(**values):
+            session = native_constructor(**values)
+            assert isinstance(session, session_module.CallSession)
+            sessions.append(session)
+            return session
+
+        def observe_capture_binding(**values):
+            tap, controller = values["capture_tap"], values["controller"]
+            capture = controller._local_audio_start.__self__
+            assert isinstance(capture, LocalAudioCapture) and tap is capture.tap
+            assert controller._local_audio_refuse == capture.refuse
+            assert controller._local_audio_close == capture.close_admission
+            assert controller._local_audio_finish == capture.finish
+            assert controller._local_audio_revoke == capture.revoke
+            built = native_pipeline(**values)
+            assert built is not None
+            bound.append(capture)
+            return built
+
+        def fail_after_owned_pipeline(**_values):
+            raise RuntimeError("controlled-stop-after-owned-native-pipeline")
+
+        graph.session_factory._session_factory = construct
+        monkeypatch.setattr(session_module, "build_pipeline", observe_capture_binding)
+        monkeypatch.setattr(session_module, "build_runtime", fail_after_owned_pipeline)
+        monkeypatch.setattr(graph.writer, "ack_outbox", observe_known_ack)
+        try:
+            await graph.supervisor.startup()
+            assert graph.writer.contract_version == 2
+            with sqlite3.connect(settings.sqlite_path) as database:
+                assert database.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert "startup-erasure-lease" in order
+            assert manifest.sparra is not None
+            for kind in ("call.initiated", "call.answered"):
+                observed = event(
+                    kind, occurred_at=graph_now, to_e164=manifest.dids[0],
+                    connection_id=manifest.sparra.connection_id, direction="incoming",
+                )
+                resolved = await graph.registry.resolve_webhook(observed)
+                result = await graph.supervisor.start_webhook_finalization(
+                    observed, resolved
+                ).wait()
+                assert result.status_code == 200, (kind, result.admission_rejection)
+            admitted = await graph.registry.snapshot("original")
+            claim = await graph.lease_authority.claim_once(
+                call_control_id="original", token_digest=admitted.token_digest
+            )
+            assert claim is not None
+            handshake = AuthenticatedTelnyxHandshake(
+                call_data=TelnyxCallData(stream_id="graph-stream", call_id="original",
+                    outbound_encoding="PCMU", to_number=manifest.dids[0], from_number=None),
+                token_locator_id="telnyx-header-connected-v1", lease_claim=claim,
+                transport=_OfflineTransport(order), audio_admission=_AudioAdmission(),
+            )
+            await graph.session_factory.run(handshake)
+            assert len(sessions) == len(bound) == 1
+            assert isinstance(sessions[0]._identity.begin_snapshot, BeginCallSnapshotV2)
+            with sqlite3.connect(settings.sqlite_path) as database:
+                lease = database.execute(
+                    "SELECT agent_id FROM call_leases WHERE call_id=?",
+                    (str(admitted.call_id),),
+                ).fetchone()
+            assert lease == (manifest.agent_id,)
+            assert manifest.agent_id != settings.deployment_id
+            frozen = await graph.writer.read_frozen_call_publication_v2(
+                admitted.call_id, generation=claim.generation,
+            )
+            assert frozen is not None and frozen.schema_version == 2
+            assert frozen.deployment_id == settings.deployment_id
+            assert graph.registry.internal_failure_code is None
+            assert not graph.writer.is_degraded and graph.writer.fatal_fault is None
+            assert "hangup" in control_actions
+            assert await graph.registry.live_call_count() == 0
+            # The process supervisor owns relay execution and durable FIFO ACKs.
+            delivery_acknowledged.clear()
+            async with asyncio.timeout(2.0):
+                if await graph.writer.oldest_outbox_created_at() is not None:
+                    await delivery_acknowledged.wait()
+            queries = [call[0] for call in native_connection.calls]
+            assert "SELECT voice.begin_call_v2(%s,%s,%s::jsonb)" in queries
+            assert "SELECT voice.ingest_operation_v2(%s::jsonb)" in queries
+            assert not await graph.writer.oldest_outbox_created_at()
+            assert native_pool.active == 0 and not recording_requests
+        finally:
+            await graph.supervisor.aclose()
+        assert order.count("stt-client-close") == order.count("llm-client-close") == 1
+        return
     from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
     from projetv0_voice.models import BeginCallSnapshotV1
     from projetv0_voice.session import CallIdentity, RecordingStartState

@@ -12,7 +12,11 @@ from uuid import UUID
 import aiosqlite
 import httpx
 import pytest
-from test_recording_archive import (
+
+from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.persistence.commands import PersistenceError, canonical_operation_bytes
+from projetv0_voice.persistence.writer import PersistenceWriter
+from tests.integration.test_recording_archive import (
     CALL_ID,
     DEADLINE,
     KEY,
@@ -25,10 +29,6 @@ from test_recording_archive import (
     stop_writer,
     wav,
 )
-
-from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.persistence.commands import PersistenceError, canonical_operation_bytes
-from projetv0_voice.persistence.writer import PersistenceWriter
 
 
 class Clock:

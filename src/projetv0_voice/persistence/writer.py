@@ -23,6 +23,14 @@ from uuid import UUID, uuid5
 
 import aiosqlite
 
+from projetv0_voice.audio_contract import (
+    AudioChunkPayloadV2,
+    AudioFinishPayloadV2,
+    AudioRevokePayloadV2,
+    BeginCallSnapshotV2,
+    VoiceOperationV2,
+)
+
 if TYPE_CHECKING:
     from projetv0_voice.telnyx.recordings import RecordingCorrelationV1
 
@@ -42,6 +50,7 @@ from projetv0_voice.models import (
     RecordingUpsertPayloadV1,
     TurnUpsertPayloadV1,
     VoiceOperationV1,
+    validate_deployment_id,
 )
 from projetv0_voice.persistence.business_contract import encrypt_message_result, validate_turn_text
 from projetv0_voice.persistence.business_result import (
@@ -55,14 +64,29 @@ from projetv0_voice.persistence.commands import (
     FatalPersistenceError,
     PersistenceCommand,
     PersistenceError,
+    PreparedAudioOperation,
+    PreparedControlOperationV2,
     canonical_operation_bytes,
     decode_operation,
+    decode_operation_v2,
+    encrypt_audio_operation,
+    encrypt_control_operation_v2,
     encrypt_operation,
+    encrypt_turn_operation_v2,
+    operation_aad,
     operation_aad_from_metadata,
     require_operation,
 )
 from projetv0_voice.persistence.schema import (
     CALL_LIFECYCLE_MIGRATION_SQL,
+    LOCAL_AUDIO_CHOICE_MIGRATION_SQL,
+    LOCAL_AUDIO_CHOICE_SCHEMA_SQL,
+    LOCAL_AUDIO_CHOICE_SCHEMA_VERSION,
+    LOCAL_AUDIO_SCHEMA_SQL,
+    LOCAL_AUDIO_SCHEMA_VERSION,
+    LOCAL_AUDIO_TERMINAL_MIGRATION_SQL,
+    LOCAL_AUDIO_TERMINAL_SCHEMA_SQL,
+    LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION,
     QUALIFICATION_ALLOWANCE_MIGRATION_SQL,
     QUALIFICATION_RUNS_SQL,
     RECORDING_ARCHIVE_SQL,
@@ -142,6 +166,9 @@ _EXPECTED_V3_SCHEMA_OBJECTS = _expected_schema_objects(V3_SCHEMA_SQL)
 _EXPECTED_V4_SCHEMA_OBJECTS = _expected_schema_objects(V4_SCHEMA_SQL)
 _EXPECTED_V5_SCHEMA_OBJECTS = _expected_schema_objects(V5_SCHEMA_SQL)
 _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
+_EXPECTED_AUDIO_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_SCHEMA_SQL)
+_EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_CHOICE_SCHEMA_SQL)
+_EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_TERMINAL_SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
     ("table", "webhook_receipts"),
@@ -251,12 +278,46 @@ class StaleLease:
 @dataclass(frozen=True, slots=True)
 class OutboxItem:
     queue_id: int
-    operation: VoiceOperationV1 = field(repr=False)
+    operation: VoiceOperationV1 | VoiceOperationV2 = field(repr=False)
     created_at: datetime
     claim_attempt: int
     next_attempt_at: datetime
     claim_expires_at: datetime
     last_error_code: str | None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _AudioPin:
+    call_id: UUID
+    generation: UUID
+    workspace_id: UUID
+    deployment_id: str
+    recording_id: UUID | None
+    revision: int
+    policy: Literal["off", "local_30d"]
+    available: bool
+    admitted_at: datetime
+    retention_until: datetime
+    denied_at: datetime | None = None
+    choice_state: Literal["undecided", "accepted", "off"] = "undecided"
+    choice_occurred_at: datetime | None = None
+    input_gate_opened: bool = False
+    committed_last_sequence: int | None = None
+    committed_total_samples: int | None = 0
+    terminal_finished: bool = False
+
+    @property
+    def denied(self) -> bool:
+        return self.denied_at is not None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AudioChoiceFacts:
+    call_id: UUID
+    generation: UUID
+    choice_state: Literal["undecided", "accepted", "off"]
+    choice_occurred_at: datetime | None
+    denied_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +452,14 @@ class RecordingArchiveJob:
     input_gate_opened: bool = False
 
 
+def _valid_contract_version(value: object) -> bool:
+    return type(value) is int and value in (1, 2)
+
+
+class _AudioChunkRefused(PersistenceError):
+    """A known optional refusal, never a storage or integrity failure."""
+
+
 class PersistenceWriter:
     """Own one queue, one coroutine, and one aiosqlite connection."""
 
@@ -409,7 +478,29 @@ class PersistenceWriter:
         file_size: Callable[[Path], int] = _default_file_size,
         max_storage_bytes: int = MAX_STORAGE_BYTES,
         failpoint: Failpoint | None = None,
+        contract_version: Literal[1, 2] = 1,
+        process_agent_id: str | None = None,
+        process_deployment_id: str | None = None,
     ) -> None:
+        if not _valid_contract_version(contract_version):
+            raise ValueError("invalid_writer_contract")
+        if contract_version == 2:
+            try:
+                if type(process_agent_id) is not str or type(process_deployment_id) is not str:
+                    raise ValueError("invalid_writer_process_identity")
+                validate_deployment_id(process_agent_id)
+                validate_deployment_id(process_deployment_id)
+            except ValueError:
+                raise ValueError("invalid_writer_process_identity") from None
+        self._contract_version: Literal[1, 2] = contract_version
+        self._process_agent_id: str | None = process_agent_id if contract_version == 2 else None
+        self._process_deployment_id: str | None = (
+            process_deployment_id if contract_version == 2 else None
+        )
+        self._audio_pins: dict[UUID, _AudioPin] = {}
+        self._audio_receipt: tuple[UUID, asyncio.Future[None]] | None = None
+        self._audio_inflight = False
+        self._audio_page_size = 0
         if control_commit_timeout_seconds <= 0 or quick_check_interval_seconds <= 0:
             raise ValueError("timeouts must be positive")
         if max_storage_bytes <= 0:
@@ -454,6 +545,10 @@ class PersistenceWriter:
         self._last_check_at = float("-inf")
         self._stale_leases: list[StaleLease] = []
         self.pragma_state: dict[str, int | str] = {}
+
+    @property
+    def contract_version(self) -> Literal[1, 2]:
+        return self._contract_version
 
     @property
     def queue_size(self) -> int:
@@ -510,6 +605,51 @@ class PersistenceWriter:
         self._track_pending(command)
         return True
 
+    def _turn_v2_matches(
+        self, operation: VoiceOperationV2, generation: UUID, pin: _AudioPin | None,
+    ) -> bool:
+        payload = operation.payload
+        return (
+            pin is not None and isinstance(payload, TurnUpsertPayloadV1)
+            and pin.generation == generation and pin.deployment_id == operation.deployment_id
+            and pin.deployment_id == self._process_deployment_id
+            and pin.call_id == operation.call_id and pin.input_gate_opened
+            and self._utcnow() < pin.retention_until
+            and pin.admitted_at <= payload.started_at <= payload.ended_at < pin.retention_until
+            and pin.admitted_at <= operation.occurred_at < pin.retention_until
+        )
+
+    def try_enqueue_turn_v2(
+        self, operation: VoiceOperationV2, *, generation: UUID, truncated: bool = False,
+    ) -> bool:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "turn.upsert" or not isinstance(generation, UUID)
+            or type(truncated) is not bool
+        ):
+            raise ValueError("invalid_turn_v2_command")
+        if not self._accepting or self._degraded:
+            self.transcript_loss_count += 1
+            self._signal_fatal("persistence_degraded")
+            return False
+        if not self._turn_v2_matches(
+            operation, generation, self._audio_pins.get(operation.call_id)
+        ):
+            return False
+        command = PersistenceCommand(
+            "sparra_content", {"action": "turn_v2", "operation": operation,
+                "generation": generation, "truncated": truncated}, None,
+            enqueued_at=self._monotonic(),
+        )
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull:
+            self.transcript_loss_count += 1
+            self._signal_fatal("queue_full")
+            return False
+        self._track_pending(command)
+        return True
+
     async def commit_control(self, command: PersistenceCommand) -> None:
         if command.kind == "shutdown":
             raise ValueError("shutdown is internal")
@@ -549,12 +689,13 @@ class PersistenceWriter:
         *,
         receipt: Mapping[str, object],
         lease: Mapping[str, object] | None,
-        operation: VoiceOperationV1 | None,
+        operation: VoiceOperationV1 | VoiceOperationV2 | None,
         legacy_v1_semantic_fingerprint_sha256: bytes | None = None,
         qualification_run_id: UUID | None = None,
         qualification_total_calls: int = 1,
         qualification_profile_sha256: bytes | None = None,
         admission_facts: LocalCallAdmissionFacts | None = None,
+        operation_generation: UUID | None = None,
     ) -> WebhookCommitTicket:
         """Synchronously transfer one webhook transaction to the writer owner."""
 
@@ -566,8 +707,21 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_webhook_receipt")
         if lease is not None and not isinstance(lease, Mapping):
             raise CommandSerializationError("invalid_lease_command")
-        if operation is not None and not isinstance(operation, VoiceOperationV1):
+        if operation is not None and not isinstance(operation, VoiceOperationV1 | VoiceOperationV2):
             raise CommandSerializationError("invalid_outbox_command")
+        if operation is not None and operation.schema_version != self._contract_version:
+            raise CommandSerializationError("writer_contract_mismatch")
+        if isinstance(operation, VoiceOperationV2) and (
+            not isinstance(operation_generation, UUID) or operation.kind != "call.upsert"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or operation.payload.status not in {"closed", "failed"}
+            or "message_result" in operation.payload.model_fields_set
+        ):
+            raise CommandSerializationError("invalid_phone_effect_v2")
+        if operation_generation is not None and (
+            self._contract_version != 2 or not isinstance(operation_generation, UUID)
+        ):
+            raise CommandSerializationError("invalid_phone_effect_v2")
         if legacy_v1_semantic_fingerprint_sha256 is not None and (
             type(legacy_v1_semantic_fingerprint_sha256) is not bytes
             or len(legacy_v1_semantic_fingerprint_sha256) != 32
@@ -588,6 +742,7 @@ class PersistenceWriter:
                 "qualification_total_calls": qualification_total_calls,
                 "qualification_profile_sha256": qualification_profile_sha256,
                 "admission_facts": admission_facts,
+                "operation_generation": operation_generation,
                 "result": result,
             },
             None,
@@ -702,6 +857,8 @@ class PersistenceWriter:
         closed_at: datetime | None,
         operation: VoiceOperationV1 | None = None,
     ) -> None:
+        if self._contract_version != 1 and operation is not None:
+            raise PersistenceError("writer_contract_mismatch")
         if operation is not None and (
             not isinstance(operation, VoiceOperationV1)
             or operation.kind != "call.upsert"
@@ -743,6 +900,8 @@ class PersistenceWriter:
     ) -> None:
         """Atomically terminalize one accepted stale cleanup and its call snapshot."""
 
+        if self._contract_version != 1:
+            raise PersistenceError("writer_contract_mismatch")
         if (
             not isinstance(stale, StaleLease)
             or not isinstance(operation, VoiceOperationV1)
@@ -927,6 +1086,144 @@ class PersistenceWriter:
             )
             raise
         return cast(LocalCallLifecycleFacts | None, await result)
+
+    async def bind_audio_snapshot(self, snapshot: BeginCallSnapshotV2, *, generation: UUID) -> None:
+        if self._contract_version != 2 or not isinstance(snapshot, BeginCallSnapshotV2):
+            raise PersistenceError("audio_pin_unavailable")
+        value = await self._content_request("audio_bind", snapshot=snapshot, generation=generation)
+        if not isinstance(value, _AudioPin):
+            raise PersistenceError("audio_pin_unavailable")
+        self._audio_pins[value.call_id] = value
+
+    async def publish_control_v2(self, operation: VoiceOperationV2, *, generation: UUID) -> None:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "call.upsert"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or not isinstance(generation, UUID)
+        ):
+            raise PersistenceError("control_v2_unavailable")
+        prepared = encrypt_control_operation_v2(operation, self._keyring)
+        published = await self._content_request(
+            "control_v2", prepared=prepared, generation=generation
+        )
+        if published is not True:
+            raise PersistenceError("control_v2_refused")
+
+    async def commit_audio_choice(
+        self, call_id: UUID, *, generation: UUID, choice: Literal["accept", "off"],
+        occurred_at: datetime | None,
+    ) -> AudioChoiceFacts:
+        if (
+            self._contract_version != 2 or not isinstance(call_id, UUID)
+            or not isinstance(generation, UUID) or choice not in {"accept", "off"}
+        ):
+            raise PersistenceError("audio_choice_refused")
+        facts = await self._content_request(
+            "audio_choice", call_id=call_id, generation=generation, choice=choice,
+            occurred_at=occurred_at,
+        )
+        if not isinstance(facts, AudioChoiceFacts):
+            raise PersistenceError("audio_choice_refused")
+        return facts
+
+    async def publish_audio_terminal_v2(
+        self, operation: VoiceOperationV2, *, generation: UUID
+    ) -> None:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind not in {"audio.finish", "audio.revoke"}
+            or not isinstance(generation, UUID)
+            or operation.kind == "audio.finish" and self._audio_inflight
+        ):
+            raise PersistenceError("audio_terminal_refused")
+        result = await self._content_request(
+            "audio_terminal", operation=operation, generation=generation
+        )
+        if result is not True:
+            raise PersistenceError("audio_terminal_refused")
+
+    def offer_audio_chunk(self, operation: VoiceOperationV2) -> bool:
+        if (
+            self._contract_version != 2 or not self._ready_ok or not self._accepting
+            or self._degraded or self._audio_inflight or self._queue.qsize() > 239
+            or not isinstance(operation, VoiceOperationV2) or operation.kind != "audio.chunk"
+            or not isinstance(operation.payload, AudioChunkPayloadV2)
+        ):
+            return False
+        pin = self._audio_pins.get(operation.call_id)
+        if pin is None or not self._audio_operation_matches(operation, pin):
+            return False
+        if operation.payload.sequence != (
+            0 if pin.committed_last_sequence is None else pin.committed_last_sequence + 1
+        ):
+            return False
+        try:
+            prepared = encrypt_audio_operation(operation, self._keyring)
+            primary = self._file_size(self._database_path)
+            measured = self._measure_storage_bytes()
+            page = self._audio_page_size
+            if type(primary) is not int or primary < 0 or page <= 0:
+                return False
+            # Conservative allowance for overflow/table/index/sequence page growth.
+            growth = ((prepared.envelope_size + page - 1) // page + 32) * page
+            if (
+                measured > self.max_storage_bytes
+                or 2 * (primary + growth) + 33_554_432 > MAX_STORAGE_BYTES
+            ):
+                return False
+        except Exception:
+            return False
+        receipt: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        command = PersistenceCommand("sparra_content", {
+            "action": "audio_chunk", "prepared": prepared, "result": receipt,
+        }, None, enqueued_at=self._monotonic())
+        try:
+            self._queue.put_nowait(command)
+        except asyncio.QueueFull:
+            return False
+        self._audio_inflight = True
+        self._audio_receipt = (operation.operation_id, receipt)
+        receipt.add_done_callback(self._finish_audio_commit)
+        self._track_pending(command)
+        return True
+
+    def _finish_audio_commit(self, receipt: asyncio.Future[None]) -> None:
+        if not receipt.cancelled():
+            receipt.exception()
+
+    async def wait_for_audio_commit(self, operation_id: UUID) -> None:
+        receipt = self._audio_receipt
+        if receipt is None or receipt[0] != operation_id:
+            raise PersistenceError("audio_commit_unknown")
+        try:
+            await asyncio.shield(receipt[1])
+        except asyncio.CancelledError:
+            raise
+        except PersistenceError:
+            if self._audio_receipt is receipt:
+                self._audio_receipt = None
+                self._audio_inflight = False
+            raise
+        else:
+            if self._audio_receipt is receipt:
+                self._audio_receipt = None
+                self._audio_inflight = False
+
+    def _audio_operation_matches(self, operation: VoiceOperationV2, pin: _AudioPin) -> bool:
+        payload = operation.payload
+        return (
+            isinstance(payload, AudioChunkPayloadV2) and pin.available and not pin.denied
+            and pin.choice_state == "accepted" and pin.input_gate_opened
+            and pin.committed_total_samples is not None and not pin.terminal_finished
+            and pin.policy == "local_30d" and pin.retention_until > self._utcnow()
+            and operation.call_id == pin.call_id and operation.deployment_id == pin.deployment_id
+            and pin.deployment_id == self._process_deployment_id
+            and payload.workspace_id == pin.workspace_id
+            and payload.recording_id == pin.recording_id
+            and payload.configuration_revision == pin.revision
+            and payload.retention_until == pin.retention_until
+        )
 
     async def _content_request(self, action: str, **values: object) -> object:
         result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
@@ -1536,6 +1833,40 @@ class PersistenceWriter:
             VoiceOperationV1 | None, await self._content_request("frozen_read", call_id=call_id)
         )
 
+    async def freeze_call_publication_v2(
+        self, operation: VoiceOperationV2, result: MessageResultV1 | None, *, generation: UUID,
+        provider_callback: str | None, result_permitted: Callable[[], bool] | None = None,
+    ) -> VoiceOperationV2 | None:
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "call.upsert" or not isinstance(generation, UUID)
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+            or operation.payload.status not in {"closing", "closed", "failed"}
+        ):
+            raise PersistenceError("final_call_v2_refused")
+        value = await self._content_request("freeze_v2", call_id=operation.call_id,
+            operation=operation, message_result=result, generation=generation,
+            provider_callback=provider_callback, result_permitted=result_permitted)
+        if value is False:
+            raise PersistenceError("final_call_v2_refused")
+        if value is not None and not isinstance(value, VoiceOperationV2):
+            raise CommandSerializationError("invalid_final_call_v2_result")
+        return value
+
+    async def read_frozen_call_publication_v2(
+        self, call_id: UUID, *, generation: UUID,
+    ) -> VoiceOperationV2 | None:
+        if self._contract_version != 2 or not isinstance(generation, UUID):
+            raise PersistenceError("final_call_v2_refused")
+        value = await self._content_request(
+            "frozen_read_v2", call_id=call_id, generation=generation
+        )
+        if value is False:
+            raise PersistenceError("final_call_v2_refused")
+        if value is not None and not isinstance(value, VoiceOperationV2):
+            raise CommandSerializationError("invalid_final_call_v2_result")
+        return value
+
     async def erase_call_content(
         self,
         call_id: UUID,
@@ -1660,6 +1991,12 @@ class PersistenceWriter:
                 "DELETE FROM sparra_content_fences WHERE call_id=?", (call_id,)
             )
             await connection.execute("DELETE FROM call_leases WHERE call_id=?", (call_id,))
+            if self._contract_version == 2:
+                await connection.execute(
+                    "DELETE FROM local_audio_terminal WHERE call_id=?", (call_id,)
+                )
+                await connection.execute("DELETE FROM local_audio_pin WHERE call_id=?", (call_id,))
+                self._audio_pins.pop(UUID(call_id), None)
             collected += 1
         return collected
 
@@ -1679,15 +2016,19 @@ class PersistenceWriter:
                 continue
             aad = operation_aad_from_metadata(
                 dict(
-                    schema_version=1,
+                    schema_version=self._contract_version,
                     kind="turn.upsert",
                     call_id=str(call_id),
                     operation_id=op_id,
                     deployment_id=deployment_id,
                 )
             )
-            operation = decode_operation(
-                self._keyring.decrypt(EncryptedValue(key_version, nonce, ciphertext), aad=aad)
+            plaintext = self._keyring.decrypt(
+                EncryptedValue(key_version, nonce, ciphertext), aad=aad
+            )
+            operation = (
+                decode_operation_v2(plaintext) if self._contract_version == 2
+                else decode_operation(plaintext)
             )
             payload = operation.payload
             if (
@@ -1724,7 +2065,9 @@ class PersistenceWriter:
             loss_count,
         )
 
-    async def _retain_turn(self, operation: VoiceOperationV1, *, truncated: bool) -> bool:
+    async def _retain_turn(
+        self, operation: VoiceOperationV1 | VoiceOperationV2, *, truncated: bool,
+    ) -> bool:
         if await self._read_call_lifecycle(operation.call_id) is None:
             return not self._sparra_active  # Preserve absent-Sparra legacy queue bytes.
         connection = self._require_owner_connection()
@@ -1759,7 +2102,13 @@ class PersistenceWriter:
             and len(json.dumps(retained_map, ensure_ascii=False, allow_nan=False).encode("utf-8"))
             <= 524288
         )
-        encrypted = encrypt_operation(operation, self._keyring).encrypted if fits else None
+        encrypted = None
+        if fits:
+            encrypted = (
+                encrypt_turn_operation_v2(operation, self._keyring).encrypted
+                if isinstance(operation, VoiceOperationV2)
+                else encrypt_operation(operation, self._keyring).encrypted
+            )
         await connection.execute(
             "INSERT INTO sparra_turn_decisions VALUES (?,?,?,?,?,?,?,?,?)",
             (
@@ -1799,9 +2148,392 @@ class PersistenceWriter:
             self._keyring.decrypt(EncryptedValue(row[2], row[3], row[4]), aad=aad)
         )
 
+    async def _frozen_publication_v2(self, call_id: UUID) -> VoiceOperationV2 | None:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT op_id,deployment_id,key_version,nonce,ciphertext "
+            "FROM sparra_publications WHERE call_id=?", (str(call_id),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        aad = operation_aad_from_metadata({"schema_version": 2, "operation_id": row[0],
+            "deployment_id": row[1], "call_id": str(call_id), "kind": "call.upsert"})
+        operation = decode_operation_v2(self._keyring.decrypt(
+            EncryptedValue(row[2], row[3], row[4]), aad=aad
+        ))
+        if (
+            operation.call_id != call_id or str(operation.operation_id) != row[0]
+            or operation.deployment_id != row[1] or operation.kind != "call.upsert"
+        ):
+            raise CommandConflictError("frozen_operation_identity_conflict")
+        return operation
+
+    async def _queue_frozen_publication_v2(self, operation: VoiceOperationV2) -> None:
+        existing = await self._load_operation_by_id(str(operation.operation_id))
+        if existing is not None:
+            if canonical_operation_bytes(existing) != canonical_operation_bytes(operation):
+                raise CommandConflictError("operation_identity_conflict")
+            return
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT key_version,nonce,ciphertext FROM sparra_publications "
+            "WHERE call_id=? AND op_id=?",
+            (str(operation.call_id), str(operation.operation_id)),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            raise CommandSerializationError("invalid_final_call_v2_result")
+        now = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,crypto_version,"
+            "key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,2,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind,
+             str(operation.call_id), CRYPTO_VERSION, row[0], row[1], row[2], now, now),
+        )
+
+    async def _apply_final_call_v2(self, values: Mapping[str, object]) -> object:
+        if self._contract_version != 2:
+            raise CommandSerializationError("writer_contract_mismatch")
+        call_id = self._required_uuid(values, "call_id")
+        generation = self._required_uuid(values, "generation")
+        facts = await self._read_call_lifecycle(call_id)
+        pin = await self._read_audio_pin(call_id)
+        if facts is None or pin is None:
+            return None
+        if (
+            facts.admission_generation != generation or pin.generation != generation
+            or pin.admitted_at != facts.admitted_at or pin.retention_until != facts.retention_until
+        ):
+            return False
+        if await self._content_denied(call_id):
+            return None
+        if values.get("action") == "frozen_read_v2":
+            return await self._frozen_publication_v2(call_id)
+        operation = values.get("operation")
+        if (
+            not isinstance(operation, VoiceOperationV2) or operation.call_id != call_id
+            or operation.kind != "call.upsert"
+            or not isinstance(operation.payload, CallUpsertPayloadV1)
+        ):
+            raise CommandSerializationError("invalid_final_call_v2_command")
+        payload = operation.payload
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT call_control_id,tenant_id,agent_id FROM call_leases WHERE call_id=?",
+            (str(call_id),),
+        )
+        leases = list(await cursor.fetchall())
+        await cursor.close()
+        if (
+            payload.status not in {"closing", "closed", "failed"}
+            or operation.deployment_id != pin.deployment_id
+            or payload.retention_until != facts.retention_until or len(leases) != 1
+            or leases[0][0] != payload.telnyx_call_control_id
+            or leases[0][1] != str(pin.workspace_id)
+            or leases[0][2] != self._process_agent_id
+            or not await self._original_admission_matches(leases[0][0], facts.admitted_at)
+            or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
+            or payload.telnyx_call_session_id != facts.telnyx_call_session_id
+            or operation.occurred_at < facts.admitted_at
+            or payload.started_at is not None and payload.started_at < facts.admitted_at
+            or payload.status != "closing" and payload.ended_at != operation.occurred_at
+        ):
+            return False
+        existing = await self._frozen_publication_v2(call_id)
+        if existing is not None:
+            await self._queue_frozen_publication_v2(existing)
+            return existing
+        retained = await self._retained_call(call_id)
+        changes: dict[str, object] = {"transcript_loss_count": retained.loss_count}
+        result = values.get("message_result")
+        permitted = values.get("result_permitted")
+        if (
+            isinstance(result, MessageResultV1) and not facts.transfer_fenced
+            and (permitted is None or callable(permitted) and permitted())
+        ):
+            callback = values.get("provider_callback")
+            try:
+                validate_result_provenance(result, retained,
+                    callback if isinstance(callback, str) else None)
+                changes["message_result"] = encrypt_message_result(
+                    result, call_id=call_id, keyring=self._keyring,
+                    authenticated_turns={t.turn_id: t.role for t in retained.turns},
+                )
+            except ValueError:
+                return False
+        payload_values = payload.model_dump(mode="python", exclude={"message_result"})
+        payload_values.update(changes)
+        operation = VoiceOperationV2.model_validate({
+            **operation.model_dump(mode="python"),
+            "payload": CallUpsertPayloadV1.model_validate(payload_values),
+        })
+        prepared = encrypt_control_operation_v2(operation, self._keyring)
+        await connection.execute(
+            "INSERT INTO sparra_publications VALUES (?,?,?,?,?,?)",
+            (str(call_id), str(operation.operation_id), operation.deployment_id,
+             prepared.encrypted.key_version, prepared.encrypted.nonce,
+             prepared.encrypted.ciphertext),
+        )
+        await self._merge_lifecycle_operation(operation)
+        await self._queue_frozen_publication_v2(operation)
+        return operation
+
+    async def _read_audio_pin(self, call_id: UUID) -> _AudioPin | None:
+        cursor = await self._require_owner_connection().execute(
+            "SELECT call_id,generation,workspace_id,deployment_id,recording_id,"
+            "configuration_revision,recording_policy,audio_available,admitted_at,"
+            "retention_until,denied_at,choice_state,choice_occurred_at,"
+            "committed_last_sequence,committed_total_samples "
+            "FROM local_audio_pin WHERE call_id=?", (str(call_id),)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        if (
+            row[6] not in {"off", "local_30d"} or row[7] not in (0, 1)
+            or row[11] not in {"undecided", "accepted", "off"}
+        ):
+            raise FatalPersistenceError("audio_pin_invalid")
+        cursor = await self._require_owner_connection().execute(
+            "SELECT agent_id FROM call_leases WHERE call_id=?", (str(call_id),)
+        )
+        lease = await cursor.fetchone()
+        await cursor.close()
+        if (
+            row[3] != self._process_deployment_id
+            or lease is None or lease[0] != self._process_agent_id
+        ):
+            return None
+        facts = await self._read_call_lifecycle(call_id)
+        evidence = None if facts is None else facts.disclosure_evidence
+        gate_opened = (
+            facts is not None and not facts.transfer_fenced
+            and facts.admission_generation == UUID(row[1]) and evidence is not None
+            and evidence.completed_at is not None and evidence.failed_at is None
+            and evidence.input_gate_opened_at is not None
+        )
+        cursor = await self._require_owner_connection().execute(
+            "SELECT 1 FROM local_audio_terminal WHERE call_id=? AND kind='audio.finish'",
+            (str(call_id),),
+        )
+        terminal_finished = await cursor.fetchone() is not None
+        await cursor.close()
+        return _AudioPin(
+            UUID(row[0]), UUID(row[1]), UUID(row[2]), row[3],
+            None if row[4] is None else UUID(row[4]), row[5],
+            cast(Literal["off", "local_30d"], row[6]), row[7] == 1,
+            _parse_datetime(row[8]), _parse_datetime(row[9]),
+            None if row[10] is None else _parse_datetime(row[10]),
+            cast(Literal["undecided", "accepted", "off"], row[11]),
+            None if row[12] is None else _parse_datetime(row[12]), gate_opened, row[13], row[14],
+            terminal_finished,
+        )
+
+    async def _apply_audio_command(self, values: Mapping[str, object]) -> object:
+        if self._contract_version != 2:
+            raise CommandSerializationError("writer_contract_mismatch")
+        connection = self._require_owner_connection()
+        if values.get("action") == "audio_bind":
+            snapshot = values.get("snapshot")
+            generation = values.get("generation")
+            if not isinstance(snapshot, BeginCallSnapshotV2) or not isinstance(generation, UUID):
+                return None
+            facts = await self._read_call_lifecycle(snapshot.call_id)
+            cursor = await connection.execute(
+                "SELECT tenant_id,agent_id,state,call_control_id,created_at "
+                "FROM call_leases WHERE call_id=?",
+                (str(snapshot.call_id),),
+            )
+            leases = list(await cursor.fetchall())
+            await cursor.close()
+            if (
+                facts is None or facts.admission_generation != generation or facts.content_erased
+                or facts.transfer_fenced or snapshot.retention_until != facts.retention_until
+                or facts.retention_until <= self._utcnow()
+                or await self._content_fenced(snapshot.call_id)
+                or len(leases) != 1 or leases[0][0] != str(snapshot.workspace_id)
+                or leases[0][1] != self._process_agent_id
+                or leases[0][2] not in {"pending", "active"}
+            ):
+                return None
+            original_admission = await self._original_admission_matches(
+                leases[0][3], facts.admitted_at
+            )
+            deployment_id = self._process_deployment_id
+            if deployment_id is None:
+                return None
+            bound_pin = _AudioPin(
+                snapshot.call_id, generation, snapshot.workspace_id, deployment_id,
+                snapshot.recording_id, snapshot.configuration_revision, snapshot.recording_policy,
+                snapshot.audio_available, facts.admitted_at, facts.retention_until,
+            )
+            existing_pin = await self._read_audio_pin(snapshot.call_id)
+            if existing_pin is not None:
+                context = replace(existing_pin, denied_at=None, choice_state="undecided",
+                                  choice_occurred_at=None, input_gate_opened=False,
+                                  committed_last_sequence=None, committed_total_samples=0,
+                                  terminal_finished=False)
+                if context != bound_pin:
+                    return None
+                if not original_admission:
+                    # Qualified historical V8 pins migrated with UNKNOWN
+                    # accounting retain only their existing refusal/purge
+                    # obligation. They cannot authorize new chunks or finish.
+                    if (
+                        existing_pin.committed_last_sequence is not None
+                        or existing_pin.committed_total_samples is not None
+                        or _parse_datetime(leases[0][4]) != facts.admitted_at
+                    ):
+                        return None
+                    cursor = await connection.execute(
+                        "SELECT 1 FROM webhook_receipts WHERE event_type='call.initiated' "
+                        "AND call_control_id=? LIMIT 1", (leases[0][3],),
+                    )
+                    receipt_exists = await cursor.fetchone() is not None
+                    await cursor.close()
+                    if receipt_exists:
+                        return None
+                return existing_pin
+            if not original_admission:
+                return None
+            cursor = await connection.execute(
+                "SELECT 1 FROM local_audio_pin WHERE call_id=?", (str(snapshot.call_id),)
+            )
+            incompatible_pin = await cursor.fetchone() is not None
+            await cursor.close()
+            if incompatible_pin:
+                return None
+            await connection.execute(
+                "INSERT INTO local_audio_pin(call_id,generation,workspace_id,deployment_id,"
+                "recording_id,configuration_revision,recording_policy,audio_available,"
+                "admitted_at,retention_until) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (str(bound_pin.call_id), str(bound_pin.generation), str(bound_pin.workspace_id),
+                 bound_pin.deployment_id,
+                 None if bound_pin.recording_id is None else str(bound_pin.recording_id),
+                 bound_pin.revision, bound_pin.policy, int(bound_pin.available),
+                 _iso(bound_pin.admitted_at), _iso(bound_pin.retention_until)),
+            )
+            return bound_pin
+        prepared = values.get("prepared")
+        if not isinstance(prepared, PreparedAudioOperation):
+            raise CommandSerializationError("invalid_audio_command")
+        operation = prepared.operation
+        audio_payload = operation.payload
+        if not isinstance(audio_payload, AudioChunkPayloadV2):
+            raise CommandSerializationError("invalid_audio_command")
+        pin = await self._read_audio_pin(operation.call_id)
+        facts = await self._read_call_lifecycle(operation.call_id)
+        if (
+            pin is None or not self._audio_operation_matches(operation, pin) or facts is None
+            or facts.admission_generation != pin.generation or facts.transfer_fenced
+            or await self._content_denied(operation.call_id)
+        ):
+            raise _AudioChunkRefused("audio_chunk_refused")
+        encrypted = prepared.encrypted
+        if self._keyring.decrypt(encrypted, aad=prepared.aad) != canonical_operation_bytes(
+            operation
+        ):
+            raise CommandSerializationError("invalid_audio_command")
+        existing_operation = await self._load_operation_by_id(str(operation.operation_id))
+        if existing_operation is not None:
+            if canonical_operation_bytes(existing_operation) != prepared.plaintext:
+                raise CommandConflictError("audio_operation_conflict")
+            return None
+        expected_sequence = (
+            0 if pin.committed_last_sequence is None else pin.committed_last_sequence + 1
+        )
+        if pin.committed_total_samples is None:
+            raise _AudioChunkRefused("audio_chunk_refused")
+        total_samples = pin.committed_total_samples + audio_payload.sample_count
+        if audio_payload.sequence != expected_sequence or total_samples > 4_800_000:
+            raise _AudioChunkRefused("audio_chunk_refused")
+        try:
+            await connection.execute(
+                "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,recording_id,"
+                "crypto_version,key_version,nonce,ciphertext,created_at,next_attempt_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(operation.operation_id), operation.deployment_id, operation.kind, 2,
+                 str(operation.call_id), str(audio_payload.recording_id), CRYPTO_VERSION,
+                 encrypted.key_version, encrypted.nonce, encrypted.ciphertext,
+                 _iso(self._utcnow()), _iso(self._utcnow())),
+            )
+        except sqlite3.IntegrityError:
+            existing_operation = await self._load_operation_by_id(str(operation.operation_id))
+            if (
+                existing_operation is None
+                or canonical_operation_bytes(existing_operation) != prepared.plaintext
+            ):
+                raise CommandConflictError("audio_operation_conflict") from None
+            return None
+        await connection.execute(
+            "UPDATE local_audio_pin SET committed_last_sequence=?,committed_total_samples=? "
+            "WHERE call_id=?", (audio_payload.sequence, total_samples, str(operation.call_id)),
+        )
+        return None
+
+    async def _apply_turn_v2_command(self, values: Mapping[str, object]) -> bool:
+        operation = values.get("operation")
+        generation = values.get("generation")
+        truncated = values.get("truncated")
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or operation.kind != "turn.upsert" or not isinstance(generation, UUID)
+            or type(truncated) is not bool
+        ):
+            raise CommandSerializationError("invalid_turn_v2_command")
+        pin = await self._read_audio_pin(operation.call_id)
+        if (
+            not self._turn_v2_matches(operation, generation, pin)
+            or await self._content_denied(operation.call_id)
+        ):
+            return False
+        if not await self._retain_turn(operation, truncated=truncated):
+            return False
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT key_version,nonce,ciphertext FROM sparra_turn_decisions WHERE call_id=? "
+            "AND op_id=? AND ciphertext IS NOT NULL",
+            (str(operation.call_id), str(operation.operation_id)),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None or not isinstance(operation.payload, TurnUpsertPayloadV1):
+            raise CommandSerializationError("invalid_turn_v2_command")
+        previous = await self._load_operation_by_id(str(operation.operation_id))
+        if previous is not None:
+            if canonical_operation_bytes(previous) != canonical_operation_bytes(operation):
+                raise CommandConflictError("operation_identity_conflict")
+            return True
+        now = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,turn_id,"
+            "recording_id,crypto_version,key_version,nonce,ciphertext,created_at,attempts,"
+            "next_attempt_at,last_error_code) VALUES(?,?,?,2,?,?,NULL,?,?,?,?,?,0,?,NULL)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind,
+             str(operation.call_id), str(operation.payload.turn_id), CRYPTO_VERSION,
+             row[0], row[1], row[2], now, now),
+        )
+        return True
+
     async def _apply_content_command(self, values: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
         action = values.get("action")
+        if action in {"freeze_v2", "frozen_read_v2"}:
+            return await self._apply_final_call_v2(values)
+        if action == "turn_v2":
+            return await self._apply_turn_v2_command(values)
+        if action == "audio_terminal":
+            return await self._apply_audio_terminal(values)
+        if action == "audio_choice":
+            return await self._apply_audio_choice(values)
+        if action == "control_v2":
+            return await self._apply_control_v2_command(values)
+        if action in {"audio_bind", "audio_chunk"}:
+            return await self._apply_audio_command(values)
         if action == "recording_head":
             cursor = await connection.execute(
                 "SELECT o.queue_id,o.op_id FROM outbox o "
@@ -2052,6 +2784,11 @@ class PersistenceWriter:
             await connection.execute(
                 "DELETE FROM outbox WHERE call_id=? AND kind!='recording.upsert'", (str(call_id),)
             )
+            if self._contract_version == 2:
+                await connection.execute(
+                    "UPDATE local_audio_pin SET denied_at=COALESCE(denied_at,?) WHERE call_id=?",
+                    (_iso(now), str(call_id)),
+                )
             if facts is not None:
                 await self._store_lifecycle(
                     replace(
@@ -2086,6 +2823,91 @@ class PersistenceWriter:
                 {"facts": facts, "operation": operation},
                 None,
             )
+        )
+
+    async def commit_transfer_observation_v2(
+        self, facts: LocalCallLifecycleFacts, operation: VoiceOperationV2 | None,
+        *, generation: UUID,
+    ) -> None:
+        if self._contract_version != 2 or not isinstance(generation, UUID):
+            raise CommandSerializationError("invalid_phone_observation_v2")
+        await self.commit_control(PersistenceCommand("transfer_observation",
+            {"facts": facts, "operation": operation, "operation_generation": generation}, None))
+
+    async def _validate_phone_fact_v2(
+        self, operation: VoiceOperationV2, generation: UUID,
+        facts: LocalCallLifecycleFacts, receipt: Mapping[str, object] | None = None,
+    ) -> None:
+        payload = operation.payload
+        pin = await self._read_audio_pin(operation.call_id)
+        cursor = await self._require_owner_connection().execute(
+            "SELECT call_control_id,tenant_id,agent_id FROM call_leases WHERE call_id=?",
+            (str(operation.call_id),),
+        )
+        leases = list(await cursor.fetchall())
+        await cursor.close()
+        if (
+            self._contract_version != 2 or not isinstance(payload, CallUpsertPayloadV1)
+            or operation.kind != "call.upsert" or operation.call_id != facts.call_id
+            or generation != facts.admission_generation
+            or payload.retention_until != facts.retention_until
+            or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
+            or payload.telnyx_call_session_id != facts.telnyx_call_session_id
+            or "message_result" in payload.model_fields_set or len(leases) != 1
+            or operation.deployment_id != self._process_deployment_id
+            or leases[0][2] != self._process_agent_id
+            or payload.telnyx_call_control_id != leases[0][0]
+            or operation.occurred_at < facts.admitted_at
+            or pin is not None and (pin.generation != generation
+                or pin.deployment_id != operation.deployment_id
+                or leases[0][1] != str(pin.workspace_id))
+        ):
+            raise CommandConflictError("phone_fact_identity_conflict")
+        if receipt is None:
+            valid = (
+                payload.status == "closing" and facts.transfer_command_id is not None
+                and facts.target_call_control_id is not None
+                and facts.target_call_leg_id is not None
+                and facts.qualified_line_bridged_at == operation.occurred_at
+                and operation.operation_id == uuid5(operation.call_id, "qualified-line-bridge")
+            )
+        else:
+            valid = (
+                payload.status in {"closed", "failed"}
+                and receipt.get("event_type") == "call.hangup"
+                and receipt.get("call_control_id") == payload.telnyx_call_control_id
+                and receipt.get("occurred_at") == operation.occurred_at
+                and receipt.get("call_leg_id") == facts.telnyx_call_leg_id
+                and receipt.get("call_session_id") == facts.telnyx_call_session_id
+                and isinstance(receipt.get("event_id"), str)
+                and operation.operation_id == uuid5(operation.call_id, str(receipt["event_id"]))
+                and payload.ended_at == operation.occurred_at
+            )
+        if not valid:
+            raise CommandConflictError("phone_fact_observation_conflict")
+
+    async def _insert_phone_fact_v2(self, operation: VoiceOperationV2) -> None:
+        if await self._content_denied(operation.call_id) or await self._read_audio_pin(
+            operation.call_id
+        ) is None:
+            return
+        prepared = encrypt_control_operation_v2(operation, self._keyring)
+        decode_operation_v2(prepared.plaintext)
+        existing = await self._load_operation_by_id(str(operation.operation_id))
+        if existing is not None:
+            if canonical_operation_bytes(existing) != prepared.plaintext:
+                raise CommandConflictError("operation_identity_conflict")
+            return
+        await self._merge_lifecycle_operation(operation)
+        encrypted = prepared.encrypted
+        now = _iso(self._utcnow())
+        await self._require_owner_connection().execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,crypto_version,"
+            "key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,2,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind,
+             str(operation.call_id), CRYPTO_VERSION, encrypted.key_version, encrypted.nonce,
+             encrypted.ciphertext, now, now),
         )
 
     async def _read_call_lifecycle(self, call_id: object) -> LocalCallLifecycleFacts | None:
@@ -2131,6 +2953,20 @@ class PersistenceWriter:
             )
         return LocalCallLifecycleFacts(**values)
 
+    async def _original_admission_matches(
+        self, call_control_id: str, admitted_at: datetime
+    ) -> bool:
+        # The signed provider occurrence anchors the business timeline. Lease
+        # creation and webhook reception are later local-clock observations.
+        cursor = await self._require_owner_connection().execute(
+            "SELECT 1 FROM webhook_receipts WHERE event_type='call.initiated' "
+            "AND call_control_id=? AND occurred_at=? LIMIT 1",
+            (call_control_id, _iso(admitted_at)),
+        )
+        matched = await cursor.fetchone() is not None
+        await cursor.close()
+        return matched
+
     async def _store_lifecycle(self, facts: LocalCallLifecycleFacts) -> None:
         if await self._content_fenced(facts.call_id):
             facts = replace(facts, disclosure_evidence=None, content_erased=True)
@@ -2151,7 +2987,212 @@ class PersistenceWriter:
             (json.dumps(values, sort_keys=True, separators=(",", ":")), str(facts.call_id)),
         )
 
-    async def _merge_lifecycle_operation(self, operation: VoiceOperationV1) -> None:
+    async def _apply_audio_terminal(self, values: Mapping[str, object]) -> bool:
+        operation = values.get("operation")
+        generation = values.get("generation")
+        if (
+            self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
+            or not isinstance(generation, UUID)
+            or not isinstance(operation.payload, (AudioFinishPayloadV2, AudioRevokePayloadV2))
+        ):
+            return False
+        payload = operation.payload
+        pin = await self._read_audio_pin(operation.call_id)
+        facts = await self._read_call_lifecycle(operation.call_id)
+        if (
+            pin is None or facts is None or pin.generation != generation
+            or facts.admission_generation != generation
+            or operation.deployment_id != pin.deployment_id
+            or payload.workspace_id != pin.workspace_id or payload.recording_id != pin.recording_id
+            or payload.configuration_revision != pin.revision
+            or payload.retention_until != pin.retention_until
+            or facts.retention_until != pin.retention_until
+        ):
+            return False
+        connection = self._require_owner_connection()
+        plaintext = canonical_operation_bytes(operation)
+        fingerprint = hashlib.sha256(plaintext).digest()
+        cursor = await connection.execute(
+            "SELECT op_id,fingerprint,key_version,nonce,ciphertext,acked FROM local_audio_terminal "
+            "WHERE call_id=? AND kind=?", (str(operation.call_id), operation.kind),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            if existing[0] != str(operation.operation_id) or existing[1] != fingerprint:
+                return False
+            encrypted = EncryptedValue(existing[2], existing[3], existing[4])
+            if self._keyring.decrypt(encrypted, aad=operation_aad(operation)) != plaintext:
+                raise FatalPersistenceError("audio_terminal_invalid")
+            if existing[5] == 1:
+                return True
+        else:
+            if isinstance(payload, AudioFinishPayloadV2) and (
+                pin.committed_total_samples is None or pin.denied
+                or pin.retention_until <= self._utcnow()
+                or facts.content_erased
+                or payload.last_sequence != pin.committed_last_sequence
+                or payload.total_samples != pin.committed_total_samples
+            ):
+                return False
+            if await self._load_operation_by_id(str(operation.operation_id)) is not None:
+                return False
+            prepared = encrypt_audio_operation(operation, self._keyring)
+            encrypted = prepared.encrypted
+            await connection.execute(
+                "INSERT INTO local_audio_terminal(call_id,kind,op_id,deployment_id,fingerprint,"
+                "key_version,nonce,ciphertext) VALUES(?,?,?,?,?,?,?,?)",
+                (str(operation.call_id), operation.kind, str(operation.operation_id),
+                 operation.deployment_id, fingerprint, encrypted.key_version, encrypted.nonce,
+                 encrypted.ciphertext),
+            )
+        if isinstance(payload, AudioRevokePayloadV2):
+            await connection.execute(
+                "UPDATE local_audio_pin SET choice_state='off',denied_at=COALESCE(denied_at,?) "
+                "WHERE call_id=?", (_iso(self._utcnow()), str(operation.call_id)),
+            )
+            await connection.execute(
+                "DELETE FROM outbox WHERE call_id=? AND kind IN ('audio.chunk','audio.finish')",
+                (str(operation.call_id),),
+            )
+        existing_outbox = await self._load_operation_by_id(str(operation.operation_id))
+        if existing_outbox is not None:
+            if canonical_operation_bytes(existing_outbox) != plaintext:
+                raise CommandConflictError("audio_terminal_conflict")
+            return True
+        now = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,recording_id,"
+            "crypto_version,key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind, 2,
+             str(operation.call_id), str(payload.recording_id), CRYPTO_VERSION,
+             encrypted.key_version,
+             encrypted.nonce, encrypted.ciphertext, now, now),
+        )
+        return True
+
+    async def _apply_audio_choice(self, values: Mapping[str, object]) -> AudioChoiceFacts | None:
+        call_id = self._required_uuid(values, "call_id")
+        generation = values.get("generation")
+        choice = values.get("choice")
+        if self._contract_version != 2 or not isinstance(generation, UUID):
+            return None
+        pin = await self._read_audio_pin(call_id)
+        facts = await self._read_call_lifecycle(call_id)
+        if (
+            pin is None or facts is None or pin.generation != generation
+            or facts.admission_generation != generation
+            or pin.admitted_at != facts.admitted_at or pin.retention_until != facts.retention_until
+            or await self._content_fenced(call_id)
+        ):
+            return None
+        now = self._utcnow()
+        connection = self._require_owner_connection()
+        if choice == "off":
+            await connection.execute(
+                "UPDATE local_audio_pin SET choice_state='off',denied_at=COALESCE(denied_at,?) "
+                "WHERE call_id=?", (_iso(now), str(call_id)),
+            )
+        elif choice == "accept":
+            occurred_at = values.get("occurred_at")
+            if (
+                pin.denied or pin.choice_state == "off" or not pin.available
+                or pin.policy != "local_30d" or pin.retention_until <= now or facts.transfer_fenced
+                or not isinstance(occurred_at, datetime) or occurred_at.tzinfo is None
+                or occurred_at.utcoffset() is None
+            ):
+                return None
+            occurred_at = occurred_at.astimezone(UTC)
+            if pin.choice_state == "accepted":
+                if occurred_at != pin.choice_occurred_at:
+                    return None
+            else:
+                evidence = facts.disclosure_evidence
+                if (
+                    evidence is None or evidence.completed_at is None
+                    or evidence.failed_at is not None
+                    or evidence.input_gate_opened_at is not None
+                    or not evidence.completed_at <= occurred_at <= now
+                    or now >= evidence.completed_at + timedelta(seconds=5)
+                ):
+                    return None
+                await connection.execute(
+                    "UPDATE local_audio_pin SET choice_state='accepted',choice_occurred_at=? "
+                    "WHERE call_id=?", (_iso(occurred_at), str(call_id)),
+                )
+        else:
+            return None
+        committed_pin = await self._read_audio_pin(call_id)
+        if committed_pin is None:
+            raise FatalPersistenceError("audio_pin_invalid")
+        return AudioChoiceFacts(call_id, generation, committed_pin.choice_state,
+                                committed_pin.choice_occurred_at, committed_pin.denied_at)
+
+    async def _apply_control_v2_command(self, values: Mapping[str, object]) -> bool:
+        prepared = values.get("prepared")
+        generation = values.get("generation")
+        if (
+            self._contract_version != 2 or not isinstance(prepared, PreparedControlOperationV2)
+            or not isinstance(generation, UUID)
+        ):
+            raise CommandSerializationError("invalid_control_v2_command")
+        operation = prepared.operation
+        payload = operation.payload
+        if operation.kind != "call.upsert" or not isinstance(payload, CallUpsertPayloadV1):
+            raise CommandSerializationError("invalid_control_v2_command")
+        facts = await self._read_call_lifecycle(operation.call_id)
+        pin = await self._read_audio_pin(operation.call_id)
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT call_control_id,tenant_id,agent_id FROM call_leases WHERE call_id=?",
+            (str(operation.call_id),),
+        )
+        leases = list(await cursor.fetchall())
+        await cursor.close()
+        if (
+            facts is None or pin is None or facts.admission_generation != generation
+            or pin.generation != generation or pin.admitted_at != facts.admitted_at
+            or pin.retention_until != facts.retention_until
+            or payload.retention_until != facts.retention_until
+            or facts.retention_until <= self._utcnow() or facts.transfer_fenced
+            or await self._content_denied(operation.call_id)
+            or operation.deployment_id != pin.deployment_id or len(leases) != 1
+            or leases[0][0] != payload.telnyx_call_control_id
+            or leases[0][1] != str(pin.workspace_id)
+            or leases[0][2] != self._process_agent_id
+            or not await self._original_admission_matches(leases[0][0], facts.admitted_at)
+            or payload.telnyx_call_leg_id != facts.telnyx_call_leg_id
+            or payload.telnyx_call_session_id != facts.telnyx_call_session_id
+        ):
+            return False
+        if (
+            prepared.aad != operation_aad(operation)
+            or prepared.plaintext != canonical_operation_bytes(operation)
+            or self._keyring.decrypt(prepared.encrypted, aad=prepared.aad) != prepared.plaintext
+        ):
+            raise CommandSerializationError("invalid_control_v2_command")
+        existing = await self._load_operation_by_id(str(operation.operation_id))
+        if existing is not None:
+            if canonical_operation_bytes(existing) != prepared.plaintext:
+                raise CommandConflictError("operation_identity_conflict")
+            return True
+        await self._merge_lifecycle_operation(operation)
+        encrypted = prepared.encrypted
+        created = _iso(self._utcnow())
+        await connection.execute(
+            "INSERT INTO outbox(op_id,deployment_id,kind,schema_version,call_id,crypto_version,"
+            "key_version,nonce,ciphertext,created_at,next_attempt_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (str(operation.operation_id), operation.deployment_id, operation.kind, 2,
+             str(operation.call_id), CRYPTO_VERSION, encrypted.key_version, encrypted.nonce,
+             encrypted.ciphertext, created, created),
+        )
+        return True
+
+    async def _merge_lifecycle_operation(
+        self, operation: VoiceOperationV1 | VoiceOperationV2
+    ) -> None:
         facts = await self._read_call_lifecycle(operation.call_id)
         if facts is None or not isinstance(operation.payload, CallUpsertPayloadV1):
             return
@@ -2200,6 +3241,18 @@ class PersistenceWriter:
         current = await self._read_call_lifecycle(facts.call_id)
         if current is None or current.admitted_at != facts.admitted_at:
             raise CommandConflictError("transfer_admission_missing")
+        operation = payload.get("operation")
+        generation = payload.get("operation_generation")
+        if self._contract_version == 2:
+            # Intent commands have no publication; observations carry the original generation.
+            if generation is not None and (
+                not isinstance(generation, UUID) or generation != current.admission_generation
+            ):
+                raise CommandConflictError("phone_fact_identity_conflict")
+            if operation is not None and (
+                not isinstance(operation, VoiceOperationV2) or not isinstance(generation, UUID)
+            ):
+                raise CommandSerializationError("invalid_phone_observation_v2")
         if current.admission_generation is not None and (
             facts.admission_generation not in {None, current.admission_generation}
             or facts.transfer_generation not in {None, current.admission_generation}
@@ -2225,6 +3278,13 @@ class PersistenceWriter:
                     raise CommandConflictError("transfer_observation_conflict")
                 # Older in-flight observations may omit newer durable facts.
                 facts = replace(facts, **{name: old})
+        if isinstance(operation, VoiceOperationV2):
+            if not isinstance(generation, UUID):
+                raise CommandSerializationError("invalid_phone_observation_v2")
+            await self._validate_phone_fact_v2(
+                operation, generation,
+                replace(facts, admission_generation=current.admission_generation),
+            )
         await self._store_lifecycle(
             replace(
                 facts,
@@ -2241,11 +3301,16 @@ class PersistenceWriter:
                 or facts.content_departed_generation,
             )
         )
-        operation = payload.get("operation")
         if operation is not None:
-            if not isinstance(operation, VoiceOperationV1) or operation.call_id != facts.call_id:
-                raise CommandSerializationError("transfer_operation_invalid")
-            await self._insert_outbox(operation)
+            if isinstance(operation, VoiceOperationV2):
+                await self._insert_phone_fact_v2(operation)
+            else:
+                if (
+                    not isinstance(operation, VoiceOperationV1)
+                    or operation.call_id != facts.call_id
+                ):
+                    raise CommandSerializationError("transfer_operation_invalid")
+                await self._insert_outbox(operation)
 
     async def drain(self, timeout_seconds: float) -> None:
         if timeout_seconds <= 0:
@@ -2311,8 +3376,18 @@ class PersistenceWriter:
                 ):
                     raise FatalPersistenceError("queue_oldest_age_exceeded")
 
-                should_stop, command_result = await self._process_command(current_command)
-                self._resolve_success(current_command, command_result)
+                try:
+                    should_stop, command_result = await self._process_command(current_command)
+                except _AudioChunkRefused:
+                    # The owner confirmed rollback; no content was admitted.
+                    result = current_command.payload.get("result")
+                    if not isinstance(result, asyncio.Future):
+                        raise CommandSerializationError("invalid_audio_command") from None
+                    if not result.done():
+                        result.set_exception(PersistenceError("audio_chunk_refused"))
+                    should_stop = False
+                else:
+                    self._resolve_success(current_command, command_result)
                 if should_stop:
                     self._queue.task_done()
                     current_owned = False
@@ -2388,6 +3463,15 @@ class PersistenceWriter:
         return self._connection
 
     async def _initialize_owner_connection(self) -> None:
+        if self._contract_version == 2:
+            await self._initialize_audio_owner_connection()
+            return
+        if (
+            self._pragma_int(await self._pragma_scalar("user_version"))
+            in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION,
+                LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION}
+        ):
+            raise FatalPersistenceError("writer_contract_mismatch")
         connection = self._require_owner_connection()
         cursor = await connection.execute("PRAGMA journal_mode=DELETE")
         journal_row = await cursor.fetchone()
@@ -2469,6 +3553,83 @@ class PersistenceWriter:
             "secure_delete": 1,
         }:
             raise FatalPersistenceError("sqlite_pragma_mismatch")
+
+    async def _initialize_audio_owner_connection(self) -> None:
+        connection = self._require_owner_connection()
+        version = self._pragma_int(await self._pragma_scalar("user_version"))
+        schema = await self._application_schema_objects()
+        if schema:
+            expected = {
+                LOCAL_AUDIO_SCHEMA_VERSION: _EXPECTED_AUDIO_SCHEMA_OBJECTS,
+                LOCAL_AUDIO_CHOICE_SCHEMA_VERSION: _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS,
+                LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION: _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS,
+            }.get(version)
+            if (
+                expected is None or schema != expected
+            ):
+                raise FatalPersistenceError("writer_contract_mismatch")
+            cursor = await connection.execute(
+                "SELECT singleton,contract_version FROM local_audio_contract"
+            )
+            marker = list(await cursor.fetchall())
+            await cursor.close()
+            cursor = await connection.execute("SELECT count(*) FROM outbox WHERE schema_version!=2")
+            legacy = await cursor.fetchone()
+            await cursor.close()
+            if marker != [(1, 2)] or legacy != (0,):
+                raise FatalPersistenceError("writer_contract_mismatch")
+            if version != LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    if version == LOCAL_AUDIO_SCHEMA_VERSION:
+                        for statement in LOCAL_AUDIO_CHOICE_MIGRATION_SQL.split(";"):
+                            if statement.strip():
+                                await connection.execute(statement)
+                        await self._call_failpoint("after_audio_choice_migration_before_commit")
+                    for statement in LOCAL_AUDIO_TERMINAL_MIGRATION_SQL.split(";"):
+                        if statement.strip():
+                            await connection.execute(statement)
+                    await self._call_failpoint("after_audio_terminal_migration_before_commit")
+                    self._check_storage_limit()
+                    await connection.commit()
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await connection.rollback()
+                    raise
+        elif version != 0:
+            raise FatalPersistenceError("sqlite_schema_mismatch")
+        # Contract and provenance are checked before any persistent PRAGMA or recovery write.
+        cursor = await connection.execute("PRAGMA journal_mode=DELETE")
+        journal = await cursor.fetchone()
+        await cursor.close()
+        await connection.execute("PRAGMA synchronous=EXTRA")
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("PRAGMA secure_delete=ON")
+        if not schema:
+            try:
+                await connection.executescript(
+                    "BEGIN IMMEDIATE;\n" + LOCAL_AUDIO_TERMINAL_SCHEMA_SQL + "\nCOMMIT;"
+                )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await connection.rollback()
+                raise
+        if (
+            self._pragma_int(await self._pragma_scalar("user_version"))
+            != LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION
+            or await self._application_schema_objects() != _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS
+        ):
+            raise FatalPersistenceError("sqlite_schema_mismatch")
+        self.pragma_state = {
+            "journal_mode": str(journal[0]).lower() if journal else "",
+            "synchronous": self._pragma_int(await self._pragma_scalar("synchronous")),
+            "foreign_keys": self._pragma_int(await self._pragma_scalar("foreign_keys")),
+            "secure_delete": self._pragma_int(await self._pragma_scalar("secure_delete")),
+        }
+        if self.pragma_state != {"journal_mode": "delete", "synchronous": 3,
+                                 "foreign_keys": 1, "secure_delete": 1}:
+            raise FatalPersistenceError("sqlite_pragma_mismatch")
+        self._audio_page_size = self._pragma_int(await self._pragma_scalar("page_size"))
 
     async def _application_schema_objects(self) -> dict[tuple[str, str], str]:
         connection = self._require_owner_connection()
@@ -2564,6 +3725,8 @@ class PersistenceWriter:
         try:
             command_result: object | None = None
             if command.kind == "outbox":
+                if self._contract_version != 1:
+                    raise CommandSerializationError("writer_contract_mismatch")
                 await self._insert_outbox(
                     require_operation(command.payload),
                     truncated=command.payload.get("truncated") is True,
@@ -2640,6 +3803,39 @@ class PersistenceWriter:
                 return False, None
             self._check_storage_limit()
             await connection.commit()
+            if self._contract_version == 2 and command.kind == "sparra_content":
+                action = command.payload.get("action")
+                if action == "audio_choice" and isinstance(command_result, AudioChoiceFacts):
+                    refreshed = await self._read_audio_pin(command_result.call_id)
+                    if refreshed is not None:
+                        self._audio_pins[refreshed.call_id] = refreshed
+                elif action == "control_v2" and command_result is True:
+                    prepared = command.payload.get("prepared")
+                    if isinstance(prepared, PreparedControlOperationV2):
+                        refreshed = await self._read_audio_pin(prepared.operation.call_id)
+                        if refreshed is not None:
+                            self._audio_pins[refreshed.call_id] = refreshed
+                elif action == "audio_chunk":
+                    audio_prepared = command.payload.get("prepared")
+                    if isinstance(audio_prepared, PreparedAudioOperation):
+                        refreshed = await self._read_audio_pin(audio_prepared.operation.call_id)
+                        if refreshed is not None:
+                            self._audio_pins[refreshed.call_id] = refreshed
+                elif action == "audio_terminal" and command_result is True:
+                    audio_terminal = command.payload.get("operation")
+                    if isinstance(audio_terminal, VoiceOperationV2):
+                        refreshed = await self._read_audio_pin(audio_terminal.call_id)
+                        if refreshed is not None:
+                            self._audio_pins[refreshed.call_id] = refreshed
+            if (
+                self._contract_version == 2 and command.kind == "sparra_content"
+                and command.payload.get("action") == "erase"
+            ):
+                self._audio_pins.pop(self._required_uuid(command.payload, "call_id"), None)
+        except _AudioChunkRefused:
+            # Failed rollback remains a genuine fatal owner failure.
+            await connection.rollback()
+            raise
         except BaseException:
             rolled_back = False
             try:
@@ -2723,6 +3919,8 @@ class PersistenceWriter:
         return "conflict"
 
     async def _insert_outbox(self, operation: VoiceOperationV1, *, truncated: bool = False) -> None:
+        if self._contract_version != 1:
+            raise CommandSerializationError("writer_contract_mismatch")
         connection = self._require_owner_connection()
         if operation.kind != "recording.upsert" and await self._content_denied(operation.call_id):
             return
@@ -2790,7 +3988,9 @@ class PersistenceWriter:
             ):
                 raise CommandConflictError("operation_identity_conflict") from None
 
-    async def _load_operation_by_id(self, operation_id: str) -> VoiceOperationV1 | None:
+    async def _load_operation_by_id(
+        self, operation_id: str
+    ) -> VoiceOperationV1 | VoiceOperationV2 | None:
         connection = self._require_owner_connection()
         cursor = await connection.execute(
             """
@@ -2804,6 +4004,8 @@ class PersistenceWriter:
         await cursor.close()
         if row is None:
             return None
+        if row[0] != self._contract_version:
+            raise FatalPersistenceError("writer_contract_mismatch")
         metadata = {
             "schema_version": row[0],
             "operation_id": row[1],
@@ -2815,6 +4017,11 @@ class PersistenceWriter:
             EncryptedValue(key_version=row[5], nonce=row[6], ciphertext=row[7]),
             aad=operation_aad_from_metadata(metadata),
         )
+        return self._decode_fixed_operation(plaintext)
+
+    def _decode_fixed_operation(self, plaintext: bytes) -> VoiceOperationV1 | VoiceOperationV2:
+        if self._contract_version == 2:
+            return decode_operation_v2(plaintext)
         return decode_operation(plaintext)
 
     async def _apply_webhook_effect(self, payload: Mapping[str, object]) -> WebhookCommitValue:
@@ -2822,6 +4029,23 @@ class PersistenceWriter:
         if not isinstance(receipt, Mapping):
             raise CommandSerializationError("invalid_webhook_receipt")
         normalized_receipt = self._normalized_receipt(receipt)
+        operation = payload.get("operation")
+        generation = payload.get("operation_generation")
+        if generation is not None:
+            if not isinstance(generation, UUID):
+                raise CommandSerializationError("invalid_phone_effect_v2")
+            if isinstance(operation, VoiceOperationV2):
+                facts = await self._read_call_lifecycle(operation.call_id)
+                if facts is None:
+                    raise CommandConflictError("phone_fact_identity_conflict")
+                await self._validate_phone_fact_v2(operation, generation, facts, receipt)
+            else:
+                lease = payload.get("lease")
+                if not isinstance(lease, Mapping):
+                    raise CommandSerializationError("invalid_phone_effect_v2")
+                facts = await self._read_call_lifecycle(lease.get("call_id"))
+                if facts is None or facts.admission_generation != generation:
+                    raise CommandConflictError("phone_fact_identity_conflict")
         legacy_fingerprint = payload.get("legacy_v1_semantic_fingerprint_sha256")
         if legacy_fingerprint is not None and (
             type(legacy_fingerprint) is not bytes or len(legacy_fingerprint) != 32
@@ -2847,7 +4071,7 @@ class PersistenceWriter:
             existing_state = await self._qualification_admitted_identity(lease)
             if existing_state is not None:
                 await self._apply_admission_facts(
-                    lease, payload.get("operation"), payload.get("admission_facts")
+                    lease, payload.get("operation"), payload.get("admission_facts"), receipt
                 )
                 await self._insert_new_receipt(normalized_receipt)
                 return WebhookCommitResult(
@@ -2860,7 +4084,6 @@ class PersistenceWriter:
             )
         await self._insert_new_receipt(normalized_receipt)
         lease = payload.get("lease")
-        operation = payload.get("operation")
         if lease is not None:
             if not isinstance(lease, Mapping):
                 raise CommandSerializationError("invalid_lease_command")
@@ -2868,23 +4091,38 @@ class PersistenceWriter:
                 await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
                 return WebhookCommitResult("first", "existing_terminal")
             await self._apply_lease(lease)
-            await self._apply_admission_facts(lease, operation, payload.get("admission_facts"))
+            await self._apply_admission_facts(
+                lease, operation, payload.get("admission_facts"), receipt
+            )
         await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
         if operation is not None:
-            if not isinstance(operation, VoiceOperationV1):
-                raise CommandSerializationError("invalid_outbox_command")
-            await self._insert_outbox(operation)
+            if isinstance(operation, VoiceOperationV2):
+                await self._insert_phone_fact_v2(operation)
+            else:
+                if not isinstance(operation, VoiceOperationV1):
+                    raise CommandSerializationError("invalid_outbox_command")
+                await self._insert_outbox(operation)
         return WebhookCommitResult("first", "applied", exhausted)
 
     async def _apply_admission_facts(
-        self, lease: Mapping[str, object], operation: object, admission: object
+        self, lease: Mapping[str, object], operation: object, admission: object,
+        receipt: Mapping[str, object],
     ) -> None:
         if admission is not None:
             if not isinstance(
                 admission, LocalCallAdmissionFacts
             ) or admission.call_id != lease.get("call_id"):
                 raise CommandConflictError("local_admission_identity_conflict")
-            if (
+            if self._contract_version == 2 and operation is None:
+                if (
+                    admission.admission_generation is None
+                    or receipt.get("event_type") != "call.initiated"
+                    or receipt.get("call_control_id") != lease.get("call_control_id")
+                    or admission.admitted_at != receipt.get("occurred_at")
+                    or admission.retention_until != admission.admitted_at + timedelta(days=30)
+                ):
+                    raise CommandConflictError("local_admission_identity_conflict")
+            elif (
                 not isinstance(operation, VoiceOperationV1)
                 or not isinstance(operation.payload, CallUpsertPayloadV1)
                 or operation.call_id != admission.call_id
@@ -2912,6 +4150,7 @@ class PersistenceWriter:
                 raise CommandConflictError("local_admission_identity_conflict")
             if existing is None:
                 await self._store_lifecycle(facts)
+
 
     async def _record_original_end(
         self,
@@ -3347,6 +4586,8 @@ class PersistenceWriter:
         now_iso = _iso(now)
         for row in rows:
             deployment_id = row[2]
+            if row[4] != self._contract_version:
+                raise FatalPersistenceError("writer_contract_mismatch")
             if deployment_id in blocked_deployments:
                 continue
             if row[11] > now_iso:
@@ -3366,7 +4607,7 @@ class PersistenceWriter:
             selected.append(
                 OutboxItem(
                     queue_id=row[0],
-                    operation=decode_operation(plaintext),
+                    operation=self._decode_fixed_operation(plaintext),
                     created_at=_parse_datetime(row[9]),
                     claim_attempt=row[10] + 1,
                     next_attempt_at=_parse_datetime(row[11]),
@@ -3500,6 +4741,10 @@ class PersistenceWriter:
             applied = cursor.rowcount == 1
             await cursor.close()
             if applied and delivered is not None:
+                if self._contract_version == 2:
+                    await connection.execute(
+                        "UPDATE local_audio_terminal SET acked=1 WHERE op_id=?", (delivered[0],)
+                    )
                 # This exact claim is ACKed only after the relay's native sink
                 # ingest returned a known success. Local archive COMMIT alone
                 # never reaches this path, and ambiguous native COMMIT does not ACK.
@@ -3617,7 +4862,9 @@ class PersistenceWriter:
             command.committed.set_exception(error)
 
     def _count_lost_command(self, command: PersistenceCommand) -> None:
-        if command.kind == "outbox":
+        if command.kind == "outbox" or (
+            command.kind == "sparra_content" and command.payload.get("action") == "turn_v2"
+        ):
             self.transcript_loss_count += 1
 
     def _fail_pending(self, error: FatalPersistenceError) -> None:

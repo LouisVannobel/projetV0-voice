@@ -58,13 +58,15 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.audio_capture import BoundedAudioBufferTap
+from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.inference.completion_strategy import (
     STT_USER_TURN_WATCHDOG_SECONDS,
     CompletionAwareTurnStopStrategy,
 )
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
-from projetv0_voice.telnyx.frames import TelnyxMarkFrame
+from projetv0_voice.telnyx.frames import TelnyxInputDTMFFrame, TelnyxMarkFrame
 
 
 class FirstFailure:
@@ -270,6 +272,8 @@ class GateController(Protocol):
 
     async def mark_forwarded(self) -> None: ...
 
+    async def accept_dtmf(self, frame: TelnyxInputDTMFFrame) -> bool: ...
+
 
 @dataclass(slots=True)
 class _EndCallAttempt:
@@ -433,6 +437,11 @@ def build_input_gate(
                 if isinstance(frame, (CancelFrame, ErrorFrame)) and end_call_playback is not None:
                     end_call_playback.invalidate()
                 return True
+            if (
+                isinstance(frame, TelnyxInputDTMFFrame) and hasattr(controller, "accept_dtmf")
+                and await controller.accept_dtmf(frame)
+            ):
+                return False
             if isinstance(frame, InputTransportMessageFrame):
                 message = frame.message
                 if not isinstance(message, dict):
@@ -827,11 +836,11 @@ class PipelineTurnRecorder(Protocol):
 
 
 SPARRA_DISCLOSURE = (
-    "Bonjour. Je suis un assistant vocal automatisé. Je peux prendre un message pour "
+    "Bonjour. Je suis un assistant vocal IA. Je peux prendre un message pour "
     "l'établissement. L'audio n'est pas enregistré ; le texte est conservé trente jours."
 )
 SPARRA_RECORDING_DISCLOSURE = (
-    "Bonjour. Je suis un assistant vocal automatisé. Je peux prendre un message pour "
+    "Bonjour. Je suis un assistant vocal IA. Je peux prendre un message pour "
     "l'établissement. L'audio est conservé trente jours en France ; Telnyx le traite "
     "temporairement. Le texte est conservé trente jours."
 )
@@ -875,7 +884,8 @@ def build_pipeline(
     controller: GateController,
     turn_recorder: PipelineTurnRecorder,
     first_failure: FirstFailure,
-    begin_snapshot: BeginCallSnapshotV1 | None = None,
+    begin_snapshot: BeginCallSnapshotV1 | BeginCallSnapshotV2 | None = None,
+    capture_tap: BoundedAudioBufferTap | None = None,
     transfer_handler: FunctionCallHandler | None = None,
     end_call_handler: FunctionCallHandler | None = None,
     end_call_playback: EndCallPlayback | None = None,
@@ -1109,6 +1119,7 @@ def build_pipeline(
             services.tts,
             barrier,
             output,
+            *([capture_tap] if capture_tap is not None else []),
             assistant_aggregator,
         ],
         first_failure=first_failure,

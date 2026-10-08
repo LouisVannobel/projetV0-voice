@@ -981,6 +981,7 @@ def _enrichment_operation(
     base = effect.operation
     if (
         base is None
+        or not isinstance(base, VoiceOperationV1)
         or base.kind != "recording.upsert"
         or not isinstance(base.payload, RecordingUpsertPayloadV1)
         or base.payload.status != "saved"

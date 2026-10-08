@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, cast
@@ -14,6 +15,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from pydantic import ValidationError
 
+from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     RoutingV1,
@@ -21,11 +23,14 @@ from projetv0_voice.models import (
     is_valid_provider_recording_id,
     validate_deployment_id,
 )
+from projetv0_voice.persistence.commands import canonical_operation_bytes
 
 INGEST_SQL = "SELECT voice.ingest_operation_v1(%s::jsonb)"
+INGEST_V2_SQL = "SELECT voice.ingest_operation_v2(%s::jsonb)"
 LEASE_PURGES_SQL = "SELECT * FROM voice.lease_recording_purge_v1(%s,%s,%s)"
 ACK_PURGE_SQL = "SELECT voice.ack_recording_purge_v1(%s,%s,%s,%s)"
 BEGIN_CALL_SQL = "SELECT voice.begin_call_v1(%s,%s,%s::jsonb)"
+BEGIN_CALL_V2_SQL = "SELECT voice.begin_call_v2(%s,%s,%s::jsonb)"
 LEASE_CALL_ERASURES_SQL = "SELECT * FROM voice.lease_call_erasure_v1(%s,%s,%s)"
 ACK_CALL_ERASURE_SQL = "SELECT voice.ack_call_erasure_v1(%s,%s,%s)"
 
@@ -166,6 +171,12 @@ class _LeaseCallResult:
 @dataclass(frozen=True, slots=True)
 class _BeginCallResult:
     snapshot: BeginCallSnapshotV1 | None = field(repr=False)
+    failure: _SafeFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class _BeginCallV2Result:
+    snapshot: BeginCallSnapshotV2 | None = field(repr=False)
     failure: _SafeFailure | None
 
 
@@ -330,6 +341,14 @@ class PsycopgOperationSink:
             del self, operation
             _raise_safe_failure(failure)
 
+    async def ingest_v2(self, operation: VoiceOperationV2) -> None:
+        if not isinstance(operation, VoiceOperationV2):
+            raise ValueError("operation must be VoiceOperationV2")
+        failure = await self._ingest_v2_result(operation)
+        if failure is not None:
+            del self, operation
+            _raise_safe_failure(failure)
+
     async def begin_call(
         self, deployment_id: str, call_id: UUID, routing: RoutingV1
     ) -> BeginCallSnapshotV1:
@@ -369,6 +388,53 @@ class PsycopgOperationSink:
             map_purge_ack_sqlstates=False,
         )
         return _BeginCallResult(
+            snapshot=None if failure is not None else snapshots[0], failure=failure
+        )
+
+    async def begin_call_v2(
+        self, deployment_id: str, call_id: UUID, routing: RoutingV1
+    ) -> BeginCallSnapshotV2:
+        validate_deployment_id(deployment_id)
+        if not isinstance(call_id, UUID) or not isinstance(routing, RoutingV1):
+            raise ValueError("call identity and routing must be typed")
+        result = await self._begin_call_v2_result(deployment_id, call_id, routing)
+        if result.failure is not None:
+            failure = result.failure
+            del result, self, deployment_id, call_id, routing
+            _raise_safe_failure(failure)
+        if result.snapshot is None:
+            raise OperationSinkContractError("begin_call_v2_result_invalid")
+        return result.snapshot
+
+    async def _begin_call_v2_result(
+        self, deployment_id: str, call_id: UUID, routing: RoutingV1
+    ) -> _BeginCallV2Result:
+        snapshots: list[BeginCallSnapshotV2] = []
+
+        def validate(rows: Sequence[tuple[object, ...]]) -> None:
+            raw = _one_json_object(rows, "begin_call_v2_result_invalid")
+            snapshot: BeginCallSnapshotV2 | None = None
+            with suppress(ValidationError, ValueError):
+                snapshot = BeginCallSnapshotV2.model_validate(raw)
+            # Raise outside the parser's suppression scope; its input-bearing
+            # ValidationError must not become the safe RPC error's context.
+            if (
+                snapshot is None
+                or snapshot.call_id != call_id
+                or snapshot.retention_until
+                != routing.admitted_at + timedelta(seconds=2_592_000)
+            ):
+                del raw, snapshot
+                raise OperationSinkContractError("begin_call_v2_result_invalid")
+            snapshots.append(snapshot)
+
+        failure = await self._execute_result(
+            BEGIN_CALL_V2_SQL,
+            (deployment_id, call_id, Jsonb(routing.model_dump(mode="json"))),
+            validate,
+            map_purge_ack_sqlstates=False,
+        )
+        return _BeginCallV2Result(
             snapshot=None if failure is not None else snapshots[0], failure=failure
         )
 
@@ -493,6 +559,38 @@ class PsycopgOperationSink:
         return await self._execute_result(
             INGEST_SQL,
             (Jsonb(operation.model_dump(mode="json")),),
+            validate,
+            map_purge_ack_sqlstates=False,
+        )
+
+    async def _ingest_v2_result(self, operation: VoiceOperationV2) -> _SafeFailure | None:
+        expected_id = operation.operation_id
+        wire = canonical_operation_bytes(operation).decode("utf-8")
+
+        def validate(rows: Sequence[tuple[object, ...]]) -> None:
+            result = _one_json_object(rows, "ingest_v2_result_invalid")
+            if set(result) != {
+                "schema_version", "status", "operation_id", "payload_sha256"
+            }:
+                raise OperationSinkContractError("ingest_v2_result_invalid")
+            if type(result["schema_version"]) is not int or result["schema_version"] != 2:
+                raise OperationSinkContractError("ingest_v2_result_invalid")
+            status = result["status"]
+            if not isinstance(status, str) or status not in {
+                "applied", "duplicate", "conflict"
+            }:
+                raise OperationSinkContractError("ingest_v2_result_invalid")
+            if _strict_uuid(result["operation_id"], "ingest_v2_result_invalid") != expected_id:
+                raise OperationSinkContractError("ingest_v2_result_invalid")
+            payload_hash = result["payload_sha256"]
+            if not isinstance(payload_hash, str) or _PAYLOAD_SHA256.fullmatch(payload_hash) is None:
+                raise OperationSinkContractError("ingest_v2_result_invalid")
+            if status == "conflict":
+                raise OperationConflictError("operation_hash_conflict")
+
+        return await self._execute_result(
+            INGEST_V2_SQL,
+            (Jsonb(operation.model_dump(mode="json"), dumps=lambda _: wire),),
             validate,
             map_purge_ack_sqlstates=False,
         )
@@ -651,8 +749,10 @@ class PsycopgOperationSink:
                             raw_error,
                             dispatched=dispatched,
                             map_purge_ack_sqlstates=map_purge_ack_sqlstates,
-                            map_erased_sqlstate=sql == INGEST_SQL,
-                            map_contract_sqlstate=sql in {BEGIN_CALL_SQL, LEASE_CALL_ERASURES_SQL},
+                            map_erased_sqlstate=sql in {INGEST_SQL, INGEST_V2_SQL},
+                            map_contract_sqlstate=sql in {
+                                BEGIN_CALL_SQL, BEGIN_CALL_V2_SQL, LEASE_CALL_ERASURES_SQL
+                            },
                         )
                     if rollback is not None:
                         raise _RollbackBoundary(rollback.kind, rollback.code)
@@ -672,8 +772,10 @@ class PsycopgOperationSink:
                     raw_error,
                     dispatched=dispatched,
                     map_purge_ack_sqlstates=map_purge_ack_sqlstates,
-                    map_erased_sqlstate=sql == INGEST_SQL,
-                    map_contract_sqlstate=sql in {BEGIN_CALL_SQL, LEASE_CALL_ERASURES_SQL},
+                    map_erased_sqlstate=sql in {INGEST_SQL, INGEST_V2_SQL},
+                    map_contract_sqlstate=sql in {
+                        BEGIN_CALL_SQL, BEGIN_CALL_V2_SQL, LEASE_CALL_ERASURES_SQL
+                    },
                 )
         finally:
             await self._leave_call()

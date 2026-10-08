@@ -24,7 +24,9 @@ from projetv0_voice.admission import (
     WebhookFinalizationHandle,
     WebhookFinalizerOwner,
 )
+from projetv0_voice.audio_contract import VoiceOperationV2
 from projetv0_voice.models import (
+    CallUpsertPayloadV1,
     VoiceOperationV1,
     _e164,
     _provider_id,
@@ -149,14 +151,31 @@ class VerifiedWebhook:
 @dataclass(frozen=True, slots=True, repr=False)
 class WebhookDurableEffect:
     lease: Mapping[str, object] | None = field(default=None, repr=False)
-    operation: VoiceOperationV1 | None = field(default=None, repr=False)
+    operation: VoiceOperationV1 | VoiceOperationV2 | None = field(default=None, repr=False)
     admission_facts: LocalCallAdmissionFacts | None = field(default=None, repr=False)
+    operation_generation: UUID | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         normalized_lease = _validated_lease(self.lease)
         if self.lease is not None and normalized_lease is None:
             raise TypeError("invalid_webhook_effect")
-        if self.operation is not None and not isinstance(self.operation, VoiceOperationV1):
+        if self.operation is not None and not isinstance(
+            self.operation, VoiceOperationV1 | VoiceOperationV2
+        ):
+            raise TypeError("invalid_webhook_effect")
+        if isinstance(self.operation, VoiceOperationV2) and (
+            not isinstance(self.operation_generation, UUID) or self.operation.kind != "call.upsert"
+            or not isinstance(self.operation.payload, CallUpsertPayloadV1)
+            or self.operation.payload.status not in {"closing", "closed", "failed"}
+            or "message_result" in self.operation.payload.model_fields_set
+        ):
+            raise TypeError("invalid_webhook_effect")
+        if (
+            self.operation_generation is not None
+            and not isinstance(self.operation_generation, UUID)
+        ):
+            raise TypeError("invalid_webhook_effect")
+        if isinstance(self.operation, VoiceOperationV1) and self.operation_generation is not None:
             raise TypeError("invalid_webhook_effect")
         object.__setattr__(self, "lease", normalized_lease)
 

@@ -19,6 +19,7 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
 
+from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1, SparraManifestV1
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
@@ -32,6 +33,7 @@ from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguou
 from projetv0_voice.persistence.writer import (
     LocalCallAdmissionFacts,
     LocalCallLifecycleFacts,
+    PersistenceWriter,
     QualificationRunConsumed,
     WebhookCommitResult,
     WebhookCommitValue,
@@ -56,6 +58,8 @@ if TYPE_CHECKING:
         WebhookDisposition,
         WebhookDurableEffect,
     )
+
+PinnedBeginSnapshot = BeginCallSnapshotV1 | BeginCallSnapshotV2
 
 
 class WebhookFinalizationHandle(Protocol):
@@ -281,15 +285,15 @@ class _CallEntry:
     session: object | None = field(default=None, repr=False)
     resources_released: bool = False
     routing: RoutingV1 | None = None
-    begin_snapshot: BeginCallSnapshotV1 | None = None
+    begin_snapshot: PinnedBeginSnapshot | None = None
     begin_task: asyncio.Task[None] | None = field(default=None, repr=False)
-    begin_future: asyncio.Future[BeginCallSnapshotV1] | None = field(default=None, repr=False)
+    begin_future: asyncio.Future[PinnedBeginSnapshot] | None = field(default=None, repr=False)
     answered_at: datetime | None = None
     transfer_facts: LocalCallLifecycleFacts | None = field(default=None, repr=False)
     transfer_task: asyncio.Task[None] | None = field(default=None, repr=False)
     content_stop_task: asyncio.Task[None] | None = field(default=None, repr=False)
     transfer_future: asyncio.Future[str] | None = field(default=None, repr=False)
-    bridge_publication: VoiceOperationV1 | None = field(default=None, repr=False)
+    bridge_publication: VoiceOperationV1 | VoiceOperationV2 | None = field(default=None, repr=False)
     no_new_ai: bool = False
     abort_target_clearers: list[tuple[_AbortTarget, Callable[[_AbortTarget], None]]] = field(
         default_factory=list, repr=False
@@ -597,7 +601,7 @@ class CallConstructionGrant:
     started_at: datetime = field(repr=False)
     retention_until: datetime = field(repr=False)
     routing: RoutingV1 | None = field(default=None, repr=False)
-    begin_snapshot: BeginCallSnapshotV1 | None = field(default=None, repr=False)
+    begin_snapshot: PinnedBeginSnapshot | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -909,7 +913,7 @@ class CallRegistry:
         background_task_factory: BackgroundTaskFactory = _default_background_task_factory,
         sparra: SparraManifestV1 | None = None,
         called_did: str | None = None,
-        begin_call: Callable[[str, UUID, RoutingV1], Awaitable[BeginCallSnapshotV1]] | None = None,
+        begin_call: Callable[[str, UUID, RoutingV1], Awaitable[PinnedBeginSnapshot]] | None = None,
     ) -> None:
         if (
             type(capacity) is not int
@@ -942,9 +946,18 @@ class CallRegistry:
             raise ValueError("call_registry_config_invalid")
         self._writer = writer
         if sparra is not None and (
-            capacity != 1 or retention_days != 30 or called_did is None or begin_call is None
+            capacity != 1 or retention_days != 30 or called_did is None or not callable(begin_call)
         ):
             raise ValueError("sparra_admission_config_invalid")
+        self._operation_contract_version: Literal[1, 2] = (
+            1 if sparra is None else sparra.operation_contract_version
+        )
+        if (
+            isinstance(writer, PersistenceWriter)
+            and writer.contract_version != self._operation_contract_version
+            or self._operation_contract_version == 2 and not isinstance(writer, PersistenceWriter)
+        ):
+            raise ValueError("sparra_writer_contract_mismatch")
         self._sparra = sparra
         self._called_did = called_did
         self._begin_call = begin_call
@@ -1092,7 +1105,7 @@ class CallRegistry:
             raise CallAdmissionRejected("call_event_invalid")
         return routing
 
-    async def _ensure_begin_snapshot(self, control_id: str) -> BeginCallSnapshotV1:
+    async def _ensure_begin_snapshot(self, control_id: str) -> PinnedBeginSnapshot:
         async with self._lock:
             entry = self._by_control.get(control_id)
             if (
@@ -1122,7 +1135,7 @@ class CallRegistry:
         return await asyncio.shield(begin_future)
 
     async def _begin_future_owned(
-        self, entry: _CallEntry, future: asyncio.Future[BeginCallSnapshotV1]
+        self, entry: _CallEntry, future: asyncio.Future[PinnedBeginSnapshot]
     ) -> None:
         try:
             result = await self._begin_owned(entry)
@@ -1134,7 +1147,7 @@ class CallRegistry:
             if not future.done():
                 future.set_result(result)
 
-    async def _begin_owned(self, entry: _CallEntry) -> BeginCallSnapshotV1:
+    async def _begin_owned(self, entry: _CallEntry) -> PinnedBeginSnapshot:
         assert self._begin_call is not None and entry.routing is not None
         remaining = min(
             entry.token_deadline - float(self._monotonic()),
@@ -1146,20 +1159,30 @@ class CallRegistry:
             except OperationSinkCommitAmbiguousError:
                 snapshot = await self._begin_call(self._deployment_id, entry.call_id, entry.routing)
         if (
-            not isinstance(snapshot, BeginCallSnapshotV1)
-            or snapshot.call_id != entry.call_id
+            not isinstance(snapshot, BeginCallSnapshotV2)
+            if self._operation_contract_version == 2
+            else not isinstance(snapshot, BeginCallSnapshotV1)
+        ):
+            raise CallAdmissionRejected("call_identity_conflict")
+        if (
+            snapshot.call_id != entry.call_id
             or snapshot.retention_until != entry.initiated_at + timedelta(days=30)
         ):
             raise CallAdmissionRejected("call_identity_conflict")
         try:
-            await cast(Any, self._writer).bind_recording_policy(
-                snapshot, generation=entry.generation
-            )
+            if isinstance(snapshot, BeginCallSnapshotV2):
+                if not isinstance(self._writer, PersistenceWriter):
+                    raise CallAdmissionRejected("call_identity_conflict")
+                await self._writer.bind_audio_snapshot(snapshot, generation=entry.generation)
+            else:
+                await cast(Any, self._writer).bind_recording_policy(
+                    snapshot, generation=entry.generation
+                )
         except PersistenceError:
             raise CallAdmissionRejected("call_identity_conflict") from None
         # Company preference is pinned; native audio activation stays closed
         # until disclosure, recording and retention qualification are complete.
-        if snapshot.recording_enabled:
+        if isinstance(snapshot, BeginCallSnapshotV1) and snapshot.recording_enabled:
             # Exercise actual owned capacity/readiness before the immutable
             # capability gate. A rejected ON admission must not retain copy authority.
             try:
@@ -1384,6 +1407,13 @@ class CallRegistry:
                 stop_result = getattr(entry.session, "stop_result_inference", None)
                 if stop_result is not None:
                     stop_result()
+                pin = entry.begin_snapshot
+                if isinstance(pin, BeginCallSnapshotV2) and (
+                    pin.audio_available and pin.recording_policy == "local_30d"
+                ):
+                    close_audio = getattr(entry.session, "close_audio_for_transfer", None)
+                    if not callable(close_audio) or close_audio() is not True:
+                        return "unavailable_collect_message"
                 assert entry.routing is not None
                 command_id = uuid4()
                 correlation = base64.b64encode(uuid4().bytes + command_id.bytes).decode("ascii")
@@ -1432,7 +1462,49 @@ class CallRegistry:
         facts = entry.transfer_facts
         assert facts is not None and facts.transfer_command_id is not None
         assert facts.transfer_correlation is not None
-        await cast(Any, self._writer).commit_transfer_intent(facts)
+        pin = entry.begin_snapshot
+        requires_local_audio = isinstance(pin, BeginCallSnapshotV2) and (
+            pin.audio_available and pin.recording_policy == "local_30d"
+        )
+        commit_entered = False
+        try:
+            if requires_local_audio:
+                prepare_audio = getattr(entry.session, "prepare_audio_for_transfer", None)
+                if not callable(prepare_audio):
+                    return "unavailable_collect_message"
+                try:
+                    prepared = await prepare_audio()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return "unavailable_collect_message"
+                if prepared is not True:
+                    return "unavailable_collect_message"
+                async with self._lock:
+                    if (
+                        self._by_control.get(entry.call_control_id) is not entry
+                        or entry.transfer_facts is not facts
+                        or entry.terminal_authority is not None
+                        or entry.terminal_event is not None
+                        or entry.cleanup_hangup_started
+                        or entry.drain_intent
+                        or self._draining
+                    ):
+                        return "unavailable_collect_message"
+                    audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
+                    if not callable(audio_ready) or audio_ready() is not True:
+                        return "unavailable_collect_message"
+            commit_entered = True
+            await cast(Any, self._writer).commit_transfer_intent(facts)
+        finally:
+            if not commit_entered:
+                async with self._lock:
+                    if (
+                        self._by_control.get(entry.call_control_id) is entry
+                        and entry.transfer_facts is facts
+                        and entry.terminal_authority is None
+                    ):
+                        entry.transfer_facts = None
         async with self._lock:
             if (
                 self._by_control.get(entry.call_control_id) is not entry
@@ -1441,6 +1513,15 @@ class CallRegistry:
                 or not getattr(self._call_control, "dispatch_available", True)
             ):
                 return "unavailable_collect_message"
+            if requires_local_audio:
+                if (
+                    entry.terminal_authority is not None or entry.terminal_event is not None
+                    or entry.cleanup_hangup_started or entry.drain_intent or self._draining
+                ):
+                    return "unavailable_collect_message"
+                audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
+                if not callable(audio_ready) or audio_ready() is not True:
+                    return "unavailable_collect_message"
         # A durable pending intent fences cleanup even after local failure/drain.
         try:
             result = await cast(Any, self._call_control).transfer(
@@ -1547,7 +1628,7 @@ class CallRegistry:
             if event.direction == "outgoing" or event.event_type == "call.bridged":
                 return ResolvedWebhook(None)
             return None
-        operation = None
+        operation: VoiceOperationV1 | VoiceOperationV2 | None = None
         assert facts is not None
         if session is not None:
             await cast(Any, session).request_drain("qualified_line_connected")
@@ -1576,14 +1657,7 @@ class CallRegistry:
                     and lifecycle.bridge_operation_id is None
                     and facts.bridge_operation_id is None
                 ):
-                    operation = entry.bridge_publication or VoiceOperationV1(
-                        schema_version=1,
-                        operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
-                        deployment_id=self._deployment_id,
-                        call_id=entry.call_id,
-                        occurred_at=bridged_at,
-                        kind="call.upsert",
-                        payload=CallUpsertPayloadV1(
+                    payload = CallUpsertPayloadV1(
                             telnyx_call_control_id=entry.call_control_id,
                             telnyx_call_leg_id=entry.call_leg_id,
                             telnyx_call_session_id=entry.call_session_id,
@@ -1608,14 +1682,34 @@ class CallRegistry:
                                     ),
                                 )
                             ),
-                        ),
                     )
+                    operation = entry.bridge_publication
+                    if operation is None:
+                        if self._operation_contract_version == 2:
+                            operation = VoiceOperationV2(schema_version=2,
+                                operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
+                                deployment_id=self._deployment_id, call_id=entry.call_id,
+                                occurred_at=bridged_at, kind="call.upsert", payload=payload)
+                        else:
+                            operation = VoiceOperationV1(schema_version=1,
+                                operation_id=uuid5(entry.call_id, "qualified-line-bridge"),
+                                deployment_id=self._deployment_id, call_id=entry.call_id,
+                                occurred_at=bridged_at, kind="call.upsert", payload=payload)
                     entry.bridge_publication = operation
                     facts = replace(facts, bridge_operation_id=operation.operation_id)
                 elif lifecycle is not None and lifecycle.bridge_operation_id is not None:
                     facts = replace(facts, bridge_operation_id=lifecycle.bridge_operation_id)
                 entry.transfer_facts = facts
-        await cast(Any, self._writer).commit_transfer_observation(facts, operation)
+        if self._operation_contract_version == 2:
+            if not isinstance(self._writer, PersistenceWriter):
+                raise CallAdmissionRejected("call_identity_conflict")
+            if isinstance(operation, VoiceOperationV1):
+                raise CallAdmissionRejected("call_identity_conflict")
+            await self._writer.commit_transfer_observation_v2(
+                facts, operation, generation=entry.generation
+            )
+        else:
+            await cast(Any, self._writer).commit_transfer_observation(facts, operation)
         return ResolvedWebhook(None)
 
     def _pending_effect(self, entry: _CallEntry) -> WebhookDurableEffect:
@@ -1664,7 +1758,11 @@ class CallRegistry:
                 admission_generation=entry.generation,
             )
         )
-        return WebhookDurableEffect(lease=lease, operation=operation, admission_facts=facts)
+        return WebhookDurableEffect(
+            lease=lease,
+            operation=operation if self._operation_contract_version == 1 else None,
+            admission_facts=facts,
+        )
 
     def _terminal_effect(self, entry: _CallEntry, event: VerifiedWebhook) -> WebhookDurableEffect:
         from projetv0_voice.telnyx.webhooks import WebhookDurableEffect
@@ -1685,17 +1783,15 @@ class CallRegistry:
         if (
             entry.routing is not None or entry.transfer_facts is not None
         ) and closed_at >= entry.initiated_at + self._retention_delta:
-            return WebhookDurableEffect(lease=lease)
+            return WebhookDurableEffect(
+                lease=lease,
+                operation_generation=(
+                    entry.generation if self._operation_contract_version == 2 else None
+                ),
+            )
         actual_start = entry.answered_at or entry.claimed_at
         answered = actual_start is not None
-        operation = VoiceOperationV1(
-            schema_version=1,
-            operation_id=uuid5(entry.call_id, event.event_id),
-            deployment_id=self._deployment_id,
-            call_id=entry.call_id,
-            occurred_at=closed_at,
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
@@ -1705,9 +1801,24 @@ class CallRegistry:
                 ended_at=closed_at,
                 end_reason="telnyx_hangup",
                 retention_until=entry.initiated_at + timedelta(days=self._retention_days),
+        )
+        operation: VoiceOperationV1 | VoiceOperationV2
+        if self._operation_contract_version == 2:
+            operation = VoiceOperationV2(schema_version=2,
+                operation_id=uuid5(entry.call_id, event.event_id),
+                deployment_id=self._deployment_id,
+                call_id=entry.call_id, occurred_at=closed_at, kind="call.upsert", payload=payload)
+        else:
+            operation = VoiceOperationV1(schema_version=1,
+                operation_id=uuid5(entry.call_id, event.event_id),
+                deployment_id=self._deployment_id,
+                call_id=entry.call_id, occurred_at=closed_at, kind="call.upsert", payload=payload)
+        return WebhookDurableEffect(
+            lease=lease, operation=operation,
+            operation_generation=(
+                entry.generation if self._operation_contract_version == 2 else None
             ),
         )
-        return WebhookDurableEffect(lease=lease, operation=operation)
 
     async def resolve_webhook(self, event: VerifiedWebhook) -> ResolvedWebhook:
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook
@@ -1981,8 +2092,8 @@ class CallRegistry:
                         ),
                     }
                 )
-                effect = effect.__class__(
-                    lease=effect.lease,
+                effect = replace(
+                    effect,
                     operation=effect.operation.model_copy(update={"payload": payload}),
                 )
         return ResolvedWebhook(effect, reservation)
@@ -3231,19 +3342,16 @@ class CallRegistry:
         entry = authority._entry
         if authority._closed_at >= entry.initiated_at + self._retention_delta:
             return None
+        if self._operation_contract_version == 2 and not isinstance(
+            entry.begin_snapshot, BeginCallSnapshotV2
+        ):
+            return None
         started_at = entry.claimed_at or entry.answered_at
         read_facts = getattr(self._writer, "read_call_lifecycle", None)
         facts = await read_facts(entry.call_id) if callable(read_facts) else None
         if facts is not None:
             started_at = facts.started_at or started_at
-        operation = VoiceOperationV1(
-            schema_version=1,
-            operation_id=authority.completion_token,
-            deployment_id=self._deployment_id,
-            call_id=entry.call_id,
-            occurred_at=authority._closed_at,
-            kind="call.upsert",
-            payload=CallUpsertPayloadV1(
+        payload = CallUpsertPayloadV1(
                 telnyx_call_control_id=entry.call_control_id,
                 telnyx_call_leg_id=entry.call_leg_id,
                 telnyx_call_session_id=entry.call_session_id,
@@ -3269,8 +3377,16 @@ class CallRegistry:
                         ),
                     )
                 ),
-            ),
         )
+        operation: VoiceOperationV1 | VoiceOperationV2
+        if self._operation_contract_version == 2:
+            operation = VoiceOperationV2(schema_version=2, operation_id=authority.completion_token,
+                deployment_id=self._deployment_id, call_id=entry.call_id,
+                occurred_at=authority._closed_at, kind="call.upsert", payload=payload)
+        else:
+            operation = VoiceOperationV1(schema_version=1, operation_id=authority.completion_token,
+                deployment_id=self._deployment_id, call_id=entry.call_id,
+                occurred_at=authority._closed_at, kind="call.upsert", payload=payload)
         commit_control = getattr(self._writer, "commit_control", None)
         if not callable(commit_control):
             self._note_terminal_failure("terminal_persistence_failed")
@@ -3278,7 +3394,15 @@ class CallRegistry:
         cancellation: asyncio.CancelledError | None = None
         while True:
             try:
-                await commit_control(PersistenceCommand("outbox", {"operation": operation}, None))
+                if isinstance(operation, VoiceOperationV2):
+                    if not isinstance(self._writer, PersistenceWriter):
+                        raise RuntimeError("terminal_persistence_failed")
+                    await self._writer.freeze_call_publication_v2(operation, None,
+                        generation=authority._generation, provider_callback=None)
+                else:
+                    await commit_control(
+                        PersistenceCommand("outbox", {"operation": operation}, None)
+                    )
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error

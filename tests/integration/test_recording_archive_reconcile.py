@@ -8,7 +8,10 @@ from uuid import uuid5
 
 import httpx
 import pytest
-from test_recording_archive import (
+
+from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.telnyx.recordings import ProviderRecordingPageV1, resolve_recording_webhook
+from tests.integration.test_recording_archive import (
     KEY,
     NOW,
     PROVIDER_ID,
@@ -20,9 +23,6 @@ from test_recording_archive import (
     stop_writer,
     wav,
 )
-
-from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.telnyx.recordings import ProviderRecordingPageV1, resolve_recording_webhook
 
 
 @pytest.mark.asyncio

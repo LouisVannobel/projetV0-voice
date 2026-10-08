@@ -13,7 +13,6 @@ from uuid import UUID
 import httpx
 import pytest
 from pydantic import SecretStr
-from test_recording_archive import KEY, NOW, Provider, queue_saved, saved_event, wav
 
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
@@ -29,6 +28,14 @@ from projetv0_voice.runtime_config import (
     RuntimeSettingsV1,
     capture_runtime_environment,
     parse_runtime_settings,
+)
+from tests.integration.test_recording_archive import (
+    KEY,
+    NOW,
+    Provider,
+    queue_saved,
+    saved_event,
+    wav,
 )
 
 
@@ -376,9 +383,8 @@ async def test_archive_graph_failed_composition_retires_owned_http_without_start
 async def test_archive_graph_broken_inventory_refuses_capacity_but_keeps_off_admissible(
     tmp_path, monkeypatch
 ):
-    from test_recording_archive import CALL_ID, identity
-
     from projetv0_voice.persistence.commands import PersistenceError
+    from tests.integration.test_recording_archive import CALL_ID, identity
 
     graph, _, requests, consumers, _, _ = await build_archive_graph(
         tmp_path, monkeypatch, broken_archive=True

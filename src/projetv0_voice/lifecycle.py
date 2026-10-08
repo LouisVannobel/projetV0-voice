@@ -33,7 +33,7 @@ from projetv0_voice.metrics import (
     RuntimePublication,
     RuntimePublishedSnapshot,
 )
-from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.models import BeginCallSnapshotV1, CallUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
 from projetv0_voice.persistence.writer import (
     PersistenceWriter,
@@ -1082,11 +1082,8 @@ class RuntimeSupervisor:
                 },
                 lease=None if effect is None else effect.lease,
                 operation=None if effect is None else effect.operation,
-                **(
-                    {"admission_facts": effect.admission_facts}
-                    if effect is not None and effect.admission_facts is not None
-                    else {}
-                ),
+                operation_generation=None if effect is None else effect.operation_generation,
+                admission_facts=None if effect is None else effect.admission_facts,
                 legacy_v1_semantic_fingerprint_sha256=(event.legacy_v1_semantic_fingerprint_sha256),
                 qualification_run_id=(
                     self._candidate_run_id
@@ -1799,7 +1796,18 @@ async def build_production_runtime(
         )
         if not isinstance(metrics, RuntimeMetrics):
             raise RuntimeError("runtime_metrics_composition_invalid")
-        writer = PersistenceWriter(Path(str(settings.sqlite_path)), keyring)
+        operation_contract_version: Literal[1, 2] = (
+            1 if manifest.sparra is None else manifest.sparra.operation_contract_version
+        )
+        writer = PersistenceWriter(
+            Path(str(settings.sqlite_path)),
+            keyring,
+            contract_version=operation_contract_version,
+            process_agent_id=manifest.agent_id if operation_contract_version == 2 else None,
+            process_deployment_id=(
+                settings.deployment_id if operation_contract_version == 2 else None
+            ),
+        )
         sink = factories.sink_factory(postgres_dsn)
 
         supervisor_ref: RuntimeSupervisor | None = None
@@ -1821,6 +1829,7 @@ async def build_production_runtime(
         relay = OutboxRelay(
             writer,
             cast(Any, sink),
+            contract_version=operation_contract_version,
             on_degraded=begin_drain,
             drain=begin_drain,
             before_fifo=prepare_sparra_fifo if manifest.sparra is not None else None,
@@ -1899,7 +1908,9 @@ async def build_production_runtime(
             qualification_observer=supervisor.observe_qualification_state,
             sparra=manifest.sparra,
             called_did=manifest.dids[0],
-            begin_call=getattr(sink, "begin_call", None),
+            begin_call=getattr(
+                sink, "begin_call_v2" if operation_contract_version == 2 else "begin_call", None
+            ),
         )
         lease_authority = ProcessLeaseAuthority(registry)
         gate = SynchronousUnauthenticatedGate(capacity)
@@ -1917,7 +1928,7 @@ async def build_production_runtime(
         def recording_factory(identity: CallIdentity) -> RecordingBoundary:
             snapshot = identity.begin_snapshot
             if (
-                snapshot is not None
+                isinstance(snapshot, BeginCallSnapshotV1)
                 and snapshot.recording_enabled
                 and (settings.runtime_mode != "strict")
             ):
@@ -1927,11 +1938,11 @@ async def build_production_runtime(
                 writer=writer,
                 retention_days=30 if snapshot is not None else recording_retention_days,
                 required=snapshot.recording_enabled
-                if snapshot is not None
-                else manifest.recording_required,
+                if isinstance(snapshot, BeginCallSnapshotV1)
+                else snapshot is None and manifest.recording_required,
                 play_beep=snapshot.recording_enabled
-                if snapshot is not None
-                else manifest.recording_play_beep,
+                if isinstance(snapshot, BeginCallSnapshotV1)
+                else snapshot is None and manifest.recording_play_beep,
                 utcnow=utcnow,
             )
 
