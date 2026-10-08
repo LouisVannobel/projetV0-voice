@@ -68,6 +68,7 @@ from projetv0_voice.qualified_profile import (
     InferenceProfileV1,
     QualificationCandidateProfileV1,
     QualifiedDeploymentProfileV1,
+    canonical_candidate_profile_sha256,
     canonical_inference_profile_sha256,
 )
 from projetv0_voice.runtime_config import capture_runtime_environment, parse_runtime_settings
@@ -645,6 +646,8 @@ class Scenario:
                     "disclosure_mark_timeout_ms": 10000,
                 }
             )
+            self.audio_profile = profile
+            self.audio_profile_sha256 = bytes.fromhex(canonical_candidate_profile_sha256(profile))
         else:
             profile = QualifiedDeploymentProfileV1.model_validate(
                 {
@@ -3475,19 +3478,64 @@ class Scenario:
         # PCMU expands to s16le: 800 encoded samples become 1600 decoded
         # mono bytes, the native tap's supported per-frame bound.
         payload = base64.b64encode(b"\x9e" * 800).decode()
-        for sequence in range(3, 803):
-            if self.audio_capture.holder.summary.committed_samples >= 512_000:
-                break
-            assert self.audio_capture.tap.state == "recording", "native_audio_capture_not_refused"
-            await self.media.input(
-                {
-                    "event": "media",
-                    "stream_id": self.media.stream,
-                    "sequence_number": str(sequence),
-                    "media": {"payload": payload, "track": "inbound"},
-                }
-            )
-            await asyncio.sleep(0.005)
+        processed = asyncio.Event()
+        pending_sequence = pending_frame_id = None
+        native_deserialize = ProjetV0TelnyxFrameSerializer.deserialize
+
+        async def observed_deserialize(serializer, data):
+            nonlocal pending_frame_id
+            frame = await native_deserialize(serializer, data)
+            if not isinstance(frame, InputAudioRawFrame):
+                return frame
+            message = json.loads(data)
+            if (
+                message.get("event") == "media"
+                and message.get("stream_id") == self.media.stream
+                and message.get("sequence_number") == pending_sequence
+                and pending_frame_id is None
+            ):
+                pending_frame_id = frame.id
+            return frame
+
+        def after_push(_tap, frame):
+            if isinstance(frame, InputAudioRawFrame) and frame.id == pending_frame_id:
+                processed.set()
+
+        tap = self.audio_capture.tap
+        tap.add_event_handler("on_after_push_frame", after_push)
+        try:
+            with patch.object(
+                ProjetV0TelnyxFrameSerializer, "deserialize", observed_deserialize
+            ):
+                for sequence in range(3, 803):
+                    if self.audio_capture.holder.summary.committed_samples >= 512_000:
+                        break
+                    assert tap.state == "recording", "native_audio_capture_not_refused"
+                    processed.clear()
+                    pending_sequence, pending_frame_id = str(sequence), None
+                    await self.media.input(
+                        {
+                            "event": "media",
+                            "stream_id": self.media.stream,
+                            "sequence_number": pending_sequence,
+                            "media": {"payload": payload, "track": "inbound"},
+                        }
+                    )
+                    await asyncio.wait_for(processed.wait(), 5)
+                    # A wire send is not native frame/event/receipt completion.
+                    # Keep the synthetic yield and let the actual owner join its
+                    # native event and exact SQLite receipt before the next send.
+                    await asyncio.sleep(0.005)
+                    await eventually(
+                        lambda: not tap.pending_join
+                        and not self.audio_capture.holder.summary.pending,
+                        "native_audio_peer_event_and_receipt_joined",
+                        5,
+                    )
+        finally:
+            tap.remove_event_handler("on_after_push_frame", after_push)
+            pending_sequence = pending_frame_id = None
+            processed.clear()
         assert self.audio_capture.holder.summary.committed_samples >= 512_000, (
             "native_audio_actual_sample_threshold"
         )
@@ -3682,7 +3730,8 @@ def candidate_consumption_receipt(path, run_id):
     uri = "file:" + path.as_posix() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as database:
         return database.execute(
-            "SELECT run_id,consumed_at FROM qualification_runs WHERE run_id=?",
+            "SELECT run_id,consumed_at,profile_sha256,total_calls,used_calls "
+            "FROM qualification_runs WHERE run_id=?",
             (str(run_id),),
         ).fetchone()
 
@@ -3713,9 +3762,12 @@ async def connected(request):
                     and scenario.audio_original_pin.call_id == scenario.call_id
                 ), "native_next_candidate_original_off_pin"
                 previous_run = scenario.audio_run
-                assert await scenario.graph.writer.qualification_run_consumed(previous_run), (
-                    "native_next_candidate_previous_consumed"
-                )
+                previous_profile = scenario.audio_profile
+                previous_profile_sha256 = scenario.audio_profile_sha256
+                assert await scenario.graph.writer.qualification_run_consumed(
+                    previous_run, total_calls=previous_profile.total_calls,
+                    profile_sha256=previous_profile_sha256,
+                ), "native_next_candidate_previous_consumed"
                 sqlite_path = scenario.settings.sqlite_path
                 previous_receipt = await asyncio.to_thread(
                     candidate_consumption_receipt, sqlite_path, previous_run
@@ -3740,10 +3792,12 @@ async def connected(request):
                 await scenario.setup()
                 assert scenario.audio_run != previous_run, "native_next_candidate_fresh_run"
                 previous_consumed = await scenario.graph.writer.qualification_run_consumed(
-                    previous_run
+                    previous_run, total_calls=previous_profile.total_calls,
+                    profile_sha256=previous_profile_sha256,
                 )
                 current_consumed = await scenario.graph.writer.qualification_run_consumed(
-                    scenario.audio_run
+                    scenario.audio_run, total_calls=scenario.audio_profile.total_calls,
+                    profile_sha256=scenario.audio_profile_sha256,
                 )
                 previous_run_preserved = previous_receipt == await asyncio.to_thread(
                     candidate_consumption_receipt, scenario.settings.sqlite_path, previous_run
