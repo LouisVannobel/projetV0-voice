@@ -10,6 +10,7 @@ from collections.abc import Callable, Coroutine, Sequence
 from contextvars import Context
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
 from typing import Any, Protocol, cast
+from uuid import UUID
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -73,6 +74,8 @@ class FirstFailure:
             "disclosure_commit_failed",
             "disclosure_failed",
             "disclosure_timeout",
+            "end_call_failed",
+            "end_call_timeout",
             "input_gate_failed",
             "lease_terminalization_failed",
             "persistence_failed",
@@ -266,6 +269,132 @@ class GateController(Protocol):
     async def mark_forwarded(self) -> None: ...
 
 
+@dataclass(slots=True)
+class _EndCallAttempt:
+    mark_name: str
+    speak_frame: TTSSpeakFrame = field(
+        default_factory=lambda: TTSSpeakFrame(END_CALL_GOODBYE, append_to_context=True)
+    )
+    forwarded: asyncio.Event = field(default_factory=asyncio.Event)
+    completed: asyncio.Event = field(default_factory=asyncio.Event)
+    audio_observed: bool = False
+    armed: bool = False
+    acknowledged: bool = False
+    invalidated: bool = False
+    context_id: str | None = None
+
+
+END_CALL_GOODBYE = "Bonne journée, au revoir."
+
+
+class EndCallPlayback:
+    """One call's interruptible final Telnyx playback acknowledgment."""
+
+    def __init__(self, *, generation: UUID, first_failure: FirstFailure) -> None:
+        self._prefix = f"pv0-end-call-{generation.hex}-"
+        self._sequence = 0
+        self._attempt: _EndCallAttempt | None = None
+        self._synthesizing_attempt: _EndCallAttempt | None = None
+        self._first_failure = first_failure
+
+    @property
+    def pending(self) -> bool:
+        return self._attempt is not None
+
+    @property
+    def acknowledged(self) -> bool:
+        return (
+            self._attempt is not None
+            and self._attempt.acknowledged
+            and not self._attempt.invalidated
+            and self._first_failure.code is None
+        )
+
+    def begin(self) -> _EndCallAttempt | None:
+        if self.pending or self._first_failure.code is not None:
+            return None
+        self._sequence += 1
+        self._attempt = _EndCallAttempt(f"{self._prefix}{self._sequence}")
+        return self._attempt
+
+    def owns_mark(self, name: str) -> bool:
+        return name.startswith(self._prefix)
+
+    def before_tts_frame(self, frame: Frame) -> None:
+        attempt = self._attempt
+        self._synthesizing_attempt = (
+            attempt if attempt is not None and frame is attempt.speak_frame else None
+        )
+
+    def after_tts_frame(self, frame: Frame) -> None:
+        if (
+            self._synthesizing_attempt is not None
+            and frame is self._synthesizing_attempt.speak_frame
+        ):
+            self._synthesizing_attempt = None
+
+    def bind_context(self, context_id: str) -> None:
+        attempt = self._synthesizing_attempt
+        if attempt is not None and attempt is self._attempt:
+            attempt.context_id = context_id
+
+    def note_audio(self, context_id: str | None) -> None:
+        if (
+            self._attempt is not None
+            and self._attempt.context_id is not None
+            and self._attempt.context_id == context_id
+        ):
+            self._attempt.audio_observed = True
+
+    def arm_mark(self, name: str) -> bool:
+        attempt = self._attempt
+        if attempt is None or attempt.mark_name != name:
+            return False
+        if not attempt.audio_observed or self._first_failure.code is not None:
+            self._first_failure.signal("end_call_failed")
+            self.invalidate()
+            return False
+        attempt.armed = True
+        return True
+
+    def mark_forwarded(self, name: str) -> None:
+        attempt = self._attempt
+        if attempt is not None and attempt.mark_name == name and attempt.armed:
+            attempt.forwarded.set()
+
+    def accept_mark(self, name: str) -> None:
+        attempt = self._attempt
+        if (
+            attempt is not None
+            and attempt.mark_name == name
+            and attempt.armed
+            and self._first_failure.code is None
+        ):
+            attempt.acknowledged = True
+            attempt.completed.set()
+
+    def invalidate(self, attempt: _EndCallAttempt | None = None) -> None:
+        current = self._attempt
+        if current is not None and (attempt is None or attempt is current):
+            current.invalidated = True
+            current.forwarded.set()
+            current.completed.set()
+            self._attempt = None
+            self._synthesizing_attempt = None
+
+    async def wait_for_ack(self, attempt: _EndCallAttempt, *, phase_timeout: float) -> bool:
+        try:
+            # Dispatch/TTS and carrier acknowledgment are separately bounded.
+            # The ACK deadline starts only after the native paced wire send.
+            await asyncio.wait_for(attempt.forwarded.wait(), timeout=phase_timeout)
+            await asyncio.wait_for(attempt.completed.wait(), timeout=phase_timeout)
+        except TimeoutError:
+            self._first_failure.signal("end_call_timeout")
+            self.invalidate(attempt)
+            return False
+        return self._attempt is attempt and self.acknowledged
+
+
 _CLOSED_INPUT_FRAMES = (
     InputDTMFFrame,
     UserSpeakingFrame,
@@ -280,6 +409,7 @@ def build_input_gate(
     *,
     controller: GateController,
     first_failure: FirstFailure,
+    end_call_playback: EndCallPlayback | None = None,
 ) -> FunctionFilter:
     """Build the one direct, total, call-owned input/control gate."""
 
@@ -298,6 +428,8 @@ def build_input_gate(
     async def predicate(frame: Frame) -> bool:
         try:
             if isinstance(frame, (StartFrame, EndFrame, CancelFrame, ErrorFrame)):
+                if isinstance(frame, (CancelFrame, ErrorFrame)) and end_call_playback is not None:
+                    end_call_playback.invalidate()
                 return True
             if isinstance(frame, InputTransportMessageFrame):
                 message = frame.message
@@ -309,6 +441,8 @@ def build_input_gate(
                     if not isinstance(mark, dict) or not isinstance(mark.get("name"), str):
                         raise ValueError
                     if first_failure.code is None:
+                        if end_call_playback is not None:
+                            end_call_playback.accept_mark(mark["name"])
                         await controller.accept_mark(mark["name"])
                 elif event in {"stop", "error"}:
                     await controller.abort("call_failed")
@@ -317,6 +451,8 @@ def build_input_gate(
                 return False
             if isinstance(frame, InputAudioRawFrame):
                 return input_is_open()
+            if isinstance(frame, InterruptionFrame) and end_call_playback is not None:
+                end_call_playback.invalidate()
             if isinstance(frame, InterruptionFrame) and not input_is_open():
                 await controller.abort("disclosure_failed")
                 return True
@@ -351,9 +487,12 @@ def build_input_gate(
 class DisclosureOutputBarrier(FrameProcessor):
     """Keep the expected Telnyx mark behind observed standalone TTS audio."""
 
-    def __init__(self, *, controller: GateController) -> None:
+    def __init__(
+        self, *, controller: GateController, end_call_playback: EndCallPlayback | None = None
+    ) -> None:
         super().__init__(name="DisclosureOutputBarrier", enable_direct_mode=True)
         self._controller = controller
+        self._end_call_playback = end_call_playback
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -361,6 +500,8 @@ class DisclosureOutputBarrier(FrameProcessor):
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, TTSAudioRawFrame):
+            if self._end_call_playback is not None:
+                self._end_call_playback.note_audio(frame.context_id)
             try:
                 await self._controller.note_disclosure_audio()
             except asyncio.CancelledError:
@@ -371,6 +512,12 @@ class DisclosureOutputBarrier(FrameProcessor):
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, TelnyxMarkFrame):
+            if self._end_call_playback is not None and self._end_call_playback.owns_mark(
+                frame.mark_name
+            ):
+                if self._end_call_playback.arm_mark(frame.mark_name):
+                    await self.push_frame(frame, direction)
+                return
             if frame.mark_name != self._controller.mark_name:
                 await self._abort_safely()
                 return
@@ -703,11 +850,18 @@ def build_pipeline(
     first_failure: FirstFailure,
     begin_snapshot: BeginCallSnapshotV1 | None = None,
     transfer_handler: FunctionCallHandler | None = None,
+    end_call_handler: FunctionCallHandler | None = None,
+    end_call_playback: EndCallPlayback | None = None,
     on_user_turn_started: Callable[[], None] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
 
-    input_gate = build_input_gate(controller=controller, first_failure=first_failure)
+    # Concrete provider types load during assembly, after logging configuration.
+    from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
+
+    input_gate = build_input_gate(
+        controller=controller, first_failure=first_failure, end_call_playback=end_call_playback
+    )
     inference_boundary = InferenceErrorBoundary(
         stt=services.stt,
         llm=services.llm,
@@ -720,6 +874,17 @@ def build_pipeline(
             {
                 "role": "system",
                 "content": SPARRA_SYSTEM_PROMPT
+                + (
+                    " Utilise l'outil end_call, sans arguments, seulement lorsque l'appelant "
+                    "a clairement terminé : il dit au revoir ou décline explicitement toute "
+                    "autre aide après une demande traitée. Une pause, un silence, un refus de "
+                    "donner une information ou une phrase encore en cours ne termine pas "
+                    "l'appel. L'outil prononce lui-même une brève formule de départ puis "
+                    "termine l'appel ; n'ajoute pas une autre réponse et ne dis pas que tu "
+                    "es incapable de raccrocher."
+                    if end_call_handler is not None
+                    else ""
+                )
                 + (
                     " L'outil request_human, sans arguments, peut demander une connexion à la "
                     "seule ligne préqualifiée ; cette connexion ne vérifie pas l'identité d'une "
@@ -743,21 +908,25 @@ def build_pipeline(
             },
         ]
     )
-    tools = (
-        None
-        if transfer_handler is None
-        else ToolsSchema(
-            standard_tools=[
-                FunctionSchema(
-                    name="request_human",
-                    description="Request connection to the qualified business line. No arguments.",
-                    properties={},
-                    required=[],
-                    handler=transfer_handler,
-                )
-            ]
+    tool_schemas: list[FunctionSchema] = []
+    if transfer_handler is not None:
+        tool_schemas.append(
+            FunctionSchema(
+                name="request_human",
+                description="Request connection to the qualified business line. No arguments.",
+                properties={},
+                required=[],
+                handler=transfer_handler,
+            )
         )
-    )
+    if end_call_handler is not None:
+        tool_schemas.append(FunctionSchema(
+            name="end_call",
+            description="End only after an explicit goodbye or refusal of further help. "
+            "Speaks a brief goodbye before hanging up. No arguments.",
+            properties={}, required=[], handler=end_call_handler,
+        ))
+    tools = ToolsSchema(standard_tools=tool_schemas) if tool_schemas else None
     context = (
         LLMContext(messages=messages, tools=tools)
         if tools is not None
@@ -847,12 +1016,19 @@ def build_pipeline(
         if not isinstance(frame, LLMContextFrame):
             return True
         try:
-            return not inference_terminal and first_failure.code is None and controller.is_active()
+            return (
+                not inference_terminal
+                and first_failure.code is None
+                and controller.is_active()
+                and (end_call_playback is None or not end_call_playback.pending)
+            )
         except Exception:
             first_failure.signal("input_gate_failed")
             return False
 
     async def disclosure_mark_sent(_output: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, TelnyxMarkFrame) and end_call_playback is not None:
+            end_call_playback.mark_forwarded(frame.mark_name)
         if not isinstance(frame, TelnyxMarkFrame) or frame.mark_name != controller.mark_name:
             return
         try:
@@ -875,10 +1051,22 @@ def build_pipeline(
         user_aggregator.add_event_handler("on_before_push_frame", note_user_turn_started)
     assistant_aggregator.add_event_handler("on_assistant_turn_stopped", record_assistant_turn)
     services.tts.add_event_handler("on_error", sanitize_tts_error)
+    if end_call_playback is not None and isinstance(services.tts, OpenRouterTTSService):
+        # Native synchronous frame hooks select the exact owned TTSSpeakFrame.
+        # The public context-creation callback runs before its synthesis starts.
+        def before_final_tts(_tts: FrameProcessor, frame: Frame) -> None:
+            end_call_playback.before_tts_frame(frame)
+
+        def after_final_tts(_tts: FrameProcessor, frame: Frame) -> None:
+            end_call_playback.after_tts_frame(frame)
+
+        services.tts.bind_end_call_context(end_call_playback.bind_context)
+        services.tts.add_event_handler("on_before_process_frame", before_final_tts)
+        services.tts.add_event_handler("on_after_process_frame", after_final_tts)
     if begin_snapshot is not None:
         services.llm.add_event_handler("on_error", abort_sparra_llm_error)
 
-    barrier = DisclosureOutputBarrier(controller=controller)
+    barrier = DisclosureOutputBarrier(controller=controller, end_call_playback=end_call_playback)
     output = transport.output()
     # Native MediaSender pushes ordered marks only after send_message returns.
     output.add_event_handler("on_after_push_frame", disclosure_mark_sent)

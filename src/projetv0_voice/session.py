@@ -16,7 +16,13 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-from pipecat.frames.frames import ErrorFrame, FunctionCallResultProperties, TTSSpeakFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    EndWorkerFrame,
+    ErrorFrame,
+    FunctionCallResultProperties,
+    TTSSpeakFrame,
+)
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.workers.runner import WorkerRunner
@@ -47,6 +53,7 @@ from projetv0_voice.pipeline import (
     SPARRA_DISCLOSURE,
     SPARRA_RECORDING_DISCLOSURE,
     CallRuntime,
+    EndCallPlayback,
     FirstFailure,
     ObservedPipeline,
     PipelineTransport,
@@ -59,7 +66,10 @@ from projetv0_voice.qualified_profile import (
     QualifiedDeploymentProfileV1,
     RuntimeDeploymentProfileV1,
 )
+from projetv0_voice.telnyx.frames import TelnyxMarkFrame
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
+
+_NORMAL_END_REASONS = frozenset({"closed", "conversation_ended"})
 
 
 class DisclosureState(Enum):
@@ -477,21 +487,21 @@ class _TerminalOutcome:
         return frozen.reason if frozen is not None else self._reason
 
     def note_caller_cancellation(self) -> None:
-        if self._frozen is None and self._reason == "closed":
+        if self._frozen is None and self._reason in _NORMAL_END_REASONS:
             self._reason = "external_cancel"
 
     def note_runtime_reason(self, reason: str | None) -> None:
-        if self._frozen is None and self._reason == "closed" and reason is not None:
+        if self._frozen is None and self._reason in _NORMAL_END_REASONS and reason is not None:
             self._reason = reason
 
     def request_reason(self, reason: str) -> None:
         if self._frozen is None and (
-            reason == "recording_required_error" or self._reason == "closed"
+            reason == "recording_required_error" or self._reason in _NORMAL_END_REASONS
         ):
             self._reason = reason
 
     def promote_failure(self, code: str | None) -> None:
-        if self._frozen is None and self._reason == "closed" and code is not None:
+        if self._frozen is None and self._reason in _NORMAL_END_REASONS and code is not None:
             self._reason = code
 
     def freeze(self) -> _FrozenTerminalOutcome:
@@ -500,7 +510,7 @@ class _TerminalOutcome:
                 status="closing"
                 if self._reason == "qualified_line_connected"
                 else "closed"
-                if self._reason == "closed"
+                if self._reason in _NORMAL_END_REASONS
                 else "failed",
                 reason=self._reason,
             )
@@ -619,6 +629,7 @@ class CallSession:
         self._controller: DisclosureController | None = None
         self._recorder: TurnRecorder | None = None
         self._active_runtime: CallRuntime | None = None
+        self._end_call_playback: EndCallPlayback | None = None
         self._terminal_publication: VoiceOperationV1 | None = None
         self._partial_result: MessageResultV1 | None = None
         self._result_inference_task: asyncio.Task[MessageResultV1 | None] | None = None
@@ -693,8 +704,53 @@ class CallSession:
             properties=FunctionCallResultProperties(run_llm=not self._no_new_ai),
         )
 
+    async def _end_call_tool(self, params: FunctionCallParams) -> None:
+        controller, playback = self._controller, self._end_call_playback
+        allowed = (
+            isinstance(params.arguments, dict)
+            and not params.arguments
+            and not self._no_new_ai
+            and not self._drain_requested
+            and self._terminal_outcome.reason == "closed"
+            and controller is not None
+            and controller.is_active()
+            and playback is not None
+        )
+        attempt = playback.begin() if allowed and playback is not None else None
+        if attempt is None or playback is None:
+            await params.result_callback(
+                {"success": False},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+        ending = False
+        try:
+            await params.result_callback(
+                {"success": True},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            await params.llm.push_frame(attempt.speak_frame)
+            await params.llm.push_frame(TelnyxMarkFrame(attempt.mark_name))
+            acknowledged = await playback.wait_for_ack(
+                attempt, phase_timeout=self._profile.disclosure_mark_timeout_ms / 1000
+            )
+            if (
+                acknowledged
+                and controller is not None
+                and controller.is_active()
+                and not self._no_new_ai
+                and not self._drain_requested
+            ):
+                await params.llm.push_frame(EndWorkerFrame(reason="conversation_ended"))
+                ending = True
+        finally:
+            if not ending:
+                playback.invalidate(attempt)
+
     def _note_caller_started(self) -> None:
         self._caller_started = True
+        if self._end_call_playback is not None:
+            self._end_call_playback.invalidate()
 
     async def _queue_opening_invitation(self) -> None:
         controller, runtime = self._controller, self._active_runtime
@@ -721,6 +777,9 @@ class CallSession:
         self._run_started = True
 
         first_failure = FirstFailure(shared_failure_event=self._writer.fatal_event)
+        self._end_call_playback = EndCallPlayback(
+            generation=self._identity.generation.generation, first_failure=first_failure
+        ) if self._identity.begin_snapshot is not None else None
         native_fatal = _NativeFatalObservation()
         controller = DisclosureController(
             identity=self._identity,
@@ -775,6 +834,9 @@ class CallSession:
                 turn_recorder=recorder,
                 first_failure=first_failure,
                 begin_snapshot=self._identity.begin_snapshot,
+                end_call_handler=self._end_call_tool
+                if self._identity.begin_snapshot is not None else None,
+                end_call_playback=self._end_call_playback,
                 transfer_handler=self._request_human_tool
                 if self._identity.begin_snapshot is not None
                 and self._registry_terminalizer is not None
@@ -810,6 +872,17 @@ class CallSession:
                 "on_pipeline_error",
                 observe_native_fatal,
             )
+
+            def observe_graceful_end(_worker: object, frame: object) -> None:
+                if (
+                    isinstance(frame, EndFrame)
+                    and frame.reason == "conversation_ended"
+                    and self._end_call_playback is not None
+                    and self._end_call_playback.acknowledged
+                ):
+                    self._terminal_outcome.note_runtime_reason("conversation_ended")
+
+            runtime.worker.add_event_handler("on_pipeline_finished", observe_graceful_end)
             await runtime.runner.add_workers(runtime.worker)
             runner_task = cast(
                 asyncio.Task[None],
@@ -877,7 +950,7 @@ class CallSession:
             raise cancellation
         if terminal_outcome.reason == "qualified_line_connected":
             return
-        if terminal_outcome.reason != "closed":
+        if terminal_outcome.reason not in _NORMAL_END_REASONS:
             raise CallSessionError(terminal_outcome.reason)
         final_error = first_failure.code
         if final_error is not None:
@@ -1092,6 +1165,8 @@ class CallSession:
         terminal_outcome: _TerminalOutcome,
         cancel_continuations: bool,
     ) -> None:
+        if self._end_call_playback is not None:
+            self._end_call_playback.invalidate()
         await self._attempt(
             lambda: controller.terminalize_and_join(
                 cancel_continuations=cancel_continuations
@@ -1330,9 +1405,9 @@ class CallSession:
                 cleanup_hangup=True,
             )
         return TerminalProposal(
-            status="closed" if reason == "closed" else "failed",
+            status="closed" if reason in _NORMAL_END_REASONS else "failed",
             reason=reason,
-            metric_class="closed" if reason == "closed" else "failed",
+            metric_class="closed" if reason in _NORMAL_END_REASONS else "failed",
             cleanup_hangup=True,
         )
 
