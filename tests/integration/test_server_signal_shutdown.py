@@ -2610,7 +2610,7 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
     from uuid import UUID
 
     from nacl.signing import SigningKey
-    from pipecat.processors.frame_processor import FrameProcessor
+    from test_call_session import _OfflineTts, _PassProcessor
     from websockets.asyncio.client import connect
 
     from projetv0_voice.admission import (
@@ -2637,16 +2637,15 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
         VerifiedWebhook,
     )
 
-    class Processor(FrameProcessor):
-        pass
-
     class SttClient:
         async def aclose(self) -> None:
             return None
 
-    class Llm(Processor):
+    processor_events: list[str] = []
+
+    class Llm(_PassProcessor):
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__("llm", processor_events)
             self._client = SimpleNamespace(close=self._close_client)
 
         async def _close_client(self) -> None:
@@ -2845,9 +2844,9 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
         writer=writer,
         keyring=keyring,
         stt_http_client_factory=SttClient,
-        stt_factory=lambda _client: Processor(),
+        stt_factory=lambda _client: _PassProcessor("stt", processor_events),
         llm_factory=Llm,
-        tts_factory=Processor,
+        tts_factory=lambda: _OfflineTts("tts", processor_events),
         recording_factory=lambda _identity: Recording(),
         idle_timeout_seconds=30.0,
         cleanup_phase_timeout_seconds=2.0,
@@ -3006,7 +3005,29 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
                 activated[control_id].wait(),
                 timeout=30.0,
             )
+            # Registry activation precedes the native pipeline startup. Observe
+            # real disclosure output before treating this owner as a live call.
+            media_seen = False
+            async with asyncio.timeout(5.0):
+                while True:
+                    output = json.loads(await connection.recv())
+                    if output.get("event") == "media":
+                        media_seen = True
+                    elif output.get("event") == "mark":
+                        assert media_seen
+                        assert output["mark"]["name"].startswith("pv0-disclosure-")
+                        await connection.send(
+                            json.dumps(
+                                {
+                                    "event": "mark",
+                                    "stream_id": f"stream-{index}",
+                                    "mark": output["mark"],
+                                }
+                            )
+                        )
+                        break
         assert all(ready.is_set() for ready in activated.values())
+        assert await registry.live_call_count() == 10
         await connections[0].close()
         await connections[0].wait_closed()
         await asyncio.wait_for(session_0_terminated.wait(), timeout=30.0)
@@ -3034,6 +3055,9 @@ async def test_ten_sessions_traverse_real_asgi_registry_and_lifecycle_owners(
         listener.close()
 
     assert server.force_exit is False
+    assert await registry.live_call_count() == 0
+    assert all(task.done() for task in lifecycle_tasks.values())
+    assert not supervisor.call_lifecycle_owners._tasks
     assert gate.in_use == 0
     assert raw_control.closed is True
     assert sink.closed is True

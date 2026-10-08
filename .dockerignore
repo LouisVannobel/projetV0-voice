@@ -6,7 +6,6 @@
 !src/**
 !scripts/
 !scripts/export_runtime_contract.py
-!scripts/prepare_tokenizers.py
 !agents/
 !agents/agent-a/
 !agents/agent-a/**

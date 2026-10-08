@@ -39,6 +39,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, F
 from pipecat.registry.registry import WorkerRegistry
 from pipecat.runner.types import TelnyxCallData
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
@@ -52,6 +53,7 @@ from starlette.websockets import WebSocket, WebSocketState
 from projetv0_voice.admission import CallGenerationHandle, ProcessLeaseClaim
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
+from projetv0_voice.inference.completion_strategy import STT_COMPLETED_SEGMENT_KEY
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.inference.services import build_llm, build_stt
 from projetv0_voice.metrics import RuntimeMetrics
@@ -312,7 +314,7 @@ async def test_service_bundle_preserves_child_cancel_after_sibling_success() -> 
 
 @pytest.mark.asyncio
 async def test_pinned_llm_close_shim_is_the_only_accepted_private_client_contract() -> None:
-    assert version("pipecat-ai") == "1.7.0"
+    assert version("pipecat-ai") == "1.12.0"
     llm = build_llm(_profile().inference, SecretStr("offline-secret"))
     stt_client = _SttClient()
     bundle = session_module.ServiceBundle(
@@ -535,21 +537,25 @@ class _SetupFailingProcessor(_PassProcessor):
 
 class _SegmentedSessionStt(SegmentedSTTService):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(settings=STTSettings(model=None, language=None))
         self.started = asyncio.Event()
         self.transcribed = asyncio.Event()
+        self.completed_segments = 0
 
     async def start(self, frame: StartFrame) -> None:
         await super().start(frame)
         self.started.set()
 
     async def run_stt(self, _audio: bytes) -> AsyncGenerator[Frame | None]:
-        yield TranscriptionFrame(
+        self.completed_segments += 1
+        transcript = TranscriptionFrame(
             text="tour-retarde",
             user_id="",
             timestamp=NOW.isoformat(),
             language=Language.FR,
         )
+        transcript.metadata[STT_COMPLETED_SEGMENT_KEY] = self.completed_segments
+        yield transcript
         self.transcribed.set()
 
 

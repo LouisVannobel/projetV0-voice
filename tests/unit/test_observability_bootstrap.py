@@ -209,24 +209,41 @@ third_party = (
     "loguru", "onnxruntime", "opentelemetry", "requests", "pipecat", "openai",
     "httpx", "telnyx"
 )
+guarded_imports = set()
+
+def observe_import(event, args):
+    if event != "import":
+        return
+    name = args[0].partition(".")[0]
+    if name in third_party[2:]:
+        configured = sys.modules.get("projetv0_voice.dependency_logging")
+        assert configured is not None and configured._configured, name
+        guarded_imports.add(name)
+
+sys.addaudithook(observe_import)
 import projetv0_voice.observability_bootstrap as bootstrap
 phase_guard = [name for name in third_party if name in sys.modules]
 import projetv0_voice.dependency_logging as dependency_logging
 phase_logging_import = [name for name in third_party if name in sys.modules]
 token = bootstrap.validate_observability_environment()
+phase_validated = [name for name in third_party if name in sys.modules]
 dependency_logging.configure_dependency_logging(token)
 phase_configured = [name for name in third_party if name in sys.modules]
 import projetv0_voice.metrics
 phase_metrics = [name for name in third_party if name in sys.modules]
+# Pipecat 1.12 keeps LLMContext's OpenAI aliases under TYPE_CHECKING.
+# SDKs load at the provider phase, after dependency logging is configured.
 import projetv0_voice.pipeline
 phase_pipeline = [name for name in third_party if name in sys.modules]
 import projetv0_voice.inference.services
 import projetv0_voice.inference.openrouter_tts
 import projetv0_voice.telnyx.call_control
 phase_providers = [name for name in third_party if name in sys.modules]
+assert guarded_imports == set(third_party[2:])
 print(json.dumps([
     phase_guard,
     phase_logging_import,
+    phase_validated,
     phase_configured,
     phase_metrics,
     phase_pipeline,
@@ -240,6 +257,7 @@ print(json.dumps([
     assert json.loads(result.stdout) == [
         [],
         [],
+        [],
         ["loguru", "onnxruntime"],
         ["loguru", "onnxruntime", "opentelemetry", "requests"],
         [
@@ -248,8 +266,6 @@ print(json.dumps([
             "opentelemetry",
             "requests",
             "pipecat",
-            "openai",
-            "httpx",
         ],
         [
             "loguru",

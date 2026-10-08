@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import math
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from contextlib import suppress
 from dataclasses import FrozenInstanceError
 from importlib import import_module
 from importlib.metadata import version
@@ -13,6 +14,7 @@ import httpx
 import pytest
 from loguru import logger
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
     CancelFrame,
     EndFrame,
     ErrorFrame,
@@ -20,6 +22,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    LLMContextFrame,
     MetricsFrame,
     OutputTransportMessageFrame,
     StartFrame,
@@ -29,6 +32,7 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     TTSStoppedFrame,
     UserSpeakingFrame,
+    UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -38,12 +42,14 @@ from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import IdleFrameObserver, PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMAssistantAggregator,
     LLMUserAggregator,
 )
 from pipecat.processors.filters.function_filter import FunctionFilter
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.tests.utils import run_test
 from pipecat.transcriptions.language import Language
@@ -52,6 +58,7 @@ from pipecat.workers.base_worker import WorkerParams
 from pipecat.workers.runner import WorkerRunner
 from pydantic import SecretStr
 
+from projetv0_voice.inference.completion_strategy import STT_COMPLETED_SEGMENT_KEY
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.qualified_profile import InferenceProfileV1
@@ -230,7 +237,7 @@ class _SetupProbe(FrameProcessor):
 
 class _SegmentedSttProbe(SegmentedSTTService):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(settings=STTSettings(model=None, language=None))
         self.started = asyncio.Event()
         self.segments: list[bytes] = []
 
@@ -240,12 +247,14 @@ class _SegmentedSttProbe(SegmentedSTTService):
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None]:
         self.segments.append(audio)
-        yield TranscriptionFrame(
+        transcript = TranscriptionFrame(
             text="bonjour",
             user_id="",
             timestamp="2026-08-28T18:00:00+00:00",
             language=Language.FR,
         )
+        transcript.metadata[STT_COMPLETED_SEGMENT_KEY] = len(self.segments)
+        yield transcript
 
 
 class _OfflineTtsProcessor(FrameProcessor):
@@ -284,7 +293,7 @@ class _FailingChunkStream(httpx.AsyncByteStream):
 
 
 def test_pinned_public_runner_pipeline_filter_and_message_contracts() -> None:
-    assert version("pipecat-ai") == "1.7.0"
+    assert version("pipecat-ai") == "1.12.0"
     assert issubclass(pipeline_module.ObservedTaskManager, TaskManager)
     assert issubclass(pipeline_module.ObservedPipeline, Pipeline)
     assert issubclass(OutputTransportMessageFrame, object)
@@ -310,7 +319,14 @@ def test_pinned_public_runner_pipeline_filter_and_message_contracts() -> None:
         "clock",
         "task_manager",
         "pipeline_worker",
+        "audio_in_sample_rate",
+        "audio_out_sample_rate",
+        "enable_metrics",
+        "enable_tracing",
+        "enable_usage_metrics",
         "observer",
+        "report_only_initial_ttfb",
+        "tracing_context",
         "tool_resources",
     ]
     assert list(inspect.signature(FunctionFilter).parameters) == [
@@ -653,13 +669,106 @@ def test_build_pipeline_has_exact_native_context_and_project_boundary_order() ->
     assert isinstance(public[3], pipeline_module.InferenceErrorBoundary)
     assert public[4] is stt
     assert isinstance(public[5], LLMUserAggregator)
-    assert public[6] is llm
-    assert public[7] is tts
-    assert isinstance(public[8], pipeline_module.DisclosureOutputBarrier)
-    assert public[9] is transport.output_processor
-    assert isinstance(public[10], LLMAssistantAggregator)
+    assert isinstance(public[6], FunctionFilter)
+    assert public[7] is llm
+    assert public[8] is tts
+    assert isinstance(public[9], pipeline_module.DisclosureOutputBarrier)
+    assert public[10] is transport.output_processor
+    assert isinstance(public[11], LLMAssistantAggregator)
     assert all(type(processor).__name__ != "TranscriptProcessor" for processor in public)
     assert all(type(processor).__name__ != "AudioBufferProcessor" for processor in public)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed_by", ["failure", "admission"])
+async def test_terminal_context_never_reaches_llm_provider_stage(closed_by: str) -> None:
+    stages = SimpleNamespace(
+        stt=_SetupProbe("stt"), llm=_SetupProbe("llm"), tts=_SetupProbe("tts")
+    )
+    failure = pipeline_module.FirstFailure()
+    if closed_by == "failure":
+        failure.signal("stt_failed")
+    pipeline = pipeline_module.build_pipeline(
+        transport=_Transport(), services=stages,
+        controller=_GateController(active=closed_by != "admission"),
+        turn_recorder=_Turns(), first_failure=failure,
+    )
+    contexts: list[LLMContextFrame] = []
+
+    def note_context(_processor: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, LLMContextFrame):
+            contexts.append(frame)
+
+    stages.llm.add_event_handler("on_before_process_frame", note_context)
+    await run_test(
+        pipeline,
+        frames_to_send=[
+            LLMContextFrame(LLMContext(messages=[{"role": "user", "content": "unit"}]))
+        ],
+    )
+    assert contexts == [], "a closed call started work at the LLM stage"
+
+
+@pytest.mark.asyncio
+async def test_empty_interruption_does_not_prompt_an_unrequested_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actual configured policy after a native empty-turn timer.
+
+    Only the public watchdog duration is shortened; no STT work is pending.
+    Bot/VAD events are controlled; this checks policy, not noise detection.
+    """
+    native_params = pipeline_module.LLMUserAggregatorParams
+
+    def short_empty_timeout(**kwargs: object) -> object:
+        return native_params(**(kwargs | {"user_turn_stop_timeout": 0.05}))
+
+    monkeypatch.setattr(pipeline_module, "LLMUserAggregatorParams", short_empty_timeout)
+    stages = SimpleNamespace(
+        stt=_SetupProbe("stt"), llm=_SetupProbe("llm"), tts=_SetupProbe("tts")
+    )
+    pipeline = pipeline_module.build_pipeline(
+        transport=_Transport(), services=stages, controller=_GateController(active=True),
+        turn_recorder=_Turns(), first_failure=pipeline_module.FirstFailure(),
+    )
+    user = next(
+        processor for processor in pipeline.processors if isinstance(processor, LLMUserAggregator)
+    )
+    started, stopped, prompted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    contexts: list[LLMContextFrame] = []
+
+    def note_user(_processor: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            stopped.set()
+
+    def note_context(_processor: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, LLMContextFrame):
+            contexts.append(frame)
+            prompted.set()
+
+    async def note_started(_worker: PipelineWorker, _frame: StartFrame) -> None:
+        started.set()
+
+    user.add_event_handler("on_after_push_frame", note_user)
+    user.add_event_handler("on_before_push_frame", note_context)
+    worker = PipelineWorker(pipeline, params=PipelineParams(audio_in_sample_rate=8000),
+                            enable_rtvi=False, cancel_on_idle_timeout=False)
+    worker.add_event_handler("on_pipeline_started", note_started)
+    runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
+    await runner.add_workers(worker)
+    running = asyncio.create_task(runner.run())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await worker.queue_frames([BotStartedSpeakingFrame(), VADUserStartedSpeakingFrame(),
+                                   VADUserStoppedSpeakingFrame()])
+        await asyncio.wait_for(stopped.wait(), timeout=6)
+        with suppress(TimeoutError):
+            await asyncio.wait_for(prompted.wait(), timeout=0.25)
+    finally:
+        if not running.done():
+            await worker.queue_frame(EndFrame())
+        await asyncio.wait_for(running, timeout=2)
+    assert contexts == [], "empty interruption triggered an unrequested LLM answer"
 
 
 @pytest.mark.asyncio

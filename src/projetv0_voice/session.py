@@ -258,7 +258,7 @@ class ServiceBundle:
             raise ServiceLifecycleError("service_close_failed") from None
 
     async def _close_pinned_llm_client(self) -> None:
-        if version("pipecat-ai") != "1.7.0":
+        if version("pipecat-ai") != "1.12.0":
             raise ServiceLifecycleError("service_close_failed")
         client = getattr(self.llm, "_client", None)
         close = getattr(client, "close", None)

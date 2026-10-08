@@ -18,6 +18,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     OutputAudioRawFrame,
     OutputTransportMessageFrame,
+    OutputTransportMessageUrgentFrame,
     StartFrame,
     SystemFrame,
     TTSAudioRawFrame,
@@ -67,7 +68,7 @@ def _assert_constant_safe(error: TelnyxSerializerError, secret: str) -> None:
 
 
 def test_pinned_native_types_and_constructor_contract() -> None:
-    assert version("pipecat-ai") == "1.7.0"
+    assert version("pipecat-ai") == "1.12.0"
     assert issubclass(TelnyxMarkFrame, OutputTransportMessageFrame)
     assert issubclass(TelnyxMarkFrame, DataFrame)
     assert not issubclass(TelnyxMarkFrame, SystemFrame)
@@ -337,7 +338,12 @@ async def test_media_critical_shape_is_validated_even_when_admission_is_closed(
 
 
 @pytest.mark.asyncio
-async def test_only_the_project_mark_frame_encodes_the_official_mark_payload() -> None:
+@pytest.mark.parametrize(
+    "generic_type", [OutputTransportMessageFrame, OutputTransportMessageUrgentFrame]
+)
+async def test_only_the_project_mark_frame_encodes_the_official_mark_payload(
+    generic_type: type[OutputTransportMessageFrame] | type[OutputTransportMessageUrgentFrame],
+) -> None:
     serializer = ProjetV0TelnyxFrameSerializer(
         "stream-one", expected_call_control_id="call-one"
     )
@@ -352,7 +358,7 @@ async def test_only_the_project_mark_frame_encodes_the_official_mark_payload() -
     )
     assert (
         await serializer.serialize(
-            OutputTransportMessageFrame(
+            generic_type(
                 message={"event": "mark", "mark": {"name": "not-project-owned"}}
             )
         )

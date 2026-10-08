@@ -10,39 +10,200 @@ from typing import Any, cast
 
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
-from pipecat.frames.frames import ErrorFrame, FatalErrorFrame, Frame
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    ErrorFrame,
+    FatalErrorFrame,
+    Frame,
+    InputAudioRawFrame,
+    StartFrame,
+    TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.services.whisper.base_stt import language_to_whisper_language
 from pipecat.transcriptions.language import Language
 from pydantic import SecretStr
 
+from projetv0_voice.inference.completion_strategy import (
+    STT_COMPLETED_SEGMENT_KEY,
+    STT_MAX_PENDING_SEGMENTS,
+    STT_REQUEST_TIMEOUT_SECONDS,
+    STT_TERMINAL_PARTIAL_KEY,
+)
 from projetv0_voice.qualified_profile import InferenceProfileV1
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _ISO_639_1 = re.compile(r"^[a-z]{2}$")
-_STT_TIMEOUT_SECONDS = 8.0
+_STT_TIMEOUT_SECONDS = STT_REQUEST_TIMEOUT_SECONDS
+_STT_DRAIN_TIMEOUT_SECONDS = 8.0
+# Pilot overload bounds; these are not provider throughput guarantees.
+_STT_MAX_PENDING_SEGMENTS = STT_MAX_PENDING_SEGMENTS
+_STT_MAX_BATCH_TEXT_BYTES = 32 * 1024
 _HTTP_TIMEOUT = httpx.Timeout(8.0, connect=2.0)
 
 
 class _BoundedOpenAISTTService(OpenAISTTService):
-    """Bound native segmented transcription without changing its scheduling."""
+    """Bound native HTTP segments and emit only a fully transcribed speech batch.
 
-    # Pipecat 1.7.0's abstract STTService lacks yield; its native Whisper method yields.
-    # Preserve the native async-generator contract exercised by HTTP deadline tests.
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame]:  # type: ignore[override]
+    Pipecat owns the audio buffer, segment queue, and serial transcription task.
+    An older segment's final transcript cannot finalize resumed speech while
+    its audio or queued transcription remains outstanding. Retain text only;
+    the last native transcript supplies the completed batch's metadata.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._pending_segments = 0
+        self._accepted_segment = 0
+        self._completed_segment = 0
+        self._batch_text = ""
+        self._last_transcript: TranscriptionFrame | None = None
+        self._caller_speaking = False
+        self._closing = False
+        self._closing_with_open_speech = False
+        self._terminal = False
+
+    def _discard_batch(self) -> None:
+        self._pending_segments = 0
+        self._batch_text = ""
+        self._last_transcript = None
+
+    def _fail_batch(self, code: str) -> FatalErrorFrame | None:
+        if self._terminal:
+            return None
+        self._terminal = True
+        self._discard_batch()
+        return FatalErrorFrame(error=code)
+
+    def _take_completed_batch(self) -> TranscriptionFrame | None:
+        if self._pending_segments or self._caller_speaking or self._terminal:
+            return None
+        frame = self._last_transcript
+        if frame is not None:
+            frame.text = self._batch_text
+        self._batch_text = ""
+        self._last_transcript = None
+        if frame is not None:
+            frame.metadata[STT_COMPLETED_SEGMENT_KEY] = self._completed_segment
+            if self._closing_with_open_speech:
+                frame.metadata[STT_TERMINAL_PARTIAL_KEY] = True
+        return frame
+
+    async def start(self, frame: StartFrame) -> None:
+        # A worker owns one call. Direct SDK warmup precedes its VAD stream.
+        self._accepted_segment = 0
+        self._completed_segment = 0
+        await super().start(frame)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(
+            frame, (InputAudioRawFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame)
+        ):
+            if self._terminal or self._closing:
+                return
+            if isinstance(frame, VADUserStartedSpeakingFrame):
+                self._caller_speaking = True
+            elif isinstance(frame, VADUserStoppedSpeakingFrame):
+                self._caller_speaking = False
+                if self._pending_segments >= _STT_MAX_PENDING_SEGMENTS:
+                    failure = self._fail_batch("openrouter_stt_segment_limit")
+                    if failure is not None:
+                        await self.push_frame(failure)
+                    return
+                # Count before native dispatch: its background task can run as
+                # soon as the public process_frame call yields to the event loop.
+                self._pending_segments += 1
+                self._accepted_segment += 1
+        await super().process_frame(frame, direction)
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame]:
+        if self._terminal:
+            return
+        # Preserve public direct run_stt usage as a single segment, too.
+        if not self._pending_segments:
+            self._pending_segments = 1
+            self._accepted_segment += 1
         try:
             async with asyncio.timeout(_STT_TIMEOUT_SECONDS):
                 async with aclosing(super().run_stt(audio)) as frames:
                     async for frame in frames:
-                        if isinstance(frame, ErrorFrame):
-                            yield FatalErrorFrame(error="openrouter_stt_transport")
+                        if self._terminal:
                             return
-                        yield frame
+                        if isinstance(frame, ErrorFrame):
+                            failure = self._fail_batch("openrouter_stt_transport")
+                            if failure is not None:
+                                yield failure
+                            return
+                        if isinstance(frame, TranscriptionFrame):
+                            text = (
+                                f"{self._batch_text} {frame.text}".strip()
+                                if frame.text
+                                else self._batch_text
+                            )
+                            if len(text.encode("utf-8")) > _STT_MAX_BATCH_TEXT_BYTES:
+                                failure = self._fail_batch("openrouter_stt_text_limit")
+                                if failure is not None:
+                                    yield failure
+                                return
+                            self._batch_text = text
+                            self._last_transcript = frame
+                        else:
+                            yield frame
+            if self._terminal:
+                return
+            self._pending_segments -= 1
+            # Native FIFO means successful exhaustion advances this frontier.
+            self._completed_segment = self._accepted_segment - self._pending_segments
+            completed = self._take_completed_batch()
+            if completed is not None:
+                yield completed
         except asyncio.CancelledError:
             raise
         except TimeoutError:
-            yield FatalErrorFrame(error="openrouter_stt_timeout")
+            failure = self._fail_batch("openrouter_stt_timeout")
+            if failure is not None:
+                yield failure
+        except UnicodeError:
+            failure = self._fail_batch("openrouter_stt_text_invalid")
+            if failure is not None:
+                yield failure
+
+    async def stop(self, frame: EndFrame) -> None:
+        self._closing = True
+        self._closing_with_open_speech = self._caller_speaking
+        self._caller_speaking = False
+        try:
+            async with asyncio.timeout(_STT_DRAIN_TIMEOUT_SECONDS):
+                await super().stop(frame)
+            completed = self._take_completed_batch()
+            if completed is not None:
+                await self.push_frame(completed)
+        except TimeoutError:
+            failure = self._fail_batch("openrouter_stt_drain_timeout")
+            await super().cancel(CancelFrame())
+            if failure is not None:
+                await self.push_frame(failure)
+        finally:
+            self._terminal = True
+            self._discard_batch()
+
+    async def cancel(self, frame: CancelFrame) -> None:
+        self._terminal = True
+        self._discard_batch()
+        await super().cancel(frame)
+
+    async def cleanup(self) -> None:
+        self._terminal = True
+        self._discard_batch()
+        try:
+            await super().cancel(CancelFrame())
+        finally:
+            await super().cleanup()  # type: ignore[no-untyped-call]
 
 
 class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
@@ -102,6 +263,9 @@ def build_stt(
             model=profile.stt_model,
             language=resolved_language,
         ),
+        # Empty segment metadata is needed when the last segment is empty;
+        # its ordered completion receipt contributes no text to the user aggregator.
+        push_empty_transcripts=True,
         http_client=http_client,
     )
 

@@ -13,6 +13,7 @@ from typing import Any, Protocol, cast
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     CancelFrame,
@@ -23,6 +24,7 @@ from pipecat.frames.frames import (
     InputDTMFFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    LLMContextFrame,
     MetricsFrame,
     StartFrame,
     TTSAudioRawFrame,
@@ -46,13 +48,17 @@ from pipecat.processors.aggregators.llm_response_universal import (
     UserTurnStoppedMessage,
 )
 from pipecat.processors.filters.function_filter import FunctionFilter
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.services.llm_service import FunctionCallHandler
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import BaseUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.inference.completion_strategy import (
+    STT_USER_TURN_WATCHDOG_SECONDS,
+    CompletionAwareTurnStopStrategy,
+)
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
 from projetv0_voice.telnyx.frames import TelnyxMarkFrame
@@ -171,6 +177,15 @@ class ObservedPipeline(Pipeline):
     ) -> None:
         super().__init__(processors, source=source, sink=sink)
         self._first_failure = first_failure
+
+    # Pipecat's BaseObject annotates setup with its task manager, while the
+    # native FrameProcessor/Pipeline public override takes FrameProcessorSetup.
+    async def setup(self, setup: FrameProcessorSetup) -> None:  # type: ignore[override]
+        await super().setup(setup)
+        # Native 1.12 reports setup exceptions as unusable processors instead
+        # of raising. Keep admission closed when any required stage failed.
+        if any(not processor.is_usable for processor in self.processors):
+            self._first_failure.signal("pipeline_task_failed")
 
     async def cleanup(self) -> None:
         failed = False
@@ -557,7 +572,7 @@ class _CallObservers:
             or len({id(stt), id(llm), id(tts)}) != 3
         ):
             raise ValueError("call_observers_invalid") from None
-        latency_observer = UserBotLatencyObserver()  # type: ignore[no-untyped-call]
+        latency_observer = UserBotLatencyObserver()
         metrics_observer = RuntimeMetricsObserver(
             runtime_metrics=runtime_metrics,
             stt=stt,
@@ -752,7 +767,16 @@ def build_pipeline(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(sample_rate=8000),
-            user_turn_strategies=UserTurnStrategies(),
+            user_turn_strategies=UserTurnStrategies(
+                stop=[
+                    CompletionAwareTurnStopStrategy(
+                        turn_analyzer=LocalSmartTurnAnalyzerV3(),
+                        on_incomplete_turn_stop=lambda: first_failure.signal("call_failed"),
+                    )
+                ]
+            ),
+            user_turn_stop_timeout=STT_USER_TURN_WATCHDOG_SECONDS,
+            empty_user_turn=None,
         ),
         realtime_service_mode=False,
     )
@@ -810,6 +834,24 @@ def build_pipeline(
         _sanitize_inline_error(error, "llm_failed")
         first_failure.signal("call_failed")
 
+    inference_terminal = False
+
+    def close_terminal_inference(_aggregator: FrameProcessor, frame: Frame) -> None:
+        nonlocal inference_terminal
+        if isinstance(frame, (CancelFrame, EndFrame)):
+            # This native synchronous hook runs before the aggregator's
+            # terminal flush, even when the call owner is still joining it.
+            inference_terminal = True
+
+    async def allow_inference(frame: Frame) -> bool:
+        if not isinstance(frame, LLMContextFrame):
+            return True
+        try:
+            return not inference_terminal and first_failure.code is None and controller.is_active()
+        except Exception:
+            first_failure.signal("input_gate_failed")
+            return False
+
     async def disclosure_mark_sent(_output: FrameProcessor, frame: Frame) -> None:
         if not isinstance(frame, TelnyxMarkFrame) or frame.mark_name != controller.mark_name:
             return
@@ -827,6 +869,7 @@ def build_pipeline(
                 return
 
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
+    user_aggregator.add_event_handler("on_before_process_frame", close_terminal_inference)
     if on_user_turn_started is not None:
         # This public hook is synchronous; native turn-start event handlers are deferred.
         user_aggregator.add_event_handler("on_before_push_frame", note_user_turn_started)
@@ -846,6 +889,7 @@ def build_pipeline(
             inference_boundary,
             services.stt,
             user_aggregator,
+            FunctionFilter(filter=allow_inference, name="CallInferenceGate"),
             services.llm,
             services.tts,
             barrier,

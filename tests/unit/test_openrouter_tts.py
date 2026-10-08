@@ -191,6 +191,46 @@ async def test_empty_provider_options_omit_entire_provider_request_field() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "extra", [{}, {"tts_speed": None}, {"tts_speed": 1.15}], ids=["absent", "none", "explicit"]
+)
+async def test_optional_tts_speed_is_sent_as_standard_top_level_http_parameter(
+    extra: dict[str, object],
+) -> None:
+    captured: list[httpx.Request] = []
+    stream = _ChunkStream([b"\x01\x02", b"\x03\x04"])
+    client = _client_for(stream=stream, captured=captured)
+    try:
+        profile = InferenceProfileV1.model_validate({**_profile_data(), **extra})
+        service = _adapter_class()(
+            profile=profile, api_key=SecretStr("unit-secret"), http_client=client
+        )
+        service._sample_rate = 24000  # Same qualified value applied by native start.
+        frames = await _collect(service, context_id="speed-context")
+    finally:
+        await client.aclose()
+
+    assert len(captured) == 1
+    assert captured[0].method == "POST"
+    assert str(captured[0].url) == TTS_ENDPOINT
+    expected = {
+        "model": "microsoft/mai-voice-2-flash",
+        "input": "Bonjour",
+        "voice": "fr-FR-Soleil:MAI-Voice-2",
+        "response_format": "pcm",
+        "provider": {"options": {"azure": {"style": "cheerful"}}},
+    }
+    if extra.get("tts_speed") is not None:
+        expected["speed"] = 1.15
+    assert json.loads(captured[0].content) == expected
+    audio = [frame for frame in frames if isinstance(frame, TTSAudioRawFrame)]
+    assert b"".join(frame.audio for frame in audio) == b"\x01\x02\x03\x04"
+    assert all(frame.sample_rate == 24000 and frame.num_channels == 1 for frame in audio)
+    assert all(frame.context_id == "speed-context" for frame in audio)
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "headers",
     [
         (),
