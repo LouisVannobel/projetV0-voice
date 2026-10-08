@@ -261,12 +261,14 @@ def _service(
     *,
     profile: QualifiedDeploymentProfileV1 | None = None,
     timeout_seconds: float = 0.5,
+    session_timeout: int | None = None,
 ) -> AuthenticatedTelnyxHandshakeService:
     return AuthenticatedTelnyxHandshakeService(
         profile=profile or _profile(),
         lease_authority=authority,
         unauthenticated_gate=gate,
         timeout_seconds=timeout_seconds,
+        session_timeout=session_timeout,
     )
 
 
@@ -280,6 +282,33 @@ def test_nonfinite_global_deadline_is_rejected(timeout_seconds: float) -> None:
     assert str(raised.value) == "telnyx_handshake_config_invalid"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_timeout", [1, 300])
+async def test_authenticated_transport_uses_native_session_timeout(session_timeout: int) -> None:
+    websocket, _state = _websocket()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+
+    result = await _service(
+        authority, _Gate(_Permit()), session_timeout=session_timeout
+    ).authenticate(websocket)
+
+    assert result.transport._params.session_timeout == session_timeout
+
+
+@pytest.mark.parametrize(
+    "session_timeout", [True, False, 0, -1, 1.5, "300", float("inf"), float("nan")]
+)
+def test_invalid_session_timeout_is_rejected_before_transport(session_timeout: object) -> None:
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    gate = _Gate(_Permit())
+
+    with pytest.raises(TelnyxHandshakeError, match="^telnyx_handshake_config_invalid$"):
+        _service(authority, gate, session_timeout=session_timeout)  # type: ignore[arg-type]
+
+    assert gate.acquire_count == 0
+    assert authority.claim_calls == []
 
 
 @pytest.mark.asyncio
@@ -319,6 +348,7 @@ async def test_authenticate_builds_exact_native_call_data_and_transport_after_cl
     assert params.audio_in_enabled is True
     assert params.audio_out_enabled is True
     assert params.add_wav_header is False
+    assert params.session_timeout is None
     assert isinstance(params.serializer, ProjetV0TelnyxFrameSerializer)
     assert result.audio_admission.is_bound is False
     assert params.serializer.audio_admission is result.audio_admission

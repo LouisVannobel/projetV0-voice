@@ -60,3 +60,14 @@ WSS/Funnel URL, OTLP endpoint, image/runtime/bundle/inference digests, candidate
 and qualified profiles, and infrastructure readiness. None of those live inputs
 belongs in commands, reports, fixtures, GitHub, Docker layers, or environment
 variable values.
+
+The qualified V1 `telnyx_data_locality: "EU"` field is an operator attestation
+for EU Voice API and media routing. It does not attest Telnyx CDR/MDR storage
+location or external inference residency. Its existing schema and admission
+guards remain in force.
+
+Linked Sparra calls use Pipecat's native WebSocket `session_timeout=300` to bound
+each session to five minutes. The existing session timeout handler closes audio
+admission and uses the call owner's terminal cleanup and hangup command. Generic
+voice deployments keep the native default of no session timeout. This duration
+bound is not a monetary spending cap.

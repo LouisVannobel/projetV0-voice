@@ -428,6 +428,7 @@ class AuthenticatedTelnyxHandshakeService:
         lease_authority: LeaseAuthority,
         unauthenticated_gate: UnauthenticatedGate,
         timeout_seconds: float,
+        session_timeout: int | None = None,
     ) -> None:
         if (
             not isinstance(
@@ -438,12 +439,17 @@ class AuthenticatedTelnyxHandshakeService:
             or isinstance(timeout_seconds, bool)
             or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
+            or (
+                session_timeout is not None
+                and (type(session_timeout) is not int or session_timeout <= 0)
+            )
         ):
             raise TelnyxHandshakeError("telnyx_handshake_config_invalid")
         self._profile = profile
         self._lease_authority = lease_authority
         self._unauthenticated_gate = unauthenticated_gate
         self._timeout_seconds = float(timeout_seconds)
+        self._session_timeout = session_timeout
         self._active_permits: tuple[threading.Lock, set[int]] = (
             threading.Lock(),
             set(),
@@ -555,6 +561,7 @@ class AuthenticatedTelnyxHandshakeService:
                         audio_out_enabled=True,
                         add_wav_header=False,
                         serializer=serializer,
+                        session_timeout=self._session_timeout,
                     )
                     transport = FastAPIWebsocketTransport(websocket, params)
                     result = AuthenticatedTelnyxHandshake(

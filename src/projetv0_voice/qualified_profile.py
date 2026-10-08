@@ -180,7 +180,12 @@ class QualifiedDeploymentProfileV1(_StrictFrozenProfile):
     inference: InferenceProfileV1
     token_locator_id: TokenLocatorId
     telnyx_api_key_sha256: Sha256
-    telnyx_data_locality: Literal["EU"]
+    telnyx_data_locality: Literal["EU"] = Field(
+        description=(
+            "Operator-attested EU Voice API and media routing. Does not attest "
+            "Telnyx CDR/MDR storage location or external inference residency."
+        )
+    )
     telnyx_handshake_fixture_sha256: Sha256
     disclosure_mark_timeout_ms: Annotated[
         int, Field(ge=3000, le=10000), BeforeValidator(_require_exact_int)

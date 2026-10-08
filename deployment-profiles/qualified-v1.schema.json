@@ -181,6 +181,7 @@
     },
     "telnyx_data_locality": {
       "const": "EU",
+      "description": "Operator-attested EU Voice API and media routing. Does not attest Telnyx CDR/MDR storage location or external inference residency.",
       "title": "Telnyx Data Locality",
       "type": "string"
     },

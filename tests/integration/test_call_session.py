@@ -3590,7 +3590,7 @@ async def test_real_transport_disconnect_and_timeout_end_call_promptly(
     trigger_timeout: bool,
     code: str,
 ) -> None:
-    session, lease, _writer, admission, _disconnect = _real_websocket_session(
+    session, lease, writer, admission, _disconnect = _real_websocket_session(
         timeout=trigger_timeout
     )
 
@@ -3599,6 +3599,9 @@ async def test_real_transport_disconnect_and_timeout_end_call_promptly(
 
     assert admission.allows_audio() is False
     assert lease.calls == [("failed", code)]
+    assert "recording-cleanup" in writer.events
+    assert "call-terminal" in writer.events
+    assert "services:stt" in writer.events and "services:llm" in writer.events
 
 
 @pytest.mark.asyncio

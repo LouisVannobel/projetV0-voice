@@ -1325,6 +1325,18 @@ def test_committed_profile_schema_is_the_exact_deterministic_model_schema(
             assert definition["additionalProperties"] is False
 
 
+def test_eu_attestation_schema_limits_its_scope_to_voice_api_and_media() -> None:
+    locality = QualifiedDeploymentProfileV1.model_json_schema()["properties"][
+        "telnyx_data_locality"
+    ]
+
+    assert locality["const"] == "EU"
+    assert locality["description"] == (
+        "Operator-attested EU Voice API and media routing. Does not attest "
+        "Telnyx CDR/MDR storage location or external inference residency."
+    )
+
+
 @pytest.mark.parametrize(
     ("schema_filename", "fixture_filename"),
     [
