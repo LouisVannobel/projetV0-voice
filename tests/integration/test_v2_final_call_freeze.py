@@ -102,6 +102,7 @@ async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None):
         session._utcnow, session._uuid_factory = lambda: current[0], uuid4
         session._registry_terminalizer = _RegistryTerminalizer(case.registry, grant, owner)
         session._metric_lease = _TEST_RUNTIME_METRICS.begin_call()
+        session._runtime_metrics = _TEST_RUNTIME_METRICS
         case.session, case.grant, case.requests, case.clock = session, grant, requests, current
         try:
             yield case

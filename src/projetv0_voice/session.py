@@ -37,7 +37,7 @@ from projetv0_voice.audio_capture import AudioCaptureSummary, AudioFinishReason,
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
+from projetv0_voice.metrics import ResultOutcome, RuntimeMetrics, _CallMetricLease
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     CallUpsertPayloadV1,
@@ -724,45 +724,82 @@ class CallSession:
             return True
         return self._controller is not None and self._controller.audio_ready_for_transfer()
 
-    async def _prepare_partial_result(self) -> None:
-        if self._identity.routing is None:
-            return
-        frozen = (
-            await cast(Any, self._writer).read_frozen_call_publication_v2(
-                self._identity.call_id, generation=self._identity.generation.generation
-            ) if isinstance(getattr(self._identity, "begin_snapshot", None), BeginCallSnapshotV2)
-            else await cast(Any, self._writer).read_frozen_call_publication(self._identity.call_id)
-        )
-        if frozen is not None:
-            self._terminal_publication = frozen
-            return
-        retained = await cast(Any, self._writer).read_retained_call(self._identity.call_id)
-        facts = await cast(Any, self._writer).read_call_lifecycle(self._identity.call_id)
-        if (
-            self._no_new_ai
-            or getattr(self, "_result_inference_fenced", False)
-            or retained.erased
-            or (facts is not None and facts.transfer_fenced)
-        ):
-            return
-        task = asyncio.create_task(
-            infer_partial_result(
-                cast(Any, self._services.llm), retained, self._identity.routing.from_e164
-            ),
-            name="call-result-inference-owned",
-        )
-        self._result_inference_task = task
+    async def _prepare_partial_result(
+        self, *, outer_timeout: asyncio.Timeout | None = None,
+    ) -> None:
+        started_at = self._runtime_metrics._sample_monotonic()  # noqa: SLF001
+        outcome: ResultOutcome = "error"
         try:
-            async with asyncio.timeout(self._cleanup_phase_timeout_seconds):
-                result = await task
-            if not self._no_new_ai and not self._result_inference_fenced:
-                self._partial_result = result
-        except (Exception, asyncio.CancelledError):
-            self._partial_result = None
+            if self._identity.routing is None:
+                outcome = "not_started"
+                return
+            frozen = (
+                await cast(Any, self._writer).read_frozen_call_publication_v2(
+                    self._identity.call_id, generation=self._identity.generation.generation
+                ) if isinstance(
+                    getattr(self._identity, "begin_snapshot", None), BeginCallSnapshotV2
+                ) else await cast(Any, self._writer).read_frozen_call_publication(
+                    self._identity.call_id
+                )
+            )
+            if frozen is not None:
+                self._terminal_publication = frozen
+                outcome = "frozen_replay"
+                return
+            retained = await cast(Any, self._writer).read_retained_call(self._identity.call_id)
+            facts = await cast(Any, self._writer).read_call_lifecycle(self._identity.call_id)
+            if (
+                self._no_new_ai
+                or getattr(self, "_result_inference_fenced", False)
+                or retained.erased
+                or (facts is not None and facts.transfer_fenced)
+            ):
+                outcome = "fenced"
+                return
+            task = asyncio.create_task(
+                infer_partial_result(
+                    cast(Any, self._services.llm), retained, self._identity.routing.from_e164
+                ),
+                name="call-result-inference-owned",
+            )
+            self._result_inference_task = task
+            inner_timeout = asyncio.timeout(self._cleanup_phase_timeout_seconds)
+            try:
+                async with inner_timeout:
+                    result = await task
+                if not self._no_new_ai and not self._result_inference_fenced:
+                    self._partial_result = result
+                    outcome = "empty" if result is None else "valid"
+                else:
+                    outcome = "fenced"
+            except (Exception, asyncio.CancelledError) as error:
+                self._partial_result = None
+                if self._no_new_ai or self._result_inference_fenced:
+                    outcome = "fenced"
+                elif outer_timeout is not None and outer_timeout.expired():
+                    outcome = "outer_timeout"
+                elif inner_timeout.expired():
+                    outcome = "inner_timeout"
+                elif isinstance(error, asyncio.CancelledError):
+                    outcome = "cancelled"
+                elif isinstance(error, ValueError):
+                    # Pydantic ValidationError and provenance rejection are ValueErrors.
+                    outcome = "invalid"
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError:
+            if self._no_new_ai or getattr(self, "_result_inference_fenced", False):
+                outcome = "fenced"
+            else:
+                outcome = (
+                    "outer_timeout" if outer_timeout is not None and outer_timeout.expired()
+                    else "cancelled"
+                )
+            raise
         finally:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            self._runtime_metrics.record_result_outcome(outcome, started_at=started_at)
 
     async def _request_human_tool(self, params: FunctionCallParams) -> None:
         if (
@@ -1385,7 +1422,13 @@ class CallSession:
             first_failure,
             "recording_cleanup_failed",
         )
-        await self._attempt(self._prepare_partial_result, first_failure, "persistence_failed")
+        # Share the actual outer deadline only with result observation. Keep the
+        # existing _attempt failure policy, including consumed inference cancellation.
+        try:
+            async with asyncio.timeout(self._cleanup_phase_timeout_seconds) as result_timeout:
+                await self._prepare_partial_result(outer_timeout=result_timeout)
+        except (Exception, asyncio.CancelledError):
+            first_failure.signal("persistence_failed")
         if self._identity.routing is None:
             await self._attempt(self._services.aclose, first_failure, "service_close_failed")
         self._promote_cleanup_failure(terminal_outcome, first_failure)
