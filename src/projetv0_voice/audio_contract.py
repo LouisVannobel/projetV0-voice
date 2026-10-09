@@ -99,10 +99,7 @@ class BeginCallSnapshotV2(_AudioModel):
         if self.recording_policy == "off":
             if self.audio_available or self.recording_id is not None:
                 raise ValueError("audio_off_has_no_recording")
-        elif (
-            self.recording_contact_phone is None
-            or self.audio_available != (self.recording_id is not None)
-        ):
+        elif self.audio_available != (self.recording_id is not None):
             raise ValueError("audio_policy_identity_mismatch")
         return self
 

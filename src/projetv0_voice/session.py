@@ -1807,7 +1807,6 @@ class DisclosureController:
                 "Bonjour. Je suis Sparra, un assistant vocal IA. "
                 "Pour prendre votre message, l'audio de notre conversation peut être conservé "
                 f"30 jours pour {pin.knowledge.business_name}. "
-                f"Vous pouvez contacter cet établissement au {pin.recording_contact_phone}. "
                 "Le texte de cet échange est conservé trente jours, "
                 "même sans enregistrement audio. "
                 "Sans choix, l'appel continue sans enregistrement. "

@@ -94,6 +94,8 @@ def test_snapshot_v2_distinguishes_off_available_and_quota_unavailable():
         snapshot(recording_policy="off", recording_contact_phone=None,
                  audio_available=False, recording_id=None),
         snapshot(audio_available=False, recording_id=None),
+        snapshot(recording_contact_phone=None),
+        snapshot(recording_contact_phone=None, audio_available=False, recording_id=None),
     ]:
         parsed = model.model_validate(data)
         assert parsed.model_dump(mode="json") == data
@@ -109,7 +111,7 @@ def test_snapshot_v2_rejects_inconsistent_policy_and_noncanonical_fields():
         {"schema_version": True}, {"schema_version": 1},
         {"workspace_id": str(WORKSPACE_ID).upper()}, {"workspace_id": "foreign"},
         {"configuration_revision": True}, {"configuration_revision": 2_147_483_648},
-        {"recording_policy": "telnyx_dual"}, {"recording_contact_phone": None},
+        {"recording_policy": "telnyx_dual"},
         {"recording_contact_phone": "0033123456789"},
         {"audio_available": "true"}, {"audio_available": False},
         {"recording_id": None}, {"recording_policy": "off"},
@@ -125,13 +127,33 @@ def test_snapshot_v2_rejects_inconsistent_policy_and_noncanonical_fields():
         model.model_validate(missing)
 
 
+@pytest.mark.parametrize("policy", ["off", "local_30d"])
+@pytest.mark.parametrize("phone", ["", "0033123456789", " +33123456789", 33123456789, True])
+def test_snapshot_v2_validates_supplied_contact_phone_for_both_policies(policy, phone):
+    with pytest.raises(ValidationError):
+        snapshot_type().model_validate(snapshot(
+            recording_policy=policy, recording_contact_phone=phone,
+            audio_available=policy == "local_30d",
+            recording_id=str(RECORDING_ID) if policy == "local_30d" else None,
+        ))
+
+
+def test_snapshot_v2_keeps_the_nullable_contact_wire_key_required():
+    missing = snapshot()
+    missing.pop("recording_contact_phone")
+    with pytest.raises(ValidationError):
+        snapshot_type().model_validate(missing)
+
+
 @pytest.mark.asyncio
-async def test_begin_v2_uses_fixed_sql_and_existing_pool_without_changing_v1():
-    sink, pool, connection, factory = sink_with_rows([(snapshot(),)])
+@pytest.mark.parametrize("contact_phone", [None, "+33123456789"])
+async def test_begin_v2_uses_fixed_sql_and_existing_pool_without_changing_v1(contact_phone):
+    admitted_snapshot = snapshot(recording_contact_phone=contact_phone)
+    sink, pool, connection, factory = sink_with_rows([(admitted_snapshot,)])
     assert callable(getattr(sink, "begin_call_v2", None)), "missing fixed begin_call_v2"
     admitted = routing()
     value = await sink.begin_call_v2("agent-a", CALL_ID, admitted)
-    assert value.model_dump(mode="json") == snapshot()
+    assert value.model_dump(mode="json") == admitted_snapshot
     sql, params, prepare = connection.calls[0]
     assert sql == "SELECT voice.begin_call_v2(%s,%s,%s::jsonb)"
     assert params[:2] == ("agent-a", CALL_ID)
