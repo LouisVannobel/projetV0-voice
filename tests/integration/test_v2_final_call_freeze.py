@@ -79,12 +79,13 @@ async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None):
 
         async def inference(_context, **options):
             requests.append(options)
-            return json.dumps({"schema_version": 1, "quality": "partial", "category": "callback",
+            return json.dumps({"result": {
+                "schema_version": 1, "quality": "partial", "category": "callback",
                 "summary": "Rappel demandé.", "next_action": "Rappeler.",
                 "contact": {"name": None, "callback_e164": "+33102030407", "preference": None,
                     "callback_source": "provider", "callback_confirmed": False},
                 "evidence": [{"turn_id": str(retained.turns[0].turn_id), "role": "user"}],
-                "request_confirmed": False})
+                "request_confirmed": False}})
 
         async def close_services():
             return None

@@ -312,7 +312,10 @@ async def test_session_result_inference_is_joined_when_ai_stops(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stopped_recorder_facts_reach_existing_native_llm_client(tmp_path, monkeypatch):
+@pytest.mark.parametrize("empty", [False, True])
+async def test_stopped_recorder_facts_reach_existing_native_llm_client(
+    tmp_path, monkeypatch, empty,
+):
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -363,7 +366,9 @@ async def test_stopped_recorder_facts_reach_existing_native_llm_client(tmp_path,
                     {
                         "index": 0,
                         "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": json.dumps(result)},
+                        "message": {"role": "assistant", "content": json.dumps({
+                            "result": None if empty else result,
+                        })},
                     }
                 ],
             },
@@ -396,12 +401,31 @@ async def test_stopped_recorder_facts_reach_existing_native_llm_client(tmp_path,
         retained = await writer.read_retained_call(call_id)
         assert len(retained.turns) == 2 and retained.turns[1].interrupted
         result = await infer_partial_result(llm, retained, "+33102030407")
-        assert result.quality == "partial" and not result.request_confirmed
-        assert (
-            result.contact.callback_source == "provider" and not result.contact.callback_confirmed
-        )
+        if empty:
+            assert result is None
+        else:
+            assert result.quality == "partial" and not result.request_confirmed
+            assert result.contact.callback_source == "provider"
+            assert not result.contact.callback_confirmed
+            assert result.summary == "Rappel demandé."
+        assert len(requests) == 1
         assert requests[0]["stream"] is False
-        assert requests[0]["provider"] == {"allow_fallbacks": True, "sort": "latency"}
+        assert requests[0]["max_completion_tokens"] == 2048
+        assert requests[0]["provider"] == {
+            "allow_fallbacks": True, "sort": "latency", "require_parameters": True,
+        }
+        response_format = requests[0]["response_format"]
+        assert response_format["type"] == "json_schema"
+        assert response_format["json_schema"]["strict"] is True
+        schema = response_format["json_schema"]["schema"]
+        assert schema["type"] == "object" and schema["additionalProperties"] is False
+        assert schema["required"] == ["result"]
+        assert schema["properties"]["result"]["anyOf"] == [
+            {"$ref": "#/$defs/MessageResultV1"}, {"type": "null"},
+        ]
+        for nested in schema["$defs"].values():
+            assert nested["additionalProperties"] is False
+            assert set(nested["required"]) == set(nested["properties"])
         assert not requests[0].get("tools")
         assert requests[0]["model"] == "test/llm"
         assert "Pouvez-vous" in requests[0]["messages"][-1]["content"]
@@ -871,7 +895,7 @@ async def test_startup_erasure_precedes_stale_recovery_and_keeps_original_genera
         await supervisor.aclose()
 
 
-@pytest.mark.parametrize("mismatch", ["role", "call", "provider", "caller"])
+@pytest.mark.parametrize("mismatch", ["role", "call", "provider", "caller", "erased"])
 def test_partial_result_rejects_unretained_roles_or_unobserved_coordinates(mismatch):
     from projetv0_voice.models import MessageResultV1
     from projetv0_voice.persistence.business_result import (
@@ -882,6 +906,8 @@ def test_partial_result_rejects_unretained_roles_or_unobserved_coordinates(misma
 
     turn_id = uuid4()
     retained = RetainedCall((RetainedTurn(turn_id, 1, "user", "Rappelez +33102030407", False),), 0)
+    if mismatch == "erased":
+        retained = RetainedCall(retained.turns, 0, erased=True)
     contact = dict(
         name=None,
         callback_e164=None,

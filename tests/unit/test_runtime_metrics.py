@@ -364,11 +364,47 @@ async def test_result_outcomes_export_only_closed_attributes_and_finite_duration
         data = _metric_map(owner)
         count = _point(data[PREFIX + "result.outcomes"])
         elapsed = _point(data[PREFIX + "result.duration"])
-        assert dict(count.attributes) == dict(elapsed.attributes) == {"outcome": outcome}
+        attributes = {"outcome": outcome}
+        if outcome == "invalid":
+            attributes["invalid_reason"] = "unknown"
+        assert dict(count.attributes) == dict(elapsed.attributes) == attributes
         assert count.value == elapsed.count == 1
         assert elapsed.sum == 0.25
         assert not count.exemplars and not elapsed.exemplars
         assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["schema", "provenance", "unknown"])
+async def test_result_invalid_reason_is_shared_by_count_and_duration(reason):
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: 2.25)
+    try:
+        owner.record_result_outcome("invalid", started_at=2.0, invalid_reason=reason)
+        data = _metric_map(owner)
+        count = _point(data[PREFIX + "result.outcomes"])
+        elapsed = _point(data[PREFIX + "result.duration"])
+        assert dict(count.attributes) == dict(elapsed.attributes) == {
+            "outcome": "invalid", "invalid_reason": reason,
+        }
+        assert count.value == elapsed.count == 1 and elapsed.sum == 0.25
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome, reason", [
+    ("invalid", "private-error"), ("invalid", {"call_id": "private-error"}),
+    ("invalid", True), ("valid", "schema"), ("empty", "provenance"),
+])
+async def test_result_invalid_reason_rejects_unclosed_or_misplaced_labels(outcome, reason):
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: 2.25)
+    try:
+        owner.record_result_outcome(outcome, started_at=2.0, invalid_reason=reason)
+        assert owner.failure_code == "metrics_record_failed"
+        assert PREFIX + "result.outcomes" not in _metric_map(owner)
+        assert PREFIX + "result.duration" not in _metric_map(owner)
     finally:
         await owner.aclose()
 

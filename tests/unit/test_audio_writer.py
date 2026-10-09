@@ -217,7 +217,9 @@ async def test_one_audio_commit_and_low_queue_refusal_preserve_native_control(tm
             await release.wait()
 
     async with owned(
-        tmp_path / "voice.sqlite", contract_version=2, failpoint=hold_commit
+        # Capacity and atomicity here; separate tests advance the queue-age clock.
+        tmp_path / "voice.sqlite", contract_version=2, failpoint=hold_commit,
+        monotonic=lambda: 0.0,
     ) as (writer, keyring):
         await seed_admission(writer)
         await authenticate_audio(writer)

@@ -82,6 +82,8 @@ _RESULT_OUTCOMES = frozenset({
     "valid", "empty", "not_started", "frozen_replay", "fenced", "invalid",
     "inner_timeout", "outer_timeout", "cancelled", "error",
 })
+ResultInvalidReason = Literal["schema", "provenance", "unknown"]
+_RESULT_INVALID_REASONS = frozenset({"schema", "provenance", "unknown"})
 
 
 def _closed(value: object, allowed: frozenset[str]) -> bool:
@@ -530,12 +532,20 @@ class RuntimeMetrics:
 
     def record_result_outcome(
         self, outcome: ResultOutcome, *, started_at: float | None,
+        invalid_reason: ResultInvalidReason | None = None,
     ) -> None:
         """Observe one preparation, containing instrument and monotonic-clock faults."""
         if not _closed(outcome, _RESULT_OUTCOMES):
             self._latch_failure()
             return
+        if invalid_reason is not None and (
+            outcome != "invalid" or not _closed(invalid_reason, _RESULT_INVALID_REASONS)
+        ):
+            self._latch_failure()
+            return
         attributes: dict[str, object] = {"outcome": outcome}
+        if outcome == "invalid":
+            attributes["invalid_reason"] = "unknown" if invalid_reason is None else invalid_reason
         self._add(self._result_outcomes, attributes)
         ended_at = self._sample_monotonic()
         if started_at is None or ended_at is None:
