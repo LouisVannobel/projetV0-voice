@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from opentelemetry.exporter.otlp.proto.http import Compression
@@ -74,6 +74,14 @@ _RELAY_STATUSES = frozenset(
     }
 )
 _RECORDING_STATUSES = frozenset({"saved", "error", "purged"})
+ResultOutcome = Literal[
+    "valid", "empty", "not_started", "frozen_replay", "fenced", "invalid",
+    "inner_timeout", "outer_timeout", "cancelled", "error",
+]
+_RESULT_OUTCOMES = frozenset({
+    "valid", "empty", "not_started", "frozen_replay", "fenced", "invalid",
+    "inner_timeout", "outer_timeout", "cancelled", "error",
+})
 
 
 def _closed(value: object, allowed: frozenset[str]) -> bool:
@@ -322,6 +330,12 @@ class RuntimeMetrics:
         self._recordings_total = self._meter.create_counter(
             _PREFIX + "recordings.total", description="", unit=""
         )
+        self._result_outcomes = self._meter.create_counter(
+            _PREFIX + "result.outcomes", description="", unit=""
+        )
+        self._result_duration = self._meter.create_histogram(
+            _PREFIX + "result.duration", description="", unit="s"
+        )
         self._event_loop_lag = self._meter.create_histogram(
             _PREFIX + "runtime.event_loop_lag", description="", unit="s"
         )
@@ -513,6 +527,28 @@ class RuntimeMetrics:
             self._latch_failure()
             return
         self._add(self._recordings_total, {"recording_status": recording_status})
+
+    def record_result_outcome(
+        self, outcome: ResultOutcome, *, started_at: float | None,
+    ) -> None:
+        """Observe one preparation, containing instrument and monotonic-clock faults."""
+        if not _closed(outcome, _RESULT_OUTCOMES):
+            self._latch_failure()
+            return
+        attributes: dict[str, object] = {"outcome": outcome}
+        self._add(self._result_outcomes, attributes)
+        ended_at = self._sample_monotonic()
+        if started_at is None or ended_at is None:
+            return
+        start = _nonnegative_number(started_at)
+        if start is None:
+            self._latch_failure()
+            return
+        duration = ended_at - start
+        if not math.isfinite(duration) or duration < 0:
+            self._latch_failure()
+            return
+        self._record(self._result_duration, duration, attributes)
 
     def record_event_loop_lag(self, seconds: object) -> None:
         value = _nonnegative_number(seconds)

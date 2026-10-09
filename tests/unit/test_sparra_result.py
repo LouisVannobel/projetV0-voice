@@ -263,9 +263,11 @@ async def test_frozen_partial_result_replays_after_ack_without_new_nonce(tmp_pat
 async def test_session_result_inference_is_joined_when_ai_stops(tmp_path):
     from types import SimpleNamespace
 
+    from projetv0_voice.metrics import RuntimeMetrics
     from projetv0_voice.session import CallSession
 
     registry, writer, worker, _ = await start(tmp_path)
+    metrics = RuntimeMetrics.in_memory()
     entered, cancelled = asyncio.Event(), asyncio.Event()
 
     async def inference(*args, **kwargs):
@@ -280,6 +282,7 @@ async def test_session_result_inference_is_joined_when_ai_stops(tmp_path):
         call_id = (await registry.snapshot("original")).call_id
         assert writer.try_enqueue_turn(capture(writer, call_id, 1))
         session = CallSession.__new__(CallSession)
+        session._runtime_metrics = metrics
         session._identity = SimpleNamespace(
             call_id=call_id, routing=SimpleNamespace(from_e164=None)
         )
@@ -303,6 +306,7 @@ async def test_session_result_inference_is_joined_when_ai_stops(tmp_path):
         assert cancelled.is_set()
         assert session._partial_result is None
     finally:
+        await metrics.aclose()
         await writer.drain(2)
         await worker
 
@@ -914,6 +918,7 @@ async def test_result_never_calls_api_after_takeover(tmp_path, departure):
     from dataclasses import replace
     from types import SimpleNamespace
 
+    from projetv0_voice.metrics import RuntimeMetrics
     from projetv0_voice.session import CallSession
 
     registry, writer, worker, _ = await start(tmp_path)
@@ -941,11 +946,15 @@ async def test_result_never_calls_api_after_takeover(tmp_path, departure):
             call_id=call_id, routing=SimpleNamespace(from_e164=None)
         )
         session._writer = writer
+        session._runtime_metrics = RuntimeMetrics.in_memory()
         session._no_new_ai = departure == "bridged"
         session._result_inference_fenced = False
         session._services = SimpleNamespace(llm=SimpleNamespace(run_inference=inference))
         session._partial_result = session._result_inference_task = None
-        await session._prepare_partial_result()
+        try:
+            await session._prepare_partial_result()
+        finally:
+            await session._runtime_metrics.aclose()
         assert session._partial_result is None and session._result_inference_task is None
     finally:
         await writer.drain(2)

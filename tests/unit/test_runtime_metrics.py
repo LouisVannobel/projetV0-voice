@@ -93,6 +93,8 @@ def _production_token() -> ObservabilityBootstrapToken:
 
 
 EXPECTED_INSTRUMENTS = {
+    "result.outcomes": ("_Counter", ""),
+    "result.duration": ("_Histogram", "s"),
     "calls.active": ("_UpDownCounter", ""),
     "calls.total": ("_Counter", ""),
     "admission.rejections": ("_Counter", ""),
@@ -336,7 +338,7 @@ async def test_in_memory_provider_has_exact_resource_scope_filter_and_inventory(
     assert meter._instrumentation_scope.name == "projetv0.voice"  # noqa: SLF001
     assert meter._instrumentation_scope.version is None  # noqa: SLF001
     instruments = list(meter._instrument_id_instrument.values())  # noqa: SLF001
-    assert len(instruments) == 22
+    assert len(instruments) == 24
     assert {
         instrument.name.removeprefix(PREFIX): (
             type(instrument).__name__,
@@ -348,6 +350,68 @@ async def test_in_memory_provider_has_exact_resource_scope_filter_and_inventory(
     assert {thread.ident for thread in threading.enumerate()} == before_threads
 
     await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "valid", "empty", "not_started", "frozen_replay", "fenced", "invalid",
+    "inner_timeout", "outer_timeout", "cancelled", "error",
+])
+async def test_result_outcomes_export_only_closed_attributes_and_finite_duration(outcome):
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: 2.25)
+    try:
+        owner.record_result_outcome(outcome, started_at=2.0)
+        data = _metric_map(owner)
+        count = _point(data[PREFIX + "result.outcomes"])
+        elapsed = _point(data[PREFIX + "result.duration"])
+        assert dict(count.attributes) == dict(elapsed.attributes) == {"outcome": outcome}
+        assert count.value == elapsed.count == 1
+        assert elapsed.sum == 0.25
+        assert not count.exemplars and not elapsed.exemplars
+        assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["private-error", {"call_id": "private-error"}, None, True])
+async def test_result_outcome_rejects_dynamic_labels_without_export(outcome):
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: 2.0)
+    try:
+        owner.record_result_outcome(outcome, started_at=1.0)
+        assert owner.failure_code == "metrics_record_failed"
+        assert PREFIX + "result.outcomes" not in _metric_map(owner)
+        assert PREFIX + "result.duration" not in _metric_map(owner)
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clock", [float("nan"), float("inf"), -1, True, "private-error", 0.5])
+async def test_result_duration_clock_fault_latches_and_never_exports_invalid_value(clock):
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: clock)
+    try:
+        owner.record_result_outcome("valid", started_at=1.0)
+        data = _metric_map(owner)
+        assert _point(data[PREFIX + "result.outcomes"]).value == 1
+        assert PREFIX + "result.duration" not in data
+        assert owner.failure_code == "metrics_record_failed"
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start", ["private-error", object(), True, -1.0])
+async def test_result_duration_rejects_invalid_start_without_breaking_the_caller(start):
+    owner = metrics_module.RuntimeMetrics.in_memory(monotonic=lambda: 2.0)
+    try:
+        owner.record_result_outcome("valid", started_at=start)
+        data = _metric_map(owner)
+        assert _point(data[PREFIX + "result.outcomes"]).value == 1
+        assert PREFIX + "result.duration" not in data
+        assert owner.failure_code == "metrics_record_failed"
+    finally:
+        await owner.aclose()
 
 
 def test_closed_enum_catalogs_are_exact_and_complete() -> None:
