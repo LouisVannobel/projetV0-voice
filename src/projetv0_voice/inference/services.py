@@ -6,10 +6,12 @@ import asyncio
 import re
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
+from contextvars import ContextVar
 from typing import Any, cast
 
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -22,9 +24,10 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.stt import OpenAISTTService
-from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.services.openrouter.llm import OpenRouterLLMService, OpenRouterLLMSettings
 from pipecat.services.whisper.base_stt import language_to_whisper_language
 from pipecat.transcriptions.language import Language
 from pydantic import SecretStr
@@ -208,6 +211,45 @@ class _BoundedOpenAISTTService(OpenAISTTService):
 
 class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
     """Pin-aware OpenRouter client factory without ambient HTTP authority."""
+
+    _settings: OpenRouterLLMSettings
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._schema_routing: ContextVar[bool] = ContextVar("result_schema_routing", default=False)
+        super().__init__(**kwargs)
+
+    async def run_inference(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
+    ) -> str | None:
+        if response_schema is not None and (
+            not self.supports_response_schema
+            or not self.model_supports_response_schema(self._settings.model or "")
+        ):
+            raise RuntimeError("result_response_schema_unsupported")
+        token = self._schema_routing.set(response_schema is not None)
+        try:
+            return await super().run_inference(
+                context, max_tokens=max_tokens, system_instruction=system_instruction,
+                response_schema=response_schema,
+            )
+        finally:
+            self._schema_routing.reset(token)
+
+    def build_chat_completion_params(
+        self, params_from_context: OpenAILLMInvocationParams,
+    ) -> dict[str, Any]:
+        params = super().build_chat_completion_params(params_from_context)
+        if self._schema_routing.get():
+            extra_body = dict(params.get("extra_body", {}))
+            provider = dict(extra_body.get("provider", {}))
+            provider["require_parameters"] = True
+            extra_body["provider"] = provider
+            params["extra_body"] = extra_body
+        return params
 
     def create_client(
         self,

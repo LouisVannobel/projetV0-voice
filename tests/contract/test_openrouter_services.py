@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 from importlib import import_module
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ import httpx
 import pytest
 from loguru import logger
 from openai import NOT_GIVEN, AsyncOpenAI, DefaultAsyncHttpxClient
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pydantic import SecretStr
@@ -16,6 +19,151 @@ from pydantic import SecretStr
 from projetv0_voice.qualified_profile import InferenceProfileV1
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+SCHEMA = {"type": "object", "properties": {"result": {"type": "null"}},
+          "required": ["result"], "additionalProperties": False}
+
+
+def _completion(content='{"result":null}'):
+    return httpx.Response(200, json={
+        "id": "offline", "object": "chat.completion", "created": 1, "model": "test/llm",
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": content,
+        }}],
+    })
+
+
+@pytest.mark.asyncio
+async def test_schema_routing_is_task_local_and_preserves_overlapping_pipeline(monkeypatch):
+    module = _services_module()
+    source = _profile_data()
+    source["llm_provider_policy"] = {"order": ["baseten/fp8", "together"],
+        "allow_fallbacks": False, "only": ["baseten/fp8", "together"],
+        "data_collection": "deny", "zdr": True}
+    profile = InferenceProfileV1.model_validate(source)
+    policy = {"order": ["baseten/fp8", "together"], "allow_fallbacks": False,
+              "only": ["baseten/fp8", "together"], "data_collection": "deny", "zdr": True}
+    entered, release = asyncio.Event(), asyncio.Event()
+    bodies = []
+
+    async def handle(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "response_format" in body:
+            entered.set()
+            await release.wait()
+        if body["stream"]:
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                                  content=b"data: [DONE]\n\n")
+        return _completion()
+
+    http = DefaultAsyncHttpxClient(transport=httpx.MockTransport(handle), trust_env=False)
+    monkeypatch.setattr(module, "DefaultAsyncHttpxClient", lambda **kwargs: http)
+    service = module.build_llm(profile, SecretStr("offline-key"))
+    before = vars(service._settings).copy()
+    before["extra"] = copy.deepcopy(before["extra"])
+    context = LLMContext([{"role": "user", "content": "fictional"}])
+    task = asyncio.create_task(service.run_inference(
+        context, max_tokens=2048, response_schema=SCHEMA,
+        system_instruction="fictional instruction",
+    ))
+    try:
+        async with asyncio.timeout(10):
+            await entered.wait()
+            stream = await service.get_chat_completions(context)
+            await stream.close()
+            release.set()
+            assert await task == '{"result":null}'
+        assert await service.run_inference(
+            context, system_instruction="fictional instruction",
+        ) == '{"result":null}'
+        assert len(bodies) == 3
+        assert bodies[0]["provider"] == {**policy, "require_parameters": True}
+        assert bodies[0]["response_format"] == {"type": "json_schema", "json_schema": {
+            "name": "response", "schema": SCHEMA, "strict": True,
+        }}
+        assert bodies[0]["stream"] is False
+        assert bodies[0]["max_completion_tokens"] == 2048
+        assert not bodies[0].get("tools")
+        assert all(body["model"] == "test/llm" for body in bodies)
+        assert [body["provider"] for body in bodies[1:]] == [policy, policy]
+        assert "response_format" not in bodies[1] and "response_format" not in bodies[2]
+        assert vars(service._settings) == before
+        assert profile.model_dump(mode="json")["llm_provider_policy"] == policy
+        assert service._client._client is http
+        assert service._client.max_retries == 0
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await service._client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_schema_routing_scope_resets_after_failure_in_same_task(monkeypatch, failure):
+    module = _services_module()
+    bodies = []
+
+    async def handle(request):
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            if failure == "cancel":
+                raise asyncio.CancelledError("fictional-private-error")
+            raise RuntimeError("fictional-private-error")
+        return _completion()
+
+    http = DefaultAsyncHttpxClient(transport=httpx.MockTransport(handle), trust_env=False)
+    monkeypatch.setattr(module, "DefaultAsyncHttpxClient", lambda **kwargs: http)
+    service = module.build_llm(InferenceProfileV1.model_validate(_profile_data()),
+                               SecretStr("offline-key"))
+    before = vars(service._settings).copy()
+    before["extra"] = copy.deepcopy(before["extra"])
+    context = LLMContext([{"role": "user", "content": "fictional"}])
+    try:
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else Exception):
+            await service.run_inference(
+                context, response_schema=SCHEMA, system_instruction="fictional instruction",
+            )
+        assert await service.run_inference(
+            context, system_instruction="fictional instruction",
+        ) == '{"result":null}'
+        assert len(bodies) == 2
+        assert bodies[0]["provider"]["require_parameters"] is True
+        assert bodies[1]["provider"] == {"sort": "latency", "allow_fallbacks": True}
+        assert "response_format" not in bodies[1]
+        assert vars(service._settings) == before
+    finally:
+        await service._client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsupported", ["service", "model"])
+async def test_known_unsupported_schema_fails_before_http_dispatch(monkeypatch, unsupported):
+    module = _services_module()
+    bodies = []
+
+    async def handle(request):
+        bodies.append(json.loads(request.content))
+        return _completion()
+
+    http = DefaultAsyncHttpxClient(transport=httpx.MockTransport(handle), trust_env=False)
+    monkeypatch.setattr(module, "DefaultAsyncHttpxClient", lambda **kwargs: http)
+    service = module.build_llm(InferenceProfileV1.model_validate(_profile_data()),
+                               SecretStr("offline-key"))
+    if unsupported == "service":
+        monkeypatch.setattr(service, "supports_response_schema", False)
+    else:
+        monkeypatch.setattr(service, "model_supports_response_schema", lambda model: False)
+    try:
+        with pytest.raises(RuntimeError, match="^result_response_schema_unsupported$"):
+            await service.run_inference(
+                LLMContext([]), response_schema=SCHEMA,
+                system_instruction="fictional instruction",
+            )
+        assert bodies == []
+    finally:
+        await service._client.close()
 
 
 def _profile_data() -> dict[str, object]:

@@ -140,13 +140,13 @@ async def test_turn_v2_actual_native_user_assistant_events_retained_aead_and_res
         class OfflineInference:
             async def run_inference(self, context, **options):
                 requested.append((context, options))
-                return json.dumps({
+                return json.dumps({"result": {
                     "schema_version": 1, "quality": "partial", "category": "callback",
                     "summary": "Rappel demandé.", "next_action": "Rappeler.",
                     "contact": {"name": None, "callback_e164": None, "preference": None,
                         "callback_source": "missing", "callback_confirmed": False},
                     "evidence": [{"turn_id": str(retained.turns[0].turn_id), "role": "user"}],
-                    "request_confirmed": False})
+                    "request_confirmed": False}})
 
         result = await infer_partial_result(OfflineInference(), retained, None)
         assert result is not None and result.quality == "partial"

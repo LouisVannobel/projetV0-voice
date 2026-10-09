@@ -37,7 +37,12 @@ from projetv0_voice.audio_capture import AudioCaptureSummary, AudioFinishReason,
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
-from projetv0_voice.metrics import ResultOutcome, RuntimeMetrics, _CallMetricLease
+from projetv0_voice.metrics import (
+    ResultInvalidReason,
+    ResultOutcome,
+    RuntimeMetrics,
+    _CallMetricLease,
+)
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     CallUpsertPayloadV1,
@@ -49,7 +54,11 @@ from projetv0_voice.models import (
     _e164,
 )
 from projetv0_voice.persistence.business_contract import validate_turn_text
-from projetv0_voice.persistence.business_result import infer_partial_result
+from projetv0_voice.persistence.business_result import (
+    ResultProvenanceRejected,
+    ResultSchemaRejected,
+    infer_partial_result,
+)
 from projetv0_voice.persistence.commands import (
     FatalPersistenceError,
     PersistenceCommand,
@@ -729,6 +738,7 @@ class CallSession:
     ) -> None:
         started_at = self._runtime_metrics._sample_monotonic()  # noqa: SLF001
         outcome: ResultOutcome = "error"
+        invalid_reason: ResultInvalidReason | None = None
         try:
             if self._identity.routing is None:
                 outcome = "not_started"
@@ -782,9 +792,15 @@ class CallSession:
                     outcome = "inner_timeout"
                 elif isinstance(error, asyncio.CancelledError):
                     outcome = "cancelled"
-                elif isinstance(error, ValueError):
-                    # Pydantic ValidationError and provenance rejection are ValueErrors.
+                elif isinstance(error, ResultSchemaRejected):
                     outcome = "invalid"
+                    invalid_reason = "schema"
+                elif isinstance(error, ResultProvenanceRejected):
+                    outcome = "invalid"
+                    invalid_reason = "provenance"
+                elif isinstance(error, ValueError):
+                    outcome = "invalid"
+                    invalid_reason = "unknown"
             finally:
                 if not task.done():
                     task.cancel()
@@ -799,7 +815,10 @@ class CallSession:
                 )
             raise
         finally:
-            self._runtime_metrics.record_result_outcome(outcome, started_at=started_at)
+            self._runtime_metrics.record_result_outcome(
+                outcome, started_at=started_at,
+                invalid_reason=invalid_reason if outcome == "invalid" else None,
+            )
 
     async def _request_human_tool(self, params: FunctionCallParams) -> None:
         if (
