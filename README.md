@@ -66,6 +66,21 @@ for EU Voice API and media routing. It does not attest Telnyx CDR/MDR storage
 location or external inference residency. Its existing schema and admission
 guards remain in force.
 
+For a fresh Sparra V2 qualification candidate, the operator must stop and close
+the old graph and finish its bounded joins before minting `admission_not_before`
+once from the current UTC clock, with full microsecond precision. Save it in the
+immutable new candidate profile before starting the new run. Preserve that exact
+floor, run identity and profile fingerprint on restart; do not derive a new floor
+at startup, backdate it, or regenerate a remaining allowance from an old run.
+The floor must precede `expires_at`. A new initiation must have a verified body
+timestamp at or after the floor, and the current clock must have reached it.
+Existing same-store duplicate receipts, terminal cleanup and media authority keep
+their existing rules. An out-of-order answered placeholder consumes no call unit;
+it cannot make a pre-floor initiation create a durable admission. This timestamp
+gate does not prove global carrier identity or deduplication across separate stores.
+Legacy candidate profiles may omit the field with unchanged canonical fingerprints;
+native Sparra operation-contract V2 candidate composition requires it.
+
 Linked Sparra calls use Pipecat's native WebSocket `session_timeout=300` to bound
 each session to five minutes. The existing session timeout handler closes audio
 admission and uses the call owner's terminal cleanup and hangup command. Generic

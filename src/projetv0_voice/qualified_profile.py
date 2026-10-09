@@ -205,6 +205,9 @@ class QualificationCandidateProfileV1(_StrictFrozenProfile):
     run_id: UUID
     deployment_id: str = Field(min_length=1)
     expires_at: datetime
+    admission_not_before: datetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     benchmark_did_hash: Sha256
     runtime_contract_sha256: Sha256
     image_digest: ImageDigest
@@ -223,6 +226,18 @@ class QualificationCandidateProfileV1(_StrictFrozenProfile):
         _validate_datetime_input
     )
     _normalize_expires_at = field_validator("expires_at", mode="after")(_utc_datetime)
+    _validate_admission_not_before_input = field_validator(
+        "admission_not_before", mode="before"
+    )(lambda value: None if value is None else _validate_datetime_input(value))
+    _normalize_admission_not_before = field_validator("admission_not_before", mode="after")(
+        lambda value: None if value is None else _utc_datetime(value)
+    )
+
+    @model_validator(mode="after")
+    def validate_admission_window(self) -> Self:
+        if self.admission_not_before is not None and self.admission_not_before >= self.expires_at:
+            raise ValueError("admission_not_before must precede expires_at")
+        return self
 
 
 class QualificationOverrideV1(_StrictFrozenProfile):

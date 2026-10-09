@@ -1905,6 +1905,10 @@ async def build_production_runtime(
             monotonic=monotonic,
             candidate_run_id=candidate_run_id,
             admission_expires_at=admission_expires_at,
+            admission_not_before=(
+                selection.profile.admission_not_before
+                if isinstance(selection.profile, QualificationCandidateProfileV1) else None
+            ),
             qualification_observer=supervisor.observe_qualification_state,
             sparra=manifest.sparra,
             called_did=manifest.dids[0],
@@ -2105,6 +2109,11 @@ def _validate_profile_selection(
             and settings.benchmark_did_sha256 == profile.benchmark_did_hash
             and now < profile.expires_at
             and manifest.recording_mode == "off"
+            and (
+                manifest.sparra is None
+                or manifest.sparra.operation_contract_version != 2
+                or profile.admission_not_before is not None
+            )
         )
     else:
         override = selection.override

@@ -641,6 +641,7 @@ class Scenario:
                     **profile_fields,
                     "run_id": self.audio_run,
                     "expires_at": now() + timedelta(minutes=2),
+                    "admission_not_before": datetime.now(UTC),
                     "benchmark_did_hash": self.settings.benchmark_did_sha256,
                     "max_concurrent_calls": 1,
                     "disclosure_mark_timeout_ms": 10000,
