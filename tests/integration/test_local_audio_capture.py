@@ -101,6 +101,7 @@ class SentOutput(_PacedDisclosureOutput):
 async def capture_case(
     tmp_path, *, failpoint=None, terminal_publication=False, monotonic=None,
     recorder_factory=None, final_playback=False, runtime_metrics=None,
+    contact_phone="+33102030405",
 ):
     assert hasattr(audio_capture, "LocalAudioCapture"), (
         "missing native LocalAudioCapture composition"
@@ -123,7 +124,7 @@ async def capture_case(
             "retention_until": (NOW + timedelta(days=30)).isoformat(
                 timespec="milliseconds"
             ).replace("+00:00", "Z"),
-            "recording_policy": "local_30d", "recording_contact_phone": "+33102030405",
+            "recording_policy": "local_30d", "recording_contact_phone": contact_phone,
             "audio_available": True, "recording_id": str(RECORDING),
         })
         routing = RoutingV1(schema_version=1, direction="incoming", connection_id="fixture",
@@ -290,8 +291,11 @@ def track(pcm, channel):
 
 
 @pytest.mark.asyncio
-async def test_local_capture_caller_passthrough_starts_only_after_real_choice_and_gate(tmp_path):
-    async with capture_case(tmp_path) as case:
+@pytest.mark.parametrize("contact_phone", [None, "+33102030405"])
+async def test_local_capture_caller_passthrough_starts_only_after_real_choice_and_gate(
+    tmp_path, contact_phone,
+):
+    async with capture_case(tmp_path, contact_phone=contact_phone) as case:
         await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
         assert captured_pcm(case) == b"" and case.capture.tap.state == "off"
         await case.runtime.worker.queue_frame(InputAudioRawFrame(b"\x7f\x00" * 80, 8000, 1))
@@ -516,6 +520,8 @@ async def test_native_session_conversation_end_keeps_local_finish_complete(tmp_p
         await accept_local(case)
         await caller_frames(case, 1, samples=80)
         session, _, _, _, _ = _session(events=[])
+        # Use CallSession's native default instead of _session's rapid-failure test budget.
+        session._cleanup_phase_timeout_seconds = 5.0
         session._identity = case.controller._identity
         session._writer = case.writer
         session._utcnow = lambda: NOW + timedelta(seconds=5)

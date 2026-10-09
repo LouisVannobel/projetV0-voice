@@ -1123,7 +1123,10 @@ async def _local_choice_wait(predicate):
 
 
 @asynccontextmanager
-async def _local_choice_case(tmp_path, *, policy="local_30d", available=True, start_success=True):
+async def _local_choice_case(
+    tmp_path, *, policy="local_30d", available=True, start_success=True,
+    contact_phone="+33102030405",
+):
     """Real writer/pipeline; local start/refusal/quiesce callbacks are test doubles."""
     clock = SimpleNamespace(utc=NOW + timedelta(seconds=1), mono=10.0)
     path = tmp_path / "local-choice.sqlite"
@@ -1151,7 +1154,7 @@ async def _local_choice_case(tmp_path, *, policy="local_30d", available=True, st
             timespec="milliseconds"
         ).replace("+00:00", "Z"),
         "recording_policy": policy,
-        "recording_contact_phone": "+33102030405" if policy == "local_30d" else None,
+        "recording_contact_phone": contact_phone if policy == "local_30d" else None,
         "audio_available": available, "recording_id": str(UUID(int=3)) if available else None,
     })
     routing = RoutingV1(schema_version=1, direction="incoming", connection_id="fixture",
@@ -1280,8 +1283,11 @@ async def test_sparra_notice_explicitly_announces_ia_for_off_and_local_on(
 
 
 @pytest.mark.asyncio
-async def test_local_choice_paced_ack_keeps_input_closed_until_disclosure_commit(tmp_path):
-    async with _local_choice_case(tmp_path) as case:
+@pytest.mark.parametrize("contact_phone", [None, "+33102030405"])
+async def test_local_choice_paced_ack_keeps_input_closed_until_disclosure_commit(
+    tmp_path, contact_phone,
+):
+    async with _local_choice_case(tmp_path, contact_phone=contact_phone) as case:
         case.probe.remaining = 1
         await asyncio.wait_for(case.output.mark_enqueued.wait(), 2)
         assert not case.output.mark_sent.is_set()
@@ -1307,7 +1313,8 @@ async def test_local_choice_paced_ack_keeps_input_closed_until_disclosure_commit
                 (2, "call.upsert")
             ]
         spoken = case.services.tts.spoken[0]
-        assert "Garage local fixture" in spoken and "+33102030405" in spoken
+        assert "Garage local fixture" in spoken
+        assert "+33102030405" not in spoken and "None" not in spoken
         assert "30" in spoken and "2" in spoken
         assert (
             "Le texte de cet échange est conservé trente jours, même sans enregistrement audio."
@@ -1323,8 +1330,11 @@ async def test_local_choice_paced_ack_keeps_input_closed_until_disclosure_commit
 
 
 @pytest.mark.asyncio
-async def test_local_choice_rejects_early_unknown_late_one_and_latches_early_two(tmp_path):
-    async with _local_choice_case(tmp_path / "one") as case:
+@pytest.mark.parametrize("contact_phone", [None, "+33102030405"])
+async def test_local_choice_rejects_early_unknown_late_one_and_latches_early_two(
+    tmp_path, contact_phone,
+):
+    async with _local_choice_case(tmp_path / "one", contact_phone=contact_phone) as case:
         await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
         await _local_choice_digit(case, "1", NOW)
         await _local_choice_digit(case, "1", None, sequence="2")
@@ -1336,7 +1346,7 @@ async def test_local_choice_rejects_early_unknown_late_one_and_latches_early_two
         await asyncio.wait_for(case.probe.active.wait(), 2)
         assert case.probe.starts == 0 and case.legacy.starts == 0
         assert case.services.stt.input_dtmf == []
-    async with _local_choice_case(tmp_path / "two") as case:
+    async with _local_choice_case(tmp_path / "two", contact_phone=contact_phone) as case:
         await _local_choice_digit(case, "2", None)
         await _local_choice_wait(lambda: case.probe.refusals > 0)
         assert not case.controller.is_active() and case.probe.starts == 0
@@ -1351,8 +1361,11 @@ async def test_local_choice_rejects_early_unknown_late_one_and_latches_early_two
 
 
 @pytest.mark.asyncio
-async def test_local_choice_valid_one_waits_for_choice_and_gate_before_local_start(tmp_path):
-    async with _local_choice_case(tmp_path) as case:
+@pytest.mark.parametrize("contact_phone", [None, "+33102030405"])
+async def test_local_choice_valid_one_waits_for_choice_and_gate_before_local_start(
+    tmp_path, contact_phone,
+):
+    async with _local_choice_case(tmp_path, contact_phone=contact_phone) as case:
         await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
         case.probe.remaining = 1
         await _local_choice_digit(case, "1", case.clock.utc)
@@ -1381,14 +1394,16 @@ async def test_local_choice_valid_one_waits_for_choice_and_gate_before_local_sta
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("contact_phone", [None, "+33102030405"])
 async def test_local_choice_timeout_off_unavailable_and_failed_start_keep_ordinary_phone_input(
-    tmp_path,
+    tmp_path, contact_phone,
 ):
     for label in ("silence", "unknown", "off", "unavailable", "failed-start"):
         async with _local_choice_case(tmp_path / label,
             policy="off" if label == "off" else "local_30d",
             available=label not in {"off", "unavailable"},
             start_success=label != "failed-start",
+            contact_phone=contact_phone,
         ) as case:
             if label == "silence":
                 case.probe.remaining = 1
@@ -1412,9 +1427,12 @@ async def test_local_choice_timeout_off_unavailable_and_failed_start_keep_ordina
 
 
 @pytest.mark.asyncio
-async def test_local_choice_two_refuses_before_denial_commit_and_never_resurrects_capture(tmp_path):
+@pytest.mark.parametrize("contact_phone", [None, "+33102030405"])
+async def test_local_choice_two_refuses_before_denial_commit_and_never_resurrects_capture(
+    tmp_path, contact_phone,
+):
     for stage in ("choice", "gate", "start", "active"):
-        async with _local_choice_case(tmp_path / stage) as case:
+        async with _local_choice_case(tmp_path / stage, contact_phone=contact_phone) as case:
             await _local_choice_wait(lambda: case.controller.state.name == "WAITING_CHOICE")
             if stage in {"choice", "gate"}:
                 case.probe.remaining = 1 if stage == "choice" else 2
