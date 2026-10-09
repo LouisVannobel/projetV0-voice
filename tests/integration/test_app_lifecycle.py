@@ -1788,6 +1788,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         **profile.model_dump(exclude={"telnyx_data_locality", "qualified_at"}),
         "run_id": UUID("00000000-0000-4000-8000-000000000001"),
         "expires_at": NOW + timedelta(hours=1),
+        "admission_not_before": NOW,
         "benchmark_did_hash": "b" * 64,
         "max_concurrent_calls": 1,
         "total_calls": 3,
@@ -1824,6 +1825,16 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         load_manifest=lambda _settings: candidate_manifest,
         load_profile=lambda *_args: RuntimeProfileSelection(candidate, None),
     )
+    if company_case == "local_audio_v2":
+        missing_floor = candidate.model_copy(update={"admission_not_before": None})
+        with pytest.raises(RuntimeError, match="^runtime_production_composition_failed$"):
+            await build_production_runtime(
+                candidate_settings,
+                factories=replace(candidate_factories, load_profile=lambda *_args:
+                    RuntimeProfileSelection(missing_floor, None)),
+                utcnow=lambda: NOW,
+            )
+        assert len(selected_profiles) == 1
     candidate_graph = await build_production_runtime(
         candidate_settings, factories=candidate_factories, utcnow=lambda: NOW,
         monotonic=lambda: 10.0, startup_phase_timeout_seconds=2.0,

@@ -909,6 +909,7 @@ class CallRegistry:
         candidate_run_id: UUID | None = None,
         candidate_consumed: bool = False,
         admission_expires_at: datetime | None = None,
+        admission_not_before: datetime | None = None,
         qualification_observer: Callable[[Literal["valid", "consumed", "expired"]], None]
         | None = None,
         background_task_factory: BackgroundTaskFactory = _default_background_task_factory,
@@ -942,6 +943,14 @@ class CallRegistry:
                 not isinstance(admission_expires_at, datetime)
                 or admission_expires_at.tzinfo is None
                 or admission_expires_at.utcoffset() is None
+            )
+            or admission_not_before is not None
+            and (
+                not isinstance(admission_not_before, datetime)
+                or admission_not_before.tzinfo is None
+                or admission_not_before.utcoffset() is None
+                or admission_expires_at is not None
+                and admission_not_before >= admission_expires_at
             )
         ):
             raise ValueError("call_registry_config_invalid")
@@ -980,6 +989,9 @@ class CallRegistry:
         self._candidate_consumed = candidate_consumed
         self._admission_expires_at = (
             None if admission_expires_at is None else admission_expires_at.astimezone(UTC)
+        )
+        self._admission_not_before = (
+            None if admission_not_before is None else admission_not_before.astimezone(UTC)
         )
         self._qualification_observer = qualification_observer
         self._lock = asyncio.Lock()
@@ -1874,6 +1886,11 @@ class CallRegistry:
                 existing.precommit_refcount += 1
                 entry = existing
             else:
+                if self._admission_not_before is not None and (
+                    self._require_aware(event.occurred_at) < self._admission_not_before
+                    or self._require_aware(self._utcnow()) < self._admission_not_before
+                ):
+                    raise CallAdmissionRejected("call_event_invalid")
                 if self._qualification_expired():
                     raise CallAdmissionRejected("qualification_window_expired")
                 if self._candidate_consumed:

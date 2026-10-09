@@ -64,6 +64,8 @@ async def registry_case(
     tmp_path, *, enabled=False, available=False, reply=None, ambiguous=False,
     utcnow=lambda: NOW, failpoint=None,
     deployment_id="fixture",
+    admission_not_before=None, candidate_run_id=None,
+    monotonic=None,
 ):
     writer = PersistenceWriter(tmp_path / "voice.sqlite", CryptoKeyring({1: KEY}, active_version=1),
                                contract_version=2, utcnow=utcnow, failpoint=failpoint,
@@ -92,8 +94,11 @@ async def registry_case(
             writer=writer, call_control=provider, tenant_id=str(WORKSPACE), agent_id=deployment_id,
             deployment_id=deployment_id, capacity=1, lease_ttl_seconds=30,
             stream_url="wss://fixture.invalid/media", retention_days=30,
-            utcnow=utcnow, monotonic=lambda: 100.0,
+            utcnow=utcnow, monotonic=monotonic or (lambda: 100.0),
             sparra=fixed_policy(), called_did=DID, begin_call=begin,
+            **({"admission_not_before": admission_not_before}
+               if admission_not_before is not None else {}),
+            candidate_run_id=candidate_run_id,
         )
         yield SimpleNamespace(registry=registry, writer=writer, provider=provider, begins=begins,
                               sink=sink, pool=pool, connection=connection,

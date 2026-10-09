@@ -74,6 +74,49 @@ def test_candidate_total_calls_rejects_nonexact_or_unbounded_values(value: objec
         QualificationCandidateProfileV1.model_validate({**data, "total_calls": value})
 
 
+def test_candidate_admission_floor_is_optional_canonical_and_immutable() -> None:
+    from projetv0_voice.qualified_profile import canonical_candidate_profile_sha256
+
+    data = json.loads(
+        (REPOSITORY_ROOT / "tests/fixtures/qualification-candidate-v1.json").read_text()
+    )
+    legacy = QualificationCandidateProfileV1.model_validate(data)
+    explicit_none = QualificationCandidateProfileV1.model_validate(
+        {**data, "admission_not_before": None}
+    )
+    expected = hashlib.sha256(json.dumps(
+        data, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()).hexdigest()
+    assert legacy.admission_not_before is None
+    assert "admission_not_before" not in explicit_none.model_dump(mode="json")
+    assert canonical_candidate_profile_sha256(explicit_none) == expected
+    floor = datetime(2026, 8, 25, 0, 0, 0, 123456, tzinfo=UTC)
+    profile = QualificationCandidateProfileV1.model_validate(
+        {**data, "admission_not_before": "2026-08-25T02:00:00.123456+02:00"}
+    )
+    assert profile.admission_not_before == floor
+    serialized = profile.model_dump_json()
+    restored = QualificationCandidateProfileV1.model_validate_json(serialized)
+    assert restored.admission_not_before == floor
+    assert canonical_candidate_profile_sha256(restored) == (
+        canonical_candidate_profile_sha256(profile)
+    ) != expected
+    assert profile.total_calls == restored.total_calls == 1
+    with pytest.raises(ValidationError, match="frozen_instance"):
+        profile.admission_not_before = floor + timedelta(microseconds=1)
+
+
+@pytest.mark.parametrize("floor", [
+    datetime(2026, 8, 25), "2026-08-25T00:00:00", True, 1787616000,
+    "not-a-date", "2026-08-25T01:00:00Z", "2026-08-25T01:00:00.000001Z",
+])
+def test_candidate_admission_floor_rejects_naive_coerced_and_empty_windows(floor) -> None:
+    with pytest.raises(ValidationError):
+        QualificationCandidateProfileV1.model_validate(
+            {**candidate_data(), "admission_not_before": floor}
+        )
+
+
 def inference_data() -> dict[str, object]:
     return {
         "schema_version": 1,

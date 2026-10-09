@@ -124,6 +124,19 @@
   },
   "additionalProperties": false,
   "properties": {
+    "admission_not_before": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Admission Not Before"
+    },
     "agent_bundle_sha256": {
       "pattern": "^[0-9a-f]{64}$",
       "title": "Agent Bundle Sha256",
