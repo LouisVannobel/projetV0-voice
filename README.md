@@ -101,6 +101,10 @@ that transfer intent; possible-send or lost-commit outcomes retain their existin
 fence and are not replayed. Correlated takeover stops AI; failed relay preserves
 the existing message-result path.
 
+A qualified relay target matching the known caller is unavailable; the call
+continues with message collection. An unknown caller keeps the existing routing
+policy and is not assigned an invented identity.
+
 This finite target-leg limit does not qualify a maximum total telephone lifetime,
 pending/original-leg behavior during provider or host outages, or remote command
 application time. The two-second margin is not provider timing evidence. Live
