@@ -1750,6 +1750,43 @@ async def test_transfer_uses_remaining_original_started_budget_and_refuses_fract
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "available"),
+    [(TARGET, False), ("+33102030407", True), (None, True)],
+    ids=["known-same-target", "known-different-caller", "unknown-caller"],
+)
+async def test_native_admission_relay_refuses_known_caller_as_target_only(
+    tmp_path, caller, available
+):
+    registry, writer, worker, provider = await start(tmp_path)
+    try:
+        await committed(registry, writer, event(from_e164=caller))
+        await persist_original_start(registry, writer)
+        generation = await registry.generation_handle("original")
+        assert await registry.human_tool_available(generation) is available
+        provider.transfer_release.set()
+        result = await registry.request_human(generation)
+        entry = registry._by_control["original"]
+        facts = await writer.read_call_lifecycle(entry.call_id)
+        transfers = [action for action in provider.actions if action[0] == "transfer"]
+        if available:
+            assert result == "ringing" and len(transfers) == 1
+            assert transfers[0][3].to_e164 == TARGET
+        else:
+            assert result == "unavailable_collect_message" and transfers == []
+            assert entry.transfer_facts is None
+            assert facts.transfer_command_id is None and not facts.transfer_fenced
+        assert await registry.live_call_count() == 1
+        assert not entry.no_new_ai
+        assert not any(action[0] == "hangup" for action in provider.actions)
+    finally:
+        provider.transfer_release.set()
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["missing", "before_admission", "future"])
 async def test_transfer_missing_or_inconsistent_original_start_refuses_before_effects(
     tmp_path, invalid,

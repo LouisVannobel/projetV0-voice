@@ -1249,6 +1249,7 @@ class CallRegistry:
             destination is None
             or destination != self._sparra.qualified_transfer_destination_e164
             or destination in {self._called_did, self._sparra.original_forward_line_e164}
+            or entry.routing is not None and destination == entry.routing.from_e164
         ):
             return None
         return destination
