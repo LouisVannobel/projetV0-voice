@@ -86,3 +86,24 @@ each session to five minutes. The existing session timeout handler closes audio
 admission and uses the call owner's terminal cleanup and hangup command. Generic
 voice deployments keep the native default of no session timeout. This duration
 bound is not a monetary spending cap.
+
+Optional Sparra relay uses the same 300-second policy as a conservative planning
+allowance from the trusted original call start, separate from the 30-second
+handshake lease. On the caller's explicit request only, the native Telnyx transfer
+receives a required answered-leg limit calculated from the remaining allowance,
+less 20 seconds of ringing and a two-second local planning margin. A UTC/monotonic
+pair retained at call creation projects at most 300 seconds from that creation
+sample, conservatively consuming preparation latency. A wall-clock jump before
+the native start followed by a correction cannot mint extra in-process allowance.
+Below Telnyx's 30-second minimum, relay is refused and
+message collection remains available. Proven local non-dispatch resolves only
+that transfer intent; possible-send or lost-commit outcomes retain their existing
+fence and are not replayed. Correlated takeover stops AI; failed relay preserves
+the existing message-result path.
+
+This finite target-leg limit does not qualify a maximum total telephone lifetime,
+pending/original-leg behavior during provider or host outages, or remote command
+application time. The two-second margin is not provider timing evidence. Live
+relay still requires the exact destination and its forwarding relationship plus
+valid existing financial/provider qualification; this offline correction renews
+none of them.

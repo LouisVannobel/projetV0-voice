@@ -8,7 +8,14 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr
 
-from tests.unit.test_sparra_admission import NOW, TARGET, committed, event, start
+from tests.unit.test_sparra_admission import (
+    NOW,
+    TARGET,
+    committed,
+    event,
+    persist_original_start,
+    start,
+)
 
 
 @pytest.mark.asyncio
@@ -22,6 +29,7 @@ async def test_bridge_observation_cannot_retain_disclosure_after_content_stop(tm
     try:
         await committed(registry, writer, event())
         await committed(registry, writer, event("call.answered"))
+        await persist_original_start(registry, writer)
         entry = registry._by_control["original"]
         requested = asyncio.create_task(
             registry.request_human(await registry.generation_handle("original"))
@@ -101,6 +109,7 @@ async def test_original_termination_fact_is_durable_and_stale_transfer_cannot_cl
     try:
         await committed(registry, writer, event())
         await committed(registry, writer, event("call.answered"))
+        await persist_original_start(registry, writer)
         requested = asyncio.create_task(
             registry.request_human(await registry.generation_handle("original"))
         )
@@ -171,6 +180,7 @@ async def test_same_writer_preserves_newer_bridge_facts_against_stale_observatio
     try:
         await committed(registry, writer, event())
         await committed(registry, writer, event("call.answered"))
+        await persist_original_start(registry, writer)
         requested = asyncio.create_task(
             registry.request_human(await registry.generation_handle("original"))
         )

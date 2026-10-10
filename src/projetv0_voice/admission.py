@@ -7,6 +7,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import math
 import re
 import secrets
 import threading
@@ -294,6 +295,10 @@ class _CallEntry:
     transfer_task: asyncio.Task[None] | None = field(default=None, repr=False)
     content_stop_task: asyncio.Task[None] | None = field(default=None, repr=False)
     transfer_future: asyncio.Future[str] | None = field(default=None, repr=False)
+    transfer_clock_utc: datetime | None = field(default=None, repr=False)
+    transfer_clock_monotonic: float | None = field(default=None, repr=False)
+    original_started_at: datetime | None = field(default=None, repr=False)
+    transfer_deadline_monotonic: float | None = field(default=None, repr=False)
     bridge_publication: VoiceOperationV1 | VoiceOperationV2 | None = field(default=None, repr=False)
     no_new_ai: bool = False
     abort_target_clearers: list[tuple[_AbortTarget, Callable[[_AbortTarget], None]]] = field(
@@ -901,6 +906,7 @@ class CallRegistry:
         lease_ttl_seconds: int,
         stream_url: str,
         retention_days: int,
+        original_call_limit_seconds: Literal[300] | None = None,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
         token_factory: Callable[[int], str] = secrets.token_urlsafe,
@@ -924,6 +930,8 @@ class CallRegistry:
             or lease_ttl_seconds <= 0
             or type(retention_days) is not int
             or retention_days <= 0
+            or original_call_limit_seconds is not None
+            and (type(original_call_limit_seconds) is not int or original_call_limit_seconds != 300)
             or not all(
                 isinstance(value, str) and value for value in (tenant_id, agent_id, deployment_id)
             )
@@ -977,6 +985,7 @@ class CallRegistry:
         self._deployment_id = deployment_id
         self._capacity = capacity
         self._lease_ttl_seconds = lease_ttl_seconds
+        self._original_call_limit_seconds = original_call_limit_seconds
         self._stream_url = stream_url
         self._retention_days = retention_days
         self._retention_delta = timedelta(days=retention_days)
@@ -1089,6 +1098,8 @@ class CallRegistry:
             hangup_command_id=hangup_id,
             precommit_refcount=1,
             routing=routing,
+            transfer_clock_utc=created_at,
+            transfer_clock_monotonic=float(minted_monotonic),
         )
 
     def _validate_sparra_routing(self, event: VerifiedWebhook) -> RoutingV1:
@@ -1292,6 +1303,8 @@ class CallRegistry:
                 answer_evidence=facts.started_at is not None,
                 no_new_ai=True,
                 attached=True,
+                transfer_clock_utc=self._require_aware(self._utcnow()),
+                transfer_clock_monotonic=float(self._monotonic()),
             )
             self._by_control[entry.call_control_id] = entry
             self._by_call_id[entry.call_id] = entry
@@ -1403,6 +1416,12 @@ class CallRegistry:
 
     async def request_human(self, generation: CallGenerationHandle) -> str:
         async with self._lock:
+            registered = self._by_control.get(generation.call_control_id)
+            if registered is None or registered.generation != generation.generation:
+                return "unavailable_collect_message"
+            call_id = registered.call_id
+        lifecycle = await self._writer.read_call_lifecycle(call_id)
+        async with self._lock:
             entry = self._by_control.get(generation.call_control_id)
             if (
                 entry is None
@@ -1417,9 +1436,8 @@ class CallRegistry:
             if destination is None:
                 return "unavailable_collect_message"
             if entry.transfer_task is None:
-                stop_result = getattr(entry.session, "stop_result_inference", None)
-                if stop_result is not None:
-                    stop_result()
+                if lifecycle is None or self._transfer_duration_locked(entry, lifecycle) is None:
+                    return "unavailable_collect_message"
                 pin = entry.begin_snapshot
                 if isinstance(pin, BeginCallSnapshotV2) and (
                     pin.audio_available and pin.recording_policy == "local_30d"
@@ -1437,6 +1455,7 @@ class CallRegistry:
                     entry.initiated_at + timedelta(days=30),
                     entry.call_leg_id,
                     entry.call_session_id,
+                    started_at=lifecycle.started_at,
                     transfer_command_id=command_id,
                     transfer_correlation=correlation,
                     transfer_generation=entry.generation,
@@ -1480,6 +1499,8 @@ class CallRegistry:
             pin.audio_available and pin.recording_policy == "local_30d"
         )
         commit_entered = False
+        commit_acknowledged = False
+        dispatch_entered = False
         try:
             if requires_local_audio:
                 prepare_audio = getattr(entry.session, "prepare_audio_for_transfer", None)
@@ -1507,8 +1528,54 @@ class CallRegistry:
                     audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
                     if not callable(audio_ready) or audio_ready() is not True:
                         return "unavailable_collect_message"
+            async with self._lock:
+                if self._transfer_duration_locked(entry, facts) is None:
+                    return "unavailable_collect_message"
             commit_entered = True
             await cast(Any, self._writer).commit_transfer_intent(facts)
+            commit_acknowledged = True
+            current = await self._writer.read_call_lifecycle(entry.call_id)
+            async with self._lock:
+                duration = (
+                    self._transfer_duration_locked(entry, current) if current is not None else None
+                )
+                eligible = (
+                    self._by_control.get(entry.call_control_id) is entry
+                    and entry.transfer_facts is facts
+                    and entry.terminal_event != "call.hangup"
+                    and not entry.cleanup_hangup_started
+                    and getattr(self._call_control, "dispatch_available", True)
+                    and duration is not None
+                )
+                if requires_local_audio:
+                    audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
+                    eligible = eligible and (
+                        entry.terminal_authority is None and entry.terminal_event is None
+                        and not entry.drain_intent and not self._draining
+                        and callable(audio_ready) and audio_ready() is True
+                    )
+            if not eligible:
+                await self._resolve_transfer_not_dispatched(entry, facts)
+                return "unavailable_collect_message"
+            assert duration is not None
+            # No await or queue between this final owner check and the SDK-capable operation.
+            dispatch_entered = True
+            try:
+                result = await cast(Any, self._call_control).transfer(
+                    entry.call_control_id,
+                    TransferRequestV1(
+                        to_e164=destination,
+                        target_leg_client_state=facts.transfer_correlation,
+                        time_limit_secs=duration,
+                    ),
+                    command_id=facts.transfer_command_id,
+                )
+            except Exception:
+                return "outcome_unknown"
+        except BaseException:
+            if commit_acknowledged and not dispatch_entered:
+                await self._resolve_transfer_not_dispatched(entry, facts)
+            raise
         finally:
             if not commit_entered:
                 async with self._lock:
@@ -1518,34 +1585,6 @@ class CallRegistry:
                         and entry.terminal_authority is None
                     ):
                         entry.transfer_facts = None
-        async with self._lock:
-            if (
-                self._by_control.get(entry.call_control_id) is not entry
-                or entry.transfer_facts is not facts
-                or entry.terminal_event == "call.hangup"
-                or not getattr(self._call_control, "dispatch_available", True)
-            ):
-                return "unavailable_collect_message"
-            if requires_local_audio:
-                if (
-                    entry.terminal_authority is not None or entry.terminal_event is not None
-                    or entry.cleanup_hangup_started or entry.drain_intent or self._draining
-                ):
-                    return "unavailable_collect_message"
-                audio_ready = getattr(entry.session, "audio_ready_for_transfer", None)
-                if not callable(audio_ready) or audio_ready() is not True:
-                    return "unavailable_collect_message"
-        # A durable pending intent fences cleanup even after local failure/drain.
-        try:
-            result = await cast(Any, self._call_control).transfer(
-                entry.call_control_id,
-                TransferRequestV1(
-                    to_e164=destination, target_leg_client_state=facts.transfer_correlation
-                ),
-                command_id=facts.transfer_command_id,
-            )
-        except Exception:
-            return "outcome_unknown"
         observed = entry.transfer_facts
         if entry.no_new_ai:
             return (
@@ -1556,6 +1595,84 @@ class CallRegistry:
         if observed is not None and observed.transfer_failed_at is not None:
             return f"{observed.transfer_failure_cause or 'target_hangup'}_collect_message"
         return "ringing" if result.outcome == "accepted" else "outcome_unknown"
+
+    def _transfer_duration_locked(
+        self, entry: _CallEntry, facts: LocalCallLifecycleFacts,
+    ) -> int | None:
+        started = facts.started_at
+        now, monotonic = self._require_aware(self._utcnow()), float(self._monotonic())
+        if (
+            self._original_call_limit_seconds is None or started is None
+            or started.tzinfo is None or started.utcoffset() is None
+            or facts.call_id != entry.call_id or facts.admitted_at != entry.initiated_at
+            or facts.telnyx_call_leg_id != entry.call_leg_id
+            or facts.telnyx_call_session_id != entry.call_session_id
+            or started < facts.admitted_at or started > now
+            or entry.original_started_at is not None and entry.original_started_at != started
+        ):
+            return None
+        deadline = started + timedelta(seconds=self._original_call_limit_seconds)
+        remaining_utc = (deadline - now).total_seconds()
+        if entry.transfer_deadline_monotonic is None:
+            entry.original_started_at = started
+            sample_utc = entry.transfer_clock_utc or now
+            sample_monotonic = entry.transfer_clock_monotonic
+            if sample_monotonic is None:
+                sample_monotonic = monotonic
+            # Preparation consumes planning allowance; a pre-start UTC jump cannot add it.
+            projected_allowance = min(
+                self._original_call_limit_seconds, (deadline - sample_utc).total_seconds()
+            )
+            entry.transfer_deadline_monotonic = (
+                sample_monotonic + projected_allowance
+            )
+        remaining = min(remaining_utc, entry.transfer_deadline_monotonic - monotonic)
+        # Ringing20 plus a conservative local planning margin2; no remote timing guarantee.
+        duration = math.floor(remaining - 20 - 2)
+        return duration if 30 <= duration <= 14400 else None
+
+    async def _resolve_transfer_not_dispatched(
+        self, entry: _CallEntry, reserved: LocalCallLifecycleFacts,
+    ) -> None:
+        async def settle() -> None:
+            async with self._lock:
+                current = entry.transfer_facts or reserved
+                if current.transfer_command_id != reserved.transfer_command_id:
+                    raise RuntimeError("transfer_identity_conflict")
+                resolved = replace(
+                    current,
+                    transfer_failed_at=(
+                        current.transfer_failed_at or self._require_aware(self._utcnow())
+                    ),
+                    transfer_failure_cause="local_not_dispatched",
+                )
+            if self._operation_contract_version == 2:
+                assert isinstance(self._writer, PersistenceWriter)
+                await self._writer.commit_transfer_observation_v2(
+                    resolved, None, generation=entry.generation)
+            else:
+                await cast(Any, self._writer).commit_transfer_observation(resolved, None)
+            async with self._lock:
+                updated = entry.transfer_facts
+                if (
+                    updated is not None
+                    and updated.transfer_command_id == reserved.transfer_command_id
+                ):
+                    entry.transfer_facts = replace(updated,
+                        transfer_failed_at=resolved.transfer_failed_at,
+                        transfer_failure_cause=resolved.transfer_failure_cause)
+
+        # This transfer owner remains responsible until its exact abort is durable.
+        settlement = asyncio.create_task(settle(), name="voice-transfer-not-dispatched")
+        cancellation = None
+        while not settlement.done():
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        await settlement
+        if cancellation is not None:
+            raise cancellation
 
     async def _resolve_transfer_event(self, event: VerifiedWebhook) -> ResolvedWebhook | None:
         from projetv0_voice.telnyx.webhooks import ResolvedWebhook

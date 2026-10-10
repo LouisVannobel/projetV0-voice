@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
+from types import SimpleNamespace
 from uuid import uuid4, uuid5
 
 import pytest
@@ -22,10 +23,12 @@ from projetv0_voice.persistence.commands import (
     operation_aad_from_metadata,
 )
 from projetv0_voice.persistence.relay import OutboxRelay
+from projetv0_voice.pipeline import FirstFailure
+from projetv0_voice.session import _TerminalOutcome
 from projetv0_voice.telnyx.webhooks import ResolvedWebhook
 from tests.integration.test_fixed_v2_process import NOW
 from tests.integration.test_v2_final_call_freeze import final_case, frozen_bytes
-from tests.unit.test_sparra_admission import TARGET, event
+from tests.unit.test_sparra_admission import TARGET, committed, event
 
 
 @asynccontextmanager
@@ -98,6 +101,65 @@ async def bind_target(case):
     assert (await supervised(case, target_event(case))).status_code == 200
     case.provider.transfer_release.set()
     await case.requested
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback", ["preparation_failed", "late_after_commit", "user_busy", "no_answer"],
+)
+async def test_refused_or_failed_human_transfer_keeps_native_v2_message_result_once(
+    tmp_path, fallback,
+):
+    def qualified_pin(pin, _call, _routing):
+        return pin.model_copy(update={"transfer_destination": TARGET})
+
+    async with final_case(tmp_path, reply=qualified_pin) as case:
+        entry = case.registry._by_control["original"]
+        if fallback == "preparation_failed":
+            entry.begin_snapshot = entry.begin_snapshot.model_copy(update={
+                "recording_policy": "local_30d", "audio_available": True,
+            })
+            entry.session = SimpleNamespace(
+                stop_result_inference=case.session.stop_result_inference,
+                close_audio_for_transfer=lambda: False)
+        else:
+            entry.session = case.session
+        if fallback == "late_after_commit":
+            native_commit = case.writer.commit_transfer_intent
+
+            async def lapse(facts):
+                await native_commit(facts)
+                case.clock[0] = NOW + timedelta(seconds=248.001)
+
+            case.writer.commit_transfer_intent = lapse
+        requested = asyncio.create_task(case.registry.request_human(case.grant.generation))
+        try:
+            if fallback in {"user_busy", "no_answer"}:
+                await asyncio.wait_for(case.provider.transfer_entered.wait(), 2)
+                case.transfer = await case.writer.read_call_lifecycle(case.grant.call_id)
+                bound = await committed(case.registry, case.writer, target_event(case))
+                assert bound.status_code == 200
+                failed = target_event(case, "call.hangup", hangup_cause=fallback)
+                assert (await committed(case.registry, case.writer, failed)).status_code == 200
+                case.provider.transfer_release.set()
+                assert await requested == f"{fallback}_collect_message"
+            else:
+                assert await requested == "unavailable_collect_message"
+                assert not any(action[0] == "transfer" for action in case.provider.actions)
+            assert not case.session.no_new_ai
+            assert await phone_operations(case) == []
+            await case.session._prepare_partial_result()
+            assert case.session._partial_result is not None and len(case.requests) == 1
+            await case.session._finish_durable_boundaries(first_failure=FirstFailure(),
+                terminal_outcome=_TerminalOutcome("closed"), disclosure_completed=True)
+            frozen = await case.writer.read_frozen_call_publication_v2(case.grant.call_id,
+                generation=case.grant.generation.generation)
+            assert frozen.payload.message_result is not None and frozen.schema_version == 2
+            await case.session._prepare_partial_result()
+            assert len(case.requests) == 1
+        finally:
+            case.provider.transfer_release.set()
+            await asyncio.gather(requested, return_exceptions=True)
 
 
 @pytest.mark.asyncio

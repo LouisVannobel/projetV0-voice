@@ -720,6 +720,7 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
         monotonic=lambda: 100.0,
         token_factory=lambda size: "A" * 43,
         sparra=policy,
+        original_call_limit_seconds=300,
         called_did=did,
         begin_call=begin,
     )
