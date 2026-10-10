@@ -924,7 +924,9 @@ def build_pipeline(
                 )
                 + (
                     " L'outil request_human, sans arguments, peut demander une connexion à la "
-                    "seule ligne préqualifiée ; cette connexion ne vérifie pas l'identité d'une "
+                    "seule ligne préqualifiée uniquement si l'appelant demande explicitement "
+                    "à parler à un interlocuteur humain. Cette connexion ne vérifie pas "
+                    "l'identité d'une "
                     "personne. Si l'outil est indisponible ou échoue, propose de recueillir "
                     "un message."
                     if transfer_handler is not None
@@ -950,7 +952,8 @@ def build_pipeline(
         tool_schemas.append(
             FunctionSchema(
                 name="request_human",
-                description="Request connection to the qualified business line. No arguments.",
+                description="Only on the caller's explicit request, connect to the qualified "
+                "business line. No arguments.",
                 properties={},
                 required=[],
                 handler=transfer_handler,

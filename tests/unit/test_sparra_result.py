@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
-from tests.unit.test_sparra_admission import NOW, committed, event, start
+from tests.unit.test_sparra_admission import NOW, committed, event, persist_original_start, start
 
 
 def capture(writer, call_id, number, text="Pouvez-vous me rappeler ?"):
@@ -1173,6 +1173,7 @@ async def test_erasure_preserves_pending_phone_transfer_without_inventing_bridge
     requested = None
     try:
         await committed(registry, writer, event())
+        await persist_original_start(registry, writer)
         generation = await registry.generation_handle("original")
         requested = asyncio.create_task(registry.request_human(generation))
         async with asyncio.timeout(2):

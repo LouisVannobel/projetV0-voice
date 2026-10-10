@@ -1899,6 +1899,7 @@ async def build_production_runtime(
             deployment_id=settings.deployment_id,
             capacity=capacity,
             lease_ttl_seconds=selection.profile.call_lease_ttl_seconds,
+            original_call_limit_seconds=300 if manifest.sparra is not None else None,
             stream_url=settings.telnyx_media_wss_url,
             retention_days=manifest.transcript_retention_days,
             utcnow=utcnow,

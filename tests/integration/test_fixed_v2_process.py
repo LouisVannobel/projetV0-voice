@@ -93,6 +93,7 @@ async def registry_case(
         registry = CallRegistry(
             writer=writer, call_control=provider, tenant_id=str(WORKSPACE), agent_id=deployment_id,
             deployment_id=deployment_id, capacity=1, lease_ttl_seconds=30,
+            original_call_limit_seconds=300,
             stream_url="wss://fixture.invalid/media", retention_days=30,
             utcnow=utcnow, monotonic=monotonic or (lambda: 100.0),
             sparra=fixed_policy(), called_did=DID, begin_call=begin,

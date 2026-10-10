@@ -2133,6 +2133,9 @@ class Scenario:
         assert transfer["to"] == "+33102030406" and transfer["timeout_secs"] == 20, (
             "native_operator_qualified_destination_only"
         )
+        assert type(transfer.get("time_limit_secs")) is int and (
+            30 <= transfer["time_limit_secs"] <= 278
+        ), "native_finite_answered_target_leg_limit"
         assert not self.session.no_new_ai, "native_command_ack_not_connected"
         facts = await self.graph.writer.read_call_lifecycle(self.call_id)
         assert facts.transfer_command_id == UUID(transfer["command_id"]), (
@@ -3158,6 +3161,8 @@ class Scenario:
                 **self._audio_transfer_boundary(),
                 "intent_committed": intent_command == transfer["command_id"],
                 "fixed_target": transfer["to"] == "+33102030406",
+                "finite_target_limit": type(transfer.get("time_limit_secs")) is int
+                    and 30 <= transfer["time_limit_secs"] <= 278,
             }
 
         with patch.object(self.audio_capture.tap, "process_frame", observed_frame), patch.object(

@@ -3284,6 +3284,14 @@ class PersistenceWriter:
                     raise CommandConflictError("transfer_observation_conflict")
                 # Older in-flight observations may omit newer durable facts.
                 facts = replace(facts, **{name: old})
+        if current.transfer_failed_at is not None:
+            if facts.transfer_failed_at is not None and (
+                facts.transfer_failed_at != current.transfer_failed_at
+                or facts.transfer_failure_cause != current.transfer_failure_cause
+            ):
+                raise CommandConflictError("transfer_observation_conflict")
+            facts = replace(facts, transfer_failed_at=current.transfer_failed_at,
+                transfer_failure_cause=current.transfer_failure_cause)
         if isinstance(operation, VoiceOperationV2):
             if not isinstance(generation, UUID):
                 raise CommandSerializationError("invalid_phone_observation_v2")

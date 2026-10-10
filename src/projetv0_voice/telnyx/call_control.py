@@ -147,6 +147,7 @@ class RecordingStartV1(_RedactedFrozenModel):
 class TransferRequestV1(_RedactedFrozenModel):
     to_e164: str = Field(repr=False)
     target_leg_client_state: str = Field(min_length=1, max_length=4096, repr=False)
+    time_limit_secs: int = Field(ge=30, le=14400)
     timeout_secs: Literal[20] = 20
 
     @field_validator("to_e164")
@@ -414,6 +415,7 @@ class CallControlClient:
                 to=request.to_e164,
                 command_id=canonical_command,
                 target_leg_client_state=request.target_leg_client_state,
+                time_limit_secs=request.time_limit_secs,
                 timeout_secs=20,
                 timeout=self._timeout,
             )

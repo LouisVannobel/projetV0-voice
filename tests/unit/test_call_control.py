@@ -167,7 +167,8 @@ async def test_pinned_sdk_explicit_region_requests_use_exact_host_and_paths(
         assert (await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID)).outcome == "accepted"
         assert (await client.hangup(CALL_CONTROL_ID, command_id=COMMAND_ID)).outcome == "accepted"
         transfer = module.TransferRequestV1(
-            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ=="
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ==",
+            time_limit_secs=180,
         )
         transferred = await client.transfer(CALL_CONTROL_ID, transfer, command_id=COMMAND_ID)
         assert transferred.outcome == "accepted"
@@ -192,7 +193,7 @@ async def test_pinned_sdk_explicit_region_requests_use_exact_host_and_paths(
 
 
 @pytest.mark.asyncio
-async def test_real_pinned_sdk_qualified_transfer_uses_twenty_seconds_and_same_command(monkeypatch):
+async def test_real_pinned_sdk_qualified_transfer_preserves_native_answered_leg_limit(monkeypatch):
     module = call_control()
     requests = []
 
@@ -206,7 +207,9 @@ async def test_real_pinned_sdk_qualified_transfer_uses_twenty_seconds_and_same_c
     try:
         assert client.dispatch_available
         request = module.TransferRequestV1(
-            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ=="
+            to_e164="+33102030406",
+            target_leg_client_state="Zml4dHVyZQ==",
+            time_limit_secs=180,
         )
         first = await client.transfer(CALL_CONTROL_ID, request, command_id=COMMAND_ID)
         second = await client.transfer(CALL_CONTROL_ID, request, command_id=COMMAND_ID)
@@ -218,12 +221,58 @@ async def test_real_pinned_sdk_qualified_transfer_uses_twenty_seconds_and_same_c
                 "command_id": str(COMMAND_ID),
                 "target_leg_client_state": "Zml4dHVyZQ==",
                 "timeout_secs": 20,
+                "time_limit_secs": 180,
             },
         )
         assert requests == [expected, expected]
     finally:
         await client.aclose()
     assert not client.dispatch_available
+
+
+@pytest.mark.parametrize("duration", [None, True, False, "180", 180.0, 180.5, 0, 29, 14401])
+def test_transfer_duration_is_a_required_strict_provider_bounded_integer(duration):
+    module = call_control()
+    with pytest.raises(ValidationError, match="time_limit_secs"):
+        module.TransferRequestV1(
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ==",
+            time_limit_secs=duration,
+        )
+
+
+def test_transfer_duration_cannot_be_omitted():
+    module = call_control()
+    with pytest.raises(ValidationError, match="time_limit_secs"):
+        module.TransferRequestV1(
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ==",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration", [30, 14400])
+async def test_real_pinned_sdk_transfer_bounds_and_ambiguous_retry_count(monkeypatch, duration):
+    module = call_control()
+    requests = []
+
+    async def handler(request):
+        requests.append(json.loads(await request.aread()))
+        return httpx.Response(500, json={"errors": []}, request=request)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(module.telnyx, "DefaultAsyncHttpxClient", lambda **_kwargs: http_client)
+    client = module.CallControlClient(api_key=API_KEY)
+    try:
+        result = await client.transfer(CALL_CONTROL_ID, module.TransferRequestV1(
+            to_e164="+33102030406", target_leg_client_state="Zml4dHVyZQ==",
+            time_limit_secs=duration,
+        ), command_id=COMMAND_ID)
+        assert result.outcome == "outcome_unknown"
+        # Wrapper owns its one immediate retry; SDK max_retries=0 adds none.
+        assert requests == [{"to": "+33102030406", "command_id": str(COMMAND_ID),
+            "target_leg_client_state": "Zml4dHVyZQ==", "timeout_secs": 20,
+            "time_limit_secs": duration}] * 2
+    finally:
+        await client.aclose()
 
 
 def malformed_response(result: str | None = None) -> object:
