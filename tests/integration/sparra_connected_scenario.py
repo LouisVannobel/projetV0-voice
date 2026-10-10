@@ -3227,6 +3227,30 @@ class Scenario:
         self.audio_opposition_chunk_ids = set()
         chunk_acked = asyncio.Event()
         native_ack = self.graph.writer.ack_outbox
+        processed = asyncio.Event()
+        pending_sequence = pending_frame_id = None
+        native_deserialize = ProjetV0TelnyxFrameSerializer.deserialize
+
+        async def observed_deserialize(serializer, data):
+            nonlocal pending_frame_id
+            frame = await native_deserialize(serializer, data)
+            if not isinstance(frame, InputAudioRawFrame):
+                return frame
+            message = json.loads(data)
+            if (
+                message.get("event") == "media"
+                and message.get("stream_id") == self.media.stream
+                and message.get("sequence_number") == pending_sequence
+                and pending_frame_id is None
+            ):
+                pending_frame_id = frame.id
+            return frame
+
+        def after_push(_tap, frame):
+            if isinstance(frame, InputAudioRawFrame) and frame.id == pending_frame_id:
+                processed.set()
+
+        tap = self.audio_capture.tap
 
         async def observed_chunk_ack(**values):
             with sqlite3.connect(self.settings.sqlite_path) as database:
@@ -3247,7 +3271,10 @@ class Scenario:
         async def delivered():
             return await self.graph.writer.oldest_outbox_created_at() is None
 
-        with patch.object(self.graph.writer, "ack_outbox", observed_chunk_ack):
+        tap.add_event_handler("on_after_push_frame", after_push)
+        with patch.object(self.graph.writer, "ack_outbox", observed_chunk_ack), patch.object(
+            ProjetV0TelnyxFrameSerializer, "deserialize", observed_deserialize
+        ):
             try:
                 for sequence in range(3, 35):
                     if chunk_acked.is_set():
@@ -3256,21 +3283,33 @@ class Scenario:
                         "native_opposition_capture_active"
                     )
                     self.audio_opposition_sequence = sequence
+                    processed.clear()
+                    pending_sequence, pending_frame_id = str(sequence), None
                     await self.media.input({
                         "event": "media", "stream_id": self.media.stream,
-                        "sequence_number": str(sequence),
+                        "sequence_number": pending_sequence,
                         "media": {
                             "payload": base64.b64encode(b"\x9e" * 800).decode(),
                             "track": "inbound",
                         },
                     })
+                    await asyncio.wait_for(processed.wait(), 5)
                     # Existing bounded synthetic wire pacing; success needs ACK.
                     await asyncio.sleep(0.005)
+                    # Match audio_finish: wire send is not frame/event/receipt completion.
+                    await eventually(
+                        lambda: not tap.pending_join
+                        and not self.audio_capture.holder.summary.pending,
+                        "native_opposition_peer_event_and_receipt_joined", 5,
+                    )
                 await asyncio.wait_for(chunk_acked.wait(), 5)
                 await eventually(
                     delivered, "native_opposition_chunk_delivery_joined", 5
                 )
             finally:
+                tap.remove_event_handler("on_after_push_frame", after_push)
+                pending_sequence = pending_frame_id = None
+                processed.clear()
                 chunk_acked.clear()
         assert self.audio_opposition_chunk_ids <= {
             str(operation_id) for operation_id in self.audio_seen
