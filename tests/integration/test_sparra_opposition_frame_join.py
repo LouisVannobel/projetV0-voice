@@ -16,7 +16,8 @@ from tests.integration.test_local_audio_capture import CALL, accept_local, captu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["native-event", "local-receipt"])
-async def test_opposition_fixture_waits_before_next_wire_pcm(tmp_path, monkeypatch, boundary):
+@pytest.mark.parametrize("fixture", ["opposition", "transfer"])
+async def test_audio_fixture_waits_before_next_wire_pcm(tmp_path, monkeypatch, boundary, fixture):
     entered, release, overlapped = asyncio.Event(), asyncio.Event(), asyncio.Event()
     resumed = asyncio.Event()
     joined_before_next_wire = []
@@ -59,7 +60,8 @@ async def test_opposition_fixture_waits_before_next_wire_pcm(tmp_path, monkeypat
             await case.runtime.worker.queue_frame(frame)
 
     class LocalPrimeScenario:
-        # Only admission and the remote active-delivery setup are outside this seam.
+        # Admission, its fixed transfer target, and remote active-delivery setup
+        # are outside this seam; actual native PCM/event/SQLite work is exercised.
         # No external audio ACK is supplied or fabricated by this test.
         async def audio_admit(self):
             await accept_local(case)
@@ -79,7 +81,15 @@ async def test_opposition_fixture_waits_before_next_wire_pcm(tmp_path, monkeypat
         probe.audio_capture = case.capture
         probe.audio_seen = set()
         probe.media = GeneratedWirePeer()
-        prime = asyncio.create_task(Scenario.audio_opposition_prime(probe))
+        probe.request = {"audio_transfer_fixture": True}
+        probe.session = SimpleNamespace(_identity=SimpleNamespace(
+            begin_snapshot=case.pin.model_copy(update={"transfer_destination": "+33102030406"}),
+        ))
+        prime_method = (
+            Scenario.audio_opposition_prime if fixture == "opposition"
+            else Scenario.audio_transfer_boundary
+        )
+        prime = asyncio.create_task(prime_method(probe))
         try:
             await asyncio.wait_for(entered.wait(), 5)
             if boundary == "native-event":
