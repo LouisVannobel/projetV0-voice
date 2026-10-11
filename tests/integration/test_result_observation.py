@@ -70,6 +70,7 @@ def _session(metrics, inference, *, timeout=1):
     session._cleanup_phase_timeout_seconds = timeout
     session._controller = session._recorder = None
     session._registry_terminalizer = session._end_call_playback = None
+    session._action_authority = session._program_action_task = None
     return session
 
 

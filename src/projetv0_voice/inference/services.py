@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
 from typing import Any, cast
@@ -18,7 +18,11 @@ from pipecat.frames.frames import (
     ErrorFrame,
     FatalErrorFrame,
     Frame,
+    FunctionCallFromLLM,
     InputAudioRawFrame,
+    InterruptionFrame,
+    LLMContextFrame,
+    LLMTextFrame,
     StartFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
@@ -32,6 +36,7 @@ from pipecat.services.whisper.base_stt import language_to_whisper_language
 from pipecat.transcriptions.language import Language
 from pydantic import SecretStr
 
+from projetv0_voice.action_authority import ActionAuthority, CallerScope
 from projetv0_voice.inference.completion_strategy import (
     STT_COMPLETED_SEGMENT_KEY,
     STT_MAX_PENDING_SEGMENTS,
@@ -216,7 +221,90 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
 
     def __init__(self, **kwargs: Any) -> None:
         self._schema_routing: ContextVar[bool] = ContextVar("result_schema_routing", default=False)
+        self._action_authority: ActionAuthority | None = None
+        self._response_scope: ContextVar[tuple[int, CallerScope | None] | None] = ContextVar(
+            "caller_response_scope", default=None,
+        )
+        self._tool_scopes: dict[str, tuple[str, CallerScope]] = {}
+        self._seen_action_ids: set[str] = set()
         super().__init__(**kwargs)
+
+    def bind_action_authority(self, authority: ActionAuthority) -> None:
+        self._action_authority = authority
+
+    def consume_action_scope(
+        self, *, tool_call_id: str, function_name: str, context: object,
+    ) -> CallerScope | None:
+        binding = self._tool_scopes.pop(tool_call_id, None)
+        authority = self._action_authority
+        if binding is None or authority is None:
+            return None
+        name, scope = binding
+        if name != function_name or scope.context is not context or not authority.claim(scope):
+            return None
+        return scope
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        authority = self._action_authority
+        if authority is not None and isinstance(frame, (CancelFrame, EndFrame, ErrorFrame)):
+            authority.close()
+            self._tool_scopes.clear()
+        elif isinstance(frame, InterruptionFrame):
+            self._tool_scopes.clear()
+            if authority is not None:
+                authority.invalidate_response()
+        if authority is None or not isinstance(frame, LLMContextFrame):
+            await super().process_frame(frame, direction)
+            return
+        scope = authority.scope_for(frame, take=True)
+        if scope is not None and not authority.current(scope):
+            # A known revoked caller frame is not a no-scope recovery request.
+            return
+        token = self._response_scope.set((authority.epoch if scope is None else scope.epoch, scope))
+        try:
+            await super().process_frame(frame, direction)
+        finally:
+            self._response_scope.reset(token)
+
+    async def run_function_calls(self, function_calls: Sequence[FunctionCallFromLLM]) -> None:
+        authority, response = self._action_authority, self._response_scope.get()
+        actions = [fc for fc in function_calls if fc.function_name in {"end_call", "request_human"}]
+        ids = [fc.tool_call_id for fc in actions]
+        valid = (
+            authority is not None and response is not None and response[1] is not None
+            and authority.current(response[1]) and len(actions) == 1
+            and len(self._seen_action_ids) < 256 and len(self._tool_scopes) < 8
+            and all(isinstance(fc.arguments, dict) and not fc.arguments for fc in actions)
+            and all(tool_id and tool_id not in self._seen_action_ids for tool_id in ids)
+        )
+        for tool_id in ids:
+            self._tool_scopes.pop(tool_id, None)
+            if len(self._seen_action_ids) < 256:
+                self._seen_action_ids.add(tool_id)
+        if valid and response is not None and response[1] is not None:
+            fc = actions[0]
+            if fc.context is response[1].context:
+                self._tool_scopes[fc.tool_call_id] = (fc.function_name, response[1])
+        # Binding happens before the native service creates background tool tasks.
+        await super().run_function_calls(function_calls)
+
+    async def push_frame(
+        self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM,
+    ) -> None:
+        response, authority = self._response_scope.get(), self._action_authority
+        if (
+            isinstance(frame, LLMTextFrame) and response is not None and authority is not None
+            and not authority.response_current(response[0])
+        ):
+            return
+        await super().push_frame(frame, direction)
+
+    async def cleanup(self) -> None:
+        if self._action_authority is not None:
+            self._action_authority.close()
+        self._tool_scopes.clear()
+        self._seen_action_ids.clear()
+        await super().cleanup()  # type: ignore[no-untyped-call]
 
     async def run_inference(
         self,

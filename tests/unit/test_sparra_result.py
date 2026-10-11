@@ -283,6 +283,7 @@ async def test_session_result_inference_is_joined_when_ai_stops(tmp_path):
         assert writer.try_enqueue_turn(capture(writer, call_id, 1))
         session = CallSession.__new__(CallSession)
         session._runtime_metrics = metrics
+        session._action_authority = session._program_action_task = None
         session._identity = SimpleNamespace(
             call_id=call_id, routing=SimpleNamespace(from_e164=None)
         )
@@ -1175,7 +1176,9 @@ async def test_erasure_preserves_pending_phone_transfer_without_inventing_bridge
         await committed(registry, writer, event())
         await persist_original_start(registry, writer)
         generation = await registry.generation_handle("original")
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         async with asyncio.timeout(2):
             await provider.transfer_entered.wait()
         entry = registry._by_control["original"]

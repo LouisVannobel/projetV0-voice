@@ -1559,12 +1559,22 @@ class Scenario:
             if processor.__class__.__name__ == "LLMUserAggregator"
         )
         self.aggregator = aggregator
-        # Controlled turn-stop timing; native aggregation produces the content/event/context.
-        # Acoustic accuracy/real speaker/latency acceptance remains an operator gate.
-        await aggregator.process_frame(transcript, FrameDirection.DOWNSTREAM)
-        await aggregator._maybe_emit_user_turn_stopped()
-        tasks = [task for _name, task in aggregator._event_tasks]
-        await asyncio.gather(*tasks)
+        completed = asyncio.Event()
+
+        def stopped(_aggregator, _strategy, message):
+            if message.content == text.strip():
+                completed.set()
+
+        aggregator.add_event_handler("on_user_turn_stopped", stopped)
+        try:
+            # The actual native strategy controls completion and synchronous
+            # capture. Observing its public event does not grant action scope.
+            await self.session._active_runtime.worker.queue_frame(
+                replace(transcript, finalized=True),
+            )
+            await asyncio.wait_for(completed.wait(), timeout=8)
+        finally:
+            aggregator.remove_event_handler("on_user_turn_stopped", stopped)
         return await self.graph.writer.read_retained_call(self.call_id)
 
     async def mapping(self):
@@ -2126,8 +2136,8 @@ class Scenario:
             "native_untrusted_tool_argument_refused",
         )
         assert self.peers.transfer is None, "native_llm_cannot_choose_destination"
-        self.peers.tool_arguments = {}
-        await self.captured("Pouvez-vous me passer la ligne qualifiée ?")
+        self.peers.tool_arguments = None
+        await self.captured("transférez-moi")
         await eventually(lambda: self.peers.transfer, "native_qualified_transfer_command")
         transfer = self.peers.transfer
         assert transfer["to"] == "+33102030406" and transfer["timeout_secs"] == 20, (
@@ -2420,7 +2430,9 @@ class Scenario:
         await self.captured("Une demande observée avant le pont et l'effacement.")
         self.peers.transfer = None
         generation = await self.graph.registry.generation_handle(self.control)
-        self.final_fix_transfer = asyncio.create_task(self.graph.registry.request_human(generation))
+        self.final_fix_transfer = asyncio.create_task(self.graph.registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await eventually(lambda: self.peers.transfer, "native_race_real_transfer")
         fields = dict(
             to="+33102030406",
@@ -2480,7 +2492,7 @@ class Scenario:
             requested = asyncio.create_task(
                 self.graph.registry.request_human(
                     await self.graph.registry.generation_handle(self.control)
-                )
+                , action_is_current=lambda: True)
             )
             await asyncio.wait_for(entered.wait(), 10)
             await self.media.close()
@@ -3174,13 +3186,13 @@ class Scenario:
                 "media": {"payload": payload, "track": "inbound"},
             })
             await asyncio.wait_for(tail_processed.wait(), 5)
-            self.peers.tool_arguments = {}
-            await self.captured("Pouvez-vous me passer la ligne qualifiée ?")
+            self.peers.tool_arguments = None
+            await self.captured("transférez-moi")
             await eventually(lambda: sdk_entry is not None, "native_transfer_actual_sdk_entry", 5)
-            await eventually(lambda: any(
-                message.get("role") == "tool" and "ringing" in str(message.get("content"))
-                for message in self.aggregator.context.get_messages()
-            ), "native_transfer_native_tool_result_after_sdk", 5)
+            facts = await self.graph.writer.read_call_lifecycle(self.call_id)
+            assert facts.transfer_command_id is not None and facts.transfer_fenced, (
+                "native_direct_transfer_intent_reserved_before_sdk"
+            )
 
         # Assert outside SDK MockTransport: an assertion there becomes a provider
         # exception and could be swallowed as outcome_unknown by native control.

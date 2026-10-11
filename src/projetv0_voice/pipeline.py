@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import json
 import math
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import suppress
 from contextvars import Context
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
@@ -58,6 +58,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import TaskManager
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.action_authority import ActionAuthority, CallerScope, direct_command
 from projetv0_voice.audio_capture import BoundedAudioBufferTap
 from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.inference.completion_strategy import (
@@ -890,6 +891,8 @@ def build_pipeline(
     end_call_handler: FunctionCallHandler | None = None,
     end_call_playback: EndCallPlayback | None = None,
     on_user_turn_started: Callable[[], None] | None = None,
+    action_authority: ActionAuthority | None = None,
+    on_direct_command: Callable[[CallerScope, str], Awaitable[None]] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
 
@@ -912,23 +915,16 @@ def build_pipeline(
                 "role": "system",
                 "content": SPARRA_SYSTEM_PROMPT
                 + (
-                    " Utilise l'outil end_call, sans arguments, seulement lorsque l'appelant "
-                    "a clairement terminé : il dit au revoir ou décline explicitement toute "
-                    "autre aide après une demande traitée. Une pause, un silence, un refus de "
-                    "donner une information ou une phrase encore en cours ne termine pas "
-                    "l'appel. L'outil prononce lui-même une brève formule de départ puis "
-                    "termine l'appel ; n'ajoute pas une autre réponse et ne dis pas que tu "
-                    "es incapable de raccrocher."
+                    " L'outil end_call, sans arguments, propose seulement d'expliquer comment "
+                    "terminer l'appel. Le programme accepte la commande complète au revoir. "
+                    "N'annonce jamais que l'appel est terminé sur la base d'une proposition."
                     if end_call_handler is not None
                     else ""
                 )
                 + (
-                    " L'outil request_human, sans arguments, peut demander une connexion à la "
-                    "seule ligne préqualifiée uniquement si l'appelant demande explicitement "
-                    "à parler à un interlocuteur humain. Cette connexion ne vérifie pas "
-                    "l'identité d'une "
-                    "personne. Si l'outil est indisponible ou échoue, propose de recueillir "
-                    "un message."
+                    " L'outil request_human, sans arguments, propose seulement d'expliquer "
+                    "la commande complète transférez-moi pour la seule ligne préqualifiée. "
+                    "Une proposition ne prouve ni transfert ni identité humaine."
                     if transfer_handler is not None
                     else " Ce pilote ne transfère pas les appels ; propose de recueillir "
                     "un message "
@@ -952,8 +948,13 @@ def build_pipeline(
         tool_schemas.append(
             FunctionSchema(
                 name="request_human",
-                description="Only on the caller's explicit request, connect to the qualified "
-                "business line. No arguments.",
+                description=(
+                    "Propose the program instruction for requesting the qualified line. "
+                    "Does not perform a transfer. No arguments."
+                    if action_authority is not None else
+                    "Only on the caller's explicit request, connect to the qualified "
+                    "business line. No arguments."
+                ),
                 properties={},
                 required=[],
                 handler=transfer_handler,
@@ -962,8 +963,13 @@ def build_pipeline(
     if end_call_handler is not None:
         tool_schemas.append(FunctionSchema(
             name="end_call",
-            description="End only after an explicit goodbye or refusal of further help. "
-            "Speaks a brief goodbye before hanging up. No arguments.",
+            description=(
+                "Propose the program instruction for ending the call. "
+                "Does not hang up. No arguments."
+                if action_authority is not None else
+                "End only after an explicit goodbye or refusal of further help. "
+                "Speaks a brief goodbye before hanging up. No arguments."
+            ),
             properties={}, required=[], handler=end_call_handler,
         ))
     tools = ToolsSchema(standard_tools=tool_schemas) if tool_schemas else None
@@ -981,6 +987,8 @@ def build_pipeline(
                     CompletionAwareTurnStopStrategy(
                         turn_analyzer=LocalSmartTurnAnalyzerV3(),
                         on_incomplete_turn_stop=lambda: first_failure.signal("call_failed"),
+                        on_completed_turn=None if action_authority is None
+                        else action_authority.caller_completed,
                     )
                 ]
             ),
@@ -1002,6 +1010,11 @@ def build_pipeline(
             and on_user_turn_started is not None
         ):
             on_user_turn_started()
+        if action_authority is not None:
+            if isinstance(frame, UserStartedSpeakingFrame):
+                action_authority.caller_started(context, frame)
+            elif isinstance(frame, LLMContextFrame):
+                action_authority.capture(frame, context=context, origin=user_aggregator)
 
     def record_user_turn(
         _aggregator: FrameProcessor,
@@ -1051,17 +1064,33 @@ def build_pipeline(
             # This native synchronous hook runs before the aggregator's
             # terminal flush, even when the call owner is still joining it.
             inference_terminal = True
+            if action_authority is not None:
+                action_authority.close()
 
     async def allow_inference(frame: Frame) -> bool:
         if not isinstance(frame, LLMContextFrame):
             return True
         try:
-            return (
+            allowed = (
                 not inference_terminal
                 and first_failure.code is None
                 and controller.is_active()
                 and (end_call_playback is None or not end_call_playback.pending)
             )
+            if allowed and action_authority is not None and on_direct_command is not None:
+                scope = action_authority.scope_for(frame)
+                if scope is not None:
+                    command = direct_command(scope.text)
+                    if command == "request_human" and transfer_handler is None:
+                        # This call has no qualified relay. Retain the ordinary
+                        # message-taking conversation through the existing gate.
+                        return allowed
+                    if command is not None:
+                        action_authority.scope_for(frame, take=True)
+                        if action_authority.claim(scope):
+                            await on_direct_command(scope, command)
+                        return False
+            return allowed
         except Exception:
             first_failure.signal("input_gate_failed")
             return False
@@ -1086,9 +1115,20 @@ def build_pipeline(
 
     user_aggregator.add_event_handler("on_user_turn_stopped", record_user_turn)
     user_aggregator.add_event_handler("on_before_process_frame", close_terminal_inference)
-    if on_user_turn_started is not None:
+    if on_user_turn_started is not None or action_authority is not None:
         # This public hook is synchronous; native turn-start event handlers are deferred.
         user_aggregator.add_event_handler("on_before_push_frame", note_user_turn_started)
+    if action_authority is not None:
+        from projetv0_voice.inference.services import _TrustlessOpenRouterLLMService
+
+        if isinstance(services.llm, _TrustlessOpenRouterLLMService):
+            services.llm.bind_action_authority(action_authority)
+        if on_user_turn_started is not None:
+            def cancel_program_action(_llm: FrameProcessor, frame: Frame) -> None:
+                if isinstance(frame, InterruptionFrame):
+                    on_user_turn_started()
+
+            services.llm.add_event_handler("on_before_process_frame", cancel_program_action)
     assistant_aggregator.add_event_handler("on_assistant_turn_stopped", record_assistant_turn)
     services.tts.add_event_handler("on_error", sanitize_tts_error)
     if end_call_playback is not None and isinstance(services.tts, OpenRouterTTSService):

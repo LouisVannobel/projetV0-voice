@@ -129,8 +129,10 @@ class _RegistryTerminalizer:
     async def complete(self, authority: TerminalAuthority) -> bool:
         return await self._registry.complete_reserved_terminal(authority)
 
-    async def request_human(self) -> str:
-        return cast(str, await cast(Any, self._registry).request_human(self._grant.generation))
+    async def request_human(self, *, action_is_current: Callable[[], bool]) -> str:
+        return cast(str, await cast(Any, self._registry).request_human(
+            self._grant.generation, action_is_current=action_is_current,
+        ))
 
     async def human_tool_available(self) -> bool:
         return cast(

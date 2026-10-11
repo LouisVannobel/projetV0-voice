@@ -45,7 +45,9 @@ async def phone_case(tmp_path, *, failpoint=None):
         case.supervisor = RuntimeSupervisor(writer=case.writer, registry=case.registry,
             sink=case.sink, call_control=case.provider, sparra_enabled=True, retention_days=30,
             utcnow=lambda: case.clock[0])
-        case.requested = asyncio.create_task(case.registry.request_human(case.grant.generation))
+        case.requested = asyncio.create_task(case.registry.request_human(
+            case.grant.generation,
+            action_is_current=lambda: True))
         try:
             await asyncio.wait_for(case.provider.transfer_entered.wait(), 2)
             case.transfer = await case.writer.read_call_lifecycle(case.grant.call_id)
@@ -132,7 +134,9 @@ async def test_refused_or_failed_human_transfer_keeps_native_v2_message_result_o
                 case.clock[0] = NOW + timedelta(seconds=248.001)
 
             case.writer.commit_transfer_intent = lapse
-        requested = asyncio.create_task(case.registry.request_human(case.grant.generation))
+        requested = asyncio.create_task(case.registry.request_human(
+            case.grant.generation,
+            action_is_current=lambda: True))
         try:
             if fallback in {"user_busy", "no_answer"}:
                 await asyncio.wait_for(case.provider.transfer_entered.wait(), 2)

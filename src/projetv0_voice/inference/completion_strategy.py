@@ -40,7 +40,8 @@ class CompletionAwareTurnStopStrategy(TurnAnalyzerUserTurnStopStrategy):
     """
 
     def __init__(
-        self, *, on_incomplete_turn_stop: Callable[[], None] | None = None, **kwargs: Any
+        self, *, on_incomplete_turn_stop: Callable[[], None] | None = None,
+        on_completed_turn: Callable[[], None] | None = None, **kwargs: Any
     ) -> None:
         super().__init__(**kwargs)
         self._latest_segment = 0
@@ -49,6 +50,7 @@ class CompletionAwareTurnStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         self._terminal = False
         self._last_nonempty_text = ""
         self._on_incomplete_turn_stop = on_incomplete_turn_stop
+        self._on_completed_turn = on_completed_turn
 
     async def handle_user_turn_started(self) -> None:
         self._last_nonempty_text = ""
@@ -99,6 +101,10 @@ class CompletionAwareTurnStopStrategy(TurnAnalyzerUserTurnStopStrategy):
             or self._delivered_segment < self._latest_segment
         ):
             return
+        # Native 1.12 emits inference before UserStoppedSpeakingFrame. Mark
+        # covered completion synchronously, before that context can be pushed.
+        if self._on_completed_turn is not None:
+            self._on_completed_turn()
         await super().trigger_user_turn_stopped(
             enable_user_speaking_frames=enable_user_speaking_frames
         )

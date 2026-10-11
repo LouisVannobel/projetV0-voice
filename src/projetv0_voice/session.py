@@ -27,6 +27,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.workers.runner import WorkerRunner
 
+from projetv0_voice.action_authority import ActionAuthority, CallerScope
 from projetv0_voice.admission import (
     CallGenerationHandle,
     ProcessLeaseClaim,
@@ -684,6 +685,12 @@ class CallSession:
         self._recorder: TurnRecorder | None = None
         self._active_runtime: CallRuntime | None = None
         self._end_call_playback: EndCallPlayback | None = None
+        self._action_authority = (
+            ActionAuthority(is_active=self._actions_active)
+            if identity.begin_snapshot is not None else None
+        )
+        self._program_action_task: asyncio.Task[None] | None = None
+        self._action_failure: FirstFailure | None = None
         self._terminal_publication: VoiceOperationV1 | VoiceOperationV2 | None = None
         self._partial_result: MessageResultV1 | None = None
         self._result_inference_task: asyncio.Task[MessageResultV1 | None] | None = None
@@ -695,6 +702,7 @@ class CallSession:
 
     def stop_new_ai(self) -> None:
         self._no_new_ai = True
+        self._close_actions()
         self.stop_result_inference()
         if self._controller is not None:
             self._controller.stop_input()
@@ -820,59 +828,112 @@ class CallSession:
                 invalid_reason=invalid_reason if outcome == "invalid" else None,
             )
 
-    async def _request_human_tool(self, params: FunctionCallParams) -> None:
-        if (
-            not isinstance(params.arguments, dict)
-            or params.arguments
-            or self._registry_terminalizer is None
-            or self._no_new_ai
-        ):
-            result = "unavailable_collect_message"
-        else:
-            result = await cast(Any, self._registry_terminalizer).request_human()
-        await params.result_callback(
-            {"status": result, "human_identity_verified": False},
-            properties=FunctionCallResultProperties(run_llm=not self._no_new_ai),
+    def _actions_active(self) -> bool:
+        return (
+            not self._no_new_ai and not self._drain_requested
+            and (self._action_failure is None or self._action_failure.code is None)
+            and self._terminal_outcome.reason == "closed"
+            and not self._writer.fatal_event.is_set()
+            and self._controller is not None and self._controller.is_active()
         )
 
+    def _consume_tool_scope(self, params: FunctionCallParams) -> CallerScope | None:
+        from projetv0_voice.inference.services import _TrustlessOpenRouterLLMService
+
+        if (
+            not isinstance(params.arguments, dict) or params.arguments
+            or self._action_authority is None or not self._actions_active()
+            or not isinstance(params.llm, _TrustlessOpenRouterLLMService)
+            or params.llm is not self._services.llm
+        ):
+            return None
+        return params.llm.consume_action_scope(
+            tool_call_id=params.tool_call_id, function_name=params.function_name,
+            context=params.context,
+        )
+
+    async def _request_human_tool(self, params: FunctionCallParams) -> None:
+        scope = self._consume_tool_scope(params)
+        proposed = scope is not None and self._registry_terminalizer is not None
+        await params.result_callback(
+            {"status": "command_required" if proposed else "unavailable_collect_message",
+             "human_identity_verified": False},
+            properties=FunctionCallResultProperties(run_llm=False),
+        )
+        if proposed and scope is not None and self._action_current(scope):
+            await params.llm.push_frame(TTSSpeakFrame(
+                "Pour demander le transfert, dites : transférez-moi.", append_to_context=True,
+            ))
+
     async def _end_call_tool(self, params: FunctionCallParams) -> None:
+        scope = self._consume_tool_scope(params)
+        result: dict[str, object] = {"success": False}
+        if scope is not None:
+            result["status"] = "command_required"
+        await params.result_callback(result, properties=FunctionCallResultProperties(run_llm=False))
+        if scope is not None and self._action_current(scope):
+            await params.llm.push_frame(TTSSpeakFrame(
+                "Pour terminer l'appel, dites : au revoir.", append_to_context=True,
+            ))
+
+    def _action_current(self, scope: CallerScope) -> bool:
+        return self._action_authority is not None and self._action_authority.current(scope)
+
+    async def _accept_direct_command(self, scope: CallerScope, command: str) -> None:
+        if not self._action_current(scope):
+            return
+        # The gate returns immediately; input/system frames remain processable.
+        # The native task manager owns this task; the session cancels and joins it.
+        self._program_action_task = self._services.llm.create_task(
+            self._execute_direct_command(scope, command), name="sparra-direct-command",
+        )
+
+    async def _execute_direct_command(self, scope: CallerScope, command: str) -> None:
+        if not self._action_current(scope):
+            return
+        if command == "end_call":
+            await self._end_call_effect(scope)
+        elif command == "request_human" and self._registry_terminalizer is not None:
+            result = await cast(Any, self._registry_terminalizer).request_human(
+                action_is_current=lambda: self._action_current(scope),
+            )
+            if result == "unavailable_collect_message" and self._action_current(scope):
+                await self._services.llm.push_frame(TTSSpeakFrame(
+                    "Le transfert est indisponible. Je peux prendre un message.",
+                    append_to_context=True,
+                ))
+
+    async def _end_call_effect(self, scope: CallerScope) -> None:
         controller, playback = self._controller, self._end_call_playback
         allowed = (
-            isinstance(params.arguments, dict)
-            and not params.arguments
-            and not self._no_new_ai
-            and not self._drain_requested
-            and self._terminal_outcome.reason == "closed"
+            self._action_current(scope)
             and controller is not None
             and controller.is_active()
             and playback is not None
         )
         attempt = playback.begin() if allowed and playback is not None else None
         if attempt is None or playback is None:
-            await params.result_callback(
-                {"success": False},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
             return
         ending = False
         try:
-            await params.result_callback(
-                {"success": True},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
-            await params.llm.push_frame(attempt.speak_frame)
-            await params.llm.push_frame(TelnyxMarkFrame(attempt.mark_name))
+            await self._services.llm.push_frame(attempt.speak_frame)
+            if not self._action_current(scope):
+                return
+            await self._services.llm.push_frame(TelnyxMarkFrame(attempt.mark_name))
+            if not self._action_current(scope):
+                return
             acknowledged = await playback.wait_for_ack(
                 attempt, phase_timeout=self._profile.disclosure_mark_timeout_ms / 1000
             )
             if (
                 acknowledged
+                and self._action_current(scope)
                 and controller is not None
                 and controller.is_active()
                 and not self._no_new_ai
                 and not self._drain_requested
             ):
-                await params.llm.push_frame(EndWorkerFrame(reason="conversation_ended"))
+                await self._services.llm.push_frame(EndWorkerFrame(reason="conversation_ended"))
                 ending = True
         finally:
             if not ending:
@@ -880,8 +941,16 @@ class CallSession:
 
     def _note_caller_started(self) -> None:
         self._caller_started = True
+        if self._program_action_task is not None:
+            self._program_action_task.cancel()
         if self._end_call_playback is not None:
             self._end_call_playback.invalidate()
+
+    def _close_actions(self) -> None:
+        if self._action_authority is not None:
+            self._action_authority.close()
+        if self._program_action_task is not None:
+            self._program_action_task.cancel()
 
     async def _queue_opening_invitation(self) -> None:
         controller, runtime = self._controller, self._active_runtime
@@ -908,6 +977,7 @@ class CallSession:
         self._run_started = True
 
         first_failure = FirstFailure(shared_failure_event=self._writer.fatal_event)
+        self._action_failure = first_failure
         self._end_call_playback = EndCallPlayback(
             generation=self._identity.generation.generation, first_failure=first_failure
         ) if self._identity.begin_snapshot is not None else None
@@ -1003,6 +1073,8 @@ class CallSession:
                 on_user_turn_started=self._note_caller_started
                 if self._identity.begin_snapshot is not None
                 else None,
+                action_authority=self._action_authority,
+                on_direct_command=self._accept_direct_command,
             )
             runtime = build_runtime(
                 pipeline=pipeline,
@@ -1118,6 +1190,7 @@ class CallSession:
 
         async with self._drain_lock:
             self._drain_requested = True
+            self._close_actions()
             if self._active_runner is not None and not self._drain_claimed:
                 self._drain_claimed = True
                 self._drain_task = asyncio.create_task(
@@ -1319,6 +1392,9 @@ class CallSession:
         terminal_outcome: _TerminalOutcome,
         cancel_continuations: bool,
     ) -> None:
+        self._close_actions()
+        if self._program_action_task is not None:
+            await asyncio.gather(self._program_action_task, return_exceptions=True)
         if self._end_call_playback is not None:
             self._end_call_playback.invalidate()
         await self._attempt(
