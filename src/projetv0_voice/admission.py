@@ -1712,11 +1712,15 @@ class CallRegistry:
                     continue
                 if facts.target_call_control_id is None:
                     if (
-                        event.event_type != "call.initiated"
-                        or event.direction != "outgoing"
-                        or event.call_leg_id is None
+                        event.event_type not in {"call.initiated", "call.bridged", "call.hangup"}
+                        or event.event_type == "call.initiated" and event.direction != "outgoing"
+                        or not event.call_control_id
+                        or not event.call_leg_id
+                        or event.call_leg_id == candidate.call_leg_id
                     ):
                         return ResolvedWebhook(None)
+                    # Terminal webhooks can precede initiation and omit direction.
+                    # The exact transfer correlation binds this non-original pair.
                     facts = replace(
                         facts,
                         target_call_control_id=event.call_control_id,

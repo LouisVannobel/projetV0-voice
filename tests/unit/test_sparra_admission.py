@@ -1184,6 +1184,110 @@ async def test_bound_target_failure_is_distinct_and_wrong_leg_cannot_take_over(t
         await worker
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["call.bridged", "call.hangup"])
+async def test_correlated_target_terminal_before_initiation_is_durable_once(tmp_path, terminal):
+    from pydantic import SecretStr
+
+    registry, writer, worker, provider = await start(tmp_path)
+    requested = None
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        await persist_original_start(registry, writer)
+        requested = asyncio.create_task(registry.request_human(
+            await registry.generation_handle("original")))
+        await asyncio.wait_for(provider.transfer_entered.wait(), 2)
+        entry = registry._by_control["original"]
+        facts = await writer.read_call_lifecycle(entry.call_id)
+        assert facts.target_call_control_id is None
+        target = dict(call_control_id="target", call_leg_id="target-leg", to_e164=TARGET,
+            client_state=SecretStr(facts.transfer_correlation), call_state=None)
+        observed = event(terminal, **target, direction=None, hangup_cause="no_answer")
+        assert (await committed(registry, writer, observed)).status_code == 200
+        durable = await writer.read_call_lifecycle(entry.call_id)
+        assert durable.target_call_control_id == "target"
+        assert durable.target_call_leg_id == "target-leg"
+        for updates in ({"call_control_id": "other-target"}, {"call_leg_id": "other-leg"}, {}):
+            assert (await committed(registry, writer,
+                event(**{**target, **updates}, direction="outgoing"))).status_code == 200
+        assert (await committed(registry, writer, observed, duplicate=True)).status_code == 200
+        same = await writer.read_call_lifecycle(entry.call_id)
+        assert same == durable
+        provider.transfer_release.set()
+        if terminal == "call.bridged":
+            assert entry.no_new_ai and same.qualified_line_bridged_at == NOW
+            assert same.bridge_operation_id is not None
+            assert await requested == "qualified_line_connected"
+        else:
+            assert not entry.no_new_ai and same.qualified_line_bridged_at is None
+            assert same.transfer_failed_at == NOW and same.transfer_failure_cause == "no_answer"
+            assert await requested == "no_answer_collect_message"
+        assert [action[0] for action in provider.actions].count("transfer") == 1
+        assert not any(action[0] == "hangup" for action in provider.actions)
+        assert await registry.live_call_count() == 1
+        with sqlite3.connect(tmp_path / "voice.sqlite") as db:
+            assert db.execute("SELECT count(*) FROM webhook_receipts WHERE event_id=?",
+                (observed.event_id,)).fetchone() == (1,)
+    finally:
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.wait_for(requested, 2)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_or_wrong", [
+    {"client_state": None}, {"client_state": "wrong"},
+    {"call_session_id": None}, {"call_session_id": "wrong"},
+    {"connection_id": None}, {"connection_id": "wrong"},
+    {"to_e164": None}, {"to_e164": "+33102030407"},
+    {"call_control_id": None},
+    {"call_control_id": "original"}, {"call_leg_id": None},
+    {"call_leg_id": "original-leg"},
+    {"event_type": "call.initiated", "direction": None},
+    {"event_type": "call.initiated", "direction": "incoming", "call_state": "parked"},
+])
+async def test_first_target_binding_requires_complete_authority(tmp_path, missing_or_wrong):
+    from pydantic import SecretStr
+
+    registry, writer, worker, provider = await start(tmp_path)
+    requested = None
+    try:
+        await committed(registry, writer, event())
+        await committed(registry, writer, event("call.answered"))
+        await persist_original_start(registry, writer)
+        requested = asyncio.create_task(registry.request_human(
+            await registry.generation_handle("original")))
+        await asyncio.wait_for(provider.transfer_entered.wait(), 2)
+        entry = registry._by_control["original"]
+        facts = await writer.read_call_lifecycle(entry.call_id)
+        target = dict(call_control_id="target", call_leg_id="target-leg", to_e164=TARGET,
+            client_state=SecretStr(facts.transfer_correlation), call_state=None, direction=None)
+        bad = {**target, **missing_or_wrong}
+        if isinstance(bad["client_state"], str):
+            bad["client_state"] = SecretStr(bad["client_state"])
+        kind = bad.pop("event_type", "call.bridged")
+        assert (await committed(registry, writer, event(kind, **bad))).status_code == 200
+        assert not entry.no_new_ai
+        assert await writer.read_call_lifecycle(entry.call_id) == facts
+        assert (await committed(registry, writer,
+            event(**{**target, "direction": "outgoing"}))).status_code == 200
+        assert (await committed(registry, writer,
+            event("call.bridged", **target))).status_code == 200
+        provider.transfer_release.set()
+        assert await requested == "qualified_line_connected"
+    finally:
+        provider.transfer_release.set()
+        if requested is not None:
+            await asyncio.wait_for(requested, 2)
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
 @pytest.mark.parametrize(
     "caller", [None, "anonymous", "unavailable", "sip:fixture@example.invalid"]
 )
