@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from typing import Any, cast
 
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, NotGiven
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.frames.frames import (
     CancelFrame,
@@ -243,8 +243,17 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         self, params_from_context: OpenAILLMInvocationParams,
     ) -> dict[str, Any]:
         params = super().build_chat_completion_params(params_from_context)
+        # Pipecat's one-shot override selects its token field by key presence.
+        # Omit only the unused native sentinel so it overrides the active ceiling.
+        if isinstance(params.get("max_tokens"), int) and isinstance(
+            params.get("max_completion_tokens"), NotGiven,
+        ):
+            params.pop("max_completion_tokens")
         if self._schema_routing.get():
             extra_body = dict(params.get("extra_body", {}))
+            # The structured summary retains its previous reasoning defaults.
+            if extra_body.get("reasoning") == {"enabled": False}:
+                extra_body.pop("reasoning")
             provider = dict(extra_body.get("provider", {}))
             provider["require_parameters"] = True
             extra_body["provider"] = provider
@@ -315,16 +324,24 @@ def build_stt(
 def build_llm(
     profile: InferenceProfileV1,
     api_key: SecretStr,
+    *,
+    sparra_conversation: bool = False,
 ) -> OpenRouterLLMService:
     """Build Pipecat's native OpenRouter LLM with qualified routing policy."""
 
     dumped = profile.model_dump(mode="json")
     policy = cast(dict[str, Any], dumped["llm_provider_policy"])
+    extra_body = {"provider": policy}
+    if sparra_conversation:
+        extra_body["reasoning"] = {"enabled": False}
+    settings = OpenRouterLLMService.Settings(
+        model=profile.llm_model,
+        extra={"extra_body": extra_body},
+    )
+    if sparra_conversation:
+        settings.max_tokens = 256
     return _TrustlessOpenRouterLLMService(
         api_key=api_key.get_secret_value(),
         base_url=_OPENROUTER_BASE_URL,
-        settings=OpenRouterLLMService.Settings(
-            model=profile.llm_model,
-            extra={"extra_body": {"provider": policy}},
-        ),
+        settings=settings,
     )
