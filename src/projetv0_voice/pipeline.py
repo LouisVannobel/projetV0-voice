@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import json
 import math
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from contextlib import suppress
 from contextvars import Context
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
@@ -892,7 +892,7 @@ def build_pipeline(
     end_call_playback: EndCallPlayback | None = None,
     on_user_turn_started: Callable[[], None] | None = None,
     action_authority: ActionAuthority | None = None,
-    on_direct_command: Callable[[CallerScope, str], Awaitable[None]] | None = None,
+    on_direct_command: Callable[[CallerScope, str], None] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
 
@@ -1088,7 +1088,7 @@ def build_pipeline(
                     if command is not None:
                         action_authority.scope_for(frame, take=True)
                         if action_authority.claim(scope):
-                            await on_direct_command(scope, command)
+                            on_direct_command(scope, command)
                         return False
             return allowed
         except Exception:

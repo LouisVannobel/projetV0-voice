@@ -236,7 +236,8 @@ async def test_transfer_rechecks_revoked_action_after_real_lifecycle_read(tmp_pa
         release.set()
         assert await requested == "unavailable_collect_message"
         entry = registry._by_control["original"]
-        assert entry.transfer_facts is None and entry.transfer_future is None
+        assert entry.transfer_facts is None
+        assert entry.transfer_future is None
         assert entry.transfer_task is None
         assert not provider.transfer_entered.is_set()
     finally:

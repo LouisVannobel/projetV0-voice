@@ -879,7 +879,7 @@ class CallSession:
     def _action_current(self, scope: CallerScope) -> bool:
         return self._action_authority is not None and self._action_authority.current(scope)
 
-    async def _accept_direct_command(self, scope: CallerScope, command: str) -> None:
+    def _accept_direct_command(self, scope: CallerScope, command: str) -> None:
         if not self._action_current(scope):
             return
         # The gate returns immediately; input/system frames remain processable.
