@@ -194,6 +194,42 @@ async def test_phone_facts_v2_verified_correlation_only_matching_bridge_publishe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["call.bridged", "call.hangup"])
+async def test_first_target_terminal_v2_survives_late_initiation_and_duplicate(tmp_path, terminal):
+    async with phone_case(tmp_path) as case:
+        case.clock[0] = NOW + timedelta(seconds=1)
+        first = target_event(case, terminal, hangup_cause="no_answer")
+        assert first.direction is None and case.transfer.target_call_control_id is None
+        assert (await supervised(case, first)).status_code == 200
+        durable = await case.writer.read_call_lifecycle(case.grant.call_id)
+        assert durable.target_call_control_id == "target"
+        assert durable.target_call_leg_id == "target-leg"
+        for updates in ({"call_control_id": "other-target"}, {"call_leg_id": "other-leg"}, {}):
+            assert (await supervised(case, target_event(case, **updates))).status_code == 200
+        assert (await supervised(case, first)).status_code == 200
+        assert await case.writer.read_call_lifecycle(case.grant.call_id) == durable
+        case.provider.transfer_release.set()
+        if terminal == "call.bridged":
+            assert await case.requested == "qualified_line_connected"
+            assert case.registry._by_control["original"].no_new_ai
+            closing = await phone_operations(case)
+            assert len(closing) == 1 and closing[0].schema_version == 2
+            assert closing[0].operation_id == uuid5(case.grant.call_id, "qualified-line-bridge")
+            assert closing[0].occurred_at == first.occurred_at
+        else:
+            assert await case.requested == "no_answer_collect_message"
+            assert not case.registry._by_control["original"].no_new_ai
+            assert durable.transfer_failure_cause == "no_answer"
+            assert await phone_operations(case) == []
+        assert durable.transfer_generation == case.grant.generation.generation
+        assert [action[0] for action in case.provider.actions].count("transfer") == 1
+        assert not any(action[0] == "hangup" for action in case.provider.actions)
+        with sqlite3.connect(case.path) as db:
+            assert db.execute("SELECT count(*) FROM webhook_receipts WHERE event_id=?",
+                (first.event_id,)).fetchone() == (1,)
+
+
+@pytest.mark.asyncio
 async def test_phone_facts_v2_original_hangup_atomic_closed_keeps_business_slot(
     tmp_path, monkeypatch,
 ):

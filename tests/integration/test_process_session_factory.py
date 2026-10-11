@@ -650,10 +650,14 @@ class _Session:
         self.events.append(f"session-drain:{reason}")
 
 
-@pytest.mark.parametrize("clear_behavior", ["stall", "raise", "cancel", "waiter_cancel", "erase"])
+@pytest.mark.parametrize(("clear_behavior", "operation_version", "early_bridge"), [
+    ("stall", 1, False), ("raise", 1, False), ("cancel", 1, False),
+    ("waiter_cancel", 1, False), ("erase", 1, False),
+    ("raise", 1, True), ("raise", 2, False), ("raise", 2, True),
+])
 @pytest.mark.asyncio
 async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
-    tmp_path, monkeypatch, clear_behavior
+    tmp_path, monkeypatch, clear_behavior, operation_version, early_bridge
 ):
     import dataclasses
     from datetime import timedelta
@@ -661,6 +665,7 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
 
     from pydantic import SecretStr
 
+    from projetv0_voice.audio_contract import BeginCallSnapshotV2
     from projetv0_voice.config import SparraManifestV1
     from projetv0_voice.models import BeginCallSnapshotV1
     from projetv0_voice.persistence.writer import PersistenceWriter
@@ -671,12 +676,16 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
     did = "+33102030405"
     policy = SparraManifestV1(
         schema_version=1,
+        operation_contract_version=operation_version,
         connection_id="fixture",
         original_forward_line_e164=None,
         qualified_transfer_destination_e164=destination,
     )
     writer = PersistenceWriter(
         tmp_path / "takeover.sqlite", CryptoKeyring({1: b"k" * 32}, active_version=1),
+        contract_version=operation_version,
+        **({"process_agent_id": "agent-a", "process_deployment_id": "deployment-a"}
+           if operation_version == 2 else {}),
         utcnow=lambda: NOW,
     )
     writer_task = asyncio.create_task(writer.run())
@@ -689,7 +698,7 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
     control = Control()
 
     async def begin(deployment, call_id, routing):
-        return BeginCallSnapshotV1(
+        original = BeginCallSnapshotV1(
             schema_version=1,
             call_id=call_id,
             configuration_revision=1,
@@ -705,11 +714,18 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
             transfer_destination=destination,
             retention_until=routing.admitted_at + timedelta(days=30),
         )
+        if operation_version == 1:
+            return original
+        return BeginCallSnapshotV2.model_validate({
+            **original.model_dump(exclude={"recording_enabled"}), "schema_version": 2,
+            "workspace_id": str(UUID(int=22)), "recording_policy": "off",
+            "recording_contact_phone": None, "audio_available": False, "recording_id": None,
+        })
 
     registry = CallRegistry(
         writer=writer,
         call_control=control,
-        tenant_id="tenant-a",
+        tenant_id=str(UUID(int=22)) if operation_version == 2 else "tenant-a",
         agent_id="agent-a",
         deployment_id="deployment-a",
         capacity=1,
@@ -747,6 +763,7 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
             lease=None if effect is None else effect.lease,
             operation=None if effect is None else effect.operation,
             admission_facts=None if effect is None else effect.admission_facts,
+            operation_generation=None if effect is None else effect.operation_generation,
         )
         await registry.reconcile_after_commit(received, resolution, await ticket.wait())
 
@@ -764,7 +781,8 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
     assert facts is not None and facts.admitted_at == NOW
     assert facts.retention_until == NOW + timedelta(days=30)
     assert facts.admission_generation == claim.generation
-    assert facts.recording_policy_revision == 1 and facts.recording_enabled is False
+    assert facts.recording_policy_revision == (1 if operation_version == 1 else None)
+    assert facts.recording_enabled is False
     assert entry.begin_snapshot is not None
     assert entry.begin_snapshot.call_id == claim.call_id
     assert entry.begin_snapshot.retention_until == facts.retention_until
@@ -905,12 +923,16 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
             )
             return await registry.resolve_webhook(received)
 
-        await target_event("call.initiated")
+        if not early_bridge:
+            await target_event("call.initiated")
         takeover = asyncio.create_task(target_event("call.bridged"))
         if clear_behavior == "waiter_cancel":
             await clear_started.wait()
             takeover.cancel()
         await asyncio.wait_for(takeover, timeout=1)
+        assert session.no_new_ai
+        if early_bridge:
+            await target_event("call.initiated")
         await session.request_drain("qualified_line_connected")
         await asyncio.wait_for(running, timeout=5)
         assert clear_started.is_set()
