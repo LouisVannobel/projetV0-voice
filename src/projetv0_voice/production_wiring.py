@@ -638,6 +638,8 @@ def _inference_factories(
     api_key: SecretStr,
     deployment_profile: RuntimeDeploymentProfileV1,
     language: str,
+    *,
+    sparra_conversation: bool = False,
 ) -> RuntimeInferenceFactories:
     if (
         not isinstance(api_key, SecretStr)
@@ -665,7 +667,10 @@ def _inference_factories(
     return RuntimeInferenceFactories(
         stt_http_client_factory=stt_http_client_factory,
         stt_factory=stt_factory,
-        llm_factory=lambda: build_llm(profile, api_key),
+        llm_factory=lambda: (
+            build_llm(profile, api_key, sparra_conversation=True)
+            if sparra_conversation else build_llm(profile, api_key)
+        ),
         tts_factory=lambda: OpenRouterTTSService(profile=profile, api_key=api_key),
     )
 
@@ -756,6 +761,16 @@ def build_production_factories(
                 raise RuntimeError("runtime_keyring_invalid") from None
             return keyring_value
 
+    def inference_factory(
+        api_key: SecretStr,
+        deployment_profile: RuntimeDeploymentProfileV1,
+        language: str,
+    ) -> RuntimeInferenceFactories:
+        return _inference_factories(
+            api_key, deployment_profile, language,
+            sparra_conversation=manifest_value is not None and manifest_value.sparra is not None,
+        )
+
     return RuntimeProductionFactories(
         validate_artifacts=validate_artifacts,
         load_manifest=load_manifest,
@@ -764,7 +779,7 @@ def build_production_factories(
         load_keyring=load_keyring,
         sink_factory=lambda dsn: PsycopgOperationSink(dsn.get_secret_value()),
         call_control_factory=_call_control_factory,
-        inference_factory=_inference_factories,
+        inference_factory=inference_factory,
         archive_factory=_archive_factory,
     )
 
