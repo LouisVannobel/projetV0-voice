@@ -353,7 +353,7 @@ class Peers:
                     {
                         "index": 0,
                         "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": json.dumps(result)},
+                        "message": {"role": "assistant", "content": json.dumps({"result": result})},
                     }
                 ],
             },
