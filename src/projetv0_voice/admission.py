@@ -1415,7 +1415,12 @@ class CallRegistry:
         entry.lifecycle_owner = None
         entry.lifecycle_owner_task = None
 
-    async def request_human(self, generation: CallGenerationHandle) -> str:
+    async def request_human(
+        self, generation: CallGenerationHandle, *,
+        action_is_current: Callable[[], bool] | None = None,
+    ) -> str:
+        if action_is_current is None or not action_is_current():
+            return "unavailable_collect_message"
         async with self._lock:
             registered = self._by_control.get(generation.call_control_id)
             if registered is None or registered.generation != generation.generation:
@@ -1431,6 +1436,7 @@ class CallRegistry:
                 or entry.terminal_authority is not None
                 or entry.terminal_event is not None
                 or self._draining
+                or not action_is_current()
             ):
                 return "unavailable_collect_message"
             destination = self._qualified_destination(entry)
@@ -1447,6 +1453,8 @@ class CallRegistry:
                     if not callable(close_audio) or close_audio() is not True:
                         return "unavailable_collect_message"
                 assert entry.routing is not None
+                if not action_is_current():
+                    return "unavailable_collect_message"
                 command_id = uuid4()
                 correlation = base64.b64encode(uuid4().bytes + command_id.bytes).decode("ascii")
                 # Reservation precedes the first writer await; terminal cleanup observes this fence.

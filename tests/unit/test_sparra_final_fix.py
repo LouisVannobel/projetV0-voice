@@ -32,7 +32,9 @@ async def test_bridge_observation_cannot_retain_disclosure_after_content_stop(tm
         await persist_original_start(registry, writer)
         entry = registry._by_control["original"]
         requested = asyncio.create_task(
-            registry.request_human(await registry.generation_handle("original"))
+            registry.request_human(
+                await registry.generation_handle("original"),
+                action_is_current=lambda: True)
         )
         await provider.transfer_entered.wait()
         facts = await writer.read_call_lifecycle(entry.call_id)
@@ -111,7 +113,9 @@ async def test_original_termination_fact_is_durable_and_stale_transfer_cannot_cl
         await committed(registry, writer, event("call.answered"))
         await persist_original_start(registry, writer)
         requested = asyncio.create_task(
-            registry.request_human(await registry.generation_handle("original"))
+            registry.request_human(
+                await registry.generation_handle("original"),
+                action_is_current=lambda: True)
         )
         await provider.transfer_entered.wait()
         call_id = registry._by_control["original"].call_id
@@ -182,7 +186,9 @@ async def test_same_writer_preserves_newer_bridge_facts_against_stale_observatio
         await committed(registry, writer, event("call.answered"))
         await persist_original_start(registry, writer)
         requested = asyncio.create_task(
-            registry.request_human(await registry.generation_handle("original"))
+            registry.request_human(
+                await registry.generation_handle("original"),
+                action_is_current=lambda: True)
         )
         await provider.transfer_entered.wait()
         call_id = registry._by_control["original"].call_id

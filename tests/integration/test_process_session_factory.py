@@ -902,7 +902,7 @@ async def test_correlated_bridge_cancels_native_ai_despite_clear_failure(
             assert "stt-client-close" in events and "llm-client-close" in events
             return
         generation = await registry.generation_handle("control-a")
-        assert await registry.request_human(generation) == "ringing"
+        assert await registry.request_human(generation, action_is_current=lambda: True) == "ringing"
         facts = await writer.read_call_lifecycle(claim.call_id)
         target = dict(
             call_control_id="target",

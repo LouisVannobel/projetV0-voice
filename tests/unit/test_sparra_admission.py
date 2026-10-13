@@ -193,6 +193,63 @@ async def persist_original_start(registry, writer, *, started_at=NOW):
 
 
 @pytest.mark.asyncio
+async def test_transfer_without_action_authority_refuses_before_reservation(tmp_path):
+    registry, writer, worker, provider = await start(tmp_path)
+    try:
+        await committed(registry, writer, event())
+        await persist_original_start(registry, writer)
+        provider.transfer_release.set()
+        generation = await registry.generation_handle("original")
+        assert await registry.request_human(generation) == "unavailable_collect_message"
+        assert registry._by_control["original"].transfer_task is None
+        assert not provider.transfer_entered.is_set()
+    finally:
+        provider.transfer_release.set()
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
+async def test_transfer_rechecks_revoked_action_after_real_lifecycle_read(tmp_path):
+    registry, writer, worker, provider = await start(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+    current = [True]
+    read = writer.read_call_lifecycle
+
+    async def delayed_read(call_id):
+        lifecycle = await read(call_id)
+        entered.set()
+        await release.wait()
+        return lifecycle
+
+    try:
+        await committed(registry, writer, event())
+        await persist_original_start(registry, writer)
+        generation = await registry.generation_handle("original")
+        writer.read_call_lifecycle = delayed_read
+        requested = asyncio.create_task(registry.request_human(
+            generation, action_is_current=lambda: current[0],
+        ))
+        await asyncio.wait_for(entered.wait(), 2)
+        current[0] = False
+        release.set()
+        assert await requested == "unavailable_collect_message"
+        entry = registry._by_control["original"]
+        assert entry.transfer_facts is None
+        assert entry.transfer_future is None
+        assert entry.transfer_task is None
+        assert not provider.transfer_entered.is_set()
+    finally:
+        release.set()
+        provider.transfer_release.set()
+        writer.read_call_lifecycle = read
+        await registry.wait_background()
+        await writer.drain(2)
+        await worker
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("begin_outcome", ["success", "failure"])
 async def test_finite_candidate_rejects_next_call_before_local_intent_begin_or_answer(
     tmp_path, begin_outcome
@@ -824,7 +881,9 @@ async def test_committed_transfer_target_is_acknowledged_without_original_admiss
         assert (await committed(registry, writer, event("call.answered"))).status_code == 200
         generation = await registry.generation_handle("original")
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await provider.transfer_entered.wait()
         facts = await writer.read_call_lifecycle((await registry.snapshot("original")).call_id)
         target = event(
@@ -936,7 +995,9 @@ async def test_pending_transfer_fence_survives_drain_cancel_and_writer_restart(t
     generation = await registry.generation_handle("original")
     try:
         await persist_original_start(registry, writer)
-        transfer = asyncio.create_task(registry.request_human(generation))
+        transfer = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await provider.transfer_entered.wait()
         transfer.cancel()
         await asyncio.gather(transfer, return_exceptions=True)
@@ -997,7 +1058,9 @@ async def test_committed_intent_survives_local_failure_but_closed_executor_canno
     generation = await registry.generation_handle("original")
     try:
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await entered.wait()
         provider.dispatch_available = False
         release.set()
@@ -1057,7 +1120,9 @@ async def test_paused_committed_intent_fences_real_terminal_authority_and_delaye
     generation = await registry.generation_handle("original")
     try:
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await entered.wait()
         authority = await registry.reserve_or_read_terminal(
             grant,
@@ -1128,7 +1193,9 @@ async def test_cleanup_reserved_first_prevents_transfer_arming(tmp_path):
                 entry, reason="pipeline_failed", persist_terminal=True, cleanup_hangup=True
             )
         assert work is not None
-        assert await registry.request_human(generation) == "unavailable_collect_message"
+        assert await registry.request_human(
+            generation,
+            action_is_current=lambda: True) == "unavailable_collect_message"
         assert entry.transfer_facts is None
         assert not any(item[0] == "transfer" for item in provider.actions)
         await registry._run_terminal_cleanup(work)
@@ -1149,7 +1216,9 @@ async def test_bound_target_failure_is_distinct_and_wrong_leg_cannot_take_over(t
     generation = await registry.generation_handle("original")
     try:
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await provider.transfer_entered.wait()
         facts = await writer.read_call_lifecycle((await registry.snapshot("original")).call_id)
         target = dict(
@@ -1196,7 +1265,7 @@ async def test_correlated_target_terminal_before_initiation_is_durable_once(tmp_
         await committed(registry, writer, event("call.answered"))
         await persist_original_start(registry, writer)
         requested = asyncio.create_task(registry.request_human(
-            await registry.generation_handle("original")))
+            await registry.generation_handle("original"), action_is_current=lambda: True))
         await asyncio.wait_for(provider.transfer_entered.wait(), 2)
         entry = registry._by_control["original"]
         facts = await writer.read_call_lifecycle(entry.call_id)
@@ -1260,7 +1329,7 @@ async def test_first_target_binding_requires_complete_authority(tmp_path, missin
         await committed(registry, writer, event("call.answered"))
         await persist_original_start(registry, writer)
         requested = asyncio.create_task(registry.request_human(
-            await registry.generation_handle("original")))
+            await registry.generation_handle("original"), action_is_current=lambda: True))
         await asyncio.wait_for(provider.transfer_entered.wait(), 2)
         entry = registry._by_control["original"]
         facts = await writer.read_call_lifecycle(entry.call_id)
@@ -1381,7 +1450,9 @@ async def test_departed_owner_target_failure_preserves_actual_original_hangup(tm
     )
     grant = await registry.consume_claim_for_construction(claim, "stream", owner, owner._task)
     await persist_original_start(registry, writer)
-    requested = asyncio.create_task(registry.request_human(grant.generation))
+    requested = asyncio.create_task(registry.request_human(
+        grant.generation,
+        action_is_current=lambda: True))
     await provider.transfer_entered.wait()
     try:
         authority = await registry.reserve_or_read_terminal(
@@ -1484,7 +1555,9 @@ async def test_transfer_audio_boundary_failure_releases_only_unpublished_intent(
         )
         generation = await registry.generation_handle("original")
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         if mode != "missing":
             await asyncio.wait_for(entered.wait(), 2)
             assert closes == [True] and registry._transfer_fenced(entry)
@@ -1495,7 +1568,9 @@ async def test_transfer_audio_boundary_failure_releases_only_unpublished_intent(
                 await asyncio.wait_for(requested, 2)
         else:
             assert await asyncio.wait_for(requested, 2) == "unavailable_collect_message"
-            assert await registry.request_human(generation) == "unavailable_collect_message"
+            assert await registry.request_human(
+                generation,
+                action_is_current=lambda: True) == "unavailable_collect_message"
         assert entry.transfer_facts is None and not registry._transfer_fenced(entry)
         assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
         assert not any(item[0] == "transfer" for item in provider.actions)
@@ -1527,7 +1602,9 @@ async def test_transfer_audio_on_missing_concrete_session_refuses_before_reserva
         assert entry.session is None
         generation = await registry.generation_handle("original")
         await persist_original_start(registry, writer)
-        assert await registry.request_human(generation) == "unavailable_collect_message"
+        assert await registry.request_human(
+            generation,
+            action_is_current=lambda: True) == "unavailable_collect_message"
         assert entry.transfer_task is None and entry.transfer_facts is None
         assert not (await writer.read_call_lifecycle(entry.call_id)).transfer_fenced
         assert not any(item[0] == "transfer" for item in provider.actions)
@@ -1558,13 +1635,13 @@ async def test_transfer_entered_real_commit_unknown_keeps_fence_without_dispatch
         generation = await registry.generation_handle("original")
         with pytest.raises(RuntimeError, match="^controlled committed response loss$"):
             await persist_original_start(registry, writer)
-            await registry.request_human(generation)
+            await registry.request_human(generation, action_is_current=lambda: True)
         assert entry.transfer_facts is not None and registry._transfer_fenced(entry)
         facts = await writer.read_call_lifecycle(entry.call_id)
         assert facts.transfer_fenced
         assert facts.transfer_command_id == entry.transfer_facts.transfer_command_id
         with pytest.raises(RuntimeError, match="^controlled committed response loss$"):
-            await registry.request_human(generation)
+            await registry.request_human(generation, action_is_current=lambda: True)
         assert commits == [facts.transfer_command_id]
         assert not any(item[0] == "transfer" for item in provider.actions)
         assert await registry.live_call_count() == 1 and registry._permits_used == 1
@@ -1595,7 +1672,9 @@ async def test_transfer_audio_off_and_unavailable_do_not_require_capture_callbac
         assert entry.session is None
         generation = await registry.generation_handle("original")
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await asyncio.wait_for(provider.transfer_entered.wait(), 2)
         provider.transfer_release.set()
         assert await requested == "ringing"
@@ -1659,7 +1738,9 @@ async def test_terminal_authority_during_audio_prepare_keeps_consumed_fence_with
             prepare_audio_for_transfer=prepare,
         )
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(grant.generation))
+        requested = asyncio.create_task(registry.request_human(
+            grant.generation,
+            action_is_current=lambda: True))
         await asyncio.wait_for(entered.wait(), 2)
         reserved = entry.transfer_facts
         assert reserved is not None
@@ -1724,7 +1805,9 @@ async def test_transfer_rechecks_live_audio_after_contended_registry_lock_before
         )
         generation = await registry.generation_handle("original")
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await asyncio.wait_for(entered.wait(), 2)
         await registry._lock.acquire()
         locked = True
@@ -1792,7 +1875,9 @@ async def test_transfer_live_audio_readiness_is_rechecked_after_real_intent_comm
         )
         generation = await registry.generation_handle("original")
         await persist_original_start(registry, writer)
-        requested = asyncio.create_task(registry.request_human(generation))
+        requested = asyncio.create_task(registry.request_human(
+            generation,
+            action_is_current=lambda: True))
         await asyncio.wait_for(entered.wait(), 2)
         if invalidated == "opposition":
             ready = False
@@ -1832,7 +1917,7 @@ async def test_transfer_uses_remaining_original_started_budget_and_refuses_fract
         clock[0], monotonic[0] = NOW + timedelta(seconds=elapsed), 100.0 + elapsed
         provider.transfer_release.set()
         generation = await registry.generation_handle("original")
-        result = await registry.request_human(generation)
+        result = await registry.request_human(generation, action_is_current=lambda: True)
         entry = registry._by_control["original"]
         facts = await writer.read_call_lifecycle(entry.call_id)
         transfers = [action for action in provider.actions if action[0] == "transfer"]
@@ -1869,7 +1954,7 @@ async def test_native_admission_relay_refuses_known_caller_as_target_only(
         generation = await registry.generation_handle("original")
         assert await registry.human_tool_available(generation) is available
         provider.transfer_release.set()
-        result = await registry.request_human(generation)
+        result = await registry.request_human(generation, action_is_current=lambda: True)
         entry = registry._by_control["original"]
         facts = await writer.read_call_lifecycle(entry.call_id)
         transfers = [action for action in provider.actions if action[0] == "transfer"]
@@ -1902,7 +1987,9 @@ async def test_transfer_missing_or_inconsistent_original_start_refuses_before_ef
             await persist_original_start(registry, writer,
                 started_at=NOW + timedelta(seconds=-1 if invalid == "before_admission" else 1))
         provider.transfer_release.set()
-        assert await registry.request_human(await registry.generation_handle("original")) == (
+        assert await registry.request_human(
+            await registry.generation_handle("original"),
+            action_is_current=lambda: True) == (
             "unavailable_collect_message")
         assert not any(action[0] == "transfer" for action in provider.actions)
         assert registry._by_control["original"].transfer_facts is None
@@ -1924,7 +2011,9 @@ async def test_backward_clock_before_first_human_request_does_not_extend_origina
         await persist_original_start(registry, writer)
         clock[0], monotonic[0] = NOW + timedelta(seconds=60), 348.001
         provider.transfer_release.set()
-        assert await registry.request_human(await registry.generation_handle("original")) == (
+        assert await registry.request_human(
+            await registry.generation_handle("original"),
+            action_is_current=lambda: True) == (
             "unavailable_collect_message")
         assert not any(action[0] == "transfer" for action in provider.actions)
         assert registry._by_control["original"].transfer_facts is None
@@ -1966,7 +2055,9 @@ async def test_forward_clock_during_native_claim_cannot_extend_transfer_planning
         # 249 real seconds since claim; UTC has corrected, still later than the start.
         clock[0], monotonic[0] = NOW + timedelta(seconds=250), 350.0
         provider.transfer_release.set()
-        assert await registry.request_human(grant.generation) == "unavailable_collect_message"
+        assert await registry.request_human(
+            grant.generation,
+            action_is_current=lambda: True) == "unavailable_collect_message"
         assert not any(action[0] == "transfer" for action in provider.actions)
         retained = await writer.read_call_lifecycle(grant.call_id)
         assert retained.started_at == original.started_at and not retained.transfer_fenced
@@ -2022,7 +2113,7 @@ async def test_transfer_post_commit_no_dispatch_is_durable_without_provider_end_
             entry.session = SimpleNamespace(close_audio_for_transfer=lambda: True,
                 prepare_audio_for_transfer=prepare, audio_ready_for_transfer=lambda: True)
         requested = asyncio.create_task(registry.request_human(
-            await registry.generation_handle("original")))
+            await registry.generation_handle("original"), action_is_current=lambda: True))
         await asyncio.wait_for(entered.wait(), 2)
         stale = await writer.read_call_lifecycle(entry.call_id)
         if lapse in {"late", "backward_clock"}:
@@ -2045,7 +2136,9 @@ async def test_transfer_post_commit_no_dispatch_is_durable_without_provider_end_
         replayed = await writer.read_call_lifecycle(entry.call_id)
         assert replayed.transfer_failed_at == facts.transfer_failed_at
         assert await registry.live_call_count() == 1
-        assert await registry.request_human(await registry.generation_handle("original")) == (
+        assert await registry.request_human(
+            await registry.generation_handle("original"),
+            action_is_current=lambda: True) == (
             "unavailable_collect_message")
     finally:
         release.set()
