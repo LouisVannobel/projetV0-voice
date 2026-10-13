@@ -1670,7 +1670,7 @@ class Scenario:
         }
 
     async def finish_replay(self):
-        await self.event("call.hangup")
+        await self.event("call.hangup", self.control)
         await self.media.close()
 
         async def frozen():
