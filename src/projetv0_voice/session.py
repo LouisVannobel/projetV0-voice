@@ -774,10 +774,15 @@ class CallSession:
             ):
                 outcome = "fenced"
                 return
-            task = asyncio.create_task(
-                infer_partial_result(
+            final_result = getattr(self._services.llm, "infer_final_result_once", None)
+            inference = (
+                final_result(retained, self._identity.routing.from_e164)
+                if callable(final_result) else infer_partial_result(
                     cast(Any, self._services.llm), retained, self._identity.routing.from_e164
-                ),
+                )
+            )
+            task = asyncio.create_task(
+                inference,
                 name="call-result-inference-owned",
             )
             self._result_inference_task = task

@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import struct
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
 from fractions import Fraction
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient, NotGiven
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, NotGiven, OpenAIError
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.frames.frames import (
     CancelFrame,
@@ -36,6 +37,7 @@ from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openrouter.llm import OpenRouterLLMService, OpenRouterLLMSettings
 from pipecat.services.whisper.base_stt import language_to_whisper_language
 from pipecat.transcriptions.language import Language
+from pipecat.utils.errors import ErrorCategory
 from pydantic import SecretStr
 
 from projetv0_voice.action_authority import ActionAuthority, CallerScope
@@ -45,6 +47,8 @@ from projetv0_voice.inference.completion_strategy import (
     STT_REQUEST_TIMEOUT_SECONDS,
     STT_TERMINAL_PARTIAL_KEY,
 )
+from projetv0_voice.models import MessageResultV1
+from projetv0_voice.persistence.business_result import RetainedCall, infer_partial_result
 from projetv0_voice.qualified_profile import InferenceProfileV1
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -260,12 +264,28 @@ class _BoundedOpenAISTTService(OpenAISTTService):
             await super().cleanup()  # type: ignore[no-untyped-call]
 
 
+class LLMOutputLimitError(OpenAIError):
+    """Constant-safe refusal before an unreserved LLM request can be dispatched."""
+
+    def __init__(self) -> None:
+        super().__init__("llm_output_limit")
+
+
 class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
     """Pin-aware OpenRouter client factory without ambient HTTP authority."""
 
     _settings: OpenRouterLLMSettings
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, enforce_output_limits: bool = False, **kwargs: Any) -> None:
+        self._enforce_output_limits = enforce_output_limits
+        self._ordinary_output_reserved = 0
+        self._ordinary_closed = False
+        self._final_result_attempted = False
+        self._final_post_reserved = False
+        self._cleanup_completed = False
+        self._final_result_scope: ContextVar[bool] = ContextVar(
+            "llm_final_result_scope", default=False,
+        )
         self._schema_routing: ContextVar[bool] = ContextVar("result_schema_routing", default=False)
         self._action_authority: ActionAuthority | None = None
         self._response_scope: ContextVar[tuple[int, CallerScope | None] | None] = ContextVar(
@@ -273,7 +293,93 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         )
         self._tool_scopes: dict[str, tuple[str, CallerScope]] = {}
         self._seen_action_ids: set[str] = set()
+        if enforce_output_limits:
+            kwargs["retry_on_timeout"] = False
         super().__init__(**kwargs)
+
+    def _refuse_output(self) -> NoReturn:
+        self._ordinary_closed = True
+        raise LLMOutputLimitError()
+
+    async def _reserve_final_request(self, request: httpx.Request) -> None:
+        """Inspect buffered SDK-final JSON and debit without any suspension or refund."""
+        if not self._enforce_output_limits:
+            return
+        if request.method != "POST" or not request.url.path.endswith("/chat/completions"):
+            self._refuse_output()
+
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            if len(pairs) != len(dict(pairs)):
+                raise ValueError("duplicate_llm_request_key")
+            return dict(pairs)
+
+        def finite(_value: str) -> NoReturn:
+            raise ValueError("nonfinite_llm_request_json")
+
+        try:
+            body = json.loads(request.content, object_pairs_hook=unique, parse_constant=finite)
+        except (ValueError, UnicodeError, httpx.RequestNotRead):
+            self._refuse_output()
+        if type(body) is not dict:
+            self._refuse_output()
+        fields = [key for key in ("max_tokens", "max_completion_tokens") if key in body]
+        if len(fields) != 1 or ("n" in body and (type(body["n"]) is not int or body["n"] != 1)):
+            self._refuse_output()
+        ceiling = body[fields[0]]
+        if type(ceiling) is not int or ceiling <= 0:
+            self._refuse_output()
+        if self._final_result_scope.get():
+            response_format = body.get("response_format")
+            if (
+                not self._cleanup_completed or not self._final_result_attempted
+                or self._final_post_reserved or ceiling != 2048 or body.get("stream") is not False
+                or type(response_format) is not dict
+                or response_format.get("type") != "json_schema"
+                or type(response_format.get("json_schema")) is not dict
+                or type(response_format["json_schema"].get("schema")) is not dict
+            ):
+                self._refuse_output()
+            self._final_post_reserved = True
+        else:
+            if (
+                self._ordinary_closed or ceiling > 256
+                or self._ordinary_output_reserved + ceiling > 13_952
+            ):
+                self._refuse_output()
+            self._ordinary_output_reserved += ceiling
+
+    async def infer_final_result_once(
+        self, retained: RetainedCall, provider_callback: str | None,
+    ) -> MessageResultV1 | None:
+        """Bind only the actual post-cleanup retained-call consumer to its final allowance."""
+        if not self._enforce_output_limits:
+            return await infer_partial_result(self, retained, provider_callback)
+        if not self._cleanup_completed or self._final_result_attempted:
+            self._refuse_output()
+        self._final_result_attempted = True
+        token = self._final_result_scope.set(True)
+        try:
+            return await infer_partial_result(self, retained, provider_callback)
+        finally:
+            self._final_result_scope.reset(token)
+
+    async def push_error(
+        self,
+        error_msg: str,
+        exception: Exception | None = None,
+        fatal: bool = False,
+        category: ErrorCategory | None = None,
+        force_treat_as_permanent: bool = False,
+    ) -> None:
+        if type(exception) is LLMOutputLimitError or (
+            exception is not None and type(exception.__cause__) is LLMOutputLimitError
+        ):
+            await super().push_error("llm_failed", exception=None, fatal=True)
+            return
+        await super().push_error(
+            error_msg, exception=exception, fatal=fatal, category=category,
+            force_treat_as_permanent=force_treat_as_permanent,
+        )
 
     def bind_action_authority(self, authority: ActionAuthority) -> None:
         self._action_authority = authority
@@ -346,11 +452,14 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         await super().push_frame(frame, direction)
 
     async def cleanup(self) -> None:
+        if self._enforce_output_limits:
+            self._ordinary_closed = True
         if self._action_authority is not None:
             self._action_authority.close()
         self._tool_scopes.clear()
         self._seen_action_ids.clear()
         await super().cleanup()  # type: ignore[no-untyped-call]
+        self._cleanup_completed = True
 
     async def run_inference(
         self,
@@ -418,6 +527,11 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
                 ),
                 timeout=_HTTP_TIMEOUT,
                 trust_env=False,
+                event_hooks=(
+                    {"request": [self._reserve_final_request]}
+                    if self._enforce_output_limits else None
+                ),
+                follow_redirects=not self._enforce_output_limits,
             ),
             default_headers=default_headers,
         )
@@ -480,4 +594,5 @@ def build_llm(
         api_key=api_key.get_secret_value(),
         base_url=_OPENROUTER_BASE_URL,
         settings=settings,
+        enforce_output_limits=sparra_conversation,
     )

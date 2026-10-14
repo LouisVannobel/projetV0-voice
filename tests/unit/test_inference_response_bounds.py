@@ -9,7 +9,7 @@ from uuid import UUID
 
 import httpx
 import pytest
-from openai import DefaultAsyncHttpxClient
+from openai import DefaultAsyncHttpxClient, OpenAIError
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pydantic import SecretStr
@@ -19,7 +19,6 @@ from projetv0_voice.inference import services
 from projetv0_voice.persistence.business_result import (
     RetainedCall,
     RetainedTurn,
-    infer_partial_result,
 )
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
 from tests.unit.test_config import manifest_data, write_bundle
@@ -134,7 +133,7 @@ async def test_shared_non_sparra_native_summary_keeps_existing_2048_override(
 
 
 @pytest.mark.asyncio
-async def test_sparra_native_summary_overrides_ceiling_without_rearming_conversation_limit(
+async def test_sparra_final_summary_preserves_ceiling_and_keeps_conversation_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     retained = RetainedCall((RetainedTurn(
@@ -142,9 +141,12 @@ async def test_sparra_native_summary_overrides_ceiling_without_rearming_conversa
     ),), 0)
     async with _recorded_production_llm(tmp_path, monkeypatch, sparra=True) as (llm, requests):
         await _conversation_request(llm)
-        assert await infer_partial_result(llm, retained, None) is None
-        await _conversation_request(llm)
-    assert len(requests) == 3
+        await llm.cleanup()
+        assert await llm.infer_final_result_once(retained, None) is None
+        assert llm._settings.max_tokens == 256
+        with pytest.raises(OpenAIError, match="llm_output_limit"):
+            await _conversation_request(llm)
+    assert len(requests) == 2
     summary = requests[1]
     assert summary["stream"] is False
     assert summary["response_format"]["type"] == "json_schema"
@@ -153,6 +155,6 @@ async def test_sparra_native_summary_overrides_ceiling_without_rearming_conversa
     assert "max_completion_tokens" not in summary
     assert "reasoning" not in summary
     assert summary["provider"] == PROVIDER_POLICY
-    assert requests[0]["max_tokens"] == requests[2]["max_tokens"] == 256
-    assert requests[0]["stream"] is requests[2]["stream"] is True
-    assert requests[0].get("reasoning") == requests[2].get("reasoning") == {"enabled": False}
+    assert requests[0]["max_tokens"] == 256
+    assert requests[0]["stream"] is True
+    assert requests[0].get("reasoning") == {"enabled": False}
