@@ -657,6 +657,11 @@ def _inference_factories(
         return cast(PublicSttHttpClient, DefaultAsyncHttpxClient(trust_env=False))
 
     def stt_factory(client: PublicSttHttpClient) -> Any:
+        if sparra_conversation:
+            return build_stt(
+                profile, api_key, language=language,
+                http_client=cast(Any, client), sparra_audio_limits=True,
+            )
         return build_stt(
             profile,
             api_key,
@@ -671,7 +676,10 @@ def _inference_factories(
             build_llm(profile, api_key, sparra_conversation=True)
             if sparra_conversation else build_llm(profile, api_key)
         ),
-        tts_factory=lambda: OpenRouterTTSService(profile=profile, api_key=api_key),
+        tts_factory=lambda: (
+            OpenRouterTTSService(profile=profile, api_key=api_key, enforce_consumption_limits=True)
+            if sparra_conversation else OpenRouterTTSService(profile=profile, api_key=api_key)
+        ),
     )
 
 

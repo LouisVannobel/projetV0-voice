@@ -340,10 +340,12 @@ class EndCallPlayback:
         ):
             self._synthesizing_attempt = None
 
-    def bind_context(self, context_id: str) -> None:
+    def bind_context(self, context_id: str) -> bool:
         attempt = self._synthesizing_attempt
         if attempt is not None and attempt is self._attempt:
             attempt.context_id = context_id
+            return True
+        return False
 
     def note_audio(self, context_id: str | None) -> None:
         if (
