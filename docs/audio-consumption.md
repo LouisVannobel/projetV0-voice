@@ -1,4 +1,4 @@
-# Per-call audio submission limits
+# Per-call inference submission limits
 
 The Sparra manifest enables these limits in the existing per-call service
 instances. Generic voice consumers retain their previous behavior.
@@ -19,6 +19,19 @@ Each call has independent counters. Exhaustion uses the existing fatal error
 path; a spoken farewell after quota exhaustion is not guaranteed.
 
 These are local submission limits, not a maximum provider invoice. This lot
-does not qualify cumulative LLM input/output tokens, remote fallback attempts,
+does not qualify native billed LLM input/output tokens, remote fallback attempts,
 carrier hangup timing, or unattended number availability. The existing session
 timeout, terminal cleanup and provider qualification remain separate controls.
+
+Sparra's LLM reserves the completion ceiling from each final SDK-prepared JSON
+request: up to 13,952 ordinary tokens, each request at most 256, plus 2,048 for
+one actual retained-call result after cleanup. It accepts exactly one positive
+integer token ceiling and at most one completion. SDK retries and HTTP redirects
+are disabled; reservations are never refunded. A schema-bearing ordinary request
+cannot claim the final allowance. Local refusal closes ordinary inference through
+Pipecat's existing fatal error path; the same client remains available for that
+single final result attempt before its owner closes it.
+
+The 16,000 total bounds requested ceilings, not provider token accounting. The
+250,000 native input-token allowance remains unqualified until the selected
+provider's exact prompt, schema and tokenizer transformations are established.
