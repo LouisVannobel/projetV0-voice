@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+import struct
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
+from fractions import Fraction
 from typing import Any, cast
 
 import httpx
@@ -52,6 +54,7 @@ _STT_DRAIN_TIMEOUT_SECONDS = 8.0
 # Pilot overload bounds; these are not provider throughput guarantees.
 _STT_MAX_PENDING_SEGMENTS = STT_MAX_PENDING_SEGMENTS
 _STT_MAX_BATCH_TEXT_BYTES = 32 * 1024
+_SPARRA_STT_MAX_AUDIO_SECONDS = 600
 _HTTP_TIMEOUT = httpx.Timeout(8.0, connect=2.0)
 
 
@@ -64,8 +67,16 @@ class _BoundedOpenAISTTService(OpenAISTTService):
     the last native transcript supplies the completed batch's metadata.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, sparra_audio_limits: bool = False, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._sparra_audio_limits = sparra_audio_limits
+        self._submitted_audio_seconds = Fraction(0)
+        self._audio_limit_seconds = Fraction(_SPARRA_STT_MAX_AUDIO_SECONDS)
+        if sparra_audio_limits:
+            # Pipecat 1.12 BaseWhisperSTTService directly constructs this private
+            # client without a retry hook. OpenAI's public copy API preserves
+            # the same call-owned HTTP client while disabling hidden uploads.
+            self._client = self._client.with_options(max_retries=0)
         self._pending_segments = 0
         self._accepted_segment = 0
         self._completed_segment = 0
@@ -132,6 +143,13 @@ class _BoundedOpenAISTTService(OpenAISTTService):
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame]:
         if self._terminal:
             return
+        if self._sparra_audio_limits:
+            refusal = self._reserve_audio(audio)
+            if refusal is not None:
+                failure = self._fail_batch(refusal)
+                if failure is not None:
+                    yield failure
+                return
         # Preserve public direct run_stt usage as a single segment, too.
         if not self._pending_segments:
             self._pending_segments = 1
@@ -180,6 +198,34 @@ class _BoundedOpenAISTTService(OpenAISTTService):
             failure = self._fail_batch("openrouter_stt_text_invalid")
             if failure is not None:
                 yield failure
+
+    def _reserve_audio(self, audio: bytes) -> str | None:
+        if not isinstance(audio, bytes) or len(audio) < 44:
+            return "openrouter_stt_audio_invalid"
+        # Pipecat 1.12 pcm_to_wav emits this exact 44-byte PCM16 header.
+        # Validate the complete upload, not wave's first data chunk: additional
+        # chunks or bytes outside RIFF must not bypass the duration reservation.
+        (
+            riff, riff_size, wave_id, fmt, fmt_size, encoding, channels,
+            rate, byte_rate, alignment, bits, data, data_size,
+        ) = struct.unpack_from("<4sI4s4sIHHIIHH4sI", audio)
+        if (
+            riff != b"RIFF" or wave_id != b"WAVE" or fmt != b"fmt " or data != b"data"
+            or fmt_size != 16 or encoding != 1 or channels <= 0 or rate <= 0 or bits != 16
+            or alignment != 2 * channels or byte_rate != rate * alignment
+            or riff_size != len(audio) - 8 or data_size != len(audio) - 44
+            or data_size <= 0 or data_size % alignment != 0
+        ):
+            return "openrouter_stt_audio_invalid"
+        # Header-only validation establishes all PCM bytes and bounds duration
+        # without allocating or copying the potentially large audio payload.
+        duration = Fraction(data_size // alignment, rate)
+        # No await between check and reservation. Timeouts, cancellation and
+        # native Start/End/Cancel/cleanup never refund or reset this counter.
+        if self._submitted_audio_seconds + duration > self._audio_limit_seconds:
+            return "openrouter_stt_audio_limit"
+        self._submitted_audio_seconds += duration
+        return None
 
     async def stop(self, frame: EndFrame) -> None:
         self._closing = True
@@ -383,6 +429,7 @@ def build_stt(
     *,
     language: str,
     http_client: DefaultAsyncHttpxClient | None = None,
+    sparra_audio_limits: bool = False,
 ) -> OpenAISTTService:
     """Build Pipecat's native segmented STT service against OpenRouter."""
 
@@ -406,6 +453,7 @@ def build_stt(
         # its ordered completion receipt contributes no text to the user aggregator.
         push_empty_transcripts=True,
         http_client=http_client,
+        sparra_audio_limits=sparra_audio_limits,
     )
 
 

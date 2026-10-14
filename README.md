@@ -87,6 +87,9 @@ admission and uses the call owner's terminal cleanup and hangup command. Generic
 voice deployments keep the native default of no session timeout. This duration
 bound is not a monetary spending cap.
 
+Sparra also applies cumulative per-call [audio submission limits](docs/audio-consumption.md)
+before provider dispatch. These local limits do not qualify a billing ceiling.
+
 Optional Sparra relay uses the same 300-second policy as a conservative planning
 allowance from the trusted original call start, separate from the 30-second
 handshake lease. On the caller's explicit request only, the native Telnyx transfer
