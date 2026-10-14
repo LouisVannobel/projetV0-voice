@@ -510,10 +510,20 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
             "shell": "bash",
             "run": (
                 "set -Eeuo pipefail\n"
-                'sudo env "PATH=$PATH" uv run --frozen --no-sync python -c '
-                '"import os, sys; assert sys.platform == \'linux\' and os.geteuid() == 0"\n'
-                'sudo env "PATH=$PATH" uv run --frozen --no-sync pytest '
-                "tests/unit/test_material_hold.py -q\n"
+                "hold_python_base=$(uv run --frozen --no-sync python -c "
+                "'import sys; print(sys.base_prefix)')\n"
+                "hold_pytest_site=$(uv run --frozen --no-sync python -c "
+                "'import sysconfig; print(sysconfig.get_path(\"purelib\"))')\n"
+                "sudo install -d -m 0755 /opt/sparra-hold-python\n"
+                'sudo cp -a "$hold_python_base/." /opt/sparra-hold-python/\n'
+                "sudo chown -R root:root /opt/sparra-hold-python\n"
+                "sudo chmod -R a+rX /opt/sparra-hold-python\n"
+                "sudo /opt/sparra-hold-python/bin/python3.13 -c "
+                "'import os, sys; sys.exit(0 if sys.platform == \"linux\" "
+                "and os.geteuid() == 0 and sys.version_info[:3] == (3, 13, 15) else 1)'\n"
+                'sudo env "PYTHONPATH=$hold_pytest_site" PYTHONDONTWRITEBYTECODE=1 '
+                "/opt/sparra-hold-python/bin/python3.13 -m pytest "
+                "tests/unit/test_material_hold.py -q -p no:cacheprovider\n"
             ),
         },
         {"run": "uv run ruff check ."},
