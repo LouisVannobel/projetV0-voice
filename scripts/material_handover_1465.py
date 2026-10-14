@@ -175,7 +175,7 @@ def derive_held_compose(before_spec, expected_preimage_sha256, original_expiry,
                            "--attempt-sha256", attempt_sha256,
                            "--candidate-sha256", candidate_sha256,
                            "--nonce-sha256", nonce_sha256,
-                           "--candidate-expiry", candidate_expiry.isoformat()]
+                           "--candidate-expiry", candidate_expiry.strftime("%Y%m%dT%H%M%S.%f%z")]
 
         # Reverse only the explicit delta to prove every retained field is unchanged.
         retained = copy.deepcopy(selected)

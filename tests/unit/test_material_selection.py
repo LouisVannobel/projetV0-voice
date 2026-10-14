@@ -91,6 +91,21 @@ def parse_selection(value):
     return yaml.load(value, Loader=_UniqueKeySafeLoader)
 
 
+@pytest.mark.parametrize("expiry", [EXPIRY, EXPIRY.replace(microsecond=0)])
+def test_expiry_argument_stays_string_after_yaml12_removes_quotes(operator, before, expiry):
+    import yaml
+
+    selected = parse_selection(invoke(operator, before, original_expiry=expiry,
+                                      candidate_expiry=expiry))
+    argument = selected["services"]["voice"]["command"][-1]
+    assert datetime.fromisoformat(argument) == expiry
+    # Dokploy's YAML1.2 serializer may emit a timestamp-looking string unquoted.
+    # Compose's YAML1.1 reader must still see a command string, not a datetime.
+    downstream = yaml.safe_load("value: " + argument)["value"]
+    assert type(downstream) is str
+    assert downstream == argument
+
+
 def test_exact_permitted_delta_preserves_spool_keys_health_and_security(operator, before, capsys):
     untouched = copy.deepcopy(before)
     result = invoke(operator, before)
@@ -114,7 +129,8 @@ def test_exact_permitted_delta_preserves_spool_keys_health_and_security(operator
     service["entrypoint"] = ["python", "/run/sparra-material/material_handover_1465.py"]
     service["command"] = ["native-hold", "--release-directory", "/run/sparra-material/control",
                           "--attempt-sha256", "a" * 64, "--candidate-sha256", "c" * 64,
-                          "--nonce-sha256", "d" * 64, "--candidate-expiry", EXPIRY.isoformat()]
+                          "--nonce-sha256", "d" * 64,
+                          "--candidate-expiry", "20300101T120000.123456+0000"]
     assert actual == expected
     assert before == untouched
     assert capsys.readouterr() == ("", "")
