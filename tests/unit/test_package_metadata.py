@@ -505,6 +505,17 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
                 '"linux_kernel or fifo or socket or grows"'
             ),
         },
+        {
+            "name": "Run native startup hold with real Linux ownership",
+            "shell": "bash",
+            "run": (
+                "set -Eeuo pipefail\n"
+                'sudo env "PATH=$PATH" uv run --frozen --no-sync python -c '
+                '"import os, sys; assert sys.platform == \'linux\' and os.geteuid() == 0"\n'
+                'sudo env "PATH=$PATH" uv run --frozen --no-sync pytest '
+                "tests/unit/test_material_hold.py -q\n"
+            ),
+        },
         {"run": "uv run ruff check ."},
         {"run": "uv run mypy --strict src"},
     ]
