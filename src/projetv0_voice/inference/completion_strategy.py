@@ -22,7 +22,7 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
 STT_COMPLETED_SEGMENT_KEY = "projetv0.stt.completed_segment_seq"
 STT_TERMINAL_PARTIAL_KEY = "projetv0.stt.terminal_partial"
 STT_MAX_PENDING_SEGMENTS = 4
-STT_REQUEST_TIMEOUT_SECONDS = 8.0
+STT_REQUEST_TIMEOUT_SECONDS = 20.0
 STT_DELIVERY_ALLOWANCE_SECONDS = 4.0
 # This coordinates the independent controller watchdog, not normal endpoint latency.
 STT_USER_TURN_WATCHDOG_SECONDS = (

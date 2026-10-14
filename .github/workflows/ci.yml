@@ -27,6 +27,18 @@ jobs:
       - run: uv run pytest -q
       - name: Run privileged Linux descriptor cases
         run: sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 uv run pytest tests/unit/test_runtime_config.py tests/unit/test_qualified_profile.py tests/unit/test_production_wiring.py -q -k "linux_kernel or fifo or socket or grows"
+      - name: Run native startup hold with real Linux ownership
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          hold_python_base=$(uv run --frozen --no-sync python -c 'import sys; print(sys.base_prefix)')
+          hold_pytest_site=$(uv run --frozen --no-sync python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+          sudo install -d -m 0755 /opt/sparra-hold-python
+          sudo cp -a "$hold_python_base/." /opt/sparra-hold-python/
+          sudo chown -R root:root /opt/sparra-hold-python
+          sudo chmod -R a+rX /opt/sparra-hold-python
+          sudo /opt/sparra-hold-python/bin/python3.13 -c 'import os, sys; sys.exit(0 if sys.platform == "linux" and os.geteuid() == 0 and sys.version_info[:3] == (3, 13, 15) else 1)'
+          sudo env "PYTHONPATH=$hold_pytest_site" PYTHONDONTWRITEBYTECODE=1 /opt/sparra-hold-python/bin/python3.13 -m pytest tests/unit/test_material_hold.py -q -p no:cacheprovider
       - run: uv run ruff check .
       - run: uv run mypy --strict src
 

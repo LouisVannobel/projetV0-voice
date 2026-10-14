@@ -692,6 +692,8 @@ async def test_stt_late_final_does_not_release_context_before_resumed_segment_tr
     b_stopped_before_a: bool,
     transcripts: tuple[str, str],
     expected_text: str,
+    *,
+    http_response_delay: float = 0,
 ) -> None:
     """Controlled VAD/COMPLETE ordering; this is not an acoustic qualification."""
     module = import_module("projetv0_voice.inference.services")
@@ -715,7 +717,8 @@ async def test_stt_late_final_does_not_release_context_before_resumed_segment_tr
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
                 stop=[CompletionAwareTurnStopStrategy(turn_analyzer=_CompletePauseAnalyzer())]
-            )
+            ),
+            user_turn_stop_timeout=STT_USER_TURN_WATCHDOG_SECONDS,
         ),
         realtime_service_mode=False,
     ).user()
@@ -725,6 +728,8 @@ async def test_stt_late_final_does_not_release_context_before_resumed_segment_tr
         requests.append(request)
         entered[index].set()
         await release[index].wait()
+        if index == 0 and http_response_delay:
+            await asyncio.sleep(http_response_delay)
         return httpx.Response(200, json={"text": transcripts[index]})
 
     def note_processed(_processor: FrameProcessor, frame: Frame) -> None:
@@ -781,7 +786,7 @@ async def test_stt_late_final_does_not_release_context_before_resumed_segment_tr
             if not b_stopped_before_a:
                 await worker.queue_frame(b_stop)
                 await asyncio.wait_for(b_stop_processed.wait(), timeout=2)
-            await asyncio.wait_for(entered[1].wait(), timeout=2)
+            await asyncio.wait_for(entered[1].wait(), timeout=http_response_delay + 2)
             release[1].set()
             await asyncio.wait_for(completed_receipt_processed.wait(), timeout=2)
             if expected_text:
