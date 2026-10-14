@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 OLD = "sha256:4a0704afbfbee02aaaefb4fcaffa8201b9ead3e696ca83cc8a851cf5cd428c26"
-NEW = "sha256:32515b282f458fee9b549a5cf891258c7a3b2f5b6f81d18b04a7aef751a841f6"
+NEW = "sha256:a444705d6ba207f542d4cb8691ac7303c605de3ec5bcb22e7cdc879ffcd238f4"
 REPO = "ghcr.io/louisvannobel/projetv0-voice@"
 EXPIRY = datetime(2030, 1, 1, 12, 0, 0, 123456, tzinfo=UTC)
 BUILD = "/opt/studio/sparra-dokploy/material-handover-1465/build"

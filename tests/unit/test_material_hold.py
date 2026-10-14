@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 OPERATOR = Path(__file__).resolve().parents[2] / "scripts/material_handover_1465.py"
-IMAGE = "sha256:32515b282f458fee9b549a5cf891258c7a3b2f5b6f81d18b04a7aef751a841f6"
+IMAGE = "sha256:a444705d6ba207f542d4cb8691ac7303c605de3ec5bcb22e7cdc879ffcd238f4"
 ATTEMPT = "a" * 64
 CANDIDATE = "c" * 64
 NONCE = "d" * 64  # Synthetic test value only.

@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import UTC, datetime
 
-IMAGE_DIGEST = "sha256:32515b282f458fee9b549a5cf891258c7a3b2f5b6f81d18b04a7aef751a841f6"
+IMAGE_DIGEST = "sha256:a444705d6ba207f542d4cb8691ac7303c605de3ec5bcb22e7cdc879ffcd238f4"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 KEYS = {"schema_version", "attempt_sha256", "candidate_sha256", "image_digest", "nonce"}
 _MISSING = object()
