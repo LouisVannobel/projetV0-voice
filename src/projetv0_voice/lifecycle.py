@@ -1863,6 +1863,10 @@ async def build_production_runtime(
             process_deployment_id=(
                 settings.deployment_id if operation_contract_version == 2 else None
             ),
+            default_phone_region=(
+                "FR" if manifest.sparra is not None
+                and all(did.startswith("+33") for did in manifest.dids) else None
+            ),
         )
         sink = factories.sink_factory(postgres_dsn)
 

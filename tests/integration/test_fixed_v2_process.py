@@ -66,10 +66,12 @@ async def registry_case(
     deployment_id="fixture",
     admission_not_before=None, candidate_run_id=None,
     monotonic=None,
+    default_phone_region=None,
 ):
     writer = PersistenceWriter(tmp_path / "voice.sqlite", CryptoKeyring({1: KEY}, active_version=1),
                                contract_version=2, utcnow=utcnow, failpoint=failpoint,
-                               process_agent_id=deployment_id, process_deployment_id=deployment_id)
+                               process_agent_id=deployment_id, process_deployment_id=deployment_id,
+                               default_phone_region=default_phone_region)
     task = asyncio.create_task(writer.run())
     sink, pool, connection, _factory = sink_with_rows([])
     begins = []
