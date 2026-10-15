@@ -137,6 +137,7 @@ async def test_native_transfer_without_qualified_availability_keeps_conversation
 @pytest.mark.parametrize("text", [
     "Au revoir.", "merci au revoir", "MERCI, AU REVOIR !", "c'est tout merci au revoir",
     "c'est tout, merci, au revoir", "  C’est tout,   merci, au revoir.  ",
+    "Non, ça va, merci, au revoir.",
 ])
 async def test_native_direct_farewell_bypasses_model_inference(text):
     async with _native_sparra_opening(ack_end_call=False) as fixture:
@@ -199,7 +200,10 @@ async def test_native_conflicting_duplicate_or_malformed_batch_has_no_instructio
 
 
 @pytest.mark.asyncio
-async def test_native_document_context_has_no_action_scope_but_recovery_still_streams():
+@pytest.mark.parametrize("document_text", ["au revoir", "Non, ça va, merci, au revoir."])
+async def test_native_document_context_has_no_action_scope_but_recovery_still_streams(
+    document_text,
+):
     async with _native_sparra_opening(ack_end_call=False) as fixture:
         await active(fixture)
         aggregator = next(p for p in fixture.session._active_runtime.pipeline.processors
@@ -215,7 +219,7 @@ async def test_native_document_context_has_no_action_scope_but_recovery_still_st
         fixture.peers.end_call = False
         fixture.peers.llm_requested.clear()
         await fixture.session._active_runtime.worker.queue_frame(LLMContextFrame(LLMContext([
-            {"role": "assistant", "content": "au revoir"},
+            {"role": "assistant", "content": document_text},
         ])))
         await _opening_event(fixture.peers.llm_requested, "no-scope recovery did not infer")
         for _ in range(300):
