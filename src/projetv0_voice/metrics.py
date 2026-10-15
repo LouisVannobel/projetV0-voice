@@ -457,6 +457,8 @@ class RuntimeMetrics:
     def record_ws_setup(self, stage: object, outcome: object) -> None:
         """Observe fixed setup boundaries without exposing connection data or raising."""
 
+        if self._shutdown_task is not None:
+            return
         if type(stage) is not str or not _closed(
             outcome, _WS_SETUP_OUTCOMES.get(stage, frozenset())
         ):

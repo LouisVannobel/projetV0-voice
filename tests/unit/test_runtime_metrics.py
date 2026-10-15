@@ -1518,6 +1518,30 @@ class _BlockingProvider(_FakeProvider):
 
 
 @pytest.mark.asyncio
+async def test_ws_setup_is_inert_once_provider_shutdown_begins() -> None:
+    provider = _BlockingProvider()
+    owner = metrics_module.RuntimeMetrics._from_provider(provider, metric_reader=None)  # noqa: SLF001
+    observations: list[object] = []
+
+    class Counter:
+        def add(self, *_args: object) -> None:
+            observations.append(_args)
+
+    owner._ws_setup = Counter()  # noqa: SLF001
+    closing = asyncio.create_task(owner.aclose())
+    try:
+        assert await asyncio.to_thread(provider.started.wait, 2)
+        owner.record_ws_setup("accept", "cancelled")
+        assert observations == []
+    finally:
+        provider.release.set()
+        await closing
+    owner.record_ws_setup("permit_release", "success")
+    assert observations == []
+    assert owner.failure_code is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("callers", [2, 10])
 async def test_aclose_concurrent_callers_share_one_provider_shutdown(callers: int) -> None:
     provider = _BlockingProvider()
