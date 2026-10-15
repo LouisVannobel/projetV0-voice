@@ -1553,8 +1553,11 @@ async def test_sparra_opening_fixture_reaches_authenticated_ack_before_release()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_context", [False, True])
+@pytest.mark.parametrize("farewell", [
+    "Merci, au revoir.", "Au revoir, bonne journée.", "Merci, au revoir, bonne soirée.",
+])
 async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
-    old_context,
+    old_context, farewell,
 ) -> None:
     async with _native_sparra_opening(ack_end_call=False) as fixture:
         fixture.writer.ack_release.set()
@@ -1600,7 +1603,7 @@ async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
 
         worker.add_event_handler("on_pipeline_finished", observe_finish)
         await worker.queue_frame(TranscriptionFrame(
-            text="Merci, au revoir.", user_id="", timestamp=NOW.isoformat(),
+            text=farewell, user_id="", timestamp=NOW.isoformat(),
             language=Language.FR, finalized=True,
         ))
         await _opening_event(fixture.final_mark_sent, "no final playback mark was sent")

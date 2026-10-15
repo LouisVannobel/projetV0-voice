@@ -138,6 +138,7 @@ async def test_native_transfer_without_qualified_availability_keeps_conversation
     "Au revoir.", "merci au revoir", "MERCI, AU REVOIR !", "c'est tout merci au revoir",
     "c'est tout, merci, au revoir", "  C’est tout,   merci, au revoir.  ",
     "Non, ça va, merci, au revoir.",
+    "Au revoir, bonne journée.", "Merci, au revoir, bonne soirée.",
 ])
 async def test_native_direct_farewell_bypasses_model_inference(text):
     async with _native_sparra_opening(ack_end_call=False) as fixture:

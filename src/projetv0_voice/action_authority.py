@@ -13,7 +13,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 Action = Literal["end_call", "request_human"]
 _FAREWELL = re.compile(
     r"(?:(?:non ça va|c'est tout|c'est bon|d'accord|ok|très bien) )?"
-    r"(?:merci(?: beaucoup)? )?au revoir"
+    r"(?:merci(?: beaucoup)? )?au revoir(?: bonne (?:journée|soirée))?"
 )
 
 
