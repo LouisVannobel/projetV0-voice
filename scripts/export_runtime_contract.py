@@ -58,6 +58,8 @@ ENVIRONMENT_VARIABLE_NAMES = [
 ]
 
 METRIC_NAMES = [
+    "projetv0.voice.actions.attempt_duration",
+    "projetv0.voice.actions.attempts",
     "projetv0.voice.actions.total",
     "projetv0.voice.admission.rejections",
     "projetv0.voice.calls.active",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,12 @@ CallControlOutcome = Literal[
     "retryable_not_sent",
     "outcome_unknown",
 ]
+CallControlAttemptCategory = Literal[
+    "accepted", "timeout", "status", "connection", "invalid", "internal"
+]
+_ATTEMPT_CATEGORIES = frozenset({
+    "accepted", "timeout", "status", "connection", "invalid", "internal"
+})
 
 
 class CallControlError(RuntimeError):
@@ -182,8 +189,36 @@ class RecordingStopV1(_RedactedFrozenModel):
 
 
 @dataclass(frozen=True, slots=True)
+class CallControlAttemptObservation:
+    """One attempt's closed category and monotonic duration, without request data."""
+
+    category: CallControlAttemptCategory
+    duration_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.category) is not str
+            or self.category not in _ATTEMPT_CATEGORIES
+            or type(self.duration_seconds) is not float
+            or not math.isfinite(self.duration_seconds)
+            or self.duration_seconds < 0
+        ):
+            raise ValueError("call_control_attempt_invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class CallControlResult:
     outcome: CallControlOutcome
+    attempt_observations: tuple[CallControlAttemptObservation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.attempt_observations) is not tuple
+            or len(self.attempt_observations) > 2
+            or any(type(item) is not CallControlAttemptObservation
+                   for item in self.attempt_observations)
+        ):
+            raise ValueError("call_control_attempts_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -737,42 +772,56 @@ class CallControlClient:
         except Exception:
             return ProviderDeleteResultV1("retry")
 
-    async def _attempt(self, action: Callable[[], Awaitable[object]]) -> _Observation:
+    async def _attempt(
+        self, action: Callable[[], Awaitable[object]]
+    ) -> tuple[_Observation, CallControlAttemptObservation]:
         loop = asyncio.get_running_loop()
+        started_at = loop.time()
         response: object | None = None
+        category: CallControlAttemptCategory
         try:
             async with asyncio.timeout_at(loop.time() + ATTEMPT_DEADLINE_SECONDS):
                 response = await action()
         except TimeoutError:
-            return _Observation("outcome_unknown", retry=True, ambiguous=True)
+            observation = _Observation("outcome_unknown", retry=True, ambiguous=True)
+            category = "timeout"
         except telnyx.APIStatusError as error:
-            return _status_observation(error.status_code)
+            observation = _status_observation(error.status_code)
+            category = "status"
         except telnyx.APIResponseValidationError:
-            return _Observation("outcome_unknown", retry=False, ambiguous=True)
+            observation = _Observation("outcome_unknown", retry=False, ambiguous=True)
+            category = "invalid"
         except telnyx.APIConnectionError as error:
-            return _connection_observation(error)
+            observation = _connection_observation(error)
+            category = "timeout" if isinstance(error, telnyx.APITimeoutError) else "connection"
         except Exception:
-            return _Observation("outcome_unknown", retry=False, ambiguous=True)
-
-        try:
-            data = getattr(response, "data", None)
-            result = getattr(data, "result", None)
-        except Exception:
-            return _Observation("outcome_unknown", retry=False, ambiguous=True)
-        if result == "ok":
-            return _Observation("accepted", retry=False, ambiguous=False)
-        return _Observation("outcome_unknown", retry=False, ambiguous=True)
+            observation = _Observation("outcome_unknown", retry=False, ambiguous=True)
+            category = "internal"
+        else:
+            try:
+                data = getattr(response, "data", None)
+                result = getattr(data, "result", None)
+            except Exception:
+                result = None
+            if result == "ok":
+                observation = _Observation("accepted", retry=False, ambiguous=False)
+                category = "accepted"
+            else:
+                observation = _Observation("outcome_unknown", retry=False, ambiguous=True)
+                category = "invalid"
+        return observation, CallControlAttemptObservation(category, loop.time() - started_at)
 
     async def _execute(self, action: Callable[[], Awaitable[object]]) -> CallControlResult:
-        first = await self._attempt(action)
+        first, first_attempt = await self._attempt(action)
         if not first.retry:
-            return CallControlResult(first.outcome)
-        second = await self._attempt(action)
+            return CallControlResult(first.outcome, (first_attempt,))
+        second, second_attempt = await self._attempt(action)
+        attempts = (first_attempt, second_attempt)
         if second.outcome == "accepted":
-            return CallControlResult("accepted")
+            return CallControlResult("accepted", attempts)
         if first.ambiguous:
-            return CallControlResult("outcome_unknown")
-        return CallControlResult(second.outcome)
+            return CallControlResult("outcome_unknown", attempts)
+        return CallControlResult(second.outcome, attempts)
 
     async def aclose(self) -> None:
         close_failed = False

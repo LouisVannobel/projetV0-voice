@@ -1263,6 +1263,66 @@ async def test_each_attempt_has_true_monotonic_500ms_deadline_without_orphan(
     assert 0.45 <= elapsed < 0.8
     assert cancelled.is_set()
     assert len(instances[0].actions.calls) == 2
+    attempts = getattr(result, "attempt_observations", ())
+    assert len(attempts) == 2
+    assert [attempt.category for attempt in attempts] == ["timeout", "accepted"]
+    assert 0.45 <= attempts[0].duration_seconds < 0.8
+    assert attempts[1].duration_seconds >= 0
+    assert instances[0].actions.calls[0] == instances[0].actions.calls[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observations", "categories"),
+    [
+        ([ok_response()], ["accepted"]),
+        ([status_error(500), ok_response()], ["status", "accepted"]),
+        ([status_error(429)], ["status"]),
+        ([connection_error(httpx.ConnectError(API_KEY)), ok_response()],
+         ["connection", "accepted"]),
+        ([telnyx.APITimeoutError(request=httpx.Request("POST", URL)), ok_response()],
+         ["timeout", "accepted"]),
+        ([response_validation_error()], ["invalid"]),
+        ([SimpleNamespace(data=SimpleNamespace(result=TOKEN))], ["invalid"]),
+        ([RuntimeError(TOKEN)], ["internal"]),
+    ],
+)
+async def test_attempt_diagnostics_preserve_each_attempt_without_private_data(
+    monkeypatch: pytest.MonkeyPatch,
+    observations: list[object],
+    categories: list[str],
+) -> None:
+    module = call_control()
+    _, instances = install_fake(monkeypatch, module, observations)
+    client = module.CallControlClient(api_key=API_KEY)
+    try:
+        result = await client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID)
+        attempts = getattr(result, "attempt_observations", ())
+        assert [attempt.category for attempt in attempts] == categories
+        assert len(instances[0].actions.calls) == len(categories)
+        assert all(attempt.duration_seconds >= 0 for attempt in attempts)
+        for sentinel in (API_KEY, TOKEN, URL, CALL_CONTROL_ID, str(COMMAND_ID)):
+            assert sentinel not in repr(result)
+    finally:
+        await client.aclose()
+
+
+def test_attempt_observation_is_closed_immutable_and_result_defaults_empty() -> None:
+    from dataclasses import FrozenInstanceError
+
+    module = call_control()
+    observation = module.CallControlAttemptObservation("accepted", 0.125)
+    assert module.CallControlResult("accepted").attempt_observations == ()
+    with pytest.raises(FrozenInstanceError):
+        observation.category = TOKEN
+    for category, seconds in [(TOKEN, 0.1), ("accepted", -1.0),
+                              ("accepted", float("nan")), ("accepted", float("inf")),
+                              ("accepted", TOKEN), ("accepted", True)]:
+        with pytest.raises(ValueError, match="^call_control_attempt_invalid$"):
+            module.CallControlAttemptObservation(category, seconds)
+    for observations in [[observation], (observation,) * 3, (TOKEN,)]:
+        with pytest.raises(ValueError, match="^call_control_attempts_invalid$"):
+            module.CallControlResult("accepted", observations)
 
 
 @pytest.mark.asyncio

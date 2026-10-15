@@ -93,6 +93,8 @@ def _production_token() -> ObservabilityBootstrapToken:
 
 
 EXPECTED_INSTRUMENTS = {
+    "actions.attempts": ("_Counter", ""),
+    "actions.attempt_duration": ("_Histogram", "s"),
     "ws.setup": ("_Counter", ""),
     "result.outcomes": ("_Counter", ""),
     "result.duration": ("_Histogram", "s"),
@@ -119,6 +121,50 @@ EXPECTED_INSTRUMENTS = {
     "runtime.event_loop_lag": ("_Histogram", "s"),
     "ready": ("_ObservableGauge", "1"),
 }
+
+
+def test_action_attempt_metrics_are_closed_and_keep_timeout_before_acceptance() -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        record = getattr(owner, "record_action_attempt", None)
+        assert callable(record)
+        record("streaming_start", 1, "timeout", 0.501)
+        record("streaming_start", 2, "accepted", 0.125)
+        counter = _points(_metric_map(owner)[PREFIX + "actions.attempts"])
+        durations = _points(_metric_map(owner)[PREFIX + "actions.attempt_duration"])
+        assert set(counter) == set(durations) == {
+            (("action", "streaming_start"), ("attempt", 1), ("category", "timeout")),
+            (("action", "streaming_start"), ("attempt", 2), ("category", "accepted")),
+        }
+        assert all(point.value == 1 for point in counter.values())
+        assert sorted(point.sum for point in durations.values()) == [0.125, 0.501]
+        assert all(tuple(point.explicit_bounds) == (0.05, 0.1, 0.25, 0.5, 1.0)
+                   for point in durations.values())
+        assert owner.failure_code is None
+    finally:
+        owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("action,attempt,category,seconds", [
+    ("RAW-CALL-ID", 1, "accepted", 0.1),
+    ("answer", True, "accepted", 0.1),
+    ("answer", 3, "accepted", 0.1),
+    ("answer", 1, "RAW-RESPONSE", 0.1),
+    ("answer", 1, "accepted", float("nan")),
+    ("answer", 1, "accepted", -1.0),
+])
+def test_action_attempt_invalid_values_never_reach_export(
+    action: object, attempt: object, category: object, seconds: object,
+) -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        owner.record_action_attempt(action, attempt, category, seconds)
+        exported = _metric_map(owner)
+        assert PREFIX + "actions.attempts" not in exported
+        assert PREFIX + "actions.attempt_duration" not in exported
+        assert owner.failure_code == "metrics_record_failed"
+    finally:
+        owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 def test_ws_setup_exports_only_closed_stage_outcome_pairs() -> None:
@@ -161,6 +207,8 @@ def test_task_10c_l_declares_exact_eleven_non_ingress_metric_owners() -> None:
 
     assert NON_INGRESS_METRIC_OWNERS == {
         "actions.total": "call_control",
+        "actions.attempts": "call_control",
+        "actions.attempt_duration": "call_control",
         "relay.runs": "relay_supervisor",
         "writer.queue_depth": "writer_snapshot",
         "writer.queue_oldest_age": "writer_snapshot",
@@ -374,7 +422,7 @@ async def test_in_memory_provider_has_exact_resource_scope_filter_and_inventory(
     assert meter._instrumentation_scope.name == "projetv0.voice"  # noqa: SLF001
     assert meter._instrumentation_scope.version is None  # noqa: SLF001
     instruments = list(meter._instrument_id_instrument.values())  # noqa: SLF001
-    assert len(instruments) == 25
+    assert len(instruments) == 27
     assert {
         instrument.name.removeprefix(PREFIX): (
             type(instrument).__name__,

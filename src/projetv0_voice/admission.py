@@ -2927,7 +2927,7 @@ class CallRegistry:
             return
         entry = work.entry
         closed_at = self._require_aware(self._utcnow())
-        operation: VoiceOperationV1 | None = None
+        operation: VoiceOperationV1 | VoiceOperationV2 | None = None
         cancellation: asyncio.CancelledError | None = None
         persistence_failed = False
         native_terminal = (
@@ -2972,30 +2972,53 @@ class CallRegistry:
                 disclosure_fields: _DisclosureFields = {}
                 if evidence is not None:
                     disclosure_fields["disclosure_evidence"] = evidence
-                operation = VoiceOperationV1(
-                    schema_version=1,
-                    operation_id=uuid5(
-                        entry.call_id, f"local-terminal:{work.generation}:{work.reason}"
-                    ),
-                    deployment_id=self._deployment_id,
-                    call_id=entry.call_id,
-                    occurred_at=closed_at,
-                    kind="call.upsert",
-                    payload=CallUpsertPayloadV1(
-                        telnyx_call_control_id=entry.call_control_id,
-                        telnyx_call_leg_id=entry.call_leg_id,
-                        telnyx_call_session_id=entry.call_session_id,
-                        status="failed",
-                        disclosure_state="completed"
-                        if evidence is not None and evidence.completed_at is not None
-                        else "failed",
-                        started_at=min(starts) if starts else None,
-                        ended_at=closed_at,
-                        end_reason=work.reason,
-                        retention_until=facts.retention_until,
-                        **disclosure_fields,
-                    ),
+                payload = CallUpsertPayloadV1(
+                    telnyx_call_control_id=entry.call_control_id,
+                    telnyx_call_leg_id=entry.call_leg_id,
+                    telnyx_call_session_id=entry.call_session_id,
+                    status="failed",
+                    disclosure_state="completed"
+                    if evidence is not None and evidence.completed_at is not None
+                    else "failed",
+                    started_at=min(starts) if starts else None,
+                    ended_at=closed_at,
+                    end_reason=work.reason,
+                    retention_until=facts.retention_until,
+                    **disclosure_fields,
                 )
+                operation_id = uuid5(
+                    entry.call_id, f"local-terminal:{work.generation}:{work.reason}"
+                )
+                if self._operation_contract_version == 2:
+                    operation = VoiceOperationV2(
+                        schema_version=2, operation_id=operation_id,
+                        deployment_id=self._deployment_id, call_id=entry.call_id,
+                        occurred_at=closed_at, kind="call.upsert", payload=payload,
+                    )
+                else:
+                    operation = VoiceOperationV1(
+                        schema_version=1, operation_id=operation_id,
+                        deployment_id=self._deployment_id, call_id=entry.call_id,
+                        occurred_at=closed_at, kind="call.upsert", payload=payload,
+                    )
+        if isinstance(operation, VoiceOperationV2):
+            while True:
+                try:
+                    if not isinstance(self._writer, PersistenceWriter):
+                        raise RuntimeError("terminal_persistence_failed")
+                    frozen = await self._writer.freeze_call_publication_v2(
+                        operation, None, generation=work.generation, provider_callback=None,
+                    )
+                    if frozen is None:
+                        raise RuntimeError("terminal_persistence_failed")
+                    break
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+                except BaseException:
+                    self._set_internal_failure("terminal_persistence_failed")
+                    persistence_failed = True
+                    break
         if work.persist_terminal:
             while True:
                 if persistence_failed:
@@ -3011,7 +3034,8 @@ class CallRegistry:
                         created_at=entry.created_at,
                         expires_at=entry.expires_at,
                         closed_at=closed_at,
-                        **({"operation": operation} if operation is not None else {}),
+                        **({"operation": operation}
+                           if isinstance(operation, VoiceOperationV1) else {}),
                     )
                 except asyncio.CancelledError as error:
                     if native_terminal:
