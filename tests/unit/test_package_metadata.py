@@ -25,6 +25,7 @@ EXPECTED_RUNTIME_DEPENDENCIES = [
     "opentelemetry-api==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.44.0",
     "opentelemetry-sdk==1.44.0",
+    "phonenumberslite==9.0.41",
     "pipecat-ai[openai,openrouter,silero,websocket]==1.12.0",
     "psycopg[binary,pool]==3.3.4",
     "pydantic==2.13.4",
