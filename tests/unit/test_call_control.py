@@ -1265,7 +1265,7 @@ async def test_each_attempt_has_true_monotonic_500ms_deadline_without_orphan(
     assert len(instances[0].actions.calls) == 2
     attempts = getattr(result, "attempt_observations", ())
     assert len(attempts) == 2
-    assert [attempt.category for attempt in attempts] == ["timeout", "accepted"]
+    assert [attempt.category for attempt in attempts] == ["deadline", "accepted"]
     assert 0.45 <= attempts[0].duration_seconds < 0.8
     assert attempts[1].duration_seconds >= 0
     assert instances[0].actions.calls[0] == instances[0].actions.calls[1]
@@ -1281,7 +1281,8 @@ async def test_each_attempt_has_true_monotonic_500ms_deadline_without_orphan(
         ([connection_error(httpx.ConnectError(API_KEY)), ok_response()],
          ["connection", "accepted"]),
         ([telnyx.APITimeoutError(request=httpx.Request("POST", URL)), ok_response()],
-         ["timeout", "accepted"]),
+         ["sdk_timeout", "accepted"]),
+        ([TimeoutError(TOKEN), ok_response()], ["timeout", "accepted"]),
         ([response_validation_error()], ["invalid"]),
         ([SimpleNamespace(data=SimpleNamespace(result=TOKEN))], ["invalid"]),
         ([RuntimeError(TOKEN)], ["internal"]),
