@@ -1301,6 +1301,7 @@ class _OpeningPeers:
         self.delayed_release = asyncio.Event()
         self.delayed_sent = asyncio.Event()
         self.response_text = "Le garage est ouvert de 8 h à 18 h."
+        self.text_before_tool: str | None = None
         self.instruction_blocked = False
         self.instruction_entered = asyncio.Event()
         self.instruction_release = asyncio.Event()
@@ -1366,6 +1367,10 @@ class _OpeningPeers:
                 "index": 1, "id": "offline-end-call-two", "type": "function",
                 "function": {"name": "end_call", "arguments": "{}"},
             }]}, "finish_reason": "tool_calls"}]})
+        if self.text_before_tool is not None and (self.end_call or self.tool_calls is not None):
+            chunks.insert(0, {**chunk, "choices": [{"index": 0, "delta": {
+                "content": self.text_before_tool,
+            }, "finish_reason": None}]})
         content = ("".join("data: " + json.dumps(item) + "\n\n" for item in chunks)
                    + "data: [DONE]\n\n").encode()
         if self.delayed_response:
@@ -1555,10 +1560,14 @@ async def test_sparra_opening_fixture_reaches_authenticated_ack_before_release()
 @pytest.mark.parametrize("old_context", [False, True])
 @pytest.mark.parametrize("farewell", [
     "Merci, au revoir.", "Au revoir, bonne journée.", "Merci, au revoir, bonne soirée.",
+    "J'ai dit au revoir.", "Au revoir, merci pour votre aide.",
 ])
 async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
     old_context, farewell,
 ) -> None:
+    from projetv0_voice.action_authority import direct_command
+
+    expected_inferences = 0 if direct_command(farewell) == "end_call" else 1
     async with _native_sparra_opening(ack_end_call=False) as fixture:
         fixture.writer.ack_release.set()
         fixture.writer.gate_release.set()
@@ -1611,7 +1620,7 @@ async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
         assert finished == []
         assert "lease-attempt" not in fixture.events
         assert fixture.peers.texts[-1] == "Bonne journée, au revoir."
-        assert fixture.peers.conversations == []
+        assert len(fixture.peers.conversations) == expected_inferences
         final_mark = fixture.sent[-1]
         assert final_mark["event"] == "mark"
         assert final_mark != fixture.sent[0]
@@ -1650,7 +1659,7 @@ async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
         )
         await worker.queue_frame(guarded)
         await _opening_event(gate_processed, "inference gate did not consume queued late input")
-        assert fixture.peers.conversations == []
+        assert len(fixture.peers.conversations) == expected_inferences
         aggregator = next(p for p in fixture.session._active_runtime.pipeline.processors
                           if isinstance(p, LLMUserAggregator))
         tools = aggregator._context.tools.standard_tools
@@ -1666,12 +1675,12 @@ async def test_native_end_call_waits_for_final_audio_ack_then_finishes_normally(
         assert terminal.payload.status == "closed"
         assert terminal.payload.end_reason == "conversation_ended"
         assert _opening_plaintext(fixture.writer.turns[-1]) == "Bonne journée, au revoir."
-        assert fixture.peers.conversations == []
+        assert len(fixture.peers.conversations) == expected_inferences
         assert fixture.session._controller.pending_task_count == 0
         assert not fixture.session._end_call_playback.pending
 
 
-async def _start_native_end_call(fixture):
+async def _start_native_end_call(fixture, *, farewell="Au revoir."):
     fixture.writer.ack_release.set()
     fixture.writer.gate_release.set()
     await fixture.session._controller.join_continuations()
@@ -1683,18 +1692,21 @@ async def _start_native_end_call(fixture):
     fixture.peers.end_call = True
     worker = fixture.session._active_runtime.worker
     await worker.queue_frame(TranscriptionFrame(
-        text="Au revoir.", user_id="", timestamp=NOW.isoformat(),
+        text=farewell, user_id="", timestamp=NOW.isoformat(),
         language=Language.FR, finalized=True,
     ))
     await _opening_event(fixture.final_mark_sent, "no final playback mark was sent")
-    assert fixture.peers.conversations == []
+    assert len(fixture.peers.conversations) == (0 if farewell == "Au revoir." else 1)
     return worker
 
 
 @pytest.mark.asyncio
-async def test_native_end_call_interruption_invalidates_late_ack_and_allows_next_turn() -> None:
+@pytest.mark.parametrize("farewell", ["Au revoir.", "J'ai dit au revoir."])
+async def test_native_end_call_interruption_invalidates_late_ack_and_allows_next_turn(
+    farewell,
+) -> None:
     async with _native_sparra_opening(ack_end_call=False) as fixture:
-        worker = await _start_native_end_call(fixture)
+        worker = await _start_native_end_call(fixture, farewell=farewell)
         final_mark = fixture.sent[-1]
         action = fixture.session._program_action_task
         # Exercise the public service interruption while the owned command task
@@ -1714,16 +1726,19 @@ async def test_native_end_call_interruption_invalidates_late_ack_and_allows_next
         ))
         await asyncio.wait_for(fixture.peers.llm_requested.wait(), timeout=8)
         assert not fixture.running.done()
-        assert len(fixture.peers.conversations) == 1
+        assert len(fixture.peers.conversations) == (1 if farewell == "Au revoir." else 2)
         assert fixture.session._terminal_outcome.reason == "closed"
         assert fixture.peers.texts.count("Bonne journée, au revoir.") == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("termination", ["missing_ack", "cancel", "disconnect"])
-async def test_native_end_call_never_relabels_failed_or_cancelled_departure(termination) -> None:
+@pytest.mark.parametrize("farewell", ["Au revoir.", "J'ai dit au revoir."])
+async def test_native_end_call_never_relabels_failed_or_cancelled_departure(
+    termination, farewell,
+) -> None:
     async with _native_sparra_opening(ack_end_call=False) as fixture:
-        await _start_native_end_call(fixture)
+        await _start_native_end_call(fixture, farewell=farewell)
         if termination == "cancel":
             await fixture.session.request_drain("external_cancel")
             reason = "external_cancel"
@@ -1738,7 +1753,7 @@ async def test_native_end_call_never_relabels_failed_or_cancelled_departure(term
         assert terminal.payload.status == "failed"
         assert terminal.payload.end_reason == reason
         assert not fixture.session._end_call_playback.pending
-        assert fixture.peers.conversations == []
+        assert len(fixture.peers.conversations) == (0 if farewell == "Au revoir." else 1)
         assert not fixture.session._controller.is_active()
 
 

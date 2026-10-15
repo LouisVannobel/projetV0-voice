@@ -888,12 +888,10 @@ class CallSession:
         scope = self._consume_tool_scope(params)
         result: dict[str, object] = {"success": False}
         if scope is not None:
-            result["status"] = "command_required"
+            result = {"status": "ending"}
         await params.result_callback(result, properties=FunctionCallResultProperties(run_llm=False))
         if scope is not None and self._action_current(scope):
-            await params.llm.push_frame(TTSSpeakFrame(
-                "Pour terminer l'appel, dites : au revoir.", append_to_context=True,
-            ))
+            self._accept_direct_command(scope, "end_call")
 
     def _action_current(self, scope: CallerScope) -> bool:
         return self._action_authority is not None and self._action_authority.current(scope)
