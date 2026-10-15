@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -10,15 +11,16 @@ from pipecat.frames.frames import LLMContextFrame, UserStartedSpeakingFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 Action = Literal["end_call", "request_human"]
+_FAREWELL = re.compile(
+    r"(?:(?:non ça va|c'est tout|c'est bon|d'accord|ok|très bien) )?"
+    r"(?:merci(?: beaucoup)? )?au revoir"
+)
 
 
 def direct_command(text: str) -> Action | None:
     normalized = " ".join(text.casefold().replace("’", "'").split())
     normalized = normalized.rstrip(".!").rstrip()
-    if normalized in {
-        "au revoir", "merci au revoir", "merci, au revoir",
-        "c'est tout merci au revoir", "c'est tout, merci, au revoir",
-    }:
+    if _FAREWELL.fullmatch(" ".join(normalized.replace(",", " ").split())):
         return "end_call"
     if normalized in {"transférez-moi", "transférez moi", "transferez-moi", "transferez moi"}:
         return "request_human"
