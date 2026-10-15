@@ -13,6 +13,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport
 from starlette.websockets import WebSocket, WebSocketState
 
 import projetv0_voice.telnyx.handshake as handshake_module
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
 from projetv0_voice.telnyx.handshake import (
     AuthenticatedTelnyxHandshakeService,
@@ -262,6 +263,7 @@ def _service(
     profile: QualifiedDeploymentProfileV1 | None = None,
     timeout_seconds: float = 0.5,
     session_timeout: int | None = None,
+    runtime_metrics: RuntimeMetrics | None = None,
 ) -> AuthenticatedTelnyxHandshakeService:
     return AuthenticatedTelnyxHandshakeService(
         profile=profile or _profile(),
@@ -269,7 +271,199 @@ def _service(
         unauthenticated_gate=gate,
         timeout_seconds=timeout_seconds,
         session_timeout=session_timeout,
+        runtime_metrics=runtime_metrics,
     )
+
+
+def _setup_points(metrics: RuntimeMetrics) -> dict[tuple[str, str], int]:
+    data = metrics._metric_reader.get_metrics_data()  # noqa: SLF001
+    return {
+        (point.attributes["stage"], point.attributes["outcome"]): point.value
+        for resource in data.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name == "projetv0.voice.ws.setup"
+        for point in metric.data.data_points
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers,messages,expected",
+    [
+        ((), (), ("header", "absent")),
+        (((handshake_module.TOKEN_HEADER, b"a"),) * 2, (), ("header", "duplicate")),
+        (((handshake_module.TOKEN_HEADER, b"\xff"),), (), ("header", "invalid")),
+        (None, ("{canary-secret",), ("connected", "invalid_json")),
+        (None, ("[]",), ("connected", "invalid_schema")),
+        (None, (_connected(event="canary-secret"),), ("connected", "invalid_event")),
+        (None, (_connected(version="canary-secret"),), ("connected", "invalid_version")),
+        (None, (_connected(connected={}),), ("connected", "token_absent")),
+        (None, (_connected(connected={handshake_module.TOKEN_FIELD: 1}),),
+         ("connected", "token_invalid")),
+        (None, (_connected("canary-secret"),), ("connected", "token_mismatch")),
+        (None, (_connected(), "{canary-secret"), ("start", "invalid_json")),
+        (None, (_connected(), _start(media_format={})), ("start", "invalid_schema")),
+        (None, ({"type": "websocket.disconnect", "code": 1000},),
+         ("connected", "peer_disconnect")),
+        (None, (_connected(), {"type": "websocket.disconnect", "code": 1000}),
+         ("start", "peer_disconnect")),
+    ],
+)
+async def test_setup_rejections_are_distinct_private_and_release_once(
+    headers: Any, messages: Any, expected: tuple[str, str],
+) -> None:
+    kwargs = {} if headers is None else {"header_values": headers}
+    websocket, _ = _websocket(messages=messages, **kwargs)
+    permit = _Permit()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    metrics = RuntimeMetrics.in_memory()
+    try:
+        with pytest.raises(TelnyxHandshakeRejectedError):
+            await _service(authority, _Gate(permit), runtime_metrics=metrics).authenticate(
+                websocket
+            )
+        points = _setup_points(metrics)
+        assert points[expected] == 1
+        assert points[("permit_release", "success")] == 1
+        assert ("authentication", "success") not in points
+        assert not any(value in repr(points) for value in ("canary-secret", TOKEN, CALL_CONTROL_ID))
+        assert permit.release_count == 1
+        assert authority.claim_calls == []
+        assert metrics.failure_code is None
+    finally:
+        metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["connected", "start"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_setup_waits_distinguish_deadline_from_peer_and_external_cancellation(
+    stage: str, cancel: bool,
+) -> None:
+    websocket, _ = _websocket()
+    waiting = asyncio.Event()
+    received_connected = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal received_connected
+        if stage == "start" and not received_connected:
+            received_connected = True
+            return {"type": "websocket.receive", "text": _connected()}
+        waiting.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    websocket._receive = receive
+    permit = _Permit()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    metrics = RuntimeMetrics.in_memory()
+    service = _service(authority, _Gate(permit), runtime_metrics=metrics,
+                       timeout_seconds=10 if cancel else 0.02)
+    task = asyncio.create_task(service.authenticate(websocket))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else TelnyxHandshakeTimeoutError):
+            await task
+        points = _setup_points(metrics)
+        assert points[(stage, "waiting")] == 1
+        assert points[(stage, "cancelled" if cancel else "timeout")] == 1
+        assert (stage, "peer_disconnect") not in points
+        assert permit.release_count == 1
+        assert authority.claim_calls == authority.abort_calls == []
+        assert metrics.failure_code is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [
+    "valid", "fixture", "lease", "lease_error", "transport", "cleanup", "abort_error",
+])
+async def test_setup_observes_actual_authentication_and_cleanup_boundaries(
+    phase: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket, _ = _websocket()
+    permit = _RaisingPermit() if phase == "cleanup" else _Permit()
+    class RaisingClaim(_LeaseAuthority):
+        async def claim_once(self, **_kwargs: Any) -> None:
+            raise RuntimeError("canary-claim-secret")
+
+    authority = (
+        RaisingClaim(expected_digest=_token_digest()) if phase == "lease_error"
+        else _RaisingAbortAuthority(expected_digest=_token_digest()) if phase == "abort_error"
+        else _LeaseAuthority(expected_digest=_token_digest(), expired=phase == "lease")
+    )
+    metrics = RuntimeMetrics.in_memory()
+    profile = _profile()
+    if phase == "fixture":
+        profile = profile.model_copy(update={"telnyx_handshake_fixture_sha256": "a" * 64})
+    if phase in {"transport", "abort_error"}:
+        def fail_transport(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("canary-transport-secret")
+        monkeypatch.setattr(handshake_module, "FastAPIWebsocketTransport", fail_transport)
+    service = _service(authority, _Gate(permit), profile=profile, runtime_metrics=metrics)
+    try:
+        if phase == "valid":
+            authenticated = await service.authenticate(websocket)
+            assert type(authenticated.transport) is FastAPIWebsocketTransport
+        else:
+            with pytest.raises(TelnyxHandshakeError):
+                await service.authenticate(websocket)
+        points = _setup_points(metrics)
+        expected = {
+            "valid": ("authentication", "success"),
+            "fixture": ("fixture", "rejected"),
+            "lease": ("lease", "refused"),
+            "lease_error": ("lease", "error"),
+            "transport": ("transport", "error"),
+            "cleanup": ("permit_release", "error"),
+            "abort_error": ("lease_abort", "error"),
+        }[phase]
+        assert points[expected] == 1
+        assert (("authentication", "success") in points) is (phase == "valid")
+        assert permit.release_count == 1
+        assert len(authority.abort_calls) == (
+            1 if phase in {"transport", "cleanup", "lease_error", "abort_error"} else 0
+        )
+        if phase in {"lease_error", "transport", "abort_error"}:
+            assert ("authentication", "error") not in points
+        assert not any(secret in repr(points) for secret in (
+            TOKEN, CALL_CONTROL_ID, STREAM_ID, FROM_NUMBER, TO_NUMBER, "canary-transport-secret",
+        ))
+        assert metrics.failure_code is None
+    finally:
+        metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_unexpected_capture_failure_is_observed_before_generic_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_validation(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("canary-model-validation-secret")
+
+    monkeypatch.setattr(handshake_module.TelnyxCallData, "model_validate", fail_validation)
+    metrics = RuntimeMetrics.in_memory()
+    permit = _Permit()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    try:
+        with pytest.raises(TelnyxHandshakeError, match="^telnyx_handshake_failed$"):
+            await _service(authority, _Gate(permit), runtime_metrics=metrics).authenticate(
+                _websocket()[0]
+            )
+        points = _setup_points(metrics)
+        assert points[("authentication", "error")] == 1
+        assert ("authentication", "success") not in points
+        assert "canary" not in repr(points)
+        assert authority.claim_calls == []
+        assert permit.release_count == 1
+    finally:
+        metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 @pytest.mark.parametrize("timeout_seconds", [float("inf"), float("nan")])
@@ -627,6 +821,33 @@ async def test_gate_cancellation_is_never_wrapped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalid_connected_without_start_rejects_before_second_receive() -> None:
+    websocket, _ = _websocket()
+    receive_count = 0
+
+    async def receive() -> dict[str, Any]:
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return {"type": "websocket.receive", "text": _connected(event="invalid")}
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    websocket._receive = receive
+    permit = _Permit()
+    authority = _LeaseAuthority(expected_digest=_token_digest())
+    service = _service(authority, _Gate(permit), timeout_seconds=10)
+
+    with pytest.raises(TelnyxHandshakeRejectedError):
+        await asyncio.wait_for(service.authenticate(websocket), timeout=0.2)
+
+    assert receive_count == 1
+    assert permit.release_count == 1
+    assert authority.claim_calls == []
+    assert authority.abort_calls == []
+
+
+@pytest.mark.asyncio
 async def test_global_timeout_before_claim_releases_permit_without_abort() -> None:
     async def never_receive() -> dict[str, Any]:
         await asyncio.Event().wait()
@@ -656,7 +877,10 @@ async def test_cancellation_during_unknown_claim_schedules_abort_and_releases() 
     websocket, _ = _websocket()
     permit = _Permit()
     authority = _BlockingLeaseAuthority(expected_digest=_token_digest())
-    task = asyncio.create_task(_service(authority, _Gate(permit)).authenticate(websocket))
+    metrics = RuntimeMetrics.in_memory()
+    task = asyncio.create_task(
+        _service(authority, _Gate(permit), runtime_metrics=metrics).authenticate(websocket)
+    )
     await authority.started.wait()
 
     task.cancel()
@@ -665,6 +889,11 @@ async def test_cancellation_during_unknown_claim_schedules_abort_and_releases() 
 
     assert permit.release_count == 1
     assert authority.abort_calls == [(CALL_CONTROL_ID, _token_digest())]
+    points = _setup_points(metrics)
+    assert points[("lease", "cancelled")] == 1
+    assert points[("lease_abort", "scheduled")] == 1
+    assert ("authentication", "success") not in points
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -672,12 +901,20 @@ async def test_timeout_during_unknown_claim_schedules_abort_and_releases() -> No
     websocket, _ = _websocket()
     permit = _Permit()
     authority = _BlockingLeaseAuthority(expected_digest=_token_digest())
+    metrics = RuntimeMetrics.in_memory()
 
     with pytest.raises(TelnyxHandshakeTimeoutError):
-        await _service(authority, _Gate(permit), timeout_seconds=0.01).authenticate(websocket)
+        await _service(
+            authority, _Gate(permit), timeout_seconds=0.01, runtime_metrics=metrics,
+        ).authenticate(websocket)
 
     assert permit.release_count == 1
     assert authority.abort_calls == [(CALL_CONTROL_ID, _token_digest())]
+    points = _setup_points(metrics)
+    assert points[("lease", "timeout")] == 1
+    assert points[("lease_abort", "scheduled")] == 1
+    assert ("authentication", "success") not in points
+    metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 @pytest.mark.asyncio

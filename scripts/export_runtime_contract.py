@@ -80,6 +80,7 @@ METRIC_NAMES = [
     "projetv0.voice.writer.queue_depth",
     "projetv0.voice.writer.queue_oldest_age",
     "projetv0.voice.writer.quick_check",
+    "projetv0.voice.ws.setup",
 ]
 
 RUNTIME_CONTRACT: dict[str, object] = {

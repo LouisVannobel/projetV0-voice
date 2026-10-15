@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Any, Protocol, cast
 
 from fastapi import FastAPI, Request, Response, WebSocket
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from projetv0_voice.lifecycle import (
     IngressMetricObservation,
@@ -53,6 +54,50 @@ class _Coordinator(Protocol):
 
 def _runtime(app: FastAPI) -> Any:
     return getattr(app.state, "runtime_graph", None)
+
+
+def _setup_metric(graph: object, stage: str, outcome: str) -> None:
+    metrics = getattr(graph, "metrics", None)
+    if isinstance(metrics, RuntimeMetrics):
+        metrics.record_ws_setup(stage, outcome)
+
+
+class _SetupObservation:
+    """Observe fixed ASGI categories before routing, without receiving any messages."""
+
+    def __init__(self, app: ASGIApp, *, owner: FastAPI) -> None:
+        self._app = app
+        self._owner = owner
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        stage = {
+            ("http", True): "asgi_media_http",
+            ("http", False): "asgi_other_http",
+            ("websocket", True): "asgi_media_websocket",
+            ("websocket", False): "asgi_other_websocket",
+        }.get((scope["type"], scope.get("path") == "/telnyx/media"))
+        if stage is None:
+            await self._app(scope, receive, send)
+            return
+        graph = _runtime(self._owner)
+        _setup_metric(graph, stage, "entered")
+        accepted = False
+
+        async def observed_send(message: Message) -> None:
+            nonlocal accepted
+            await send(message)
+            message_type = message["type"]
+            if message_type == "websocket.accept":
+                accepted = True
+                _setup_metric(graph, stage, "accepted")
+            elif message_type == "websocket.close":
+                _setup_metric(graph, stage, "closed" if accepted else "denied")
+            elif message_type == "websocket.http.response.start":
+                _setup_metric(graph, stage, "denied")
+            elif message_type == "http.response.start":
+                _setup_metric(graph, stage, "response")
+
+        await self._app(scope, receive, observed_send)
 
 
 def _response(status_code: int) -> Response:
@@ -176,6 +221,7 @@ def create_app(
         redirect_slashes=False,
         lifespan=lifespan,
     )
+    app.add_middleware(_SetupObservation, owner=app)
 
     @app.get("/health/live", response_class=Response)
     async def live() -> Response:
@@ -228,31 +274,49 @@ def create_app(
     @app.websocket("/telnyx/media")
     async def stream(websocket: WebSocket) -> None:
         graph = _runtime(app)
+        _setup_metric(graph, "endpoint", "entered")
         gate = getattr(graph, "unauthenticated_gate", None)
         handshake = getattr(graph, "handshake", None)
         session_factory = getattr(graph, "session_factory", None)
         if gate is None or handshake is None or session_factory is None:
+            _setup_metric(graph, "endpoint", "components_missing")
             await websocket.send_denial_response(_response(503))
             return
 
         permit: Any | None = None
+        _setup_metric(graph, "gate", "waiting")
         try:
             permit = gate.try_acquire()
+        except asyncio.CancelledError:
+            _setup_metric(graph, "gate", "cancelled")
+            raise
         except Exception:
+            _setup_metric(graph, "gate", "error")
             await websocket.send_denial_response(_response(503))
             return
         if permit is None:
+            _setup_metric(graph, "gate", "refused")
             await websocket.send_denial_response(_response(503))
             return
+        _setup_metric(graph, "gate", "acquired")
 
         transferred = False
+        stage: str | None = "accept"
         try:
+            _setup_metric(graph, "accept", "waiting")
             await websocket.accept()
+            _setup_metric(graph, "accept", "accepted")
+            stage = "auth_transfer"
+            _setup_metric(graph, "auth_transfer", "waiting")
             operation = handshake.transfer_authentication(websocket, permit)
             transferred = True
+            _setup_metric(graph, "auth_transfer", "transferred")
+            stage = None
             authenticated = await operation
             await session_factory.run(authenticated)
         except asyncio.CancelledError:
+            if stage is not None:
+                _setup_metric(graph, stage, "cancelled")
             raise
         except TelnyxHandshakeRejectedError:
             with contextlib.suppress(Exception):
@@ -261,12 +325,18 @@ def create_app(
             with contextlib.suppress(Exception):
                 await websocket.close(code=1013, reason="authentication_timeout")
         except Exception:
+            if stage is not None:
+                _setup_metric(graph, stage, "error")
             with contextlib.suppress(Exception):
                 await websocket.close(code=1011, reason="runtime_failed")
         finally:
             if not transferred:
-                with contextlib.suppress(Exception):
+                try:
                     permit.release()
+                except Exception:
+                    _setup_metric(graph, "permit_release", "error")
+                else:
+                    _setup_metric(graph, "permit_release", "success")
 
     return app
 

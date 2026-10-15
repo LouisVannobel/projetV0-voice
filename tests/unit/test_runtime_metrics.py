@@ -93,6 +93,7 @@ def _production_token() -> ObservabilityBootstrapToken:
 
 
 EXPECTED_INSTRUMENTS = {
+    "ws.setup": ("_Counter", ""),
     "result.outcomes": ("_Counter", ""),
     "result.duration": ("_Histogram", "s"),
     "calls.active": ("_UpDownCounter", ""),
@@ -118,6 +119,41 @@ EXPECTED_INSTRUMENTS = {
     "runtime.event_loop_lag": ("_Histogram", "s"),
     "ready": ("_ObservableGauge", "1"),
 }
+
+
+def test_ws_setup_exports_only_closed_stage_outcome_pairs() -> None:
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        owner.record_ws_setup("connected", "waiting")
+        owner.record_ws_setup("connected", "token_mismatch")
+        owner.record_ws_setup("connected", "canary-secret")
+        owner.record_ws_setup("canary/path", "waiting")
+        owner.record_ws_setup("header", "constructed")
+        points = _points(_metric_map(owner)[PREFIX + "ws.setup"])
+        assert set(points) == {
+            (("outcome", "waiting"), ("stage", "connected")),
+            (("outcome", "token_mismatch"), ("stage", "connected")),
+        }
+        assert all(point.value == 1 for point in points.values())
+        assert owner.failure_code == "metrics_record_failed"
+    finally:
+        owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("error", [RuntimeError("canary-secret"), asyncio.CancelledError()])
+def test_ws_setup_instrument_failure_never_escapes(error: BaseException) -> None:
+    class FailedCounter:
+        def add(self, *_args: Any) -> None:
+            raise error
+
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    owner._ws_setup = FailedCounter()  # noqa: SLF001
+    try:
+        owner.record_ws_setup("permit_release", "success")
+        assert owner.failure_code == "metrics_record_failed"
+        assert PREFIX + "ws.setup" not in _metric_map(owner)
+    finally:
+        owner._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 def test_task_10c_l_declares_exact_eleven_non_ingress_metric_owners() -> None:
@@ -338,7 +374,7 @@ async def test_in_memory_provider_has_exact_resource_scope_filter_and_inventory(
     assert meter._instrumentation_scope.name == "projetv0.voice"  # noqa: SLF001
     assert meter._instrumentation_scope.version is None  # noqa: SLF001
     instruments = list(meter._instrument_id_instrument.values())  # noqa: SLF001
-    assert len(instruments) == 24
+    assert len(instruments) == 25
     assert {
         instrument.name.removeprefix(PREFIX): (
             type(instrument).__name__,
