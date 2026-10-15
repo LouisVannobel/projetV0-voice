@@ -1868,6 +1868,17 @@ class PersistenceWriter:
             raise CommandSerializationError("invalid_final_call_v2_result")
         return value
 
+    async def unstarted_pending_recovery_allowed(
+        self, stale: StaleLease, *, now: datetime,
+    ) -> bool:
+        """Read the exact durable, never-claimed V2 cleanup precondition."""
+        if self._contract_version != 2 or not isinstance(stale, StaleLease):
+            return False
+        value = await self._content_request("unstarted_pending_recovery", stale=stale, now=now)
+        if type(value) is not bool:
+            raise CommandSerializationError("invalid_pending_recovery_result")
+        return value
+
     async def erase_call_content(
         self,
         call_id: UUID,
@@ -2193,6 +2204,81 @@ class PersistenceWriter:
             "VALUES(?,?,?,2,?,?,?,?,?,?,?)",
             (str(operation.operation_id), operation.deployment_id, operation.kind,
              str(operation.call_id), CRYPTO_VERSION, row[0], row[1], row[2], now, now),
+        )
+
+    async def _unstarted_pending_recovery_allowed(self, values: Mapping[str, object]) -> bool:
+        stale = values.get("stale")
+        now = self._required_datetime(values, "now")
+        if self._contract_version != 2 or not isinstance(stale, StaleLease):
+            return False
+        facts = await self._read_call_lifecycle(stale.call_id)
+        pin = await self._read_audio_pin(stale.call_id)
+        if (
+            stale.previous_state != "pending" or stale.expires_at > now
+            or facts is None or facts != stale.lifecycle or pin is None
+            or facts.call_id != stale.call_id or facts.admission_generation != pin.generation
+            or facts.admitted_at != pin.admitted_at or facts.retention_until != pin.retention_until
+            or not facts.admitted_at <= stale.created_at < stale.expires_at < facts.retention_until
+            or now >= facts.retention_until
+            or not facts.telnyx_call_leg_id or not facts.telnyx_call_session_id
+            or stale.tenant_id != str(pin.workspace_id) or stale.agent_id != self._process_agent_id
+            or pin.deployment_id != self._process_deployment_id
+            or facts.disclosure_evidence is not None or facts.recording_enabled
+            or facts.audio_reserved_bytes or pin.policy != "off" or pin.available
+            or pin.recording_id is not None or pin.denied_at is not None
+            or pin.choice_state != "undecided" or pin.choice_occurred_at is not None
+            or pin.committed_last_sequence is not None or pin.committed_total_samples != 0
+            or pin.terminal_finished or facts.content_erased
+            or any(value is not None for value in (
+                facts.transfer_command_id, facts.transfer_correlation, facts.transfer_generation,
+                facts.transfer_connection_sha256, facts.transfer_destination_sha256,
+                facts.target_call_control_id, facts.target_call_leg_id,
+                facts.qualified_line_bridged_at, facts.bridge_operation_id,
+                facts.transfer_failed_at, facts.transfer_failure_cause, facts.local_closing_at,
+                facts.content_departed_generation, facts.original_ended_at,
+            ))
+            or await self._content_denied(stale.call_id)
+            or not await self._original_admission_matches(stale.call_control_id, facts.admitted_at)
+        ):
+            return False
+        connection = self._require_owner_connection()
+        cursor = await connection.execute(
+            "SELECT call_id,tenant_id,agent_id,token_hash,state,created_at,expires_at,closed_at "
+            "FROM call_leases WHERE call_control_id=?", (stale.call_control_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row != (
+            str(stale.call_id), stale.tenant_id, stale.agent_id, stale.token_hash,
+            "pending", _iso(stale.created_at), _iso(stale.expires_at), None,
+        ):
+            return False
+        cursor = await connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM sparra_turn_decisions WHERE call_id=?),"
+            "EXISTS(SELECT 1 FROM local_audio_terminal WHERE call_id=?),"
+            "EXISTS(SELECT 1 FROM recording_archives WHERE call_id=?)",
+            (str(stale.call_id),) * 3,
+        )
+        activity = await cursor.fetchone()
+        await cursor.close()
+        if activity != (0, 0, 0):
+            return False
+        frozen = await self._frozen_publication_v2(stale.call_id)
+        if frozen is None:
+            return facts.started_at is None
+        payload = frozen.payload
+        return (
+            isinstance(payload, CallUpsertPayloadV1) and payload.status == "failed"
+            and payload.end_reason in {"token_deadline", "process_draining"}
+            and payload.disclosure_state == "failed" and payload.disclosure_evidence is None
+            and payload.message_result is None and payload.started_at == facts.started_at
+            and payload.ended_at == frozen.occurred_at
+            and frozen.call_id == stale.call_id and frozen.deployment_id == pin.deployment_id
+            and facts.admitted_at <= frozen.occurred_at <= now < facts.retention_until
+            and payload.retention_until == facts.retention_until
+            and payload.telnyx_call_control_id == stale.call_control_id
+            and payload.telnyx_call_leg_id == facts.telnyx_call_leg_id
+            and payload.telnyx_call_session_id == facts.telnyx_call_session_id
         )
 
     async def _apply_final_call_v2(self, values: Mapping[str, object]) -> object:
@@ -2523,6 +2609,8 @@ class PersistenceWriter:
     async def _apply_content_command(self, values: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
         action = values.get("action")
+        if action == "unstarted_pending_recovery":
+            return await self._unstarted_pending_recovery_allowed(values)
         if action in {"freeze_v2", "frozen_read_v2"}:
             return await self._apply_final_call_v2(values)
         if action == "turn_v2":

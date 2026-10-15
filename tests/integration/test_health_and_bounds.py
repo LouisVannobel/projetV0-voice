@@ -1132,7 +1132,7 @@ async def test_duplicate_resolver_rejection_emits_one_duplicate_and_zero_admissi
     }
 
 
-def test_integrated_runtime_metric_owner_inventory_is_exactly_thirteen() -> None:
+def test_integrated_runtime_metric_owner_inventory_is_exactly_fifteen() -> None:
     from projetv0_voice.app import INGRESS_METRIC_OWNERS
     from projetv0_voice.lifecycle import NON_INGRESS_METRIC_OWNERS
 
@@ -1141,6 +1141,8 @@ def test_integrated_runtime_metric_owner_inventory_is_exactly_thirteen() -> None
         "admission.rejections": "webhook_delivery",
         "webhooks.total": "webhook_delivery",
         "actions.total": "call_control",
+        "actions.attempts": "call_control",
+        "actions.attempt_duration": "call_control",
         "relay.runs": "relay_supervisor",
         "writer.queue_depth": "writer_snapshot",
         "writer.queue_oldest_age": "writer_snapshot",

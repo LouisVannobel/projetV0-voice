@@ -48,6 +48,9 @@ _DISPOSITIONS = frozenset(
     {"ok", "bad_request", "forbidden", "too_large", "unavailable", "internal_error"}
 )
 _ACTIONS = frozenset({"answer", "streaming_start", "hangup"})
+_ATTEMPT_CATEGORIES = frozenset({
+    "accepted", "timeout", "status", "connection", "invalid", "internal"
+})
 _OUTCOMES = frozenset(
     {
         "accepted",
@@ -306,6 +309,13 @@ class RuntimeMetrics:
         self._actions_total = self._meter.create_counter(
             _PREFIX + "actions.total", description="", unit=""
         )
+        self._action_attempts = self._meter.create_counter(
+            _PREFIX + "actions.attempts", description="", unit=""
+        )
+        self._action_attempt_duration = self._meter.create_histogram(
+            _PREFIX + "actions.attempt_duration", description="", unit="s",
+            explicit_bucket_boundaries_advisory=(0.05, 0.1, 0.25, 0.5, 1.0),
+        )
         self._ws_setup = self._meter.create_counter(
             _PREFIX + "ws.setup", description="", unit=""
         )
@@ -536,6 +546,22 @@ class RuntimeMetrics:
             self._latch_failure()
             return
         self._add(self._actions_total, {"action": action, "outcome": outcome})
+
+    def record_action_attempt(
+        self, action: object, attempt: object, category: object, seconds: object
+    ) -> None:
+        value = _nonnegative_number(seconds)
+        if not (
+            _closed(action, _ACTIONS)
+            and type(attempt) is int and attempt in {1, 2}
+            and _closed(category, _ATTEMPT_CATEGORIES)
+            and value is not None
+        ):
+            self._latch_failure()
+            return
+        attributes = {"action": action, "attempt": attempt, "category": category}
+        self._add(self._action_attempts, attributes)
+        self._record(self._action_attempt_duration, value, attributes)
 
     def record_user_bot_latency(self, latency_kind: object, seconds: object) -> None:
         value = _nonnegative_number(seconds)

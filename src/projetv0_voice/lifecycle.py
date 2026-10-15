@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal, NoReturn, Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from pipecat.processors.frame_processor import FrameProcessor
 from pydantic import SecretStr
@@ -26,6 +26,7 @@ from projetv0_voice.admission import (
     SynchronousUnauthenticatedGate,
     select_call_capacity,
 )
+from projetv0_voice.audio_contract import VoiceOperationV2
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import (
@@ -88,6 +89,8 @@ _RUNTIME_HARD_EXIT_CODE = 72
 NON_INGRESS_METRIC_OWNERS = MappingProxyType(
     {
         "actions.total": "call_control",
+        "actions.attempts": "call_control",
+        "actions.attempt_duration": "call_control",
         "relay.runs": "relay_supervisor",
         "writer.queue_depth": "writer_snapshot",
         "writer.queue_oldest_age": "writer_snapshot",
@@ -407,6 +410,10 @@ class _MeasuredCallControl:
             self._metrics.record_action(action, "internal_error")
             raise RuntimeError("call_control_result_invalid") from None
         self._metrics.record_action(action, result.outcome)
+        for ordinal, observation in enumerate(result.attempt_observations, start=1):
+            self._metrics.record_action_attempt(
+                action, ordinal, observation.category, observation.duration_seconds
+            )
         return result
 
 
@@ -1411,7 +1418,51 @@ class RuntimeSupervisor:
                     self._writer.read_call_lifecycle(stale.call_id), code="stale_recovery_failed"
                 )
                 stale = replace(stale, lifecycle=lifecycle)
-            if stale.lifecycle is not None and not stale.lifecycle.transfer_fenced:
+            local_pending = self._writer.contract_version == 2 and await self._startup_await(
+                self._writer.unstarted_pending_recovery_allowed(
+                    stale, now=_aware_utc(self._utcnow()),
+                ), code="stale_recovery_failed",
+            )
+            if local_pending:
+                facts = stale.lifecycle
+                assert facts is not None and facts.admission_generation is not None
+                operation = await self._startup_await(
+                    self._writer.read_frozen_call_publication_v2(
+                        stale.call_id, generation=facts.admission_generation,
+                    ), code="stale_recovery_failed",
+                )
+                if operation is None:
+                    operation = VoiceOperationV2(
+                        schema_version=2, operation_id=uuid5(
+                            stale.call_id,
+                            f"local-terminal:{facts.admission_generation}:token_deadline",
+                        ), deployment_id=self._deployment_id, call_id=stale.call_id,
+                        occurred_at=stale.expires_at, kind="call.upsert",
+                        payload=CallUpsertPayloadV1(
+                            telnyx_call_control_id=stale.call_control_id,
+                            telnyx_call_leg_id=facts.telnyx_call_leg_id,
+                            telnyx_call_session_id=facts.telnyx_call_session_id,
+                            status="failed", disclosure_state="failed", started_at=None,
+                            ended_at=stale.expires_at, end_reason="token_deadline",
+                            retention_until=facts.retention_until,
+                        ),
+                    )
+                frozen = await self._startup_await(
+                    self._writer.freeze_call_publication_v2(
+                        operation, None, generation=facts.admission_generation,
+                        provider_callback=None,
+                    ), code="stale_recovery_failed",
+                )
+                if frozen is None:
+                    raise RuntimeError("stale_recovery_failed") from None
+                await self._startup_await(self._writer.commit_lease(
+                    call_control_id=stale.call_control_id, call_id=stale.call_id,
+                    tenant_id=stale.tenant_id, agent_id=stale.agent_id, state="terminal",
+                    token_hash=stale.token_hash, created_at=stale.created_at,
+                    expires_at=stale.expires_at, closed_at=frozen.occurred_at,
+                ), code="stale_recovery_failed")
+            if (not local_pending and stale.lifecycle is not None
+                    and not stale.lifecycle.transfer_fenced):
                 # Leasing is not a negative witness: held leases and later batches
                 # remain invisible. Actual AI departure preserves the original phone.
                 lifecycle = await self._startup_await(
@@ -1419,7 +1470,8 @@ class RuntimeSupervisor:
                     code="stale_recovery_failed",
                 )
                 stale = replace(stale, lifecycle=lifecycle)
-            if stale.lifecycle is not None and stale.lifecycle.transfer_fenced:
+            if (not local_pending and stale.lifecycle is not None
+                    and stale.lifecycle.transfer_fenced):
                 if self._registry is None:
                     raise RuntimeError("transfer_recovery_registry_missing")
                 await cast(Any, self._registry).restore_transfer_fence(stale)
@@ -1446,7 +1498,11 @@ class RuntimeSupervisor:
             except asyncio.CancelledError:
                 raise
             except BaseException:
+                if local_pending:
+                    continue
                 raise RuntimeError("stale_recovery_failed") from None
+            if local_pending:
+                continue
             if result.outcome != "accepted":
                 raise RuntimeError("stale_recovery_failed") from None
             ended_at = _aware_utc(self._utcnow())
