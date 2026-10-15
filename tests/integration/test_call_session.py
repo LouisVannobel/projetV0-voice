@@ -2087,10 +2087,10 @@ async def test_company_pin_drives_native_session_notice_and_recording_after_comm
         assert session._controller.is_active()
         assert len(requests) == int(enabled)
         assert len(texts) == 2
-        assert "assistant vocal IA" in texts[0]
-        assert "texte est conservé trente jours" in texts[0]
+        assert "assistant" in texts[0] and "IA" in texts[0]
         assert texts[1] == "Comment puis-je vous aider ?"
         if enabled:
+            assert "texte est conservé trente jours" in texts[0]
             assert "audio est conservé trente jours en France" in texts[0]
             assert "Telnyx" in texts[0] and "temporairement" in texts[0]
             assert requests[0][0].play_beep is True
@@ -2100,7 +2100,7 @@ async def test_company_pin_drives_native_session_notice_and_recording_after_comm
                 if operation.kind == "recording.upsert"
             ] == ["pending"]
         else:
-            assert "audio n'est pas enregistré" in texts[0]
+            assert texts[0] == "Bonjour, je suis l'assistant IA."
         await session.request_drain("qualified_line_connected")
         await asyncio.wait_for(running, 5)
     finally:

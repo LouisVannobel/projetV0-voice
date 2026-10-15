@@ -153,7 +153,7 @@ async def test_sparra_final_summary_preserves_ceiling_and_keeps_conversation_clo
     assert summary["response_format"]["json_schema"]["strict"] is True
     assert summary.get("max_tokens") == 2048
     assert "max_completion_tokens" not in summary
-    assert "reasoning" not in summary
+    assert summary.get("reasoning") == {"enabled": False}
     assert summary["provider"] == PROVIDER_POLICY
     assert requests[0]["max_tokens"] == 256
     assert requests[0]["stream"] is True

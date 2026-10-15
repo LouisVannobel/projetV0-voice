@@ -9,8 +9,9 @@ import struct
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
+from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, NoReturn, cast
+from typing import Any, Literal, NoReturn, cast
 
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, NotGiven, OpenAIError
@@ -48,7 +49,11 @@ from projetv0_voice.inference.completion_strategy import (
     STT_TERMINAL_PARTIAL_KEY,
 )
 from projetv0_voice.models import MessageResultV1
-from projetv0_voice.persistence.business_result import RetainedCall, infer_partial_result
+from projetv0_voice.persistence.business_result import (
+    ResultCompletionRejected,
+    RetainedCall,
+    infer_partial_result,
+)
 from projetv0_voice.qualified_profile import InferenceProfileV1
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -271,6 +276,19 @@ class LLMOutputLimitError(OpenAIError):
         super().__init__("llm_output_limit")
 
 
+_FinalFinishReason = Literal["stop", "length", "content_filter", "tool_calls", "error", "unknown"]
+
+
+@dataclass(frozen=True, slots=True)
+class FinalCompletionDiagnostic:
+    """Call-local completion facts without response text, identifiers or errors."""
+
+    finish_reason: _FinalFinishReason
+    content_nonempty: bool
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+
 class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
     """Pin-aware OpenRouter client factory without ambient HTTP authority."""
 
@@ -283,6 +301,7 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         self._final_result_attempted = False
         self._final_post_reserved = False
         self._cleanup_completed = False
+        self._final_completion_diagnostic: FinalCompletionDiagnostic | None = None
         self._final_result_scope: ContextVar[bool] = ContextVar(
             "llm_final_result_scope", default=False,
         )
@@ -296,6 +315,46 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         if enforce_output_limits:
             kwargs["retry_on_timeout"] = False
         super().__init__(**kwargs)
+
+    @property
+    def final_completion_diagnostic(self) -> FinalCompletionDiagnostic | None:
+        return self._final_completion_diagnostic
+
+    async def _observe_final_completion(self, response: httpx.Response) -> None:
+        """Read only the actual final JSON response, preserving native HTTP errors."""
+        if not (
+            self._enforce_output_limits and self._final_result_scope.get()
+            and self._schema_routing.get() and response.is_success
+        ):
+            return
+        await response.aread()
+        diagnostic = FinalCompletionDiagnostic("unknown", False)
+        try:
+            body = response.json()
+        except (ValueError, UnicodeError):
+            self._final_completion_diagnostic = diagnostic
+            return
+        choices = body.get("choices") if type(body) is dict else None
+        choice = choices[0] if type(choices) is list and choices else None
+        if type(choice) is dict:
+            raw_reason = choice.get("finish_reason")
+            reason: _FinalFinishReason = "unknown"
+            if type(raw_reason) is str and raw_reason in {
+                "stop", "length", "content_filter", "tool_calls", "error",
+            }:
+                reason = cast(_FinalFinishReason, raw_reason)
+            message = choice.get("message")
+            content = message.get("content") if type(message) is dict else None
+            usage = body.get("usage")
+            completion = usage.get("completion_tokens") if type(usage) is dict else None
+            details = usage.get("completion_tokens_details") if type(usage) is dict else None
+            reasoning = details.get("reasoning_tokens") if type(details) is dict else None
+            diagnostic = FinalCompletionDiagnostic(
+                reason, type(content) is str and bool(content.strip()),
+                completion if type(completion) is int and completion >= 0 else None,
+                reasoning if type(reasoning) is int and reasoning >= 0 else None,
+            )
+        self._final_completion_diagnostic = diagnostic
 
     def _refuse_output(self) -> NoReturn:
         self._ordinary_closed = True
@@ -474,11 +533,27 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         ):
             raise RuntimeError("result_response_schema_unsupported")
         token = self._schema_routing.set(response_schema is not None)
+        inspect_final = (
+            self._enforce_output_limits and self._final_result_scope.get()
+            and response_schema is not None
+        )
+        if inspect_final:
+            self._final_completion_diagnostic = None
         try:
-            return await super().run_inference(
+            result = await super().run_inference(
                 context, max_tokens=max_tokens, system_instruction=system_instruction,
                 response_schema=response_schema,
             )
+            if inspect_final:
+                diagnostic = self._final_completion_diagnostic
+                if diagnostic is None:
+                    raise ResultCompletionRejected("unknown")
+                reason = diagnostic.finish_reason
+                if reason != "stop":
+                    raise ResultCompletionRejected(reason)
+                if not diagnostic.content_nonempty:
+                    raise ResultCompletionRejected("empty")
+            return result
         finally:
             self._schema_routing.reset(token)
 
@@ -494,9 +569,6 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
             params.pop("max_completion_tokens")
         if self._schema_routing.get():
             extra_body = dict(params.get("extra_body", {}))
-            # The structured summary retains its previous reasoning defaults.
-            if extra_body.get("reasoning") == {"enabled": False}:
-                extra_body.pop("reasoning")
             provider = dict(extra_body.get("provider", {}))
             provider["require_parameters"] = True
             extra_body["provider"] = provider
@@ -528,7 +600,8 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
                 timeout=_HTTP_TIMEOUT,
                 trust_env=False,
                 event_hooks=(
-                    {"request": [self._reserve_final_request]}
+                    {"request": [self._reserve_final_request],
+                     "response": [self._observe_final_completion]}
                     if self._enforce_output_limits else None
                 ),
                 follow_redirects=not self._enforce_output_limits,

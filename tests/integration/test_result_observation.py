@@ -102,7 +102,7 @@ def _assert_observed(metrics, expected, *, duration=None, invalid_reason=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case, expected", [
-    ("valid", "valid"), ("null", "empty"), ("none", "empty"),
+    ("valid", "valid"), ("null", "invalid"), ("none", "invalid"),
     ("null_envelope", "empty"), ("legacy_value_error", "invalid"),
     ("no_caller", "empty"), ("schema", "invalid"), ("provenance", "invalid"),
     ("provider", "error"), ("provider_timeout", "error"), ("provider_cancel", "cancelled"),
@@ -165,7 +165,31 @@ async def test_native_result_observes_closed_outcome_without_changing_return(cas
             assert session._result_inference_task.done()
         _assert_observed(metrics, expected, duration=0.25, invalid_reason={
             "schema": "schema", "provenance": "provenance", "legacy_value_error": "unknown",
+            "null": "schema", "none": "schema",
         }.get(case))
+    finally:
+        await metrics.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "length", "content_filter", "tool_calls", "error", "unknown", "empty",
+])
+async def test_incomplete_completion_is_settled_as_a_private_bounded_rejection(reason):
+    from projetv0_voice.persistence.business_result import ResultCompletionRejected
+
+    metrics = RuntimeMetrics.in_memory()
+
+    async def inference(*_args, **_kwargs):
+        raise ResultCompletionRejected(reason)
+
+    session = _session(metrics, inference)
+    try:
+        await session._prepare_partial_result()
+        assert session._partial_result is None
+        assert session._result_inference_task.done()
+        _assert_observed(metrics, "invalid", invalid_reason="completion_" + reason)
+        assert metrics.failure_code is None
     finally:
         await metrics.aclose()
 

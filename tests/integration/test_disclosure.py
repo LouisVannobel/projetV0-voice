@@ -1278,7 +1278,8 @@ async def test_sparra_notice_explicitly_announces_ia_for_off_and_local_on(
     tmp_path, policy, available,
 ):
     async with _local_choice_case(tmp_path, policy=policy, available=available) as case:
-        assert "un assistant vocal IA." in case.controller.announcement_text
+        assert "assistant" in case.controller.announcement_text
+        assert "IA." in case.controller.announcement_text
         assert "un assistant vocal IA." in pipeline_module.SPARRA_RECORDING_DISCLOSURE
 
 

@@ -113,8 +113,14 @@ _RESULT_OUTCOMES = frozenset({
     "valid", "empty", "not_started", "frozen_replay", "fenced", "invalid",
     "inner_timeout", "outer_timeout", "cancelled", "error",
 })
-ResultInvalidReason = Literal["schema", "provenance", "unknown"]
-_RESULT_INVALID_REASONS = frozenset({"schema", "provenance", "unknown"})
+ResultInvalidReason = Literal[
+    "schema", "provenance", "unknown", "completion_length", "completion_content_filter",
+    "completion_tool_calls", "completion_error", "completion_unknown", "completion_empty",
+]
+_RESULT_INVALID_REASONS = frozenset({
+    "schema", "provenance", "unknown", "completion_length", "completion_content_filter",
+    "completion_tool_calls", "completion_error", "completion_unknown", "completion_empty",
+})
 
 
 def _closed(value: object, allowed: frozenset[str]) -> bool:

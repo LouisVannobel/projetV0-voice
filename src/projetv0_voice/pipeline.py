@@ -838,10 +838,7 @@ class PipelineTurnRecorder(Protocol):
     def record_assistant(self, content: str, timestamp: str, interrupted: bool) -> None: ...
 
 
-SPARRA_DISCLOSURE = (
-    "Bonjour. Je suis un assistant vocal IA. Je peux prendre un message pour "
-    "l'établissement. L'audio n'est pas enregistré ; le texte est conservé trente jours."
-)
+SPARRA_DISCLOSURE = "Bonjour, je suis l'assistant IA."
 SPARRA_RECORDING_DISCLOSURE = (
     "Bonjour. Je suis un assistant vocal IA. Je peux prendre un message pour "
     "l'établissement. L'audio est conservé trente jours en France ; Telnyx le traite "
