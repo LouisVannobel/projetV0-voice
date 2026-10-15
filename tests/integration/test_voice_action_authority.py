@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from pipecat.frames.frames import (
+    EndFrame,
     FunctionCallResultFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
 from pipecat.transcriptions.language import Language
 
+from projetv0_voice.action_authority import direct_command
 from tests.integration.sparra_connected_scenario import Scenario
 from tests.integration.test_call_session import (
     NOW,
@@ -84,24 +88,137 @@ def transfer_consumer():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("text", [
-    "Quels sont vos horaires ?", "ne raccrochez pas", '"au revoir"',
-    "au revoir mais attendez", "oui", "au revoir ?", "**au revoir**",
-    "il a dit au revoir", "ne me transférez pas", '"transférez-moi"',
+    "J'ai dit au revoir.", "Au revoir, merci pour votre aide.",
+    "Je vous demande de raccrocher maintenant.",
 ])
-async def test_current_native_end_tool_is_only_one_owned_proposal(text):
+async def test_current_native_end_tool_starts_owned_goodbye_after_its_single_callback(text):
+    # The scripted SSE proves current-turn execution, not semantic model selection.
+    assert direct_command(text) is None
     async with _native_sparra_opening(ack_end_call=False) as fixture:
         await active(fixture)
         fixture.peers.end_call = True
+        results, order = [], []
+        completed = asyncio.Event()
+        handler = fixture.session._end_call_tool
+
+        async def recorded_handler(params):
+            async def callback(result, *, properties):
+                results.append((params.arguments, result, properties.run_llm))
+                await params.result_callback(result, properties=properties)
+                order.append("callback")
+                completed.set()
+
+            await handler(replace(params, result_callback=callback))
+
+        def observe(_llm, frame):
+            if isinstance(frame, TTSSpeakFrame) and frame.text == "Bonne journée, au revoir.":
+                order.append("programmed-goodbye")
+
+        fixture.llm.register_function("end_call", recorded_handler)
+        fixture.llm.add_event_handler("on_after_push_frame", observe)
         await caller(fixture, text)
-        await _opening_event(fixture.peers.llm_requested, "caller inference missing")
-        for _ in range(300):
-            if len(fixture.peers.texts) > 2:
-                break
-            await asyncio.sleep(0.01)
-        assert not fixture.session._end_call_playback.pending
-        assert fixture.peers.texts[2:] == ["Pour terminer l'appel, dites : au revoir."]
-        assert not fixture.final_mark_sent.is_set()
+        await _opening_event(completed, "native result callback missing")
+        assert results == [({}, {"status": "ending"}, False)]
+        await _opening_event(fixture.final_mark_sent, "current native tool did not play goodbye")
+        assert order == ["callback", "programmed-goodbye"]
+        assert len(fixture.peers.conversations) == 1
+        request = fixture.peers.conversations[0]
+        instruction = request["messages"][0]["content"]
+        description = request["tools"][0]["function"]["description"]
+        assert all(word in instruction for word in ("intention présente", "citation", "négation"))
+        assert "clarification" in instruction and "sans prononcer" in instruction
+        assert "current caller turn" in description and "task completion" in description
+        assert "without saying another" in description
+        assert fixture.peers.texts[2:] == ["Bonne journée, au revoir."]
+        assert fixture.session._end_call_playback.pending
         assert not fixture.running.done()
+        final_mark = fixture.sent[-1]
+        await fixture.incoming.put({"type": "websocket.receive", "text": json.dumps({
+            **final_mark, "stream_id": "stream-1",
+        })})
+        await asyncio.wait_for(fixture.running, timeout=3)
+        assert fixture.writer.commands[-1].payload.end_reason == "conversation_ended"
+
+
+@pytest.mark.asyncio
+async def test_current_native_end_tool_with_model_text_still_has_one_programmed_ending():
+    async with _native_sparra_opening(ack_end_call=False) as fixture:
+        await active(fixture)
+        fixture.peers.end_call = True
+        fixture.peers.text_before_tool = "Très bien."
+        finished = []
+        fixture.session._active_runtime.worker.add_event_handler(
+            "on_pipeline_finished", lambda _worker, frame: finished.append(frame),
+        )
+        await caller(fixture, "J'ai dit au revoir.")
+        await _opening_event(fixture.final_mark_sent, "mixed native response did not play goodbye")
+        assert "Très bien." in fixture.peers.texts
+        assert fixture.peers.texts.count("Bonne journée, au revoir.") == 1
+        assert "Pour terminer l'appel, dites : au revoir." not in fixture.peers.texts
+        assert len(fixture.peers.conversations) == 1
+        assert len([wire for wire in fixture.sent if wire.get("event") == "mark"]) == 2
+        assert not fixture.running.done() and finished == []
+        await fixture.incoming.put({"type": "websocket.receive", "text": json.dumps({
+            **fixture.sent[-1], "stream_id": "stream-1",
+        })})
+        await asyncio.wait_for(fixture.running, timeout=3)
+        assert len(finished) == 1 and isinstance(finished[0], EndFrame)
+        assert finished[0].reason == "conversation_ended"
+        assert fixture.writer.commands[-1].payload.end_reason == "conversation_ended"
+
+
+@pytest.mark.asyncio
+async def test_end_tool_revalidates_scope_after_callback_and_resolves_once():
+    async with _native_sparra_opening(ack_end_call=False) as fixture:
+        await active(fixture)
+        handler = fixture.session._end_call_tool
+        callbacks = []
+        completed = asyncio.Event()
+
+        async def revoke_after_callback(params):
+            async def callback(result, *, properties):
+                callbacks.append((result, properties.run_llm))
+                await params.result_callback(result, properties=properties)
+                fixture.session._action_authority.invalidate_response()
+
+            await handler(replace(params, result_callback=callback))
+            completed.set()
+
+        fixture.llm.register_function("end_call", revoke_after_callback)
+        fixture.peers.end_call = True
+        await caller(fixture, "J'ai dit au revoir.")
+        await _opening_event(completed, "revoked native handler did not resolve")
+        assert callbacks == [({"status": "ending"}, False)]
+        assert fixture.session._program_action_task is None
+        assert not fixture.final_mark_sent.is_set()
+        assert not fixture.session._end_call_playback.pending
+
+
+@pytest.mark.asyncio
+async def test_consumed_current_tool_scope_cannot_start_another_goodbye():
+    async with _native_sparra_opening(ack_end_call=False) as fixture:
+        await active(fixture)
+        captured = []
+
+        async def handler(params):
+            captured.append(params)
+            await fixture.session._end_call_tool(params)
+
+        fixture.llm.register_function("end_call", handler)
+        fixture.peers.end_call = True
+        await caller(fixture, "J'ai dit au revoir.")
+        await _opening_event(fixture.final_mark_sent, "first native tool did not play goodbye")
+        original_task = fixture.session._program_action_task
+        results = []
+
+        async def callback(result, *, properties):
+            results.append((result, properties.run_llm))
+
+        await fixture.session._end_call_tool(replace(captured[0], result_callback=callback))
+        assert results == [({"success": False}, False)]
+        assert fixture.session._program_action_task is original_task
+        assert fixture.peers.texts.count("Bonne journée, au revoir.") == 1
+        assert len([wire for wire in fixture.sent if wire.get("event") == "mark"]) == 2
 
 
 @pytest.mark.asyncio

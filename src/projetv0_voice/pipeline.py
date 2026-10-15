@@ -914,9 +914,14 @@ def build_pipeline(
                 "role": "system",
                 "content": SPARRA_SYSTEM_PROMPT
                 + (
-                    " L'outil end_call, sans arguments, propose seulement d'expliquer comment "
-                    "terminer l'appel. Le programme accepte la commande complète au revoir. "
-                    "N'annonce jamais que l'appel est terminé sur la base d'une proposition."
+                    " L'outil end_call, sans arguments, termine cet appel seulement si le tour "
+                    "actuel de l'appelant exprime son intention présente et explicite de "
+                    "raccrocher : adieu naturel, correction explicite d'un adieu mal compris "
+                    "ou demande de raccrocher. La seule réalisation d'une tâche, une citation "
+                    "ou une négation ne suffit pas. Si l'intention est ambiguë, pose une courte "
+                    "question naturelle de clarification. Appelle l'outil sans prononcer un "
+                    "autre adieu : le programme prononce l'adieu puis attend sa lecture avant "
+                    "de raccrocher. Ne prétends pas que l'appel est déjà fermé."
                     if end_call_handler is not None
                     else ""
                 )
@@ -963,11 +968,12 @@ def build_pipeline(
         tool_schemas.append(FunctionSchema(
             name="end_call",
             description=(
-                "Propose the program instruction for ending the call. "
-                "Does not hang up. No arguments."
-                if action_authority is not None else
-                "End only after an explicit goodbye or refusal of further help. "
-                "Speaks a brief goodbye before hanging up. No arguments."
+                "End this call only for an explicit present intention in the current caller "
+                "turn: a goodbye, an explicit correction of a misunderstood goodbye, or a "
+                "request to hang up. Not for task completion, quoted or negated goodbyes. "
+                "If unclear, ask a short natural clarification. Call without saying another "
+                "goodbye; the program plays its goodbye and waits for playback before hanging "
+                "up. No arguments."
             ),
             properties={}, required=[], handler=end_call_handler,
         ))
