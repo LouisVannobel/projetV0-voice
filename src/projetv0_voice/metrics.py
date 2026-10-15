@@ -74,6 +74,37 @@ _RELAY_STATUSES = frozenset(
     }
 )
 _RECORDING_STATUSES = frozenset({"saved", "error", "purged"})
+_WS_SETUP_OUTCOMES = {
+    "asgi_media_http": frozenset({"entered", "response"}),
+    "asgi_other_http": frozenset({"entered", "response"}),
+    "asgi_media_websocket": frozenset({"entered", "accepted", "denied", "closed"}),
+    "asgi_other_websocket": frozenset({"entered", "accepted", "denied", "closed"}),
+    "endpoint": frozenset({"entered", "components_missing"}),
+    "gate": frozenset({"waiting", "acquired", "refused", "error", "cancelled"}),
+    "accept": frozenset({"waiting", "accepted", "error", "cancelled"}),
+    "auth_transfer": frozenset({"waiting", "transferred", "error", "cancelled"}),
+    "header": frozenset({"absent", "duplicate", "invalid", "valid"}),
+    "connected": frozenset({
+        "waiting", "invalid_json", "invalid_schema", "invalid_event", "invalid_version",
+        "token_absent", "token_invalid", "token_mismatch", "valid", "peer_disconnect",
+        "receive_error", "timeout", "cancelled",
+    }),
+    "start": frozenset({
+        "waiting", "invalid_json", "invalid_schema", "valid", "peer_disconnect",
+        "receive_error", "timeout", "cancelled",
+    }),
+    "fixture": frozenset({"valid", "rejected", "error"}),
+    "lease": frozenset({"waiting", "claimed", "refused", "error", "timeout", "cancelled"}),
+    "transport": frozenset({"waiting", "constructed", "error", "cancelled"}),
+    "lease_abort": frozenset({"scheduled", "error"}),
+    "permit_release": frozenset({"success", "error"}),
+    "authentication": frozenset({"success", "error"}),
+    "owner_registration": frozenset({"waiting", "registered", "refused", "error", "cancelled"}),
+    "construction_grant": frozenset({"waiting", "granted", "refused", "error", "cancelled"}),
+    "begin_call": frozenset({"reached"}),
+    "construction": frozenset({"waiting", "constructed", "not_live", "error", "cancelled"}),
+    "activation": frozenset({"waiting", "activated", "refused", "error", "cancelled"}),
+}
 ResultOutcome = Literal[
     "valid", "empty", "not_started", "frozen_replay", "fenced", "invalid",
     "inner_timeout", "outer_timeout", "cancelled", "error",
@@ -269,6 +300,9 @@ class RuntimeMetrics:
         self._actions_total = self._meter.create_counter(
             _PREFIX + "actions.total", description="", unit=""
         )
+        self._ws_setup = self._meter.create_counter(
+            _PREFIX + "ws.setup", description="", unit=""
+        )
         self._sessions_duration = self._meter.create_histogram(
             _PREFIX + "sessions.duration", description="", unit="s"
         )
@@ -419,6 +453,18 @@ class RuntimeMetrics:
             self._latch_failure()
             return
         self._add(self._admission_rejections, {"reason": reason})
+
+    def record_ws_setup(self, stage: object, outcome: object) -> None:
+        """Observe fixed setup boundaries without exposing connection data or raising."""
+
+        if self._shutdown_task is not None:
+            return
+        if type(stage) is not str or not _closed(
+            outcome, _WS_SETUP_OUTCOMES.get(stage, frozenset())
+        ):
+            self._latch_failure()
+            return
+        self._add(self._ws_setup, {"stage": stage, "outcome": outcome})
 
     def begin_call(self) -> _CallMetricLease:
         """Begin one call without letting metric or clock faults escape."""

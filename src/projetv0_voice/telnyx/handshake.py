@@ -18,8 +18,9 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 from pydantic import SecretStr
-from starlette.websockets import WebSocket, WebSocketState
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
+from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.qualified_profile import (
     QualificationCandidateProfileV1,
     QualifiedDeploymentProfileV1,
@@ -35,6 +36,11 @@ MAX_TOKEN_CHARACTERS = 4_000
 MAX_OPAQUE_FIELD_BYTES = 1_024
 MAX_PHONE_FIELD_BYTES = 256
 MAX_SEQUENCE_BYTES = 32
+
+
+def _setup(metrics: RuntimeMetrics | None, stage: str, outcome: str) -> None:
+    if metrics is not None:
+        metrics.record_ws_setup(stage, outcome)
 
 
 class TelnyxHandshakeError(RuntimeError):
@@ -110,6 +116,7 @@ class _TransferredAuthentication(
         "_active_permits",
         "_permit",
         "_permit_id",
+        "_metrics",
         "_release_failed",
         "_released",
         "_runner",
@@ -125,6 +132,7 @@ class _TransferredAuthentication(
         self._active_permits = service._active_permits  # noqa: SLF001
         self._permit = permit
         self._permit_id = permit_id
+        self._metrics = service._runtime_metrics  # noqa: SLF001
         self._release_failed = False
         self._released = False
         self._runner = self._run(service, websocket)
@@ -163,6 +171,7 @@ class _TransferredAuthentication(
         finally:
             with self._active_permits[0]:
                 self._active_permits[1].discard(self._permit_id)
+        _setup(self._metrics, "permit_release", "error" if self._release_failed else "success")
         return self._release_failed
 
     async def _run(
@@ -196,7 +205,9 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _strict_json_object(raw: str) -> dict[str, Any]:
+def _strict_json_object(
+    raw: str, *, metrics: RuntimeMetrics | None = None, stage: str = "connected",
+) -> dict[str, Any]:
     parsed: object | None = None
     invalid = False
     try:
@@ -212,6 +223,7 @@ def _strict_json_object(raw: str) -> dict[str, Any]:
     except (UnicodeEncodeError, json.JSONDecodeError, _InvalidJson):
         invalid = True
     if invalid or not isinstance(parsed, dict):
+        _setup(metrics, stage, "invalid_json" if invalid else "invalid_schema")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
     return parsed
 
@@ -240,7 +252,9 @@ def _token_bytes(value: object) -> tuple[SecretStr, bytes]:
     return SecretStr(cast(str, value)), encoded
 
 
-def _single_header_token(websocket: WebSocket) -> tuple[SecretStr, bytes]:
+def _single_header_token(
+    websocket: WebSocket, metrics: RuntimeMetrics | None = None,
+) -> tuple[SecretStr, bytes]:
     matches: list[bytes] = []
     headers = websocket.scope.get("headers", [])
     if isinstance(headers, list):
@@ -254,6 +268,7 @@ def _single_header_token(websocket: WebSocket) -> tuple[SecretStr, bytes]:
             ):
                 matches.append(item[1])
     if len(matches) != 1:
+        _setup(metrics, "header", "absent" if not matches else "duplicate")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
     decoded: str | None = None
     invalid = False
@@ -262,20 +277,41 @@ def _single_header_token(websocket: WebSocket) -> tuple[SecretStr, bytes]:
     except UnicodeDecodeError:
         invalid = True
     if invalid or decoded is None:
+        _setup(metrics, "header", "invalid")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    return _token_bytes(decoded)
+    try:
+        result = _token_bytes(decoded)
+    except TelnyxHandshakeRejectedError:
+        _setup(metrics, "header", "invalid")
+        raise
+    _setup(metrics, "header", "valid")
+    return result
 
 
-async def _receive_text(websocket: WebSocket) -> str:
+async def _receive_text(
+    websocket: WebSocket, *, metrics: RuntimeMetrics | None = None,
+    stage: str = "connected", deadline: asyncio.Timeout | None = None,
+) -> str:
     failed = False
     message: str | None = None
+    _setup(metrics, stage, "waiting")
     try:
         message = await websocket.receive_text()
     except asyncio.CancelledError:
+        _setup(
+            metrics, stage,
+            "timeout" if deadline is not None and deadline.expired() else "cancelled",
+        )
         raise
+    except WebSocketDisconnect:
+        _setup(metrics, stage, "peer_disconnect")
+        failed = True
     except Exception:
+        _setup(metrics, stage, "receive_error")
         failed = True
     if failed or not isinstance(message, str):
+        if not failed:
+            _setup(metrics, stage, "receive_error")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
     return message
 
@@ -343,51 +379,79 @@ def _safe_summary(
     )
 
 
-async def _capture_telnyx_handshake(websocket: WebSocket) -> _CapturedTelnyxHandshake:
-    header_token, header_bytes = _single_header_token(websocket)
-    connected = _strict_json_object(await _receive_text(websocket))
-    start_message = _strict_json_object(await _receive_text(websocket))
+async def _capture_telnyx_handshake(
+    websocket: WebSocket, *, metrics: RuntimeMetrics | None = None,
+    deadline: asyncio.Timeout | None = None,
+) -> _CapturedTelnyxHandshake:
+    header_token, header_bytes = _single_header_token(websocket, metrics)
+    connected = _strict_json_object(
+        await _receive_text(websocket, metrics=metrics, stage="connected", deadline=deadline),
+        metrics=metrics, stage="connected",
+    )
 
-    if connected.get("event") != "connected" or connected.get("version") != "1.0.0":
+    if connected.get("event") != "connected":
+        _setup(metrics, "connected", "invalid_event")
+        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+    if connected.get("version") != "1.0.0":
+        _setup(metrics, "connected", "invalid_version")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
     connected_payload = connected.get("connected")
     if not isinstance(connected_payload, dict):
+        _setup(metrics, "connected", "invalid_schema")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    _, connected_bytes = _token_bytes(connected_payload.get(TOKEN_FIELD))
+    if TOKEN_FIELD not in connected_payload:
+        _setup(metrics, "connected", "token_absent")
+        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+    try:
+        _, connected_bytes = _token_bytes(connected_payload.get(TOKEN_FIELD))
+    except TelnyxHandshakeRejectedError:
+        _setup(metrics, "connected", "token_invalid")
+        raise
     if not hmac.compare_digest(header_bytes, connected_bytes):
+        _setup(metrics, "connected", "token_mismatch")
         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+    _setup(metrics, "connected", "valid")
 
-    if start_message.get("event") != "start":
-        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    sequence_number = _bounded_utf8(
-        start_message.get("sequence_number"), maximum_bytes=MAX_SEQUENCE_BYTES
+    start_message = _strict_json_object(
+        await _receive_text(websocket, metrics=metrics, stage="start", deadline=deadline),
+        metrics=metrics, stage="start",
     )
-    if not sequence_number.isdecimal():
-        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    stream_id = _bounded_utf8(
-        start_message.get("stream_id"), maximum_bytes=MAX_OPAQUE_FIELD_BYTES
-    )
-    start = start_message.get("start")
-    if not isinstance(start, dict):
-        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    call_control_id = _bounded_utf8(
-        start.get("call_control_id"), maximum_bytes=MAX_OPAQUE_FIELD_BYTES
-    )
-    media_format = start.get("media_format")
-    if not isinstance(media_format, dict):
-        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    if (
-        media_format.get("encoding") != "PCMU"
-        or type(media_format.get("sample_rate")) is not int
-        or media_format.get("sample_rate") != 8000
-        or type(media_format.get("channels")) is not int
-        or media_format.get("channels") != 1
-    ):
-        raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
-    from_number = _optional_bounded(
-        start.get("from"), maximum_bytes=MAX_PHONE_FIELD_BYTES
-    )
-    to_number = _optional_bounded(start.get("to"), maximum_bytes=MAX_PHONE_FIELD_BYTES)
+    try:
+        if start_message.get("event") != "start":
+            raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+        sequence_number = _bounded_utf8(
+            start_message.get("sequence_number"), maximum_bytes=MAX_SEQUENCE_BYTES
+        )
+        if not sequence_number.isdecimal():
+            raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+        stream_id = _bounded_utf8(
+            start_message.get("stream_id"), maximum_bytes=MAX_OPAQUE_FIELD_BYTES
+        )
+        start = start_message.get("start")
+        if not isinstance(start, dict):
+            raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+        call_control_id = _bounded_utf8(
+            start.get("call_control_id"), maximum_bytes=MAX_OPAQUE_FIELD_BYTES
+        )
+        media_format = start.get("media_format")
+        if not isinstance(media_format, dict):
+            raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+        if (
+            media_format.get("encoding") != "PCMU"
+            or type(media_format.get("sample_rate")) is not int
+            or media_format.get("sample_rate") != 8000
+            or type(media_format.get("channels")) is not int
+            or media_format.get("channels") != 1
+        ):
+            raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+        from_number = _optional_bounded(
+            start.get("from"), maximum_bytes=MAX_PHONE_FIELD_BYTES
+        )
+        to_number = _optional_bounded(start.get("to"), maximum_bytes=MAX_PHONE_FIELD_BYTES)
+    except TelnyxHandshakeRejectedError:
+        _setup(metrics, "start", "invalid_schema")
+        raise
+    _setup(metrics, "start", "valid")
 
     token_digest = hashlib.sha256(header_bytes).digest()
     fixture = _redacted_fixture(
@@ -429,6 +493,7 @@ class AuthenticatedTelnyxHandshakeService:
         unauthenticated_gate: UnauthenticatedGate,
         timeout_seconds: float,
         session_timeout: int | None = None,
+        runtime_metrics: RuntimeMetrics | None = None,
     ) -> None:
         if (
             not isinstance(
@@ -450,6 +515,7 @@ class AuthenticatedTelnyxHandshakeService:
         self._unauthenticated_gate = unauthenticated_gate
         self._timeout_seconds = float(timeout_seconds)
         self._session_timeout = session_timeout
+        self._runtime_metrics = runtime_metrics
         self._active_permits: tuple[threading.Lock, set[int]] = (
             threading.Lock(),
             set(),
@@ -461,16 +527,21 @@ class AuthenticatedTelnyxHandshakeService:
     async def authenticate(self, websocket: WebSocket) -> AuthenticatedTelnyxHandshake:
         permit: UnauthenticatedPermit | None = None
         gate_failed = False
+        _setup(self._runtime_metrics, "gate", "waiting")
         try:
             permit = self._unauthenticated_gate.try_acquire()
         except asyncio.CancelledError:
+            _setup(self._runtime_metrics, "gate", "cancelled")
             raise
         except Exception:
+            _setup(self._runtime_metrics, "gate", "error")
             gate_failed = True
         if gate_failed:
             raise TelnyxHandshakeError("telnyx_handshake_gate_failed")
         if permit is None:
+            _setup(self._runtime_metrics, "gate", "refused")
             raise TelnyxHandshakeCapacityError("telnyx_handshake_capacity")
+        _setup(self._runtime_metrics, "gate", "acquired")
         try:
             operation = self.transfer_authentication(websocket, permit)
         except BaseException:
@@ -526,10 +597,14 @@ class AuthenticatedTelnyxHandshakeService:
         unexpected_failure = False
         cleanup_failed = False
         stored_error: TelnyxHandshakeError | None = None
+        setup_stage: str | None = "authentication"
         try:
             try:
-                async with asyncio.timeout(self._timeout_seconds):
-                    captured = await _capture_telnyx_handshake(websocket)
+                async with asyncio.timeout(self._timeout_seconds) as deadline:
+                    captured = await _capture_telnyx_handshake(
+                        websocket, metrics=self._runtime_metrics, deadline=deadline,
+                    )
+                    setup_stage = "fixture"
                     call_control_id = captured.call_data.call_id
                     token_digest = captured.token_digest
                     if (
@@ -539,38 +614,61 @@ class AuthenticatedTelnyxHandshakeService:
                             self._profile.telnyx_handshake_fixture_sha256,
                         )
                     ):
+                        _setup(self._runtime_metrics, "fixture", "rejected")
                         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+                    _setup(self._runtime_metrics, "fixture", "valid")
 
+                    setup_stage = None
                     abort_required = True
-                    lease_claim = await self._lease_authority.claim_once(
-                        call_control_id=call_control_id,
-                        token_digest=token_digest,
-                    )
+                    _setup(self._runtime_metrics, "lease", "waiting")
+                    try:
+                        lease_claim = await self._lease_authority.claim_once(
+                            call_control_id=call_control_id,
+                            token_digest=token_digest,
+                        )
+                    except asyncio.CancelledError:
+                        _setup(self._runtime_metrics, "lease",
+                               "timeout" if deadline.expired() else "cancelled")
+                        raise
+                    except Exception:
+                        _setup(self._runtime_metrics, "lease", "error")
+                        raise
                     if lease_claim is None:
+                        _setup(self._runtime_metrics, "lease", "refused")
                         abort_required = False
                         raise TelnyxHandshakeRejectedError("telnyx_handshake_rejected")
+                    _setup(self._runtime_metrics, "lease", "claimed")
 
-                    audio_admission = AudioAdmission()
-                    serializer = ProjetV0TelnyxFrameSerializer(
-                        captured.call_data.stream_id or "",
-                        expected_call_control_id=call_control_id,
-                        audio_admission=audio_admission,
-                    )
-                    params = FastAPIWebsocketParams(
-                        audio_in_enabled=True,
-                        audio_out_enabled=True,
-                        add_wav_header=False,
-                        serializer=serializer,
-                        session_timeout=self._session_timeout,
-                    )
-                    transport = FastAPIWebsocketTransport(websocket, params)
-                    result = AuthenticatedTelnyxHandshake(
-                        call_data=captured.call_data,
-                        token_locator_id=TOKEN_LOCATOR_ID,
-                        lease_claim=lease_claim,
-                        transport=transport,
-                        audio_admission=audio_admission,
-                    )
+                    _setup(self._runtime_metrics, "transport", "waiting")
+                    try:
+                        audio_admission = AudioAdmission()
+                        serializer = ProjetV0TelnyxFrameSerializer(
+                            captured.call_data.stream_id or "",
+                            expected_call_control_id=call_control_id,
+                            audio_admission=audio_admission,
+                        )
+                        params = FastAPIWebsocketParams(
+                            audio_in_enabled=True,
+                            audio_out_enabled=True,
+                            add_wav_header=False,
+                            serializer=serializer,
+                            session_timeout=self._session_timeout,
+                        )
+                        transport = FastAPIWebsocketTransport(websocket, params)
+                        result = AuthenticatedTelnyxHandshake(
+                            call_data=captured.call_data,
+                            token_locator_id=TOKEN_LOCATOR_ID,
+                            lease_claim=lease_claim,
+                            transport=transport,
+                            audio_admission=audio_admission,
+                        )
+                    except asyncio.CancelledError:
+                        _setup(self._runtime_metrics, "transport", "cancelled")
+                        raise
+                    except Exception:
+                        _setup(self._runtime_metrics, "transport", "error")
+                        raise
+                    _setup(self._runtime_metrics, "transport", "constructed")
                     handoff_complete = True
                     abort_required = False
             except TimeoutError:
@@ -580,6 +678,8 @@ class AuthenticatedTelnyxHandshakeService:
             except TelnyxHandshakeError as error:
                 stored_error = error
             except Exception:
+                if setup_stage is not None:
+                    _setup(self._runtime_metrics, setup_stage, "error")
                 unexpected_failure = True
         finally:
             try:
@@ -593,7 +693,9 @@ class AuthenticatedTelnyxHandshakeService:
                         call_control_id=call_control_id,
                         token_digest=token_digest,
                     )
+                    _setup(self._runtime_metrics, "lease_abort", "scheduled")
             except Exception:
+                _setup(self._runtime_metrics, "lease_abort", "error")
                 cleanup_failed = True
             finally:
                 permit_release_failed = finish_permit()
@@ -609,7 +711,9 @@ class AuthenticatedTelnyxHandshakeService:
                                 call_control_id=call_control_id,
                                 token_digest=token_digest,
                             )
+                            _setup(self._runtime_metrics, "lease_abort", "scheduled")
                         except Exception:
+                            _setup(self._runtime_metrics, "lease_abort", "error")
                             cleanup_failed = True
 
         if cleanup_failed:
@@ -620,6 +724,7 @@ class AuthenticatedTelnyxHandshakeService:
             raise TelnyxHandshakeTimeoutError("telnyx_handshake_timeout")
         if unexpected_failure or result is None:
             raise TelnyxHandshakeError("telnyx_handshake_failed")
+        _setup(self._runtime_metrics, "authentication", "success")
         return result
 
 

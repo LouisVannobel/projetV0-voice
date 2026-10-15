@@ -1925,6 +1925,7 @@ async def build_production_runtime(
             unauthenticated_gate=gate,
             timeout_seconds=settings.handshake_timeout_seconds,
             session_timeout=300 if manifest.sparra is not None else None,
+            runtime_metrics=metrics,
         )
         recording_retention_days = (
             manifest.recording_retention_days or manifest.transcript_retention_days

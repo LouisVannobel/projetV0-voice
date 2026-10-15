@@ -287,6 +287,7 @@ async def _raw_websocket(
     app: Any,
     *,
     send_hook: Any | None = None,
+    path: str = "/telnyx/media",
 ) -> list[dict[str, Any]]:
     queued = [{"type": "websocket.connect"}]
     sent: list[dict[str, Any]] = []
@@ -306,8 +307,8 @@ async def _raw_websocket(
             "type": "websocket",
             "asgi": {"version": "3.0", "spec_version": "2.5"},
             "scheme": "ws",
-            "path": "/telnyx/media",
-            "raw_path": b"/telnyx/media",
+            "path": path,
+            "raw_path": path.encode("ascii"),
             "query_string": b"",
             "root_path": "",
             "headers": [],
@@ -328,6 +329,33 @@ class _ReadySupervisor:
 
     def readiness_snapshot(self) -> SimpleNamespace:
         return SimpleNamespace(ready=self._ready)
+
+
+@pytest.mark.asyncio
+async def test_setup_observes_pre_router_categories_without_exporting_paths() -> None:
+    from tests.integration.test_telnyx_handshake import _setup_points
+
+    app, _ = _test_app()
+    metrics = app.state.runtime_graph.metrics
+    try:
+        wrong = await _raw_websocket(app, path="/canary-secret")
+        missing = await _raw_websocket(app)
+        await _raw_http(app, path="/telnyx/media")
+        await _raw_http(app, path="/canary-secret")
+        assert wrong == [{"type": "websocket.close", "code": 1000, "reason": ""}]
+        assert missing[0]["status"] == 503
+        points = _setup_points(metrics)
+        assert points[("asgi_other_websocket", "entered")] == 1
+        assert points[("asgi_other_websocket", "denied")] == 1
+        assert points[("asgi_media_websocket", "entered")] == 1
+        assert points[("asgi_media_websocket", "denied")] == 1
+        assert points[("asgi_media_http", "entered")] == 1
+        assert points[("asgi_other_http", "entered")] == 1
+        assert points[("endpoint", "components_missing")] == 1
+        assert "canary-secret" not in repr(points)
+        assert metrics.failure_code is None
+    finally:
+        metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
 class _RecordingProcessor:

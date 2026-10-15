@@ -339,15 +339,26 @@ class ProcessSessionFactory:
     async def run(self, handshake: AuthenticatedTelnyxHandshake) -> None:
         owner = _CallLifecycleOwner(self)
         owner_coroutine = owner.run()
-        owner_task = self._registrar.try_start(
-            owner_coroutine,
-            name="voice-call-session-owner",
-        )
+        self._runtime_metrics.record_ws_setup("owner_registration", "waiting")
+        try:
+            owner_task = self._registrar.try_start(
+                owner_coroutine,
+                name="voice-call-session-owner",
+            )
+        except asyncio.CancelledError:
+            self._runtime_metrics.record_ws_setup("owner_registration", "cancelled")
+            raise
+        except Exception:
+            self._runtime_metrics.record_ws_setup("owner_registration", "error")
+            raise
         if owner_task is None:
+            self._runtime_metrics.record_ws_setup("owner_registration", "refused")
             owner._phase = "done"  # noqa: SLF001
             owner._closed.set()  # noqa: SLF001
             raise RuntimeError("session_owner_registration_failed") from None
+        self._runtime_metrics.record_ws_setup("owner_registration", "registered")
         owner.bind_task(owner_task)
+        self._runtime_metrics.record_ws_setup("construction_grant", "waiting")
         try:
             stream_id = handshake.call_data.stream_id
             grant = await self._registry.consume_claim_for_construction(
@@ -356,13 +367,20 @@ class ProcessSessionFactory:
                 owner,
                 owner_task,
             )
-        except BaseException:
+        except BaseException as error:
+            self._runtime_metrics.record_ws_setup(
+                "construction_grant",
+                "cancelled" if isinstance(error, asyncio.CancelledError) else "error",
+            )
             await owner.cancel_and_join()
             raise
         if grant is None:
+            self._runtime_metrics.record_ws_setup("construction_grant", "refused")
             await owner.cancel_and_join()
             raise RuntimeError("process_lease_claim_unavailable") from None
+        self._runtime_metrics.record_ws_setup("construction_grant", "granted")
         metric_lease = self._runtime_metrics.begin_call()
+        self._runtime_metrics.record_ws_setup("begin_call", "reached")
         owner.publish(grant, handshake, metric_lease)
         cancellation: asyncio.CancelledError | None = None
         owner_wait = asyncio.create_task(owner.wait())
@@ -430,6 +448,8 @@ class ProcessSessionFactory:
         )
         if not live and owner._drain_cause is None:  # noqa: SLF001
             owner._drain_cause = "token_deadline"  # noqa: SLF001
+        if not live:
+            self._runtime_metrics.record_ws_setup("construction", "not_live")
         return live
 
     async def _construct_and_run(
@@ -443,6 +463,8 @@ class ProcessSessionFactory:
         stack = _ConstructionStack()
         transferred = False
         session: CallSession | None = None
+        setup_stage: str | None = "construction"
+        self._runtime_metrics.record_ws_setup("construction", "waiting")
         try:
             if not await self._live(grant, owner, owner_task):
                 return
@@ -534,21 +556,35 @@ class ProcessSessionFactory:
                 idle_timeout_seconds=self._idle_timeout_seconds,
                 cleanup_phase_timeout_seconds=self._cleanup_phase_timeout_seconds,
             )
+            self._runtime_metrics.record_ws_setup("construction", "constructed")
             owner._session = session  # noqa: SLF001
             owner._phase = "preactivated"  # noqa: SLF001
             stack.detach_all()
             transferred = True
+            setup_stage = "activation"
+            self._runtime_metrics.record_ws_setup("activation", "waiting")
             if await self._registry.activate_session(
                 grant,
                 owner,
                 owner_task,
                 session,
             ):
+                self._runtime_metrics.record_ws_setup("activation", "activated")
+                setup_stage = None
                 await session.run(handshake)
                 owner._phase = "finishing"  # noqa: SLF001
                 return
+            self._runtime_metrics.record_ws_setup("activation", "refused")
             if owner._drain_cause is None:  # noqa: SLF001
                 owner._drain_cause = "token_deadline"  # noqa: SLF001
+        except asyncio.CancelledError:
+            if setup_stage is not None:
+                self._runtime_metrics.record_ws_setup(setup_stage, "cancelled")
+            raise
+        except Exception:
+            if setup_stage is not None:
+                self._runtime_metrics.record_ws_setup(setup_stage, "error")
+            raise
         finally:
             if not transferred:
                 await stack.aclose()

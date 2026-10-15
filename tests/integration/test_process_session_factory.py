@@ -1031,6 +1031,47 @@ def _factory(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["owner_error", "grant_refused"])
+async def test_setup_distinguishes_owner_error_from_grant_refusal(
+    phase: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _claim()
+    registry = _Registry(_grant(claim))
+    registrar = _Registrar()
+    metrics = RuntimeMetrics.in_memory()
+
+    def registration_error(coroutine: Any, **_kwargs: Any) -> None:
+        coroutine.close()
+        raise RuntimeError("canary-owner-secret")
+
+    async def refuse_grant(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    if phase == "owner_error":
+        monkeypatch.setattr(registrar, "try_start", registration_error)
+    else:
+        monkeypatch.setattr(registry, "consume_claim_for_construction", refuse_grant)
+    factory = _factory(
+        registry=registry, registrar=registrar, runtime_metrics=metrics, events=[],
+    )
+    try:
+        with pytest.raises(RuntimeError):
+            await factory.run(_handshake(claim))
+        attributes = {
+            "stage": "owner_registration" if phase == "owner_error" else "construction_grant",
+            "outcome": "error" if phase == "owner_error" else "refused",
+        }
+        setup = _metric_points(metrics, "projetv0.voice.ws.setup")
+        assert any(p.attributes == attributes and p.value == 1 for p in setup)
+        assert "canary" not in repr(setup)
+        assert all(task.done() for task in registrar.tasks)
+        assert _metric_points(metrics, "projetv0.voice.calls.active") == []
+        assert metrics.failure_code is None
+    finally:
+        metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_registrar_rejection_closes_candidate_before_claim_or_metric() -> None:
     claim = _claim()
     registry = _Registry(_grant(claim))
@@ -1053,6 +1094,9 @@ async def test_registrar_rejection_closes_candidate_before_claim_or_metric() -> 
     assert registry.consume_calls == []
     assert events == []
     assert _metric_points(metrics, "projetv0.voice.calls.active") == []
+    setup = _metric_points(metrics, "projetv0.voice.ws.setup")
+    assert any(p.attributes == {"stage": "owner_registration", "outcome": "refused"}
+               and p.value == 1 for p in setup)
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
@@ -1075,6 +1119,9 @@ async def test_pregrant_exception_cancels_and_joins_registered_candidate() -> No
             await factory.run(_handshake(claim))
         assert len(registrar.tasks) == 1
         assert registrar.tasks[0].done()
+        setup = _metric_points(metrics, "projetv0.voice.ws.setup")
+        assert any(p.attributes == {"stage": "construction_grant", "outcome": "error"}
+                   and p.value == 1 for p in setup)
     finally:
         for task in registrar.tasks:
             if not task.done():
@@ -1180,6 +1227,11 @@ async def test_constructor_failure_retains_outer_reverse_cleanup_and_metric_auth
     total = _metric_points(metrics, "projetv0.voice.calls.total")
     assert len(total) == 1
     assert total[0].attributes["session"] == "failed"
+    setup = _metric_points(metrics, "projetv0.voice.ws.setup")
+    assert any(p.attributes == {"stage": "construction", "outcome": "error"}
+               and p.value == 1 for p in setup)
+    assert not any(p.attributes == {"stage": "construction", "outcome": "constructed"}
+                   for p in setup)
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
@@ -1240,6 +1292,9 @@ async def test_activation_failure_uses_transferred_session_cleanup_once() -> Non
     total = _metric_points(metrics, "projetv0.voice.calls.total")
     assert len(total) == 1
     assert total[0].attributes["session"] == "failed"
+    setup = _metric_points(metrics, "projetv0.voice.ws.setup")
+    assert any(p.attributes == {"stage": "activation", "outcome": "error"}
+               and p.value == 1 for p in setup)
     metrics._provider.shutdown(timeout_millis=10000.0)  # noqa: SLF001
 
 
@@ -1376,6 +1431,9 @@ async def test_blocked_registry_lock_route_cancellation_joins_candidate_without_
     assert len(registrar.tasks) == 1
     assert registrar.tasks[0].done()
     assert _metric_points(metrics, "projetv0.voice.calls.active") == []
+    setup = _metric_points(metrics, "projetv0.voice.ws.setup")
+    assert any(p.attributes == {"stage": "construction_grant", "outcome": "cancelled"}
+               and p.value == 1 for p in setup)
     snapshot = await registry.snapshot("control-a")
     assert snapshot is not None
     assert snapshot.lease_state == "active"
