@@ -59,6 +59,7 @@ class _Peer:
     final_entered: asyncio.Event = field(default_factory=asyncio.Event)
     final_release: asyncio.Event = field(default_factory=asyncio.Event)
     block_final: bool = False
+    finish_reason: str = "stop"
     owner_events: list[str] | None = None
     owner_llm: Any = None
     final_owner_state: list[tuple[bool, bool]] = field(default_factory=list)
@@ -72,7 +73,7 @@ class _Peer:
         return [body for body in self.requests if not body["stream"]]
 
 
-def _result_response(body: dict[str, Any]) -> dict[str, Any]:
+def _result_response(body: dict[str, Any], *, finish_reason: str = "stop") -> dict[str, Any]:
     submitted = json.loads(body["messages"][-1]["content"])
     user = next(turn for turn in submitted["turns"] if turn["role"] == "user")
     result = {
@@ -88,15 +89,15 @@ def _result_response(body: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": "offline-result", "object": "chat.completion", "created": 0,
         "model": body["model"], "choices": [{
-            "index": 0, "finish_reason": "stop",
+            "index": 0, "finish_reason": finish_reason,
             "message": {"role": "assistant", "content": json.dumps({"result": result})},
         }],
     }
 
 
 @asynccontextmanager
-async def _peer(*, block_final: bool = False) -> AsyncIterator[_Peer]:
-    peer = _Peer(block_final=block_final)
+async def _peer(*, block_final: bool = False, finish_reason: str = "stop") -> AsyncIterator[_Peer]:
+    peer = _Peer(block_final=block_final, finish_reason=finish_reason)
     connections: set[asyncio.Task[Any]] = set()
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -127,7 +128,9 @@ async def _peer(*, block_final: bool = False) -> AsyncIterator[_Peer]:
                 if peer.block_final:
                     await peer.final_release.wait()
                 content_type = "application/json"
-                payload = json.dumps(_result_response(body)).encode()
+                payload = json.dumps(
+                    _result_response(body, finish_reason=peer.finish_reason)
+                ).encode()
             writer.write(
                 f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n"
                 f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
@@ -206,10 +209,11 @@ def _assert_final_wire(peer: _Peer, turn: int = 101) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quota", [False, True], ids=["normal", "quota"])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
 async def test_actual_owner_cleans_then_uses_same_client_for_one_retained_result(
-    quota: bool, monkeypatch,
+    quota: bool, finish_reason: str, monkeypatch,
 ) -> None:
-    async with _peer() as peer:
+    async with _peer(finish_reason=finish_reason) as peer:
         monkeypatch.setattr(services, "_OPENROUTER_BASE_URL", peer.base_url)
         llm = _llm()
         original_client = llm._client
@@ -290,10 +294,13 @@ async def test_actual_owner_cleans_then_uses_same_client_for_one_retained_result
             assert peer.final_owner_state == [(True, True)]
             assert llm._client is original_client and original_client.is_closed()
             assert stt_http.calls == 1
-            assert session._partial_result is not None
-            assert session._partial_result.evidence[0].turn_id == UUID(int=101)
-            assert session._partial_result.contact.callback_source == "missing"
             assert "recording-cleanup" in events and "lease-terminal" in events
+            if finish_reason == "stop":
+                assert session._partial_result is not None
+                assert session._partial_result.evidence[0].turn_id == UUID(int=101)
+                assert session._partial_result.contact.callback_source == "missing"
+            else:
+                assert session._partial_result is None
             with pytest.raises(OpenAIError, match="llm_output_limit"):
                 await _final_method(llm)(writer.retained, None)
             assert len(peer.final) == 1

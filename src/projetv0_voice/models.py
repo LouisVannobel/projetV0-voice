@@ -299,7 +299,7 @@ PilotFalse = Annotated[Literal[False], BeforeValidator(_exact_false)]
 
 class MessageContactV1(_StrictFrozenModel):
     name: StrictStr | None
-    callback_e164: StrictStr | None
+    callback_e164: Annotated[StrictStr, Field(pattern=_E164.pattern)] | None
     preference: StrictStr | None
     callback_source: Literal["caller", "provider", "missing"]
     callback_confirmed: PilotFalse

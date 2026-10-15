@@ -56,6 +56,7 @@ from projetv0_voice.models import (
 )
 from projetv0_voice.persistence.business_contract import validate_turn_text
 from projetv0_voice.persistence.business_result import (
+    ResultCompletionRejected,
     ResultProvenanceRejected,
     ResultSchemaRejected,
     infer_partial_result,
@@ -87,6 +88,14 @@ from projetv0_voice.telnyx.frames import TelnyxInputDTMFFrame, TelnyxMarkFrame
 from projetv0_voice.telnyx.handshake import AuthenticatedTelnyxHandshake
 
 _NORMAL_END_REASONS = frozenset({"closed", "conversation_ended"})
+_COMPLETION_INVALID_REASONS: dict[str, ResultInvalidReason] = {
+    "length": "completion_length",
+    "content_filter": "completion_content_filter",
+    "tool_calls": "completion_tool_calls",
+    "error": "completion_error",
+    "unknown": "completion_unknown",
+    "empty": "completion_empty",
+}
 
 
 class DisclosureState(Enum):
@@ -805,6 +814,11 @@ class CallSession:
                     outcome = "inner_timeout"
                 elif isinstance(error, asyncio.CancelledError):
                     outcome = "cancelled"
+                elif isinstance(error, ResultCompletionRejected):
+                    outcome = "invalid"
+                    invalid_reason = _COMPLETION_INVALID_REASONS.get(
+                        error.reason, "completion_unknown",
+                    )
                 elif isinstance(error, ResultSchemaRejected):
                     outcome = "invalid"
                     invalid_reason = "schema"
