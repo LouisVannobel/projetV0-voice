@@ -1256,7 +1256,7 @@ async def test_shutdown_deadline_bounds_each_dependency_close(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "company_case", ["on", "candidate", "override", "linked", "local_audio_v2"]
+    "company_case", ["on", "candidate", "override", "linked", "linked_foreign", "local_audio_v2"]
 )
 async def test_production_composition_builds_ordered_graph_with_one_measured_control(
     tmp_path: Path,
@@ -1265,6 +1265,10 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
 ) -> None:
     import base64
     import hashlib
+
+    foreign_line = company_case == "linked_foreign"
+    if foreign_line:
+        company_case = "linked"
 
     from nacl.signing import SigningKey
     from pydantic import SecretStr
@@ -1357,7 +1361,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
             "tenant_id": "tenant-a",
             "agent_id": "agent-a",
             "revision": "r1",
-            "dids": ["+33123456789"],
+            "dids": ["+442071234567" if foreign_line else "+33123456789"],
             "language": "fr",
             "prompt_path": tmp_path / "prompt.md",
             "prompt_revision": "p1",
@@ -1607,6 +1611,9 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         "inference:fr",
     ]
     assert len(selected_profiles) == 1 and selected_profiles[0] is profile
+    assert graph.writer._default_phone_region == (
+        "FR" if manifest.sparra is not None and not foreign_line else None
+    )
     assert graph.raw_call_control is not graph.measured_call_control
     assert graph.supervisor.call_control_facade is graph.measured_call_control
     assert graph.registry.call_control_identity is graph.measured_call_control

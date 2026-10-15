@@ -482,7 +482,11 @@ class PersistenceWriter:
         contract_version: Literal[1, 2] = 1,
         process_agent_id: str | None = None,
         process_deployment_id: str | None = None,
+        default_phone_region: Literal["FR"] | None = None,
     ) -> None:
+        if default_phone_region not in (None, "FR"):
+            raise ValueError("invalid_result_phone_region")
+        self._default_phone_region: Literal["FR"] | None = default_phone_region
         if not _valid_contract_version(contract_version):
             raise ValueError("invalid_writer_contract")
         if contract_version == 2:
@@ -2075,6 +2079,7 @@ class PersistenceWriter:
         return RetainedCall(
             tuple(sorted(turns, key=lambda t: (t.turn_no, str(t.turn_id)))),
             loss_count,
+            default_phone_region=self._default_phone_region,
         )
 
     async def _retain_turn(

@@ -29,10 +29,12 @@ from tests.unit.test_sparra_admission import committed, event
 
 
 @asynccontextmanager
-async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None):
+async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None,
+                     default_phone_region=None, caller_text="Pouvez-vous me rappeler ?",
+                     caller_callback=None):
     current = [NOW] if clock is None else clock
     async with registry_case(tmp_path, utcnow=lambda: current[0], failpoint=failpoint,
-                             reply=reply) as case:
+                             reply=reply, default_phone_region=default_phone_region) as case:
         initiated = event(occurred_at=NOW, from_e164="+33102030407")
         assert (await committed(case.registry, case.writer, initiated)).status_code == 200
         assert (await committed(case.registry, case.writer,
@@ -71,7 +73,7 @@ async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None):
         failure = FirstFailure()
         recorder = TurnRecorder(identity=identity, writer=case.writer, keyring=case.writer._keyring,
             first_failure=failure, runtime_metrics=_TEST_RUNTIME_METRICS, utcnow=lambda: NOW)
-        recorder.record_user("Pouvez-vous me rappeler ?", NOW.isoformat())
+        recorder.record_user(caller_text, NOW.isoformat())
         await case.writer.wait_until_idle()
         retained = await case.writer.read_retained_call(grant.call_id)
         assert len(retained.turns) == 1 and failure.code is None
@@ -82,8 +84,10 @@ async def final_case(tmp_path, *, clock=None, failpoint=None, reply=None):
             return json.dumps({"result": {
                 "schema_version": 1, "quality": "partial", "category": "callback",
                 "summary": "Rappel demandé.", "next_action": "Rappeler.",
-                "contact": {"name": None, "callback_e164": "+33102030407", "preference": None,
-                    "callback_source": "provider", "callback_confirmed": False},
+                "contact": {"name": None, "callback_e164": caller_callback or "+33102030407",
+                    "preference": None,
+                    "callback_source": "caller" if caller_callback else "provider",
+                    "callback_confirmed": False},
                 "evidence": [{"turn_id": str(retained.turns[0].turn_id), "role": "user"}],
                 "request_confirmed": False}})
 
@@ -159,6 +163,39 @@ async def test_final_call_v2_actual_off_session_result_and_issued_terminal_autho
         assert result.evidence[0].role == "user" and len(case.requests) == 1
         assert await case.registry.live_call_count() == 0
         assert [action[0] for action in case.provider.actions].count("hangup") == 1
+
+
+@pytest.mark.asyncio
+async def test_fr_national_callback_survives_native_inference_and_final_freeze(tmp_path):
+    async with final_case(tmp_path, default_phone_region="FR",
+        caller_text="Rappelez-moi au 0 6. 1 2 34 56 78.",
+        caller_callback="+33612345678") as case:
+        original = case.session._services.llm.run_inference
+
+        async def observe(context, **options):
+            data = json.loads(context.messages[-1]["content"])
+            assert data["default_phone_region"] == "FR"
+            assert data["turns"][0]["caller_phone_candidates"] == ["+33612345678"]
+            assert "en français" in options["system_instruction"]
+            return await original(context, **options)
+
+        case.session._services.llm.run_inference = observe
+        await case.session._prepare_partial_result()
+        authority = await reserve(case)
+        await case.session._finish_durable_boundaries(first_failure=FirstFailure(),
+            terminal_outcome=_TerminalOutcome("closed"), disclosure_completed=True)
+        frozen = await case.writer.read_frozen_call_publication_v2(case.grant.call_id,
+            generation=case.grant.generation.generation)
+        assert frozen.operation_id == authority.completion_token
+        envelope = frozen.payload.message_result
+        result = MessageResultV1.model_validate_json(case.writer._keyring.decrypt(EncryptedValue(
+            envelope.key_version, base64.b64decode(envelope.nonce_b64),
+            base64.b64decode(envelope.ciphertext_b64)),
+            aad=f"result:{case.grant.call_id}".encode("ascii")))
+        assert result.contact.callback_e164 == "+33612345678"
+        assert result.contact.callback_source == "caller"
+        assert not result.contact.callback_confirmed and not result.request_confirmed
+        assert len(case.requests) == 1 and await case.registry.live_call_count() == 0
 
 
 @pytest.mark.asyncio
