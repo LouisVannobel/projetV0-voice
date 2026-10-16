@@ -44,10 +44,10 @@ CallControlOutcome = Literal[
     "outcome_unknown",
 ]
 CallControlAttemptCategory = Literal[
-    "accepted", "timeout", "status", "connection", "invalid", "internal"
+    "accepted", "deadline", "sdk_timeout", "timeout", "status", "connection", "invalid", "internal"
 ]
 _ATTEMPT_CATEGORIES = frozenset({
-    "accepted", "timeout", "status", "connection", "invalid", "internal"
+    "accepted", "deadline", "sdk_timeout", "timeout", "status", "connection", "invalid", "internal"
 })
 
 
@@ -779,12 +779,13 @@ class CallControlClient:
         started_at = loop.time()
         response: object | None = None
         category: CallControlAttemptCategory
+        deadline = asyncio.timeout_at(loop.time() + ATTEMPT_DEADLINE_SECONDS)
         try:
-            async with asyncio.timeout_at(loop.time() + ATTEMPT_DEADLINE_SECONDS):
+            async with deadline:
                 response = await action()
         except TimeoutError:
             observation = _Observation("outcome_unknown", retry=True, ambiguous=True)
-            category = "timeout"
+            category = "deadline" if deadline.expired() else "timeout"
         except telnyx.APIStatusError as error:
             observation = _status_observation(error.status_code)
             category = "status"
@@ -793,7 +794,7 @@ class CallControlClient:
             category = "invalid"
         except telnyx.APIConnectionError as error:
             observation = _connection_observation(error)
-            category = "timeout" if isinstance(error, telnyx.APITimeoutError) else "connection"
+            category = "sdk_timeout" if isinstance(error, telnyx.APITimeoutError) else "connection"
         except Exception:
             observation = _Observation("outcome_unknown", retry=False, ambiguous=True)
             category = "internal"

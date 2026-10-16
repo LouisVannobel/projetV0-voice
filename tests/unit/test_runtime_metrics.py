@@ -123,17 +123,20 @@ EXPECTED_INSTRUMENTS = {
 }
 
 
-def test_action_attempt_metrics_are_closed_and_keep_timeout_before_acceptance() -> None:
+@pytest.mark.parametrize("timeout_category", ["deadline", "sdk_timeout", "timeout"])
+def test_action_attempt_metrics_are_closed_and_keep_timeout_before_acceptance(
+    timeout_category: str,
+) -> None:
     owner = metrics_module.RuntimeMetrics.in_memory()
     try:
         record = getattr(owner, "record_action_attempt", None)
         assert callable(record)
-        record("streaming_start", 1, "timeout", 0.501)
+        record("streaming_start", 1, timeout_category, 0.501)
         record("streaming_start", 2, "accepted", 0.125)
         counter = _points(_metric_map(owner)[PREFIX + "actions.attempts"])
         durations = _points(_metric_map(owner)[PREFIX + "actions.attempt_duration"])
         assert set(counter) == set(durations) == {
-            (("action", "streaming_start"), ("attempt", 1), ("category", "timeout")),
+            (("action", "streaming_start"), ("attempt", 1), ("category", timeout_category)),
             (("action", "streaming_start"), ("attempt", 2), ("category", "accepted")),
         }
         assert all(point.value == 1 for point in counter.values())

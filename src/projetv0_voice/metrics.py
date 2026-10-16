@@ -49,7 +49,7 @@ _DISPOSITIONS = frozenset(
 )
 _ACTIONS = frozenset({"answer", "streaming_start", "hangup"})
 _ATTEMPT_CATEGORIES = frozenset({
-    "accepted", "timeout", "status", "connection", "invalid", "internal"
+    "accepted", "deadline", "sdk_timeout", "timeout", "status", "connection", "invalid", "internal"
 })
 _OUTCOMES = frozenset(
     {
