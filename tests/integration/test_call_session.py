@@ -1301,7 +1301,11 @@ class _OpeningPeers:
         self.delayed_release = asyncio.Event()
         self.delayed_sent = asyncio.Event()
         self.response_text = "Le garage est ouvert de 8 h à 18 h."
-        self.text_before_tool: str | None = None
+        self.text_before_tool: str | list[str] | None = None
+        self.pause_after_llm_chunks: int | None = None
+        self.llm_prefix_sent = asyncio.Event()
+        self.llm_suffix_release = asyncio.Event()
+        self.llm_suffix_failure = False
         self.instruction_blocked = False
         self.instruction_entered = asyncio.Event()
         self.instruction_release = asyncio.Event()
@@ -1368,9 +1372,13 @@ class _OpeningPeers:
                 "function": {"name": "end_call", "arguments": "{}"},
             }]}, "finish_reason": "tool_calls"}]})
         if self.text_before_tool is not None and (self.end_call or self.tool_calls is not None):
-            chunks.insert(0, {**chunk, "choices": [{"index": 0, "delta": {
-                "content": self.text_before_tool,
-            }, "finish_reason": None}]})
+            parts = (
+                [self.text_before_tool] if isinstance(self.text_before_tool, str)
+                else self.text_before_tool
+            )
+            chunks[:0] = [{**chunk, "choices": [{"index": 0, "delta": {
+                "content": part,
+            }, "finish_reason": None}]} for part in parts]
         content = ("".join("data: " + json.dumps(item) + "\n\n" for item in chunks)
                    + "data: [DONE]\n\n").encode()
         if self.delayed_response:
@@ -1385,6 +1393,22 @@ class _OpeningPeers:
 
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
                                   stream=DelayedStream())
+        if self.pause_after_llm_chunks is not None:
+            peers = self
+
+            class PausedStream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    for index, item in enumerate(chunks, start=1):
+                        yield ("data: " + json.dumps(item) + "\n\n").encode()
+                        if index == peers.pause_after_llm_chunks:
+                            peers.llm_prefix_sent.set()
+                            await asyncio.wait_for(peers.llm_suffix_release.wait(), timeout=8)
+                            if peers.llm_suffix_failure:
+                                raise httpx.ReadError("offline SSE suffix failure")
+                    yield b"data: [DONE]\n\n"
+
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                                  stream=PausedStream())
         return httpx.Response(
             200, headers={"Content-Type": "text/event-stream"},
             content=content,
@@ -1538,6 +1562,7 @@ async def _native_sparra_opening(*, ack_end_call: bool = True, registry_terminal
         peers.invitation_release.set()
         peers.llm_release.set()
         peers.delayed_release.set()
+        peers.llm_suffix_release.set()
         peers.instruction_release.set()
         if not running.done():
             await session.request_drain()
