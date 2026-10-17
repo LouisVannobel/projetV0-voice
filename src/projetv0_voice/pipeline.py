@@ -1127,7 +1127,9 @@ def build_pipeline(
         from projetv0_voice.inference.services import _TrustlessOpenRouterLLMService
 
         if isinstance(services.llm, _TrustlessOpenRouterLLMService):
-            services.llm.bind_action_authority(action_authority)
+            services.llm.bind_action_authority(
+                action_authority, end_call_goodbye=END_CALL_GOODBYE if end_call_handler else None,
+            )
         if on_user_turn_started is not None:
             def cancel_program_action(_llm: FrameProcessor, frame: Frame) -> None:
                 if isinstance(frame, InterruptionFrame):

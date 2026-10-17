@@ -1,4 +1,4 @@
-"""Caller coordinates require one complete supported token in cited caller evidence."""
+"""Caller coordinates require complete supported occurrences in cited caller evidence."""
 
 from dataclasses import dataclass
 from typing import Literal
@@ -91,9 +91,8 @@ def test_unsupported_or_partial_phone_tokens_never_authorize_coordinates(text):
 
 
 @pytest.mark.parametrize("call_type", [RetainedCall, _FrenchRetainedCall])
-def test_phone_cannot_be_joined_across_two_cited_caller_turns(call_type):
-    first = "01 02" if call_type is _FrenchRetainedCall else "+33102"
-    retained = call_type((RetainedTurn(CALLER, 1, "user", first, False),
+def test_international_phone_cannot_be_joined_across_two_cited_caller_turns(call_type):
+    retained = call_type((RetainedTurn(CALLER, 1, "user", "+33102", False),
                          RetainedTurn(SECOND, 2, "user", "030407", False)), 0)
     evidence = [{"turn_id": str(item.turn_id), "role": "user"} for item in retained.turns]
     with pytest.raises(ValueError, match="^result_caller_coordinate_missing$"):

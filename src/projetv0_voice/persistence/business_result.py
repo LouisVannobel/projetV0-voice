@@ -73,12 +73,13 @@ contact exact keys: name, callback_e164, preference, callback_source,
 callback_confirmed=false. Unknown fields are forbidden. Missing coordinates use
 null and callback_source='missing'. Provider number is an observation, not identity.
 callback_e164 must be canonical E.164: '+' followed by ASCII digits, with no separators.
-For caller coordinates, require one complete number in a cited caller turn;
-only spaces, non-breaking spaces, dots and hyphens may separate its digits.
-Explicit international '+' numbers need no default region. National numbers are supported
-only when the program supplies default_phone_region='FR' and a caller_phone_candidates
-entry for that same caller turn. Use that canonical candidate without changing its digits.
-Without that configured region and candidate, never expand a national number.
+For caller coordinates, use a caller_phone_candidates occurrence and cite ALL of its
+turn_ids as user evidence. Use its canonical callback_e164 without changing its digits.
+Each occurrence comes from one complete caller token or, only with configured
+default_phone_region='FR', an uninterrupted national numeric dictation across caller turns.
+Only spaces, non-breaking spaces, dots and hyphens may separate digits.
+Explicit international '+' numbers need no default region and are never joined across turns.
+Without a supplied candidate, never expand a national number or assemble caller coordinates.
 Do not infer a country from caller language or identity, repair digits, or convert number words.
 Unsupported caller coordinates use null and callback_source='missing'.
 Keep the summary and next action short; cite only the minimum necessary evidence.
@@ -124,6 +125,61 @@ def _caller_phone_candidates(
     return tuple(sorted(candidates))
 
 
+def _numeric_suffix(text: str) -> str | None:
+    """Keep a whole trailing phone token and the existing lexical boundary policy."""
+    for match in _PHONE_TOKEN.finditer(text):
+        if match.end() != len(text) or not re.search(r"[0-9]", match.group()):
+            continue
+        start = match.start() + len(match.group()) - len(
+            match.group().lstrip(_PHONE_SEPARATORS)
+        )
+        before = text[start - 1] if start else ""
+        if not before.isalnum() and before != "_":
+            return match.group()
+    return None
+
+
+def _caller_phone_occurrences(retained: RetainedCall) -> tuple[tuple[str, tuple[UUID, ...]], ...]:
+    """Derive alternatives without merging their supports or changing retained evidence."""
+    occurrences: list[tuple[str, tuple[UUID, ...]]] = [
+        (phone, (turn.turn_id,))
+        for turn in retained.turns if turn.role == "user"
+        for phone in _caller_phone_candidates(turn.text, retained.default_phone_region)
+    ]
+    if retained.default_phone_region != "FR" or retained.loss_count:
+        return tuple(occurrences)
+
+    index = 0
+    while index < len(retained.turns):
+        first = retained.turns[index]
+        fragment = _numeric_suffix(first.text) if first.role == "user" else None
+        if fragment is None:
+            index += 1
+            continue
+        fragments = [fragment]
+        support = [first.turn_id]
+        end = index + 1
+        # Consume the maximal continuation, including oversize/invalid runs. Never
+        # accept a ten-digit prefix or slide a later window through the same run.
+        while end < len(retained.turns):
+            previous, following = retained.turns[end - 1:end + 1]
+            if (following.role != "user" or following.turn_no != previous.turn_no + 1
+                    or not _PHONE_TOKEN.fullmatch(following.text)
+                    or not re.search(r"[0-9]", following.text)):
+                break
+            fragments.append(following.text)
+            support.append(following.turn_id)
+            end += 1
+        digits = " ".join(fragments).translate(_REMOVE_PHONE_SEPARATORS)
+        if (len(support) > 1 and re.fullmatch(r"0[1-9][0-9]{8}", digits)
+                and not _caller_phone_candidates(fragment, "FR")):
+            occurrences.extend(
+                (phone, tuple(support)) for phone in _caller_phone_candidates(digits, "FR")
+            )
+        index = end
+    return tuple(occurrences)
+
+
 def validate_result_provenance(
     result: MessageResultV1, retained: RetainedCall, provider_callback: str | None
 ) -> None:
@@ -143,15 +199,13 @@ def validate_result_provenance(
     contact = result.contact
     if contact.callback_source == "provider" and contact.callback_e164 != provider_callback:
         raise ValueError("result_provider_coordinate_mismatch")
-    if contact.callback_source == "caller" and not any(
-        turns[item.turn_id].role == "user"
-        and contact.callback_e164 is not None
-        and contact.callback_e164 in _caller_phone_candidates(
-            turns[item.turn_id].text, retained.default_phone_region,
-        )
-        for item in result.evidence
-    ):
-        raise ValueError("result_caller_coordinate_missing")
+    if contact.callback_source == "caller":
+        cited_callers = {item.turn_id for item in result.evidence if item.role == "user"}
+        if not any(
+            contact.callback_e164 == phone and cited_callers.issuperset(support)
+            for phone, support in _caller_phone_occurrences(retained)
+        ):
+            raise ValueError("result_caller_coordinate_missing")
 
 
 async def infer_partial_result(
@@ -170,16 +224,16 @@ async def infer_partial_result(
                         "provider_callback": provider_callback,
                         "default_phone_region": retained.default_phone_region,
                         "transcript_loss_count": retained.loss_count,
+                        "caller_phone_candidates": [
+                            {"callback_e164": phone, "turn_ids": [str(t) for t in support]}
+                            for phone, support in _caller_phone_occurrences(retained)
+                        ],
                         "turns": [
                             {
                                 "turn_id": str(t.turn_id),
                                 "role": t.role,
                                 "text": t.text,
                                 "interrupted": t.interrupted,
-                                **({"caller_phone_candidates": _caller_phone_candidates(
-                                    t.text, retained.default_phone_region,
-                                )} if t.role == "user" and retained.default_phone_region == "FR"
-                                   else {}),
                             }
                             for t in retained.turns
                         ],

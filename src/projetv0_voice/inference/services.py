@@ -9,7 +9,7 @@ import struct
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Literal, NoReturn, cast
 
@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InterruptionFrame,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
     LLMTextFrame,
     StartFrame,
     TranscriptionFrame,
@@ -65,6 +66,7 @@ _STT_MAX_PENDING_SEGMENTS = STT_MAX_PENDING_SEGMENTS
 _STT_MAX_BATCH_TEXT_BYTES = 32 * 1024
 _SPARRA_STT_MAX_AUDIO_SECONDS = 600
 _HTTP_TIMEOUT = httpx.Timeout(8.0, connect=2.0)
+_FAREWELL_PADDING_CHARACTERS = 8
 
 
 class _BoundedOpenAISTTService(OpenAISTTService):
@@ -289,6 +291,20 @@ class FinalCompletionDiagnostic:
     reasoning_tokens: int | None = None
 
 
+@dataclass(slots=True)
+class _FarewellPrefix:
+    """Keep only the bounded goodbye prefix and its original frames."""
+
+    frames: list[tuple[LLMTextFrame, FrameDirection]] = field(default_factory=list)
+    text: str = ""
+    enabled: bool = True
+
+    def discard(self) -> None:
+        self.frames.clear()
+        self.text = ""
+        self.enabled = False
+
+
 class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
     """Pin-aware OpenRouter client factory without ambient HTTP authority."""
 
@@ -309,6 +325,10 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         self._action_authority: ActionAuthority | None = None
         self._response_scope: ContextVar[tuple[int, CallerScope | None] | None] = ContextVar(
             "caller_response_scope", default=None,
+        )
+        self._end_call_goodbye: str | None = None
+        self._farewell_prefix: ContextVar[_FarewellPrefix | None] = ContextVar(
+            "caller_farewell_prefix", default=None,
         )
         self._tool_scopes: dict[str, tuple[str, CallerScope]] = {}
         self._seen_action_ids: set[str] = set()
@@ -440,8 +460,11 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
             force_treat_as_permanent=force_treat_as_permanent,
         )
 
-    def bind_action_authority(self, authority: ActionAuthority) -> None:
+    def bind_action_authority(
+        self, authority: ActionAuthority, *, end_call_goodbye: str | None = None,
+    ) -> None:
         self._action_authority = authority
+        self._end_call_goodbye = end_call_goodbye
 
     def consume_action_scope(
         self, *, tool_call_id: str, function_name: str, context: object,
@@ -472,9 +495,14 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
             # A known revoked caller frame is not a no-scope recovery request.
             return
         token = self._response_scope.set((authority.epoch if scope is None else scope.epoch, scope))
+        prefix = _FarewellPrefix() if scope is not None and self._end_call_goodbye else None
+        prefix_token = self._farewell_prefix.set(prefix)
         try:
             await super().process_frame(frame, direction)
         finally:
+            if prefix is not None:
+                prefix.discard()
+            self._farewell_prefix.reset(prefix_token)
             self._response_scope.reset(token)
 
     async def run_function_calls(self, function_calls: Sequence[FunctionCallFromLLM]) -> None:
@@ -496,6 +524,17 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
             fc = actions[0]
             if fc.context is response[1].context:
                 self._tool_scopes[fc.tool_call_id] = (fc.function_name, response[1])
+                prefix = self._farewell_prefix.get()
+                if (
+                    fc.function_name == "end_call" and prefix is not None
+                    and self.has_function("end_call")
+                ):
+                    # Native streaming text precedes tool dispatch. Keep the
+                    # owned TTSSpeakFrame as the only final-goodbye producer.
+                    prefix.discard()
+        prefix = self._farewell_prefix.get()
+        if prefix is not None:
+            await self._flush_farewell_prefix(prefix)
         # Binding happens before the native service creates background tool tasks.
         await super().run_function_calls(function_calls)
 
@@ -503,12 +542,46 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
         self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM,
     ) -> None:
         response, authority = self._response_scope.get(), self._action_authority
+        prefix = self._farewell_prefix.get()
         if (
             isinstance(frame, LLMTextFrame) and response is not None and authority is not None
             and not authority.response_current(response[0])
         ):
+            if prefix is not None:
+                prefix.discard()
             return
+        if prefix is not None:
+            if isinstance(frame, (CancelFrame, EndFrame, ErrorFrame, InterruptionFrame)):
+                prefix.discard()
+            elif (
+                direction == FrameDirection.DOWNSTREAM
+                and isinstance(frame, LLMTextFrame) and prefix.enabled and frame.text
+            ):
+                candidate = prefix.text + frame.text
+                if (
+                    self._end_call_goodbye is not None
+                    and len(candidate) <= len(self._end_call_goodbye) + _FAREWELL_PADDING_CHARACTERS
+                    and self._end_call_goodbye.startswith(candidate.strip(" \t\r\n"))
+                ):
+                    prefix.text = candidate
+                    prefix.frames.append((frame, direction))
+                    return
+                await self._flush_farewell_prefix(prefix)
+                # A caller may have interrupted while original frames flushed.
+                await self.push_frame(frame, direction)
+                return
+            elif (
+                direction == FrameDirection.DOWNSTREAM
+                and isinstance(frame, LLMFullResponseEndFrame)
+            ):
+                await self._flush_farewell_prefix(prefix)
         await super().push_frame(frame, direction)
+
+    async def _flush_farewell_prefix(self, prefix: _FarewellPrefix) -> None:
+        frames = tuple(prefix.frames)
+        prefix.discard()
+        for original, direction in frames:
+            await self.push_frame(original, direction)
 
     async def cleanup(self) -> None:
         if self._enforce_output_limits:
