@@ -467,6 +467,10 @@ class CallControlClient:
         control_id, canonical_command = self._validated_ids(call_control_id, command_id)
         if not isinstance(request, StreamingStartV1):
             raise CallControlInputError("call_control_input_invalid")
+        streaming_deadline_seconds = 2.0
+        streaming_timeout = httpx.Timeout(
+            ATTEMPT_DEADLINE_SECONDS, read=streaming_deadline_seconds,
+        )
 
         async def action() -> object:
             return await self._client.calls.actions.start_streaming(
@@ -480,10 +484,10 @@ class CallControlClient:
                 stream_url=request.stream_url,
                 stream_auth_token=request.stream_auth_token.get_secret_value(),
                 command_id=canonical_command,
-                timeout=self._timeout,
+                timeout=streaming_timeout,
             )
 
-        return await self._execute(action)
+        return await self._execute(action, deadline_seconds=streaming_deadline_seconds)
 
     async def start_recording(
         self,
@@ -773,13 +777,13 @@ class CallControlClient:
             return ProviderDeleteResultV1("retry")
 
     async def _attempt(
-        self, action: Callable[[], Awaitable[object]]
+        self, action: Callable[[], Awaitable[object]], *, deadline_seconds: float,
     ) -> tuple[_Observation, CallControlAttemptObservation]:
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         response: object | None = None
         category: CallControlAttemptCategory
-        deadline = asyncio.timeout_at(loop.time() + ATTEMPT_DEADLINE_SECONDS)
+        deadline = asyncio.timeout_at(loop.time() + deadline_seconds)
         try:
             async with deadline:
                 response = await action()
@@ -812,11 +816,16 @@ class CallControlClient:
                 category = "invalid"
         return observation, CallControlAttemptObservation(category, loop.time() - started_at)
 
-    async def _execute(self, action: Callable[[], Awaitable[object]]) -> CallControlResult:
-        first, first_attempt = await self._attempt(action)
+    async def _execute(
+        self,
+        action: Callable[[], Awaitable[object]],
+        *,
+        deadline_seconds: float = ATTEMPT_DEADLINE_SECONDS,
+    ) -> CallControlResult:
+        first, first_attempt = await self._attempt(action, deadline_seconds=deadline_seconds)
         if not first.retry:
             return CallControlResult(first.outcome, (first_attempt,))
-        second, second_attempt = await self._attempt(action)
+        second, second_attempt = await self._attempt(action, deadline_seconds=deadline_seconds)
         attempts = (first_attempt, second_attempt)
         if second.outcome == "accepted":
             return CallControlResult("accepted", attempts)

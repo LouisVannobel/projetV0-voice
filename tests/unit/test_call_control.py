@@ -600,10 +600,13 @@ async def test_one_owned_sdk_client_and_exact_action_arguments(
     }
     assert "trim" not in calls[2][2]
     assert set(calls[3][2]) == {"command_id", "timeout"}
-    for _, _, kwargs in calls:
+    for action, _, kwargs in calls:
         timeout = kwargs["timeout"]
         assert isinstance(timeout, httpx.Timeout)
-        assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (0.5,) * 4
+        read_seconds = 2.0 if action == "start_streaming" else 0.5
+        assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (
+            0.5, read_seconds, 0.5, 0.5,
+        )
     rendered = repr(client) + "".join(repr(result) for result in results)
     for secret in (API_KEY, TOKEN, URL, CALL_CONTROL_ID, str(COMMAND_ID)):
         assert secret not in rendered
@@ -1327,8 +1330,10 @@ def test_attempt_observation_is_closed_immutable_and_result_defaults_empty() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["answer", "start_streaming"])
 async def test_external_cancellation_propagates_without_retry_or_orphan(
     monkeypatch: pytest.MonkeyPatch,
+    action: str,
 ) -> None:
     module = call_control()
     entered = asyncio.Event()
@@ -1343,7 +1348,13 @@ async def test_external_cancellation_propagates_without_retry_or_orphan(
 
     _, instances = install_fake(monkeypatch, module, [blocked, ok_response()])
     client = module.CallControlClient(api_key=API_KEY)
-    pending = asyncio.create_task(client.answer(CALL_CONTROL_ID, command_id=COMMAND_ID))
+    request_args = (
+        [module.StreamingStartV1(stream_url=URL, stream_auth_token=TOKEN)]
+        if action == "start_streaming" else []
+    )
+    pending = asyncio.create_task(
+        getattr(client, action)(CALL_CONTROL_ID, *request_args, command_id=COMMAND_ID)
+    )
     await entered.wait()
     pending.cancel()
 
