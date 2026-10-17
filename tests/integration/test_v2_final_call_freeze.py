@@ -171,16 +171,21 @@ async def test_fr_national_callback_survives_native_inference_and_final_freeze(t
         caller_text="Rappelez-moi au 0 6. 1 2 34 56 78.",
         caller_callback="+33612345678") as case:
         original = case.session._services.llm.run_inference
+        retained = await case.writer.read_retained_call(case.grant.call_id)
 
         async def observe(context, **options):
             data = json.loads(context.messages[-1]["content"])
             assert data["default_phone_region"] == "FR"
-            assert data["turns"][0]["caller_phone_candidates"] == ["+33612345678"]
+            assert data["caller_phone_candidates"] == [{
+                "callback_e164": "+33612345678",
+                "turn_ids": [str(retained.turns[0].turn_id)],
+            }]
             assert "en français" in options["system_instruction"]
             return await original(context, **options)
 
         case.session._services.llm.run_inference = observe
         await case.session._prepare_partial_result()
+        assert case.session._partial_result is not None
         authority = await reserve(case)
         await case.session._finish_durable_boundaries(first_failure=FirstFailure(),
             terminal_outcome=_TerminalOutcome("closed"), disclosure_completed=True)
@@ -188,6 +193,7 @@ async def test_fr_national_callback_survives_native_inference_and_final_freeze(t
             generation=case.grant.generation.generation)
         assert frozen.operation_id == authority.completion_token
         envelope = frozen.payload.message_result
+        assert envelope is not None
         result = MessageResultV1.model_validate_json(case.writer._keyring.decrypt(EncryptedValue(
             envelope.key_version, base64.b64decode(envelope.nonce_b64),
             base64.b64decode(envelope.ciphertext_b64)),
