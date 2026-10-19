@@ -11,9 +11,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
+from typing import TYPE_CHECKING
 
-import httpx
 from pydantic import SecretStr
+
+if TYPE_CHECKING:
+    import httpx
 
 _MAX_BODY = 2_097_152
 _PRODUCTS = (
@@ -151,6 +154,8 @@ async def _collect(
     utcnow: Callable[[], datetime],
     monotonic: Callable[[], float],
 ) -> BudgetObservation:
+    import httpx
+
     started = _utc(utcnow())
     start_tick = monotonic()
     _need(math.isfinite(start_tick))
