@@ -98,7 +98,7 @@ async def test_choice_exact_v7_upgrade_preserves_cipher_and_refuses_unknown_prov
         original = db.execute("SELECT op_id,key_version,nonce,ciphertext FROM outbox").fetchone()
     async with owned(path, contract_version=2) as (writer, _keyring):
         with sqlite3.connect(path) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
             assert db.execute(
                 "SELECT op_id,key_version,nonce,ciphertext FROM outbox"
             ).fetchone() == original
@@ -143,7 +143,7 @@ async def test_choice_exact_v7_upgrade_preserves_cipher_and_refuses_unknown_prov
     assert ready is False and failed.read_bytes() == before
     async with owned(failed, contract_version=2) as (_writer, _keyring):
         with sqlite3.connect(failed) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
 
 
 @pytest.mark.asyncio

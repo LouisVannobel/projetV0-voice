@@ -121,6 +121,33 @@ async def _close(service: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_paid_fence_refuses_actual_completion_dispatch(peer: _LLMHTTPPeer) -> None:
+    service = _service()
+    # This is the final HTTP boundary, after SDK/context preparatory awaits.
+    service.paid_work_permitted = lambda: False
+    try:
+        with pytest.raises((services.LLMOutputLimitError, OpenAIError)):
+            await _ordinary(service)
+        assert peer.requests == []
+    finally:
+        await _close(service)
+
+
+@pytest.mark.asyncio
+async def test_paid_summary_has_no_exemption_after_cleanup(peer: _LLMHTTPPeer) -> None:
+    service = _service()
+    retained = RetainedCall((RetainedTurn(UUID(int=1), 1, "user", "Please call back", False),), 0)
+    try:
+        await service.cleanup()
+        service.paid_work_permitted = lambda: False
+        with pytest.raises((services.LLMOutputLimitError, OpenAIError)):
+            await service.infer_final_result_once(retained, None)
+        assert peer.requests == []
+    finally:
+        await service._client.close()
+
+
+@pytest.mark.asyncio
 async def test_fifty_fifth_native_256_ceiling_refuses_before_wire(peer: _LLMHTTPPeer) -> None:
     service = _service()
     try:

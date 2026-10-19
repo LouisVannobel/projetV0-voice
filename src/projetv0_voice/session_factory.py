@@ -9,6 +9,7 @@ from importlib.metadata import version
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+import httpx
 from pipecat.processors.frame_processor import FrameProcessor
 
 from projetv0_voice.admission import (
@@ -481,12 +482,22 @@ class ProcessSessionFactory:
                 retention_until=grant.retention_until,
                 routing=grant.routing,
                 begin_snapshot=grant.begin_snapshot,
+                budget_permit=grant.budget_permit,
+                original_deadline=grant.original_deadline,
+                paid_work_permitted=grant.paid_work_permitted,
             )
             if not await self._live(grant, owner, owner_task):
                 return
             stt_client = self._stt_http_client_factory()
             stt_client_close = stt_client.aclose
             stack.push(stt_client_close)
+            if grant.paid_work_permitted is not None:
+                async def guard_paid_request(_request: httpx.Request) -> None:
+                    if not grant.paid_work_permitted or not grant.paid_work_permitted():
+                        raise RuntimeError("owned_budget_paid_fence")
+                if not isinstance(stt_client, httpx.AsyncClient):
+                    raise RuntimeError("owned_budget_stt_client_invalid")
+                stt_client.event_hooks["request"].append(guard_paid_request)
             if not await self._live(grant, owner, owner_task):
                 return
             stt = self._stt_factory(stt_client)
@@ -494,6 +505,8 @@ class ProcessSessionFactory:
             if not await self._live(grant, owner, owner_task):
                 return
             llm = self._llm_factory()
+            if grant.paid_work_permitted is not None:
+                cast(Any, llm).paid_work_permitted = grant.paid_work_permitted
 
             def llm_client_close() -> Any:
                 return self._close_llm_client(llm)
@@ -503,6 +516,8 @@ class ProcessSessionFactory:
             if not await self._live(grant, owner, owner_task):
                 return
             tts = self._tts_factory()
+            if grant.paid_work_permitted is not None:
+                cast(Any, tts).paid_work_permitted = grant.paid_work_permitted
             stack.push(tts.cleanup)
             if not await self._live(grant, owner, owner_task):
                 return

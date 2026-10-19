@@ -874,7 +874,7 @@ async def test_just_over_64_kib_is_fatal_and_never_inserted(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_schema_has_exact_v6_tables_required_columns_checks_and_delete_journal(
+async def test_schema_has_exact_v10_tables_required_columns_checks_and_delete_journal(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -912,6 +912,7 @@ async def test_schema_has_exact_v6_tables_required_columns_checks_and_delete_jou
         "sparra_publications",
         "sparra_content_fences",
         "recording_archives",
+        "owned_pilot_budget",
     }
     assert "natural_key" not in ddl
     assert "delivered_at" not in ddl
@@ -925,7 +926,7 @@ async def test_schema_has_exact_v6_tables_required_columns_checks_and_delete_jou
     assert "length(semantic_fingerprint_sha256) = 32" in ddl
     assert journal_mode == ("delete",)
     assert "lifecycle_json" in ddl
-    assert user_version == (6,)
+    assert user_version == (10,)
 
 
 @pytest.mark.parametrize("legacy_version", [1, 2, 3, 4, 5])
@@ -974,7 +975,7 @@ async def test_forward_lifecycle_migration_preserves_every_legacy_outbox_byte(
     await stop_writer(writer, task)
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT * FROM outbox").fetchall() == before
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
         assert "lifecycle_json" in {
             row[1] for row in connection.execute("PRAGMA table_info(call_leases)")
         }

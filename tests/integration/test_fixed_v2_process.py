@@ -189,7 +189,7 @@ async def test_fixed_v2_process_off_unavailable_admission_grant_has_no_legacy_po
             assert identity.begin_snapshot is grant.begin_snapshot
             assert grant.retention_until == NOW + timedelta(days=30)
             with sqlite3.connect(case.path) as db:
-                assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+                assert db.execute("PRAGMA user_version").fetchone()[0] == 11
                 assert db.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
                 assert db.execute("SELECT generation FROM local_audio_pin").fetchone()[0] == (
                     str(grant.generation.generation)

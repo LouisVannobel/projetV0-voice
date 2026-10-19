@@ -7,7 +7,7 @@ import threading
 from collections.abc import Coroutine
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID
 
@@ -1256,7 +1256,8 @@ async def test_shutdown_deadline_bounds_each_dependency_close(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "company_case", ["on", "candidate", "override", "linked", "linked_foreign", "local_audio_v2"]
+    "company_case", ["on", "candidate", "override", "linked", "linked_foreign", "local_audio_v2",
+                     "linked_missing_budget"]
 )
 async def test_production_composition_builds_ordered_graph_with_one_measured_control(
     tmp_path: Path,
@@ -1267,6 +1268,9 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     import hashlib
 
     foreign_line = company_case == "linked_foreign"
+    missing_budget = company_case == "linked_missing_budget"
+    if missing_budget:
+        company_case = "linked"
     if foreign_line:
         company_case = "linked"
 
@@ -1542,10 +1546,18 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
     def inference_factories(_key, _profile, language):
         order.append(f"inference:{language}")
         if company_case == "local_audio_v2":
-            from tests.integration.test_process_session_factory import _Llm, _Processor, _SttClient
+            import httpx
+
+            from tests.integration.test_process_session_factory import _Llm, _Processor
+
+            class SttClient(httpx.AsyncClient):
+                async def aclose(self):
+                    order.append("stt-client-close")
+                    await super().aclose()
 
             return RuntimeInferenceFactories(
-                stt_http_client_factory=lambda: _SttClient(order),
+                stt_http_client_factory=lambda: SttClient(
+                    transport=httpx.MockTransport(lambda _: httpx.Response(500))),
                 stt_factory=lambda _client: _Processor("stt", order),
                 llm_factory=lambda: _Llm(order),
                 tts_factory=lambda: _Processor("tts", order),
@@ -1556,6 +1568,37 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
             llm_factory=lambda: object(),  # type: ignore[arg-type]
             tts_factory=lambda: object(),  # type: ignore[arg-type]
         )
+
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetGate
+    from tests.unit.test_owned_pilot_budget import budget_policy, observation
+
+    pilot_policy = None
+    pilot_fact = None
+    if manifest.sparra is not None:
+        pilot_identity = replace(observation().identity,
+            openrouter_credential_sha256=hashlib.sha256(b"openrouter-key").hexdigest(),
+            telnyx_credential_sha256=hashlib.sha256(api_key.encode()).hexdigest(),
+            did=manifest.dids[0], connection_id=manifest.sparra.connection_id,
+            accounting_start_utc=graph_now - timedelta(days=1),
+            openrouter_expires_at_utc=graph_now + timedelta(days=1))
+        pilot_policy = budget_policy(identity=pilot_identity,
+            paid_until=graph_now + timedelta(days=1),
+            qualified_profile_sha256=canonical_qualified_profile_sha256(profile),
+            runtime_contract_sha256=settings.runtime_contract_sha256,
+            agent_bundle_sha256=settings.agent_bundle_sha256,
+            inference_profile_sha256=settings.inference_profile_sha256,
+            image_digest=settings.image_digest, deployment_id=settings.deployment_id)
+        pilot_fact = replace(observation(), identity=pilot_identity,
+            collection_started_at_utc=graph_now, collection_finished_at_utc=graph_now,
+            openrouter_expires_at_utc=pilot_identity.openrouter_expires_at_utc)
+
+    async def collect_pilot():
+        assert pilot_fact is not None
+        return pilot_fact
+
+    def budget_factory(_settings, writer, _or_key, _tel_key, utcnow, _monotonic):
+        assert pilot_policy is not None
+        return OwnedPilotBudgetGate(writer, pilot_policy, collect_pilot, utcnow=utcnow)
 
     factories = RuntimeProductionFactories(
         validate_artifacts=lambda received: order.append(
@@ -1580,14 +1623,27 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         sink_factory=lambda _dsn: order.append("sink") or Sink(),
         call_control_factory=build_control,
         inference_factory=inference_factories,
+        budget_factory=budget_factory,
     )
 
     token = settings.observability_token()
     settings = replace(
         settings, sqlite_path=tmp_path / "company-recording.sqlite",
         deployment_max_calls=1 if company_case in {"linked", "local_audio_v2"} else 10,
+        owned_budget_policy_path=PurePosixPath("/run/secrets/pilot.json")
+        if pilot_policy is not None else None,
+        owned_budget_policy_sha256=pilot_policy.sha256 if pilot_policy is not None else None,
     )
     object.__setattr__(settings, "_observability_token", token)
+    if missing_budget:
+        settings = replace(settings, owned_budget_policy_path=None)
+        object.__setattr__(settings, "_observability_token", token)
+        with pytest.raises(RuntimeError, match="^runtime_production_composition_failed$"):
+            await build_production_runtime(settings, factories=factories,
+                                           utcnow=lambda: graph_now, monotonic=lambda: 10.0)
+        assert not selected_profiles and not control_actions
+        assert not settings.sqlite_path.exists()
+        return
     graph = await build_production_runtime(
         settings,
         factories=factories,
@@ -1685,9 +1741,13 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         monkeypatch.setattr(graph.writer, "ack_outbox", observe_known_ack)
         try:
             await graph.supervisor.startup()
+            assert await graph.writer.owned_budget_request("state") is None
+            assert await graph.writer.owned_budget_request("enroll", observation=pilot_fact,
+                                                         predecessor_retired=True)
+            assert await graph.registry._owned_budget.refresh()
             assert graph.writer.contract_version == 2
             with sqlite3.connect(settings.sqlite_path) as database:
-                assert database.execute("PRAGMA user_version").fetchone()[0] == 9
+                assert database.execute("PRAGMA user_version").fetchone()[0] == 11
             assert "startup-erasure-lease" in order
             assert manifest.sparra is not None
             for kind in ("call.initiated", "call.answered"):

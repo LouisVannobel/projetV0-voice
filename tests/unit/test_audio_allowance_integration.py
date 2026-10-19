@@ -43,7 +43,7 @@ async def test_audio_upgrade_preserves_finite_and_legacy_v6_authority(tmp_path, 
     try:
         assert await writer.wait_ready()
         with sqlite3.connect(path) as db:
-            assert db.execute("PRAGMA user_version").fetchone() == (9,)
+            assert db.execute("PRAGMA user_version").fetchone() == (11,)
             assert db.execute("SELECT * FROM qualification_runs").fetchall() == rows
         assert not await writer.qualification_run_consumed(
             RUN_ID, total_calls=3, profile_sha256=b"p" * 32)

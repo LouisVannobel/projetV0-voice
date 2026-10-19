@@ -16,9 +16,11 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+import httpx
 from openai import DefaultAsyncHttpxClient
 from pydantic import SecretStr
 
+from projetv0_voice.budget_observation import BudgetObservation, collect_budget_observation
 from projetv0_voice.config import AgentManifestV1, load_agent_manifest
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
@@ -28,6 +30,7 @@ from projetv0_voice.lifecycle import (
     RuntimeProductionFactories,
     RuntimeProfileSelection,
 )
+from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetGate, OwnedPilotBudgetPolicy
 from projetv0_voice.persistence.postgres_sink import PsycopgOperationSink
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.qualified_profile import (
@@ -617,6 +620,45 @@ def _load_profile(
     return RuntimeProfileSelection(profile, override)
 
 
+def load_owned_budget_policy(settings: RuntimeSettingsV1) -> OwnedPilotBudgetPolicy:
+    path = settings.owned_budget_policy_path
+    if path is None or settings.owned_budget_policy_sha256 is None:
+        raise RuntimeError("owned_budget_policy_unavailable") from None
+    descriptors: list[int] = []
+    try:
+        descriptors, parent, name, ancestors, leaf = _open_parent(path)
+        raw = _read_stable_file(parent, name, maximum=32_768, expected=leaf)
+        _verify_ancestor_authorities(ancestors)
+        value = json.loads(raw, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+        policy = OwnedPilotBudgetPolicy.model_validate(value)
+        if not hmac.compare_digest(policy.sha256, settings.owned_budget_policy_sha256):
+            raise _WiringInvalid
+        return policy
+    except Exception:
+        raise RuntimeError("owned_budget_policy_unavailable") from None
+    finally:
+        _close_all(descriptors)
+
+
+def _budget_factory(settings: RuntimeSettingsV1, writer: PersistenceWriter,
+                    openrouter_key: SecretStr, telnyx_key: SecretStr,
+                    utcnow: Callable[[], datetime], monotonic: Callable[[], float],
+                    ) -> OwnedPilotBudgetGate:
+    policy = load_owned_budget_policy(settings)
+
+    async def collect() -> BudgetObservation:
+        # One scoped caller-owned client; cancellation closes it within the
+        # existing supervisor task. No retries, redirects, hooks or proxy env.
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0),
+                                     trust_env=False, follow_redirects=False, timeout=15) as client:
+            return await collect_budget_observation(client, identity=policy.identity,
+                openrouter_key=openrouter_key, telnyx_key=telnyx_key,
+                utcnow=utcnow, monotonic=monotonic)
+
+    return OwnedPilotBudgetGate(writer, policy, collect, utcnow=utcnow,
+        start_envelope_seconds=300 + 30 + settings.call_cleanup_phase_timeout_seconds)
+
+
 def _call_control_factory(
     api_key: SecretStr,
     deployment_profile: RuntimeDeploymentProfileV1,
@@ -789,6 +831,7 @@ def build_production_factories(
         call_control_factory=_call_control_factory,
         inference_factory=inference_factory,
         archive_factory=_archive_factory,
+        budget_factory=_budget_factory,
     )
 
 

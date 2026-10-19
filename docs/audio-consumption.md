@@ -67,3 +67,65 @@ never the final request. The admission consumer must enforce its 60-second age,
 persist reported floors and apply its policy: these facts issue no grant, enroll
 no authority and write no ledger or file. Call-control IDs are sensitive and are
 excluded from the observation's repr; consumers must also keep them out of logs.
+
+## Continuous original-pilot authority
+
+Strict Sparra requires `VOICE_OWNED_BUDGET_POLICY_PATH` and
+`VOICE_OWNED_BUDGET_POLICY_SHA256`. The latter is the canonical policy digest
+(`OwnedPilotBudgetPolicy.sha256`), not a digest of JSON whitespace. The protected
+policy binds original account/credential fingerprints, DID/connection, original
+accounting start and historical spending anchors, paid/key expiry, the qualified
+profile and exact runtime/image/bundle/inference consumer. Its cost scope is
+`original-dedicated-account-key`; account cash and original-key usage are only
+normalized under that explicitly qualified dedicated scope.
+
+The permanent SQLite slot is `sparra-original-pilot`. The operator retires the
+predecessor, establishes its historical exposure and genuine paid/renewal
+disposition, then runs once using the qualified strict runtime environment:
+
+```
+python -m projetv0_voice.owned_pilot_budget_cli enroll --predecessor-retired
+```
+
+This command reads authenticated metadata and refuses active/unsettled authority.
+It neither buys credit nor changes provider resources. Startup never enrolls or
+repairs authority. Same-policy enrollment cannot reset consumption; a different
+UUID/hash/anchor/consumer cannot replace the original slot. Before starting from
+a known restored store, the operator must suspend it explicitly:
+
+```
+python -m projetv0_voice.owned_pilot_budget_cli suspend-restored
+```
+
+There is no automatic unsuspend/regrant path and no claim of arbitrary full-store
+rollback detection. Missing authority refuses paid work. Additive legacy10 and
+native-audio11 migrations preserve historical qualification rows and old logical
+contents; the new table and nullable lease permit do not reinterpret those rows.
+
+For each provider, new admission uses `E=max(S,A+n*d)` and requires `E+R<=5`
+and `cash-(E-S)>=R`, with remaining OpenRouter key headroom checked separately.
+The unchanged reserves are OR3.780408/Telnyx1.22; per-admission forecasts are
+OR0.505068/Telnyx0.12. Uncertainty is already included exactly once. The immutable
+lifetime ceiling is five, but the whole-envelope inequality can stop earlier:
+even a zero historical OR anchor permits at most three new admissions. The last
+admitted call checks its own ordinal minus one, so a closed next-admission gate
+does not reserve that call again. Reported high-water marks remain separate from
+the pessimistic forecast; lag cannot refund an admission or become a false
+reported-spending regression. These are operational forecasts, not invoice guarantees.
+
+The existing writer commits receipt, pending lease, permit and increment together.
+Answered-first webhooks remain inert placeholders until initiated supplies native
+routing, then reuse the same permit for streaming without an extra Answer. Native
+Answer/stream owners, WSS claims and session construction recheck after awaits.
+A durable paid-dispatch intent survives cancellation, lease expiry and restart;
+only native accepted hangup or matching verified terminal evidence settles it.
+Observation refresh never clears that uncertainty.
+
+The existing supervisor refreshes bounded metadata without enrolling. Budget
+closure affects readiness, while `/health/live` and owned local finalization stay
+available. Deployment must use liveness for process restart decisions. New starts
+must fit the call/setup/finalization envelope before the absolute paid fence;
+the original300s deadline is never restarted by WSS. STT/LLM/TTS dispatch and the
+paid final summary also respect the fence. Existing submission limits and native
+Pipecat transport/serializer remain unchanged. Closing admissions does not cancel
+number rental or authorize renewal.

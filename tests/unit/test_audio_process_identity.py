@@ -82,7 +82,7 @@ async def test_process_identity_v2_unequal_agent_deployment_pin_and_native_publi
             assert db.execute(
                 "SELECT deployment_id FROM local_audio_pin"
             ).fetchone()[0] == DEPLOYMENT
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         operation = control()
         await writer.publish_control_v2(operation, generation=GENERATION)
         with pytest.raises(PersistenceError):
@@ -146,4 +146,4 @@ async def test_process_identity_v2_restart_conflict_refuses_new_work_preserves_o
     async with owned(tmp_path / "legacy.sqlite") as (writer, _keyring):
         assert writer.contract_version == 1
         with sqlite3.connect(tmp_path / "legacy.sqlite") as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 10

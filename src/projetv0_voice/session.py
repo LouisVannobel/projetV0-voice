@@ -54,6 +54,7 @@ from projetv0_voice.models import (
     VoiceOperationV1,
     _e164,
 )
+from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPermit
 from projetv0_voice.persistence.business_contract import validate_turn_text
 from projetv0_voice.persistence.business_result import (
     ResultCompletionRejected,
@@ -143,6 +144,9 @@ class CallIdentity:
     started_at: datetime
     retention_until: datetime
     routing: RoutingV1 | None = field(default=None, repr=False)
+    budget_permit: OwnedPilotBudgetPermit | None = field(default=None, repr=False)
+    original_deadline: datetime | None = field(default=None, repr=False)
+    paid_work_permitted: Callable[[], bool] | None = field(default=None, repr=False)
     begin_snapshot: BeginCallSnapshotV1 | BeginCallSnapshotV2 | None = field(
         default=None, repr=False
     )
@@ -775,11 +779,13 @@ class CallSession:
                 return
             retained = await cast(Any, self._writer).read_retained_call(self._identity.call_id)
             facts = await cast(Any, self._writer).read_call_lifecycle(self._identity.call_id)
+            paid_guard = getattr(self._identity, "paid_work_permitted", None)
             if (
                 self._no_new_ai
                 or getattr(self, "_result_inference_fenced", False)
                 or retained.erased
                 or (facts is not None and facts.transfer_fenced)
+                or (paid_guard is not None and not paid_guard())
             ):
                 outcome = "fenced"
                 return
@@ -1147,9 +1153,16 @@ class CallSession:
             )
             done, _pending = await asyncio.wait(
                 (runner_task, failure_task),
+                timeout=(max(0, (self._identity.original_deadline - self._utcnow()).total_seconds())
+                         if self._identity.original_deadline is not None else None),
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if failure_task in done:
+            if not done:
+                if (self._identity.budget_permit is not None
+                        and self._utcnow() >= self._identity.budget_permit.paid_until):
+                    self._no_new_ai = True
+                reason = "transport_session_timeout"
+            elif failure_task in done:
                 reason = failure_task.result()
             else:
                 await runner_task
