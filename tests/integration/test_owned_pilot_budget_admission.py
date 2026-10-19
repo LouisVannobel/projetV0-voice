@@ -906,6 +906,48 @@ def saved_permit(path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("predicate", ["admission", "continuation"])
+async def test_missing_snapshot_floors_cannot_grant_authority(tmp_path, monkeypatch, predicate):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetSnapshot
+
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        missing = OwnedPilotBudgetSnapshot(observation(), True)
+        monkeypatch.setattr(case.writer, "owned_budget_snapshots", lambda: (missing,))
+        if predicate == "admission":
+            assert not gate.ready
+        else:
+            assert not gate.permits(permit)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openrouter", "telnyx"])
+@pytest.mark.parametrize("invalid", ["NaN", "sNaN", "Infinity", "-0.1", "1e-25", "1e25",
+                                     "0." + "1" * 65, "not-money"])
+async def test_invalid_durable_floor_cannot_be_repaired_into_authority(tmp_path, provider, invalid):
+    fact = observation(openrouter_reported_spend_usd=Decimal("0.8"),
+                       telnyx_reported_spend_usd=Decimal("0.5"))
+    async with registry_case(tmp_path) as case:
+        await attach(case, fact=fact)
+    column = provider + "_floor"
+    with sqlite3.connect(tmp_path / "voice.sqlite") as db:
+        db.execute(f"UPDATE owned_pilot_budget SET {column}=?", (invalid,))
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, enrolled=False, fact=fact)
+        assert not gate.ready
+        assert await case.writer.owned_budget_request("state") is None
+        assert not case.writer.is_degraded
+        result = await committed(case.registry, case.writer, event(occurred_at=NOW))
+        assert result.status_code == 503
+        assert not case.provider.actions
+        row = budget_rows(case.path)[0]
+        assert row[0] == 0
+        assert row[1 if provider == "openrouter" else 2] == invalid
+
+
+@pytest.mark.asyncio
 async def test_committed_floor_closes_permit_before_observe_result_delivery(tmp_path, monkeypatch):
     async with registry_case(tmp_path) as case:
         gate = await attach(case)

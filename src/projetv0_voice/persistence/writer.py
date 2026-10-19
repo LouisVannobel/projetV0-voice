@@ -40,6 +40,7 @@ from projetv0_voice.owned_pilot_budget import (
     OwnedPilotBudgetSnapshot,
     affordable,
     observation_valid,
+    reported_floors_valid,
 )
 
 if TYPE_CHECKING:
@@ -848,6 +849,14 @@ class PersistenceWriter:
             await connection.execute("UPDATE owned_pilot_budget SET suspended=1 WHERE slot=?",
                                      (ORIGINAL_PILOT_SLOT,))
             return True
+        floors = None
+        if row is not None:
+            try:
+                floors = (Decimal(row[2]), Decimal(row[3]))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            if not reported_floors_valid(floors):
+                return None
         if action == "enroll":
             fact = payload.get("observation")
             cursor = await connection.execute(
@@ -871,7 +880,7 @@ class PersistenceWriter:
                  str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd)),
             )
             return True
-        if (row is None or row[0] != policy.sha256 or row[4]
+        if (row is None or floors is None or row[0] != policy.sha256 or row[4]
                 or row[6] != policy.model_dump_json()):
             return None
         if action == "state":
@@ -889,8 +898,8 @@ class PersistenceWriter:
             if (not isinstance(fact, BudgetObservation)
                     or not observation_valid(policy, fact, self._utcnow())):
                 return None
-            floors = (max(Decimal(row[2]), fact.openrouter_reported_spend_usd),
-                      max(Decimal(row[3]), fact.telnyx_reported_spend_usd))
+            floors = (max(floors[0], fact.openrouter_reported_spend_usd),
+                      max(floors[1], fact.telnyx_reported_spend_usd))
             await connection.execute(
                 "UPDATE owned_pilot_budget SET openrouter_floor=?,telnyx_floor=? WHERE slot=?",
                 (str(floors[0]), str(floors[1]), ORIGINAL_PILOT_SLOT),
@@ -909,7 +918,7 @@ class PersistenceWriter:
                     or not observation_valid(policy, fact, self._utcnow())
                     or permit.policy_sha256 != policy.sha256
                     or not affordable(policy, fact, permit.ordinal - 1,
-                                      reported_floors=(Decimal(row[2]), Decimal(row[3])))):
+                                      reported_floors=floors)):
                 return False
             cursor = await connection.execute(
                 "SELECT budget_permit_json,state FROM call_leases WHERE call_control_id=?",

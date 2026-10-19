@@ -69,8 +69,10 @@ def test_independent_exact_whole_reserve_threshold(provider, limit):
     from projetv0_voice.owned_pilot_budget import affordable
 
     field = provider + "_reported_spend_usd"
-    assert affordable(budget_policy(), observation(**{field: D(limit)}), 0)
-    assert not affordable(budget_policy(), observation(**{field: D(limit) + D("0.000001")}), 0)
+    assert affordable(budget_policy(), observation(**{field: D(limit)}), 0,
+                      reported_floors=(D("0"), D("0")))
+    assert not affordable(budget_policy(), observation(**{field: D(limit) + D("0.000001")}), 0,
+                          reported_floors=(D("0"), D("0")))
 
 
 def test_forecast_gap_cash_and_last_permit_count_are_distinct():
@@ -79,10 +81,33 @@ def test_forecast_gap_cash_and_last_permit_count_are_distinct():
     p = budget_policy()
     # With zero historical anchor the full unchanged envelope permits n=0,1,2,
     # then conservatively refuses. The lifetime5 is a maximum, not five promises.
-    assert affordable(p, observation(), 2)
-    assert not affordable(p, observation(), 3)
-    assert not affordable(p, observation(openrouter_available_cash_usd=D("4.790543")), 2)
-    assert affordable(p, observation(openrouter_available_cash_usd=D("4.790544")), 2)
+    assert affordable(p, observation(), 2, reported_floors=(D("0"), D("0")))
+    assert not affordable(p, observation(), 3, reported_floors=(D("0"), D("0")))
+    assert not affordable(p, observation(openrouter_available_cash_usd=D("4.790543")), 2,
+                          reported_floors=(D("0"), D("0")))
+    assert affordable(p, observation(openrouter_available_cash_usd=D("4.790544")), 2,
+                      reported_floors=(D("0"), D("0")))
+
+
+def test_reported_floors_cannot_be_implicitly_zero():
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    with pytest.raises(TypeError):
+        affordable(budget_policy(), observation(), 0)
+
+
+@pytest.mark.parametrize(
+    "floors",
+    [None, (), (D("0"),), (D("0"), D("0"), D("0")), [D("0"), D("0")],
+     (0, D("0")), ("0", D("0")), (D("NaN"), D("0")), (D("sNaN"), D("0")),
+     (D("Infinity"), D("0")), (D("-0.1"), D("0")), (D("1e-25"), D("0")),
+     (D("1e25"), D("0")), (D("0." + "1" * 65), D("0")),
+     (D("0"), D("NaN")), (D("0"), D("-0.1"))],
+)
+def test_invalid_reported_floors_refuse_without_money_arithmetic(floors):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    assert affordable(budget_policy(), observation(), 0, reported_floors=floors) is False
 
 
 @pytest.mark.parametrize(

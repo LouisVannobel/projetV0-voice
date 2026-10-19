@@ -33,7 +33,12 @@ Stage matching protected policy/config while stopped. Unknown COMMIT is observe-
 only, never replay or restore an older allowance-bearing database. No enrollment,
 automatic upgrade framework, dependency change or provider mutation is needed.
 
-Oracle standard Pro session sparra-spend-restatemen-oct20 is pending; its advice
-must be checked before release/deployment. Independent source review has endorsed
-the equations and this bounded rebind. Source tests remain offline; no production
+Oracle standard Pro session sparra-spend-restatemen-oct20 completed with
+APPROVE_WITH_EXACT_AMENDMENTS. Reported floors must be explicit trusted inputs,
+with no implicit zero default: require exactly two finite, nonnegative Decimals
+within the existing numeric bounds before use, including writer-loaded floors;
+missing or invalid snapshot floors cannot grant admission or continuation. The
+retained raw-below-anchor veto is an explicitly stricter anomaly policy, not proof
+against an accounting-window reset. Independent source review has endorsed the
+equations and this bounded rebind. Source tests remain offline; no production
 data or provider credentials in fixtures, logs or second-model attachments.

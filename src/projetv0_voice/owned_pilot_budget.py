@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, localcontext
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeGuard
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,6 +30,14 @@ def _exact_money(value: Decimal) -> bool:
         and len(parts.digits) <= 64
         and isinstance(parts.exponent, int)
         and -24 <= parts.exponent <= 24
+    )
+
+
+def reported_floors_valid(value: object) -> TypeGuard[tuple[Decimal, Decimal]]:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(amount, Decimal) and _exact_money(amount) for amount in value)
     )
 
 
@@ -108,7 +116,7 @@ class OwnedPilotBudgetSnapshot:
 
     observation: BudgetObservation | None = None
     admission_available: bool = False
-    reported_floors: tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))
+    reported_floors: tuple[Decimal, Decimal] | None = None
 
 
 def observation_valid(
@@ -141,9 +149,10 @@ def observation_valid(
 
 def affordable(
     policy: OwnedPilotBudgetPolicy, fact: BudgetObservation, count: int,
-    *, reported_floors: tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0")),
+    *, reported_floors: tuple[Decimal, Decimal],
 ) -> bool:
-    if type(count) is not int or not 0 <= count < policy.total_calls:
+    if (not reported_floors_valid(reported_floors)
+            or type(count) is not int or not 0 <= count < policy.total_calls):
         return False
     with localcontext() as ctx:
         ctx.prec = 128
@@ -227,6 +236,7 @@ class OwnedPilotBudgetGate:
             and all(
                 snapshot.admission_available
                 and snapshot.observation is not None
+                and reported_floors_valid(snapshot.reported_floors)
                 and observation_valid(self.policy, snapshot.observation, now)
                 and not snapshot.observation.active_call_control_ids
                 for snapshot in snapshots
@@ -243,6 +253,7 @@ class OwnedPilotBudgetGate:
             and bool(snapshots)
             and all(
                 snapshot.observation is not None
+                and reported_floors_valid(snapshot.reported_floors)
                 and observation_valid(self.policy, snapshot.observation, self.utcnow())
                 and affordable(self.policy, snapshot.observation, permit.ordinal - 1,
                                reported_floors=snapshot.reported_floors)
