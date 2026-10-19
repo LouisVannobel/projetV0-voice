@@ -108,6 +108,7 @@ class OwnedPilotBudgetSnapshot:
 
     observation: BudgetObservation | None = None
     admission_available: bool = False
+    reported_floors: tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0"))
 
 
 def observation_valid(
@@ -131,29 +132,36 @@ def observation_valid(
             and fact.openrouter_limit_reset is None
             and fact.openrouter_limit_usd == 5
             and all(isinstance(v, Decimal) and _exact_money(v) for v in money)
+            and fact.openrouter_reported_spend_usd >= policy.openrouter_anchor_usd
+            and fact.telnyx_reported_spend_usd >= policy.telnyx_anchor_usd
         )
     except (ValueError, TypeError, ArithmeticError):
         return False
 
 
-def affordable(policy: OwnedPilotBudgetPolicy, fact: BudgetObservation, count: int) -> bool:
+def affordable(
+    policy: OwnedPilotBudgetPolicy, fact: BudgetObservation, count: int,
+    *, reported_floors: tuple[Decimal, Decimal] = (Decimal("0"), Decimal("0")),
+) -> bool:
     if type(count) is not int or not 0 <= count < policy.total_calls:
         return False
     with localcontext() as ctx:
         ctx.prec = 128
-        for anchor, spent, cash, reserve, forecast in zip(
+        for anchor, spent, cash, reserve, forecast, floor in zip(
             (policy.openrouter_anchor_usd, policy.telnyx_anchor_usd),
             (fact.openrouter_reported_spend_usd, fact.telnyx_reported_spend_usd),
             (fact.openrouter_available_cash_usd, fact.telnyx_available_cash_usd),
             RESERVES,
             FORECASTS,
+            reported_floors,
             strict=True,
         ):
-            effective = max(spent, anchor + count * forecast)
+            effective = max(floor, spent, anchor + count * forecast)
             if effective + reserve > 5 or cash - (effective - spent) < reserve:
                 return False
         gap = max(
-            fact.openrouter_reported_spend_usd, policy.openrouter_anchor_usd + count * FORECASTS[0]
+            reported_floors[0], fact.openrouter_reported_spend_usd,
+            policy.openrouter_anchor_usd + count * FORECASTS[0],
         )
         return (
             fact.openrouter_limit_remaining_usd - (gap - fact.openrouter_reported_spend_usd)
@@ -236,7 +244,8 @@ class OwnedPilotBudgetGate:
             and all(
                 snapshot.observation is not None
                 and observation_valid(self.policy, snapshot.observation, self.utcnow())
-                and affordable(self.policy, snapshot.observation, permit.ordinal - 1)
+                and affordable(self.policy, snapshot.observation, permit.ordinal - 1,
+                               reported_floors=snapshot.reported_floors)
                 for snapshot in snapshots
             )
         )

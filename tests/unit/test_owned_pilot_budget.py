@@ -86,6 +86,40 @@ def test_forecast_gap_cash_and_last_permit_count_are_distinct():
 
 
 @pytest.mark.parametrize(
+    "floors,count,raw,allowed",
+    [
+        (("1.219592", "3.78"), 0, ("0.2", "0.5"), True),
+        (("1.219593", "0"), 0, ("0.2", "0.5"), False),
+        (("0", "3.780001"), 0, ("0.2", "0.5"), False),
+        (("0.1", "0.1"), 2, ("0.2", "0.5"), True),
+        (("0.1", "0.1"), 3, ("0.2", "0.5"), False),
+        (("0.1", "0.1"), 0, ("1.219593", "0.5"), False),
+    ],
+)
+def test_floor_raw_and_forecast_each_preserve_the_independent_provider_cap(
+    floors, count, raw, allowed,
+):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    fact = observation(openrouter_reported_spend_usd=D(raw[0]),
+                       telnyx_reported_spend_usd=D(raw[1]))
+    assert affordable(budget_policy(), fact, count,
+                      reported_floors=(D(floors[0]), D(floors[1]))) is allowed
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "telnyx"])
+def test_original_anchor_remains_a_raw_observation_fence(provider):
+    from projetv0_voice.owned_pilot_budget import observation_valid
+
+    policy = budget_policy(**{provider + "_anchor_usd": D("0.2")})
+    assert observation_valid(policy, observation(**{provider + "_reported_spend_usd": D("0.2")}),
+                             NOW)
+    assert not observation_valid(
+        policy, observation(**{provider + "_reported_spend_usd": D("0.199999")}), NOW,
+    )
+
+
+@pytest.mark.parametrize(
     "field,value",
     [
         ("total_calls", 6),
