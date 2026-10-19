@@ -121,6 +121,74 @@ async def _close(service: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_paid_fence_refuses_actual_completion_dispatch(peer: _LLMHTTPPeer) -> None:
+    service = _service()
+    # This is the final HTTP boundary, after SDK/context preparatory awaits.
+    service.paid_work_permitted = lambda: False
+    try:
+        with pytest.raises((services.LLMOutputLimitError, OpenAIError)):
+            await _ordinary(service)
+        assert peer.requests == []
+    finally:
+        await _close(service)
+
+
+@pytest.mark.asyncio
+async def test_paid_summary_has_no_exemption_after_cleanup(peer: _LLMHTTPPeer) -> None:
+    service = _service()
+    retained = RetainedCall((RetainedTurn(UUID(int=1), 1, "user", "Please call back", False),), 0)
+    try:
+        await service.cleanup()
+        service.paid_work_permitted = lambda: False
+        with pytest.raises((services.LLMOutputLimitError, OpenAIError)):
+            await service.infer_final_result_once(retained, None)
+        assert peer.requests == []
+    finally:
+        await service._client.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_unaffordable_floor_blocks_wire_before_refresh_resumes(
+    tmp_path, monkeypatch, peer: _LLMHTTPPeer,
+) -> None:
+    from decimal import Decimal
+
+    from tests.integration.test_fixed_v2_process import NOW, registry_case
+    from tests.integration.test_owned_pilot_budget_admission import (
+        attach,
+        budget_rows,
+        committed,
+        completed_observe_barrier,
+        saved_permit,
+    )
+    from tests.unit.test_owned_pilot_budget import observation
+    from tests.unit.test_sparra_admission import event
+
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        service = _service()
+        service.paid_work_permitted = lambda: gate.permits(permit)
+        async def collect():
+            return observation(openrouter_reported_spend_usd=Decimal("1.30"))
+        gate.collect = collect
+        refresh = None
+        try:
+            async with completed_observe_barrier(case.writer, monkeypatch) as (entered, _release):
+                refresh = asyncio.create_task(gate.refresh())
+                await asyncio.wait_for(entered.wait(), 2)
+                assert budget_rows(case.path)[0][1] == "1.30"
+                with pytest.raises((services.LLMOutputLimitError, OpenAIError)):
+                    await _ordinary(service)
+                assert peer.requests == []
+        finally:
+            if refresh is not None:
+                await refresh
+            await _close(service)
+
+
+@pytest.mark.asyncio
 async def test_fifty_fifth_native_256_ceiling_refuses_before_wire(peer: _LLMHTTPPeer) -> None:
     service = _service()
     try:

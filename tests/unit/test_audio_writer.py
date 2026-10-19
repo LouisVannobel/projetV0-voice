@@ -188,7 +188,7 @@ async def test_v2_admitted_chunk_commits_real_ciphertext_and_claim_decodes_exact
                 "SELECT schema_version,kind,key_version,nonce,ciphertext FROM outbox "
                 "WHERE kind='audio.chunk'"
             ).fetchone()
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert (version, kind) == (2, "audio.chunk") and len(nonce) == 12
         plaintext = keyring.decrypt(EncryptedValue(key_version, nonce, ciphertext),
                                     aad=operation_aad(operation))
@@ -536,7 +536,7 @@ async def test_control_v2_fresh_disclosure_and_gate_commit_exact_crypto_and_immu
                 "SELECT op_id,schema_version,kind,key_version,nonce,ciphertext FROM outbox "
                 "ORDER BY queue_id"
             ).fetchall()
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert len(frozen) == 2
         for row, operation in zip(frozen, (first, gated), strict=True):
             assert row[:3] == (str(operation.operation_id), 2, "call.upsert")
@@ -573,7 +573,7 @@ async def test_control_v2_default_v1_refuses_before_queue_and_preserves_legacy_b
         assert writer.queue_size == 0 and not writer.is_degraded
         await writer.commit_control(PersistenceCommand("outbox", {"operation": legacy}, None))
         with sqlite3.connect(path) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 10
             row = db.execute(
                 "SELECT schema_version,key_version,nonce,ciphertext FROM outbox"
             ).fetchone()

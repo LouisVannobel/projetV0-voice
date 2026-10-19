@@ -88,6 +88,9 @@ class OpenRouterTTSService(TTSService):
                 self._farewell_context_id = context_id
 
     def _reserve_input(self, body: dict[str, Any], context_id: str) -> bool:
+        paid_guard = getattr(self, "paid_work_permitted", None)
+        if paid_guard is not None and not paid_guard():
+            return False
         """Debit the final input synchronously; failures and cancellation never refund."""
         if not self._enforce_consumption_limits:
             return True

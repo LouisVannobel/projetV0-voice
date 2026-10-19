@@ -35,3 +35,110 @@ single final result attempt before its owner closes it.
 The 16,000 total bounds requested ceilings, not provider token accounting. The
 250,000 native input-token allowance remains unqualified until the selected
 provider's exact prompt, schema and tokenizer transformations are established.
+
+`budget_observation.collect_budget_observation` is an inert account metadata
+reader. Its frozen identity binds the original credential SHA-256 fingerprints,
+OpenRouter creator-account and Telnyx charges user-account SHA-256 fingerprints,
+active DID/connection, original UTC midnight accounting start and exact key expiry.
+The caller supplies `SecretStr` credentials, UTC/monotonic clocks and owns the
+HTTPX client, whose transport and hooks must neither retry nor log secrets/bodies.
+It performs only fixed-origin GETs, disables redirects, limits each decoded body
+to 2 MiB and the whole acquisition to 15 seconds. Refusals have constant errors;
+cancellation propagates. No provider response body or secret is retained in facts.
+
+Facts include acquisition start/end UTC, exact Decimal spending/cash, the USD5
+OpenRouter key limit, remaining limit, no-reset state and expected expiry, complete
+active call-control IDs and a digest of the ordered request/body provenance.
+OpenRouter cash is account credits minus account usage, read separately from key
+headroom using the same bound inference credential. Missing/forbidden credits
+refuse observation; a management-key flag is not a capability test. Native-host
+capability remains a deployment qualification requirement.
+
+Telnyx spending preserves the seven original usage products (negative usage never
+refunds spend) plus absolute charges, with a separate USD wallet read. Both the
+original top-level charges response and the documented SDK `data` envelope have
+the same validated monetary/account contract. Date windows remain anchored to
+the original start and split at 31 days, the provider's maximum report interval.
+Usage uses the original flat `page_size`; numbers use native `page[size]`; active
+calls use `total_items`, `cursors.after/before` and top-level `next/previous` metadata.
+Only complete results of at most 100 rows per response are accepted; multipage or
+continuation results fail closed. Collection age starts at acquisition start,
+never the final request. The admission consumer must enforce its 60-second age,
+persist reported floors and apply its policy: these facts issue no grant, enroll
+no authority and write no ledger or file. Call-control IDs are sensitive and are
+excluded from the observation's repr; consumers must also keep them out of logs.
+
+## Continuous original-pilot authority
+
+Strict Sparra requires `VOICE_OWNED_BUDGET_POLICY_PATH` and
+`VOICE_OWNED_BUDGET_POLICY_SHA256`. The latter is the canonical policy digest
+(`OwnedPilotBudgetPolicy.sha256`), not a digest of JSON whitespace. The protected
+policy binds original account/credential fingerprints, DID/connection, original
+accounting start and historical spending anchors, paid/key expiry, the qualified
+profile and exact runtime/image/bundle/inference consumer. Its cost scope is
+`original-dedicated-account-key`; account cash and original-key usage are only
+normalized under that explicitly qualified dedicated scope.
+
+The permanent SQLite slot is `sparra-original-pilot`. The operator retires the
+predecessor, establishes its historical exposure and genuine paid/renewal
+disposition, then runs once using the qualified strict runtime environment:
+
+```
+python -m projetv0_voice.owned_pilot_budget_cli enroll --predecessor-retired
+```
+
+This command reads authenticated metadata and refuses active/unsettled authority.
+It neither buys credit nor changes provider resources. Startup never enrolls or
+repairs authority. Same-policy enrollment cannot reset consumption; a different
+UUID/hash/anchor/consumer cannot replace the original slot. Before starting from
+a known restored store, the operator must suspend it explicitly:
+
+```
+python -m projetv0_voice.owned_pilot_budget_cli suspend-restored
+```
+
+An operator timeout reports `owned_budget_transition_unknown`, because the row
+may commit after the timeout. The command drains and joins its writer even when
+degraded, retaining late committed state. If bounded drain and cancellation
+cannot close the owner, the standalone command exits with that unknown outcome;
+it never returns while leaving a writer alive. Inspect the same durable authority
+before deciding how to continue.
+
+There is no automatic unsuspend/regrant path and no claim of arbitrary full-store
+rollback detection. Missing authority refuses paid work. Additive legacy10 and
+native-audio11 migrations preserve historical qualification rows and old logical
+contents; the new table and nullable lease permit do not reinterpret those rows.
+
+For each provider, new admission uses `E=max(S,A+n*d)` and requires `E+R<=5`
+and `cash-(E-S)>=R`, with remaining OpenRouter key headroom checked separately.
+The unchanged reserves are OR3.780408/Telnyx1.22; per-admission forecasts are
+OR0.505068/Telnyx0.12. Uncertainty is already included exactly once. The immutable
+lifetime ceiling is five, but the whole-envelope inequality can stop earlier:
+even a zero historical OR anchor permits at most three new admissions. The last
+admitted call checks its own ordinal minus one, so a closed next-admission gate
+does not reserve that call again. Reported high-water marks remain separate from
+the pessimistic forecast; lag cannot refund an admission or become a false
+reported-spending regression. These are operational forecasts, not invoice guarantees.
+
+The existing writer commits receipt, pending lease, permit and increment together.
+Answered-first webhooks remain inert placeholders until initiated supplies native
+routing, then reuse the same permit for streaming without an extra Answer. Native
+Answer/stream owners, WSS claims and session construction recheck after awaits.
+A durable paid-dispatch intent survives cancellation, lease expiry and restart;
+only native accepted hangup or matching verified terminal evidence settles it.
+Observation refresh never clears that uncertainty.
+
+Synchronous paid predicates read the writer's committed snapshot, not a delayed
+refresh response. While COMMIT is in flight, prepared state may only restrict an
+existing committed permission; it cannot grant one. Publication follows commit,
+so an older observation result cannot reopen a newer busy/exhausted admission.
+This readiness closure still leaves an affordable current permit usable.
+
+The existing supervisor refreshes bounded metadata without enrolling. Budget
+closure affects readiness, while `/health/live` and owned local finalization stay
+available. Deployment must use liveness for process restart decisions. New starts
+must fit the call/setup/finalization envelope before the absolute paid fence;
+the original300s deadline is never restarted by WSS. STT/LLM/TTS dispatch and the
+paid final summary also respect the fence. Existing submission limits and native
+Pipecat transport/serializer remain unchanged. Closing admissions does not cancel
+number rental or authorize renewal.

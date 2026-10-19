@@ -373,7 +373,7 @@ async def test_v5_six_consumed_runs_migrate_or_roll_back_as_one_authority(
             "SELECT run_id,consumed_at FROM qualification_runs"
         ).fetchall() == history
         assert connection.execute("PRAGMA user_version").fetchone() == (
-            (5,) if migration_fails else (6,)
+            (5,) if migration_fails else (10,)
         )
         if not migration_fails:
             assert connection.execute(
@@ -443,7 +443,7 @@ def _operation(operation_id: int = 1) -> VoiceOperationV1:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_writer_establishes_exact_sqlite_v6_before_readiness(
+async def test_writer_establishes_exact_sqlite_v10_before_readiness(
     tmp_path: Path, legacy: bool
 ) -> None:
     database = tmp_path / "voice.sqlite"
@@ -464,7 +464,7 @@ async def test_writer_establishes_exact_sqlite_v6_before_readiness(
             )
         }
 
-    assert version == (6,)
+    assert version == (10,)
     assert objects == {
         ("index", "outbox_due_fifo_idx"),
         ("table", "call_leases"),
@@ -475,6 +475,7 @@ async def test_writer_establishes_exact_sqlite_v6_before_readiness(
         ("table", "sparra_content_fences"),
         ("table", "sparra_publications"),
         ("table", "recording_archives"),
+        ("table", "owned_pilot_budget"),
     }
 
 

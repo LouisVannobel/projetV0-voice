@@ -273,3 +273,28 @@ LOCAL_AUDIO_TERMINAL_MIGRATION_SQL = (
     "DROP TABLE local_audio_pin_v8;\n"
     + LOCAL_AUDIO_TERMINAL_SLOTS_SQL + "\nPRAGMA user_version = 9;"
 )
+
+# Separate versions preserve the historical V1/V2 contract distinction.
+OWNED_BUDGET_SCHEMA_VERSION = 10
+OWNED_AUDIO_BUDGET_SCHEMA_VERSION = 11
+OWNED_BUDGET_SQL = """
+CREATE TABLE owned_pilot_budget (
+    slot TEXT PRIMARY KEY NOT NULL CHECK (slot = 'sparra-original-pilot'),
+    policy_json TEXT NOT NULL,
+    policy_sha256 TEXT NOT NULL,
+    used_calls INTEGER NOT NULL CHECK (typeof(used_calls)='integer' AND used_calls BETWEEN 0 AND 5),
+    openrouter_floor TEXT NOT NULL,
+    telnyx_floor TEXT NOT NULL,
+    suspended INTEGER NOT NULL DEFAULT 0 CHECK (suspended IN (0,1)),
+    paid_call_control_id TEXT
+);
+"""
+OWNED_BUDGET_MIGRATION_SQL = (
+    OWNED_BUDGET_SQL + "ALTER TABLE call_leases ADD COLUMN budget_permit_json TEXT;"
+)
+OWNED_BUDGET_SCHEMA_SQL = SCHEMA_SQL.replace(
+    "lifecycle_json TEXT,", "lifecycle_json TEXT, budget_permit_json TEXT,", 1,
+).replace("PRAGMA user_version = 6;", OWNED_BUDGET_SQL + "PRAGMA user_version = 10;")
+OWNED_AUDIO_BUDGET_SCHEMA_SQL = LOCAL_AUDIO_TERMINAL_SCHEMA_SQL.replace(
+    "lifecycle_json TEXT,", "lifecycle_json TEXT, budget_permit_json TEXT,", 1,
+).replace("PRAGMA user_version = 9;", OWNED_BUDGET_SQL + "PRAGMA user_version = 11;")

@@ -17,6 +17,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID, uuid5
@@ -29,6 +30,16 @@ from projetv0_voice.audio_contract import (
     AudioRevokePayloadV2,
     BeginCallSnapshotV2,
     VoiceOperationV2,
+)
+from projetv0_voice.budget_observation import BudgetObservation
+from projetv0_voice.owned_pilot_budget import (
+    ORIGINAL_PILOT_SLOT,
+    OwnedPilotBudgetDenied,
+    OwnedPilotBudgetPermit,
+    OwnedPilotBudgetPolicy,
+    OwnedPilotBudgetSnapshot,
+    affordable,
+    observation_valid,
 )
 
 if TYPE_CHECKING:
@@ -88,6 +99,11 @@ from projetv0_voice.persistence.schema import (
     LOCAL_AUDIO_TERMINAL_MIGRATION_SQL,
     LOCAL_AUDIO_TERMINAL_SCHEMA_SQL,
     LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION,
+    OWNED_AUDIO_BUDGET_SCHEMA_SQL,
+    OWNED_AUDIO_BUDGET_SCHEMA_VERSION,
+    OWNED_BUDGET_MIGRATION_SQL,
+    OWNED_BUDGET_SCHEMA_SQL,
+    OWNED_BUDGET_SCHEMA_VERSION,
     QUALIFICATION_ALLOWANCE_MIGRATION_SQL,
     QUALIFICATION_RUNS_SQL,
     RECORDING_ARCHIVE_SQL,
@@ -170,6 +186,8 @@ _EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(SCHEMA_SQL)
 _EXPECTED_AUDIO_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_SCHEMA_SQL)
 _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_CHOICE_SCHEMA_SQL)
 _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS = _expected_schema_objects(LOCAL_AUDIO_TERMINAL_SCHEMA_SQL)
+_EXPECTED_BUDGET_SCHEMA = _expected_schema_objects(OWNED_BUDGET_SCHEMA_SQL)
+_EXPECTED_AUDIO_BUDGET_SCHEMA = _expected_schema_objects(OWNED_AUDIO_BUDGET_SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
     ("table", "webhook_receipts"),
@@ -375,6 +393,7 @@ class WebhookCommitResult:
     receipt: WebhookReceiptKind
     effect: WebhookEffectKind
     qualification_exhausted: bool = False
+    budget_permit: OwnedPilotBudgetPermit | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,7 +401,7 @@ class QualificationRunConsumed:
     pass
 
 
-WebhookCommitValue = WebhookCommitResult | QualificationRunConsumed
+WebhookCommitValue = WebhookCommitResult | QualificationRunConsumed | OwnedPilotBudgetDenied
 WebhookReceiptClassification = Literal["missing", "duplicate", "conflict"]
 
 
@@ -515,6 +534,11 @@ class PersistenceWriter:
         self._fatal_handler = fatal_handler
         self._monotonic = monotonic
         self._utcnow = utcnow
+        self._owned_budget_policy: OwnedPilotBudgetPolicy | None = None
+        self._owned_budget_observation: BudgetObservation | None = None
+        self._owned_budget_start_envelope = 335.0
+        self._owned_budget_snapshot = OwnedPilotBudgetSnapshot()
+        self._owned_budget_pending_snapshot: OwnedPilotBudgetSnapshot | None = None
         self._sparra_active = False
         self._audio_cleanup: Callable[[UUID, tuple[UUID, ...]], Awaitable[None]] | None = None
         self._audio_free_bytes: Callable[[], int] | None = None
@@ -682,6 +706,7 @@ class PersistenceWriter:
             future.add_done_callback(self._consume_control_commit_exception)
             raise
         except TimeoutError:
+            future.add_done_callback(self._consume_control_commit_exception)
             raise self.latch_control_commit_timeout() from None
 
     def latch_control_commit_timeout(self) -> FatalPersistenceError:
@@ -762,6 +787,182 @@ class PersistenceWriter:
             raise safe_error from None
         self._track_pending(command)
         return WebhookCommitTicket(result)
+
+    def set_owned_budget(self, policy: OwnedPilotBudgetPolicy, *,
+                         start_envelope_seconds: float = 335) -> None:
+        if self._owned_budget_policy is not None and self._owned_budget_policy != policy:
+            raise ValueError("owned_budget_binding_changed")
+        self._owned_budget_policy = policy
+        if not math.isfinite(start_envelope_seconds) or start_envelope_seconds < 300:
+            raise ValueError("owned_budget_envelope_invalid")
+        self._owned_budget_start_envelope = start_envelope_seconds
+
+    async def owned_budget_request(self, action: str, **values: object) -> object:
+        result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        try:
+            await self.commit_control(PersistenceCommand(
+                "owned_budget", {"action": action, **values, "result": result}, None,
+            ))
+        except BaseException:
+            result.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+            raise
+        return await result
+
+    def owned_budget_snapshots(self) -> tuple[OwnedPilotBudgetSnapshot, ...]:
+        if self._degraded or self._closed_event.is_set():
+            return ()
+        committed = self._owned_budget_snapshot
+        pending = self._owned_budget_pending_snapshot
+        # The pre-commit view can only restrict committed permission. This also
+        # fences the SQLite-thread COMMIT -> event-loop publication interval.
+        return (committed,) if pending is None else (committed, pending)
+
+    async def _prepare_owned_budget_snapshot(self) -> OwnedPilotBudgetSnapshot:
+        policy, fact = self._owned_budget_policy, self._owned_budget_observation
+        state = await self._owned_budget_command({"action": "state"})
+        if (policy is None or fact is None or not isinstance(state, tuple)
+                or fact.openrouter_reported_spend_usd < Decimal(state[1])
+                or fact.telnyx_reported_spend_usd < Decimal(state[2])):
+            return OwnedPilotBudgetSnapshot()
+        cursor = await self._require_owner_connection().execute(
+            "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+        busy = await cursor.fetchone()
+        await cursor.close()
+        return OwnedPilotBudgetSnapshot(
+            fact, state[3] is None and busy == (0,) and affordable(policy, fact, state[0]))
+
+    async def _owned_budget_command(self, payload: Mapping[str, object]) -> object:
+        connection = self._require_owner_connection()
+        policy = self._owned_budget_policy
+        if policy is None:
+            return None
+        cursor = await connection.execute(
+            "SELECT policy_sha256,used_calls,openrouter_floor,telnyx_floor,suspended,"
+            "paid_call_control_id,policy_json FROM owned_pilot_budget WHERE slot=?",
+            (ORIGINAL_PILOT_SLOT,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        action = payload.get("action")
+        if action == "suspend":
+            await connection.execute("UPDATE owned_pilot_budget SET suspended=1 WHERE slot=?",
+                                     (ORIGINAL_PILOT_SLOT,))
+            return True
+        if action == "enroll":
+            fact = payload.get("observation")
+            cursor = await connection.execute(
+                "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+            busy = await cursor.fetchone()
+            await cursor.close()
+            if (payload.get("predecessor_retired") is not True or busy != (0,)
+                    or not isinstance(fact, BudgetObservation)
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or fact.active_call_control_ids
+                    or fact.openrouter_reported_spend_usd < policy.openrouter_anchor_usd
+                    or fact.telnyx_reported_spend_usd < policy.telnyx_anchor_usd):
+                return False
+            if row is not None:
+                return (row[0] == policy.sha256 and not row[4] and row[5] is None
+                        and row[6] == policy.model_dump_json())
+            await connection.execute(
+                "INSERT INTO owned_pilot_budget(slot,policy_json,policy_sha256,used_calls,"
+                "openrouter_floor,telnyx_floor) VALUES(?,?,?,0,?,?)",
+                (ORIGINAL_PILOT_SLOT, policy.model_dump_json(), policy.sha256,
+                 str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd)),
+            )
+            return True
+        if (row is None or row[0] != policy.sha256 or row[4]
+                or row[6] != policy.model_dump_json()):
+            return None
+        if action == "state":
+            return (row[1], row[2], row[3], row[5])
+        if action == "settled":
+            await connection.execute(
+                "UPDATE owned_pilot_budget SET paid_call_control_id=NULL "
+                "WHERE slot=? AND paid_call_control_id=?",
+                (ORIGINAL_PILOT_SLOT, payload.get("call_control_id")),
+            )
+            return True
+        if action == "observe":
+            fact = payload.get("observation")
+            self._owned_budget_observation = None
+            if (not isinstance(fact, BudgetObservation)
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or fact.openrouter_reported_spend_usd < Decimal(row[2])
+                    or fact.telnyx_reported_spend_usd < Decimal(row[3])):
+                return None
+            await connection.execute(
+                "UPDATE owned_pilot_budget SET openrouter_floor=?,telnyx_floor=? WHERE slot=?",
+                (str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd),
+                 ORIGINAL_PILOT_SLOT),
+            )
+            self._owned_budget_observation = fact
+            cursor = await connection.execute(
+                "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+            busy = await cursor.fetchone()
+            await cursor.close()
+            return row[5] is None and busy == (0,) and affordable(policy, fact, row[1])
+        if action == "dispatch":
+            permit = payload.get("permit")
+            fact = self._owned_budget_observation
+            if (not isinstance(permit, OwnedPilotBudgetPermit) or fact is None
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or permit.policy_sha256 != policy.sha256
+                    or not affordable(policy, fact, permit.ordinal - 1)):
+                return False
+            cursor = await connection.execute(
+                "SELECT budget_permit_json,state FROM call_leases WHERE call_control_id=?",
+                (permit.call_control_id,),
+            )
+            saved = await cursor.fetchone()
+            await cursor.close()
+            if (saved is None or saved[1] == "terminal"
+                    or saved[0] != permit.model_dump_json()
+                    or row[5] not in (None, permit.call_control_id)):
+                return False
+            # Crash/cancellation after this durable intent is unresolved until a
+            # native accepted hangup or the matching verified terminal receipt.
+            await connection.execute(
+                "UPDATE owned_pilot_budget SET paid_call_control_id=? WHERE slot=?",
+                (permit.call_control_id, ORIGINAL_PILOT_SLOT),
+            )
+            return True
+        return None
+
+    async def _consume_owned_budget(
+        self, lease: Mapping[str, object], facts: object,
+    ) -> OwnedPilotBudgetPermit | OwnedPilotBudgetDenied:
+        policy, fact = self._owned_budget_policy, self._owned_budget_observation
+        connection = self._require_owner_connection()
+        if policy is None or fact is None or not isinstance(facts, LocalCallAdmissionFacts):
+            return OwnedPilotBudgetDenied()
+        state = await self._owned_budget_command({"action": "state"})
+        if (not isinstance(state, tuple) or state[3] is not None
+                or not observation_valid(policy, fact, self._utcnow())
+                or not affordable(policy, fact, state[0])
+                or fact.openrouter_reported_spend_usd < Decimal(state[1])
+                or fact.telnyx_reported_spend_usd < Decimal(state[2])
+                or (policy.paid_until - self._utcnow()).total_seconds()
+                < self._owned_budget_start_envelope
+                or facts.admission_generation is None
+                or fact.active_call_control_ids - {str(lease.get("call_control_id"))}):
+            return OwnedPilotBudgetDenied()
+        cursor = await connection.execute(
+            "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+        busy = await cursor.fetchone()
+        await cursor.close()
+        if busy != (0,):
+            return OwnedPilotBudgetDenied()
+        permit = OwnedPilotBudgetPermit(policy_sha256=policy.sha256, ordinal=state[0] + 1,
+            call_id=facts.call_id, call_control_id=str(lease["call_control_id"]),
+            call_leg_id=facts.telnyx_call_leg_id, call_session_id=facts.telnyx_call_session_id,
+            generation=facts.admission_generation, paid_until=policy.paid_until)
+        await connection.execute(
+            "UPDATE owned_pilot_budget SET used_calls=used_calls+1,"
+            "openrouter_floor=?,telnyx_floor=? WHERE slot=?",
+            (str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd),
+             ORIGINAL_PILOT_SLOT))
+        return permit
 
     async def qualification_run_consumed(
         self, run_id: UUID, *, total_calls: int = 1, profile_sha256: bytes | None = None
@@ -3427,6 +3628,7 @@ class PersistenceWriter:
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         command = PersistenceCommand("shutdown", {}, future, enqueued_at=self._monotonic())
+        future.add_done_callback(self._consume_control_commit_exception)
         async with asyncio.timeout(timeout_seconds):
             await self._queue.put(command)
             self._track_pending(command)
@@ -3448,6 +3650,7 @@ class PersistenceWriter:
             self._database_path.parent.mkdir(parents=True, exist_ok=True)
             self._connection = await aiosqlite.connect(self._database_path)
             await self._initialize_owner_connection()
+            await self._initialize_budget_schema()
             await self._discover_stale_leases()
             if not await self._perform_quick_check():
                 raise FatalPersistenceError("quick_check_failed")
@@ -3576,7 +3779,7 @@ class PersistenceWriter:
         if (
             self._pragma_int(await self._pragma_scalar("user_version"))
             in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION,
-                LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION}
+                LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION, OWNED_AUDIO_BUDGET_SCHEMA_VERSION}
         ):
             raise FatalPersistenceError("writer_contract_mismatch")
         connection = self._require_owner_connection()
@@ -3630,7 +3833,11 @@ class PersistenceWriter:
                     with contextlib.suppress(Exception):
                         await connection.rollback()
                     raise FatalPersistenceError("sqlite_schema_mismatch") from None
-            elif existing_version != SCHEMA_VERSION or existing_schema != _EXPECTED_SCHEMA_OBJECTS:
+            elif not (
+                (existing_version == SCHEMA_VERSION and existing_schema == _EXPECTED_SCHEMA_OBJECTS)
+                or (existing_version == OWNED_BUDGET_SCHEMA_VERSION
+                    and existing_schema == _EXPECTED_BUDGET_SCHEMA)
+            ):
                 raise FatalPersistenceError("sqlite_schema_mismatch")
         else:
             if existing_version != 0:
@@ -3670,6 +3877,7 @@ class PersistenceWriter:
                 LOCAL_AUDIO_SCHEMA_VERSION: _EXPECTED_AUDIO_SCHEMA_OBJECTS,
                 LOCAL_AUDIO_CHOICE_SCHEMA_VERSION: _EXPECTED_AUDIO_CHOICE_SCHEMA_OBJECTS,
                 LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION: _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS,
+                OWNED_AUDIO_BUDGET_SCHEMA_VERSION: _EXPECTED_AUDIO_BUDGET_SCHEMA,
             }.get(version)
             if (
                 expected is None or schema != expected
@@ -3685,7 +3893,7 @@ class PersistenceWriter:
             await cursor.close()
             if marker != [(1, 2)] or legacy != (0,):
                 raise FatalPersistenceError("writer_contract_mismatch")
-            if version != LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION:
+            if version in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION}:
                 await connection.execute("BEGIN IMMEDIATE")
                 try:
                     if version == LOCAL_AUDIO_SCHEMA_VERSION:
@@ -3721,11 +3929,11 @@ class PersistenceWriter:
                 with contextlib.suppress(Exception):
                     await connection.rollback()
                 raise
-        if (
-            self._pragma_int(await self._pragma_scalar("user_version"))
-            != LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION
-            or await self._application_schema_objects() != _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS
-        ):
+        if (self._pragma_int(await self._pragma_scalar("user_version")),
+                await self._application_schema_objects()) not in (
+                    (LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION, _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS),
+                    (OWNED_AUDIO_BUDGET_SCHEMA_VERSION, _EXPECTED_AUDIO_BUDGET_SCHEMA),
+                ):
             raise FatalPersistenceError("sqlite_schema_mismatch")
         self.pragma_state = {
             "journal_mode": str(journal[0]).lower() if journal else "",
@@ -3737,6 +3945,28 @@ class PersistenceWriter:
                                  "foreign_keys": 1, "secure_delete": 1}:
             raise FatalPersistenceError("sqlite_pragma_mismatch")
         self._audio_page_size = self._pragma_int(await self._pragma_scalar("page_size"))
+
+    async def _initialize_budget_schema(self) -> None:
+        connection = self._require_owner_connection()
+        target = (OWNED_AUDIO_BUDGET_SCHEMA_VERSION if self._contract_version == 2
+                  else OWNED_BUDGET_SCHEMA_VERSION)
+        if self._pragma_int(await self._pragma_scalar("user_version")) == target:
+            return
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in OWNED_BUDGET_MIGRATION_SQL.split(";"):
+                if statement.strip():
+                    await connection.execute(statement)
+            await connection.execute(f"PRAGMA user_version = {target}")
+            expected = (_EXPECTED_AUDIO_BUDGET_SCHEMA if self._contract_version == 2
+                        else _EXPECTED_BUDGET_SCHEMA)
+            if await self._application_schema_objects() != expected:
+                raise FatalPersistenceError("sqlite_schema_mismatch")
+            await self._call_failpoint("after_owned_budget_migration_before_commit")
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
 
     async def _application_schema_objects(self) -> dict[tuple[str, str], str]:
         connection = self._require_owner_connection()
@@ -3857,6 +4087,8 @@ class PersistenceWriter:
                 await self._apply_relay_command(command.payload)
             elif command.kind == "qualification_run_status":
                 command_result = await self._qualification_run_consumed(command.payload)
+            elif command.kind == "owned_budget":
+                command_result = await self._owned_budget_command(command.payload)
             elif command.kind == "call_lifecycle_read":
                 command_result = await self._read_call_lifecycle(command.payload["call_id"])
             elif command.kind == "sparra_activation":
@@ -3909,7 +4141,15 @@ class PersistenceWriter:
                 await connection.rollback()
                 return False, None
             self._check_storage_limit()
+            if (self._owned_budget_policy is not None
+                    and command.kind in {"owned_budget", "webhook_effect", "lease"}):
+                self._owned_budget_pending_snapshot = await self._prepare_owned_budget_snapshot()
             await connection.commit()
+            if self._owned_budget_pending_snapshot is not None:
+                # No await between successful COMMIT and publication. A caller
+                # resuming much later cannot restore a superseded observation.
+                self._owned_budget_snapshot = self._owned_budget_pending_snapshot
+                self._owned_budget_pending_snapshot = None
             if self._contract_version == 2 and command.kind == "sparra_content":
                 action = command.payload.get("action")
                 if action == "audio_choice" and isinstance(command_result, AudioChoiceFacts):
@@ -3968,6 +4208,8 @@ class PersistenceWriter:
                     else "recording_archive_commit_unknown"
                 ) from None
             raise
+        finally:
+            self._owned_budget_pending_snapshot = None
         return False, command_result
 
     async def _apply_stale_terminal(self, payload: Mapping[str, object]) -> None:
@@ -4163,6 +4405,21 @@ class PersistenceWriter:
             return WebhookCommitResult("duplicate", "duplicate")
         qualification_run_id = payload.get("qualification_run_id")
         exhausted = False
+        budget_permit: OwnedPilotBudgetPermit | None = None
+        lease = payload.get("lease")
+        if (self._owned_budget_policy is not None and isinstance(lease, Mapping)
+                and lease.get("state") == "pending"):
+            existing_state = await self._qualification_admitted_identity(lease)
+            if existing_state is not None:
+                await self._insert_new_receipt(normalized_receipt)
+                return WebhookCommitResult(
+                    "first", "existing_terminal" if existing_state == "terminal" else "duplicate",
+                )
+            consumed_budget = await self._consume_owned_budget(
+                lease, payload.get("admission_facts"))
+            if isinstance(consumed_budget, OwnedPilotBudgetDenied):
+                return consumed_budget
+            budget_permit = consumed_budget
         if qualification_run_id is not None:
             if not isinstance(qualification_run_id, UUID):
                 raise CommandSerializationError("invalid_qualification_run")
@@ -4198,6 +4455,11 @@ class PersistenceWriter:
                 await self._record_original_end(normalized_receipt, payload.get("lease"), receipt)
                 return WebhookCommitResult("first", "existing_terminal")
             await self._apply_lease(lease)
+            if budget_permit is not None:
+                await self._require_owner_connection().execute(
+                    "UPDATE call_leases SET budget_permit_json=? WHERE call_control_id=?",
+                    (budget_permit.model_dump_json(), budget_permit.call_control_id),
+                )
             await self._apply_admission_facts(
                 lease, operation, payload.get("admission_facts"), receipt
             )
@@ -4209,7 +4471,7 @@ class PersistenceWriter:
                 if not isinstance(operation, VoiceOperationV1):
                     raise CommandSerializationError("invalid_outbox_command")
                 await self._insert_outbox(operation)
-        return WebhookCommitResult("first", "applied", exhausted)
+        return WebhookCommitResult("first", "applied", exhausted, budget_permit)
 
     async def _apply_admission_facts(
         self, lease: Mapping[str, object], operation: object, admission: object,
@@ -4299,6 +4561,8 @@ class PersistenceWriter:
             await self._store_lifecycle(
                 replace(facts, original_ended_at=_parse_datetime(receipt[3]))
             )
+        if self._owned_budget_policy is not None:
+            await self._owned_budget_command({"action": "settled", "call_control_id": receipt[2]})
 
     def _normalized_receipt(
         self, receipt: Mapping[str, object]
@@ -4956,7 +5220,8 @@ class PersistenceWriter:
             and not result.done()
             and (
                 value is not None
-                or command.kind in {"call_lifecycle_read", "sparra_content", "recording_archive"}
+                or command.kind in {"call_lifecycle_read", "sparra_content", "recording_archive",
+                                    "owned_budget"}
             )
         ):
             result.set_result(value)

@@ -21,6 +21,8 @@ ALLOWED_NAMES = (
     "VOICE_RUNTIME_CONTRACT_PATH",
     "VOICE_AGENT_BUNDLE_PATH",
     "VOICE_QUALIFIED_PROFILE_PATH",
+    "VOICE_OWNED_BUDGET_POLICY_PATH",
+    "VOICE_OWNED_BUDGET_POLICY_SHA256",
     "VOICE_QUALIFICATION_CANDIDATE_PATH",
     "VOICE_QUALIFICATION_OVERRIDE_PATH",
     "VOICE_KEYRING_PATH",
@@ -50,6 +52,17 @@ ALLOWED_NAMES = (
     "VOICE_BIND_PORT",
 )
 HEX_A = "a" * 64
+
+
+def test_owned_budget_paths_are_explicit_optional_runtime_inputs():
+    module = _runtime_config()
+    values = valid_environment()
+    values.update(VOICE_OWNED_BUDGET_POLICY_PATH="/run/secrets/owned-budget.json",
+                  VOICE_OWNED_BUDGET_POLICY_SHA256="b" * 64)
+    settings = module.parse_runtime_settings(module.capture_runtime_environment(values),
+                                             geteuid=lambda: 10001, getegid=lambda: 10001)
+    assert str(settings.owned_budget_policy_path) == "/run/secrets/owned-budget.json"
+    assert settings.owned_budget_policy_sha256 == "b" * 64
 
 
 def test_archive_settings_are_explicit_optional_and_consume_exact_https_origins():

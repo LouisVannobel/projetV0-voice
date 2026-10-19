@@ -30,6 +30,11 @@ from projetv0_voice.models import (
     VoiceOperationV1,
     _canonical_milliseconds,
 )
+from projetv0_voice.owned_pilot_budget import (
+    OwnedPilotBudgetDenied,
+    OwnedPilotBudgetGate,
+    OwnedPilotBudgetPermit,
+)
 from projetv0_voice.persistence.commands import PersistenceCommand, PersistenceError
 from projetv0_voice.persistence.postgres_sink import OperationSinkCommitAmbiguousError
 from projetv0_voice.persistence.writer import (
@@ -251,6 +256,7 @@ class _CallEntry:
     streaming: _ActionSlot = field(repr=False)
     hangup_command_id: UUID = field(repr=False)
     precommit_refcount: int = 0
+    budget_permit: OwnedPilotBudgetPermit | None = None
     durable: bool = False
     answer_evidence: bool = False
     streaming_evidence: bool = False
@@ -608,6 +614,9 @@ class CallConstructionGrant:
     retention_until: datetime = field(repr=False)
     routing: RoutingV1 | None = field(default=None, repr=False)
     begin_snapshot: PinnedBeginSnapshot | None = field(default=None, repr=False)
+    budget_permit: OwnedPilotBudgetPermit | None = field(default=None, repr=False)
+    original_deadline: datetime | None = field(default=None, repr=False)
+    paid_work_permitted: Callable[[], bool] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -986,6 +995,7 @@ class CallRegistry:
         self._capacity = capacity
         self._lease_ttl_seconds = lease_ttl_seconds
         self._original_call_limit_seconds = original_call_limit_seconds
+        self._owned_budget: OwnedPilotBudgetGate | None = None
         self._stream_url = stream_url
         self._retention_days = retention_days
         self._retention_delta = timedelta(days=retention_days)
@@ -1047,6 +1057,22 @@ class CallRegistry:
             "terminal_removal_failed",
         }:
             self._set_internal_failure(code)
+
+    def set_owned_budget(self, gate: OwnedPilotBudgetGate) -> None:
+        if self._owned_budget is not None or self._by_control:
+            raise ValueError("owned_budget_binding_changed")
+        self._owned_budget = gate
+
+    def _budget_permits(self, entry: _CallEntry) -> bool:
+        permit = entry.budget_permit
+        return self._owned_budget is None or (
+            permit is not None and permit.call_id == entry.call_id
+            and permit.call_control_id == entry.call_control_id
+            and permit.call_leg_id == entry.call_leg_id
+            and permit.call_session_id == entry.call_session_id
+            and permit.generation == entry.generation
+            and self._owned_budget.permits(permit)
+        )
 
     def _qualification_expired(self) -> bool:
         if self._admission_expires_at is None:
@@ -1267,7 +1293,10 @@ class CallRegistry:
                 if self._transfer_fenced(entry):
                     return CallControlResult("accepted")
                 entry.cleanup_hangup_started = True
-        return await self._call_control.hangup(control_id, command_id=command_id)
+        result = await self._call_control.hangup(control_id, command_id=command_id)
+        if self._owned_budget is not None and result.outcome == "accepted":
+            await self._owned_budget.settled(control_id)
+        return result
 
     async def restore_transfer_fence(self, stale: Any) -> None:
         facts = stale.lifecycle
@@ -2403,6 +2432,7 @@ class CallRegistry:
             ):
                 entry.durable = True
                 entry.lease_state = "pending"
+                entry.budget_permit = result.budget_permit
                 if (
                     self._candidate_run_id is not None
                     and result.qualification_exhausted
@@ -2525,7 +2555,7 @@ class CallRegistry:
             reservation_cancellation = await reservation.confirm(result)
         elif isinstance(reservation, _PlaceholderReservation):
             await reservation.confirm_fail_closed(result)
-        if isinstance(result, QualificationRunConsumed):
+        if isinstance(result, (QualificationRunConsumed, OwnedPilotBudgetDenied)):
             return WebhookDisposition(503, admission_rejection="qualification")
         if result.effect == "existing_terminal":
             if event.event_type == "call.hangup" and event.call_control_id is not None:
@@ -2674,6 +2704,13 @@ class CallRegistry:
             except Exception:
                 return WebhookDisposition(503, admission_rejection="invalid")
 
+        if self._owned_budget is not None:
+            async with self._lock:
+                budget_entry = self._by_control.get(call_control_id)
+                permit = None if budget_entry is None else budget_entry.budget_permit
+            if permit is None or not await self._owned_budget.dispatch(permit):
+                return WebhookDisposition(503, admission_rejection="qualification")
+
         owner = False
         completion: asyncio.Future[WebhookDisposition] | None = None
         command_id: UUID | None = None
@@ -2692,6 +2729,7 @@ class CallRegistry:
                 entry is None
                 or entry.terminal_event is not None
                 or not entry.durable
+                or not self._budget_permits(entry)
                 or (self._transfer_fenced(entry))
             ):
                 return WebhookDisposition(200)
@@ -3204,6 +3242,7 @@ class CallRegistry:
                 or self._qualification_expired()
                 or entry.terminal_event is not None
                 or not entry.durable
+                or not self._budget_permits(entry)
                 or entry.lease_state != "pending"
                 or entry.streaming.state not in {"in_flight", "accepted", "unknown"}
                 or now >= entry.token_deadline
@@ -3245,6 +3284,7 @@ class CallRegistry:
                 or current.generation != generation
                 or current.lease_state != "claiming"
                 or current.terminal_event is not None
+                or not self._budget_permits(current)
             ):
                 return None
             claim = ProcessLeaseClaim(
@@ -3618,6 +3658,7 @@ class CallRegistry:
                 not self._session_owner_registration_open
                 or entry is None
                 or entry.generation != claim.generation
+                or not self._budget_permits(entry)
                 or entry.claim is not claim
                 or entry.claimed_at != claim.claimed_at
                 or entry.lease_state != "active"
@@ -3648,6 +3689,17 @@ class CallRegistry:
                 retention_until=entry.initiated_at + timedelta(days=self._retention_days),
                 routing=entry.routing,
                 begin_snapshot=entry.begin_snapshot,
+                budget_permit=entry.budget_permit,
+                original_deadline=(
+                    min(entry.budget_permit.paid_until,
+                        (entry.answered_at or entry.created_at) + timedelta(seconds=300))
+                    if entry.budget_permit is not None else None
+                ),
+                paid_work_permitted=(
+                    (lambda: self._owned_budget is not None
+                     and self._owned_budget.permits(entry.budget_permit))
+                    if entry.budget_permit is not None else None
+                ),
             )
             entry.construction_grant = grant
             entry.lifecycle_owner = owner
@@ -3680,6 +3732,7 @@ class CallRegistry:
             return (
                 self._session_owner_registration_open
                 and entry is not None
+                and self._budget_permits(entry)
                 and entry.generation == grant.generation.generation
                 and entry.claim is grant.lease_claim
                 and entry.construction_grant is grant
@@ -3715,6 +3768,7 @@ class CallRegistry:
                 not self._session_owner_registration_open
                 or entry is None
                 or entry.generation != grant.generation.generation
+                or not self._budget_permits(entry)
                 or entry.claim is not grant.lease_claim
                 or entry.construction_grant is not grant
                 or entry.lifecycle_owner is not owner

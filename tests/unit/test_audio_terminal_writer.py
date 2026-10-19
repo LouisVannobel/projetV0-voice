@@ -93,7 +93,7 @@ async def test_terminal_real_chunk_counters_and_finish_include_only_known_commit
         await seed_admission(writer)
         await authenticate_audio(writer)
         with sqlite3.connect(path) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
         assert counters(path) == (None, 0)
         operation = chunk(keyring)
         armed = True
@@ -300,7 +300,7 @@ async def test_terminal_historical_seven_migrates_atomically_with_unknown_accoun
         await writer.bind_audio_snapshot(snapshot(), generation=GENERATION)
         assert counters(path) == (None, None)
         with sqlite3.connect(path) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 11
             assert db.execute(
                 "SELECT op_id,key_version,nonce,ciphertext FROM outbox"
             ).fetchone() == original

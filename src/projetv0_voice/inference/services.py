@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import struct
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -382,6 +382,9 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
 
     async def _reserve_final_request(self, request: httpx.Request) -> None:
         """Inspect buffered SDK-final JSON and debit without any suspension or refund."""
+        paid_guard: Callable[[], bool] | None = getattr(self, "paid_work_permitted", None)
+        if paid_guard is not None and not paid_guard():
+            self._refuse_output()
         if not self._enforce_output_limits:
             return
         if request.method != "POST" or not request.url.path.endswith("/chat/completions"):

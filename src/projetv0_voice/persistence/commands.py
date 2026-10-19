@@ -56,6 +56,7 @@ class PersistenceCommand:
         "outbox",
         "relay_batch",
         "qualification_run_status",
+        "owned_budget",
         "call_lifecycle_read",
         "sparra_activation",
         "transfer_intent",

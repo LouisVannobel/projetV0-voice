@@ -26,6 +26,8 @@ ENVIRONMENT_VARIABLE_NAMES = [
     "VOICE_RUNTIME_CONTRACT_PATH",
     "VOICE_AGENT_BUNDLE_PATH",
     "VOICE_QUALIFIED_PROFILE_PATH",
+    "VOICE_OWNED_BUDGET_POLICY_PATH",
+    "VOICE_OWNED_BUDGET_POLICY_SHA256",
     "VOICE_QUALIFICATION_CANDIDATE_PATH",
     "VOICE_QUALIFICATION_OVERRIDE_PATH",
     "VOICE_KEYRING_PATH",
@@ -264,7 +266,7 @@ def test_runtime_contract_is_the_exact_canonical_v1_object() -> None:
     assert observed.endswith(b"}\n")
     assert not observed.startswith(b"\xef\xbb\xbf")
     assert json.loads(observed) == EXPECTED_CONTRACT
-    assert len(EXPECTED_CONTRACT["environment_variable_names"]) == 30  # type: ignore[arg-type]
+    assert len(EXPECTED_CONTRACT["environment_variable_names"]) == 32  # type: ignore[arg-type]
     assert EXPECTED_CONTRACT["metrics"] == sorted(METRIC_NAMES)
     assert len(METRIC_NAMES) == 25
 

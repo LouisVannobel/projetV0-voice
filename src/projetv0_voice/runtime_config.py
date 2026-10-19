@@ -29,6 +29,8 @@ _ALLOWED_ENVIRONMENT_NAMES = (
     "VOICE_RUNTIME_CONTRACT_PATH",
     "VOICE_AGENT_BUNDLE_PATH",
     "VOICE_QUALIFIED_PROFILE_PATH",
+    "VOICE_OWNED_BUDGET_POLICY_PATH",
+    "VOICE_OWNED_BUDGET_POLICY_SHA256",
     "VOICE_QUALIFICATION_CANDIDATE_PATH",
     "VOICE_QUALIFICATION_OVERRIDE_PATH",
     "VOICE_KEYRING_PATH",
@@ -150,6 +152,8 @@ class RuntimeSettingsV1:
     bind_port: int
     recording_archive_directory: PurePosixPath | None = None
     recording_download_origins: tuple[str, ...] = ()
+    owned_budget_policy_path: PurePosixPath | None = None
+    owned_budget_policy_sha256: str | None = None
     _observability_token: ObservabilityBootstrapToken | None = field(
         default=None,
         init=False,
@@ -487,6 +491,9 @@ def parse_runtime_settings(
             qualification_candidate_path=qualification_candidate_path,
             qualification_override_path=qualification_override_path,
             keyring_path=_required_path(capture, "VOICE_KEYRING_PATH"),
+            owned_budget_policy_path=_optional_path(capture, "VOICE_OWNED_BUDGET_POLICY_PATH"),
+            owned_budget_policy_sha256=_optional_sha256(
+                capture, "VOICE_OWNED_BUDGET_POLICY_SHA256"),
             sqlite_path=_required_path(capture, "VOICE_SQLITE_PATH"),
             recording_archive_directory=_optional_path(capture,"VOICE_RECORDING_ARCHIVE_DIRECTORY"),
             recording_download_origins=_recording_origins(capture),

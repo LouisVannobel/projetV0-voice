@@ -35,6 +35,7 @@ from projetv0_voice.metrics import (
     RuntimePublishedSnapshot,
 )
 from projetv0_voice.models import BeginCallSnapshotV1, CallUpsertPayloadV1, VoiceOperationV1
+from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetDenied, OwnedPilotBudgetGate
 from projetv0_voice.persistence.relay import OutboxRelay, maintain_call_content
 from projetv0_voice.persistence.writer import (
     PersistenceWriter,
@@ -324,6 +325,10 @@ class RuntimeProductionFactories:
         ]
         | None
     ) = None
+    budget_factory: Callable[
+        [RuntimeSettingsV1, PersistenceWriter, SecretStr, SecretStr,
+         Callable[[], datetime], Callable[[], float]], OwnedPilotBudgetGate,
+    ] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -653,6 +658,7 @@ class RuntimeSupervisor:
         deployment_id: str = "projetv0-voice",
         retention_days: int = 7,
         sparra_enabled: bool = False,
+        owned_budget: OwnedPilotBudgetGate | None = None,
         utcnow: Callable[[], datetime] = lambda: datetime.now(UTC),
         loop_interval_seconds: float = 0.25,
         startup_phase_timeout_seconds: float = 5.0,
@@ -661,6 +667,7 @@ class RuntimeSupervisor:
         hard_exit: Callable[[int], NoReturn] = os._exit,
     ) -> None:
         self.webhook_finalizers = _OwnedTaskSet()
+        self._owned_budget = owned_budget
         self.call_lifecycle_owners = _OwnedTaskSet()
         self.fixed_supervisors = _OwnedTaskSet()
         if (
@@ -805,7 +812,7 @@ class RuntimeSupervisor:
                 )
                 if await self._startup_await(candidate_status, code="qualification_status_failed"):
                     raise RuntimeError("qualification_run_consumed")
-            self._qualification_valid = True
+            self._qualification_valid = self._owned_budget is None
             if self._sparra_enabled:
                 await self._startup_await(
                     self._writer.assert_sparra_compatible(), code="writer_startup_failed"
@@ -1144,9 +1151,10 @@ class RuntimeSupervisor:
             return
 
         disposition = WebhookDisposition(
-            503 if isinstance(result, QualificationRunConsumed) else 200,
+            503 if isinstance(result, (QualificationRunConsumed, OwnedPilotBudgetDenied)) else 200,
             admission_rejection=(
-                "qualification" if isinstance(result, QualificationRunConsumed) else None
+                "qualification" if isinstance(result, (QualificationRunConsumed,
+                                                       OwnedPilotBudgetDenied)) else None
             ),
         )
         if self._registry is not None:
@@ -1501,6 +1509,8 @@ class RuntimeSupervisor:
                 if local_pending:
                     continue
                 raise RuntimeError("stale_recovery_failed") from None
+            if self._owned_budget is not None and result.outcome == "accepted":
+                await self._owned_budget.settled(stale.call_control_id)
             if local_pending:
                 continue
             if result.outcome != "accepted":
@@ -1617,6 +1627,13 @@ class RuntimeSupervisor:
                 return
 
     async def _qualification_expiry_loop(self) -> None:
+        if self._owned_budget is not None:
+            while not self._state_stop.is_set():
+                self._qualification_valid = await self._owned_budget.refresh()
+                self._publish_current()
+                if await _wait_or_stop(self._state_stop, 20):
+                    return
+            return
         while not self._state_stop.is_set():
             if self._registry is not None:
                 try:
@@ -1699,7 +1716,9 @@ class RuntimeSupervisor:
             startup_profile_and_stale_recovery_complete=self._startup_complete,
             draining=self._draining,
             admission_open=self._admission_open,
-            qualification_state_valid=self._qualification_valid,
+            qualification_state_valid=(self._qualification_valid and (
+                self._owned_budget is None or (
+                    self._owned_budget.ready and self._owned_budget.can_start()))),
             writer_owner_alive_and_ready=(
                 self._writer_task is not None and not self._writer_task.done()
             ),
@@ -1868,6 +1887,31 @@ async def build_production_runtime(
                 and all(did.startswith("+33") for did in manifest.dids) else None
             ),
         )
+        owned_budget = None
+        if manifest.sparra is not None and settings.runtime_mode == "strict":
+            if (factories.budget_factory is None or settings.owned_budget_policy_path is None
+                    or settings.owned_budget_policy_sha256 is None):
+                raise RuntimeError("owned_budget_policy_unavailable")
+            owned_budget = factories.budget_factory(
+                settings, writer, openrouter_api_key, telnyx_api_key, utcnow, monotonic,
+            )
+            policy = owned_budget.policy
+            from projetv0_voice.qualified_profile import canonical_qualified_profile_sha256
+            if (not isinstance(selection.profile, QualifiedDeploymentProfileV1)
+                    or policy.sha256 != settings.owned_budget_policy_sha256
+                    or policy.qualified_profile_sha256
+                    != canonical_qualified_profile_sha256(selection.profile)
+                    or policy.runtime_contract_sha256 != settings.runtime_contract_sha256
+                    or policy.agent_bundle_sha256 != settings.agent_bundle_sha256
+                    or policy.inference_profile_sha256 != settings.inference_profile_sha256
+                    or policy.image_digest != settings.image_digest
+                    or policy.deployment_id != settings.deployment_id
+                    or policy.identity.did != manifest.dids[0]
+                    or policy.identity.connection_id != manifest.sparra.connection_id
+                    or policy.identity.telnyx_credential_sha256 != api_key_sha256
+                    or policy.identity.openrouter_credential_sha256 != hashlib.sha256(
+                        openrouter_api_key.get_secret_value().encode()).hexdigest()):
+                raise RuntimeError("owned_budget_policy_mismatch")
         sink = factories.sink_factory(postgres_dsn)
 
         supervisor_ref: RuntimeSupervisor | None = None
@@ -1929,6 +1973,7 @@ async def build_production_runtime(
             deployment_id=settings.deployment_id,
             retention_days=manifest.transcript_retention_days,
             sparra_enabled=manifest.sparra is not None,
+            owned_budget=owned_budget,
             utcnow=utcnow,
             loop_interval_seconds=0.25,
             startup_phase_timeout_seconds=float(startup_phase_timeout_seconds),
@@ -1978,6 +2023,8 @@ async def build_production_runtime(
             ),
         )
         lease_authority = ProcessLeaseAuthority(registry)
+        if owned_budget is not None:
+            registry.set_owned_budget(owned_budget)
         gate = SynchronousUnauthenticatedGate(capacity)
         handshake = AuthenticatedTelnyxHandshakeService(
             profile=selection.profile,
