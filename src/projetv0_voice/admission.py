@@ -2433,8 +2433,6 @@ class CallRegistry:
                 entry.durable = True
                 entry.lease_state = "pending"
                 entry.budget_permit = result.budget_permit
-                if self._owned_budget is not None:
-                    self._owned_budget.ready = False
                 if (
                     self._candidate_run_id is not None
                     and result.qualification_exhausted

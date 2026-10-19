@@ -102,6 +102,14 @@ class OwnedPilotBudgetDenied:
     """Ordinary admission refusal, not a persistence fault."""
 
 
+@dataclass(frozen=True, repr=False)
+class OwnedPilotBudgetSnapshot:
+    """Writer publication; admission closure does not revoke an existing permit."""
+
+    observation: BudgetObservation | None = None
+    admission_available: bool = False
+
+
 def observation_valid(
     policy: OwnedPilotBudgetPolicy, fact: BudgetObservation, now: datetime
 ) -> bool:
@@ -158,6 +166,7 @@ class _BudgetWriter(Protocol):
         self, policy: OwnedPilotBudgetPolicy, *, start_envelope_seconds: float = 335
     ) -> None: ...
     async def owned_budget_request(self, action: str, **values: object) -> object: ...
+    def owned_budget_snapshots(self) -> tuple[OwnedPilotBudgetSnapshot, ...]: ...
 
 
 class OwnedPilotBudgetGate:
@@ -177,8 +186,6 @@ class OwnedPilotBudgetGate:
         self.collect = collect
         self.utcnow = utcnow
         self.start_envelope_seconds = start_envelope_seconds
-        self.observation: BudgetObservation | None = None
-        self.ready = False
         self._lock = asyncio.Lock()
         writer.set_owned_budget(policy, start_envelope_seconds=start_envelope_seconds)
 
@@ -186,35 +193,52 @@ class OwnedPilotBudgetGate:
         async with self._lock:
             try:
                 fact = await self.collect()
-                result = await self.writer.owned_budget_request("observe", observation=fact)
-                self.observation = fact if result is not None else None
-                self.ready = result is True and self.can_start()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.observation = None
-                self.ready = False
+                fact = None
+            try:
+                await self.writer.owned_budget_request("observe", observation=fact)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return False
+            # Result delivery can be arbitrarily late. Never copy its old
+            # observation/readiness over the writer's newer committed state.
             return self.ready
 
+    @property
+    def ready(self) -> bool:
+        return self.can_start()
+
     def can_start(self) -> bool:
-        fact = self.observation
+        snapshots = self.writer.owned_budget_snapshots()
         now = self.utcnow()
         return (
-            fact is not None
-            and observation_valid(self.policy, fact, now)
-            and not fact.active_call_control_ids
+            bool(snapshots)
+            and all(
+                snapshot.admission_available
+                and snapshot.observation is not None
+                and observation_valid(self.policy, snapshot.observation, now)
+                and not snapshot.observation.active_call_control_ids
+                for snapshot in snapshots
+            )
             and (self.policy.paid_until - now).total_seconds() >= self.start_envelope_seconds
         )
 
     def permits(self, permit: OwnedPilotBudgetPermit | None) -> bool:
-        fact = self.observation
+        snapshots = self.writer.owned_budget_snapshots()
         return (
             permit is not None
             and permit.policy_sha256 == self.policy.sha256
             and permit.paid_until == self.policy.paid_until
-            and fact is not None
-            and observation_valid(self.policy, fact, self.utcnow())
-            and affordable(self.policy, fact, permit.ordinal - 1)
+            and bool(snapshots)
+            and all(
+                snapshot.observation is not None
+                and observation_valid(self.policy, snapshot.observation, self.utcnow())
+                and affordable(self.policy, snapshot.observation, permit.ordinal - 1)
+                for snapshot in snapshots
+            )
         )
 
     async def dispatch(self, permit: OwnedPilotBudgetPermit) -> bool:

@@ -97,6 +97,13 @@ a known restored store, the operator must suspend it explicitly:
 python -m projetv0_voice.owned_pilot_budget_cli suspend-restored
 ```
 
+An operator timeout reports `owned_budget_transition_unknown`, because the row
+may commit after the timeout. The command drains and joins its writer even when
+degraded, retaining late committed state. If bounded drain and cancellation
+cannot close the owner, the standalone command exits with that unknown outcome;
+it never returns while leaving a writer alive. Inspect the same durable authority
+before deciding how to continue.
+
 There is no automatic unsuspend/regrant path and no claim of arbitrary full-store
 rollback detection. Missing authority refuses paid work. Additive legacy10 and
 native-audio11 migrations preserve historical qualification rows and old logical
@@ -120,6 +127,12 @@ Answer/stream owners, WSS claims and session construction recheck after awaits.
 A durable paid-dispatch intent survives cancellation, lease expiry and restart;
 only native accepted hangup or matching verified terminal evidence settles it.
 Observation refresh never clears that uncertainty.
+
+Synchronous paid predicates read the writer's committed snapshot, not a delayed
+refresh response. While COMMIT is in flight, prepared state may only restrict an
+existing committed permission; it cannot grant one. Publication follows commit,
+so an older observation result cannot reopen a newer busy/exhausted admission.
+This readiness closure still leaves an affordable current permit usable.
 
 The existing supervisor refreshes bounded metadata without enrolling. Budget
 closure affects readiness, while `/health/live` and owned local finalization stay

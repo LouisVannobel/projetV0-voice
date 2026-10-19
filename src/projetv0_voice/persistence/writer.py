@@ -37,6 +37,7 @@ from projetv0_voice.owned_pilot_budget import (
     OwnedPilotBudgetDenied,
     OwnedPilotBudgetPermit,
     OwnedPilotBudgetPolicy,
+    OwnedPilotBudgetSnapshot,
     affordable,
     observation_valid,
 )
@@ -536,6 +537,8 @@ class PersistenceWriter:
         self._owned_budget_policy: OwnedPilotBudgetPolicy | None = None
         self._owned_budget_observation: BudgetObservation | None = None
         self._owned_budget_start_envelope = 335.0
+        self._owned_budget_snapshot = OwnedPilotBudgetSnapshot()
+        self._owned_budget_pending_snapshot: OwnedPilotBudgetSnapshot | None = None
         self._sparra_active = False
         self._audio_cleanup: Callable[[UUID, tuple[UUID, ...]], Awaitable[None]] | None = None
         self._audio_free_bytes: Callable[[], int] | None = None
@@ -703,6 +706,7 @@ class PersistenceWriter:
             future.add_done_callback(self._consume_control_commit_exception)
             raise
         except TimeoutError:
+            future.add_done_callback(self._consume_control_commit_exception)
             raise self.latch_control_commit_timeout() from None
 
     def latch_control_commit_timeout(self) -> FatalPersistenceError:
@@ -803,6 +807,29 @@ class PersistenceWriter:
             result.add_done_callback(lambda f: None if f.cancelled() else f.exception())
             raise
         return await result
+
+    def owned_budget_snapshots(self) -> tuple[OwnedPilotBudgetSnapshot, ...]:
+        if self._degraded or self._closed_event.is_set():
+            return ()
+        committed = self._owned_budget_snapshot
+        pending = self._owned_budget_pending_snapshot
+        # The pre-commit view can only restrict committed permission. This also
+        # fences the SQLite-thread COMMIT -> event-loop publication interval.
+        return (committed,) if pending is None else (committed, pending)
+
+    async def _prepare_owned_budget_snapshot(self) -> OwnedPilotBudgetSnapshot:
+        policy, fact = self._owned_budget_policy, self._owned_budget_observation
+        state = await self._owned_budget_command({"action": "state"})
+        if (policy is None or fact is None or not isinstance(state, tuple)
+                or fact.openrouter_reported_spend_usd < Decimal(state[1])
+                or fact.telnyx_reported_spend_usd < Decimal(state[2])):
+            return OwnedPilotBudgetSnapshot()
+        cursor = await self._require_owner_connection().execute(
+            "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+        busy = await cursor.fetchone()
+        await cursor.close()
+        return OwnedPilotBudgetSnapshot(
+            fact, state[3] is None and busy == (0,) and affordable(policy, fact, state[0]))
 
     async def _owned_budget_command(self, payload: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
@@ -3601,6 +3628,7 @@ class PersistenceWriter:
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         command = PersistenceCommand("shutdown", {}, future, enqueued_at=self._monotonic())
+        future.add_done_callback(self._consume_control_commit_exception)
         async with asyncio.timeout(timeout_seconds):
             await self._queue.put(command)
             self._track_pending(command)
@@ -4113,7 +4141,15 @@ class PersistenceWriter:
                 await connection.rollback()
                 return False, None
             self._check_storage_limit()
+            if (self._owned_budget_policy is not None
+                    and command.kind in {"owned_budget", "webhook_effect", "lease"}):
+                self._owned_budget_pending_snapshot = await self._prepare_owned_budget_snapshot()
             await connection.commit()
+            if self._owned_budget_pending_snapshot is not None:
+                # No await between successful COMMIT and publication. A caller
+                # resuming much later cannot restore a superseded observation.
+                self._owned_budget_snapshot = self._owned_budget_pending_snapshot
+                self._owned_budget_pending_snapshot = None
             if self._contract_version == 2 and command.kind == "sparra_content":
                 action = command.payload.get("action")
                 if action == "audio_choice" and isinstance(command_result, AudioChoiceFacts):
@@ -4172,6 +4208,8 @@ class PersistenceWriter:
                     else "recording_archive_commit_unknown"
                 ) from None
             raise
+        finally:
+            self._owned_budget_pending_snapshot = None
         return False, command_result
 
     async def _apply_stale_terminal(self, payload: Mapping[str, object]) -> None:

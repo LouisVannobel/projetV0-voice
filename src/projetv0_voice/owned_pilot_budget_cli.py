@@ -18,6 +18,35 @@ from projetv0_voice.qualified_profile import (
 )
 from projetv0_voice.runtime_config import capture_runtime_environment, parse_runtime_settings
 
+_WRITER_CLOSE_SECONDS = 5.0
+
+
+class OwnedPilotBudgetOutcomeUnknown(RuntimeError):
+    """A submitted transition may have committed; never report it as non-commit."""
+
+    def __init__(self) -> None:
+        super().__init__("owned_budget_transition_unknown")
+
+
+async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[None]) -> None:
+    failed = False
+    try:
+        # Degradation does not stop the owner loop. Drain still queues shutdown
+        # behind the in-flight transition and retains any late committed row.
+        await writer.drain(_WRITER_CLOSE_SECONDS)
+    except BaseException:
+        failed = True
+        owner.cancel()
+    done, _ = await asyncio.wait({owner}, timeout=_WRITER_CLOSE_SECONDS)
+    if owner not in done:
+        # Like the runtime's hard-exit boundary, an uncloseable native SQLite
+        # owner cannot be left running after this standalone operator returns.
+        print("owned_budget_transition_unknown", flush=True)
+        os._exit(1)
+    await owner
+    if failed:
+        raise RuntimeError("owned_budget_writer_close_failed") from None
+
 
 async def operate(action: str, *, predecessor_retired: bool) -> bool:
     settings = parse_runtime_settings(capture_runtime_environment(os.environ))
@@ -59,22 +88,43 @@ async def operate(action: str, *, predecessor_retired: bool) -> bool:
     ):
         raise RuntimeError("owned_budget_operator_refused")
     owner = asyncio.create_task(writer.run())
+    submitted = False
     try:
         if not await writer.wait_ready():
             return False
         if action == "suspend-restored":
+            submitted = True
             return await writer.owned_budget_request("suspend") is True
         if action != "enroll" or not predecessor_retired:
             return False
         fact = await gate.collect()
+        submitted = True
         return (
             await writer.owned_budget_request("enroll", observation=fact, predecessor_retired=True)
             is True
         )
+    except Exception:
+        if submitted:
+            raise OwnedPilotBudgetOutcomeUnknown() from None
+        raise
     finally:
-        if not writer.is_degraded:
-            await writer.drain(5)
-        await owner
+        cleanup = asyncio.create_task(_close_operator_writer(writer, owner))
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                cancellation = error
+            except Exception:
+                break
+        try:
+            cleanup.result()
+        except Exception:
+            if submitted:
+                raise OwnedPilotBudgetOutcomeUnknown() from None
+            raise RuntimeError("owned_budget_writer_close_failed") from None
+        if cancellation is not None:
+            raise cancellation
 
 
 def main() -> int:
@@ -90,6 +140,9 @@ def main() -> int:
         parser.error("enroll requires --predecessor-retired")
     try:
         accepted = asyncio.run(operate(args.action, predecessor_retired=args.predecessor_retired))
+    except OwnedPilotBudgetOutcomeUnknown:
+        print("owned_budget_transition_unknown")
+        return 1
     except Exception:
         accepted = False
     print("owned_budget_transition_accepted" if accepted else "owned_budget_transition_refused")

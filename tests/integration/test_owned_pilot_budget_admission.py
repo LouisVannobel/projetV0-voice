@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sqlite3
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
@@ -566,3 +567,141 @@ async def test_pending_native_begin_keeps_readiness_busy_despite_reporting_lag(t
         finally:
             release.set()
             await action
+
+
+@asynccontextmanager
+async def completed_observe_barrier(writer, monkeypatch):
+    """Hold only result delivery; the real owner has already committed SQLite."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    native = writer.owned_budget_request
+    hold = True
+
+    async def deliver(action, **values):
+        nonlocal hold
+        result = await native(action, **values)
+        if action == "observe" and hold:
+            hold = False
+            entered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(writer, "owned_budget_request", deliver)
+    try:
+        yield entered, release
+    finally:
+        release.set()
+
+
+def saved_permit(path):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPermit
+
+    with sqlite3.connect(path) as db:
+        encoded = db.execute("SELECT budget_permit_json FROM call_leases").fetchone()[0]
+    return OwnedPilotBudgetPermit.model_validate_json(encoded)
+
+
+@pytest.mark.asyncio
+async def test_committed_floor_closes_permit_before_observe_result_delivery(tmp_path, monkeypatch):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+
+        async def collect():
+            return observation(openrouter_reported_spend_usd=Decimal("1.30"))
+
+        gate.collect = collect
+        refresh = None
+        try:
+            async with completed_observe_barrier(case.writer, monkeypatch) as (entered, _release):
+                refresh = asyncio.create_task(gate.refresh())
+                await asyncio.wait_for(entered.wait(), 2)
+                assert budget_rows(case.path)[0][1] == "1.30"
+                assert not gate.permits(permit)
+        finally:
+            if refresh is not None:
+                await refresh
+
+
+@pytest.mark.asyncio
+async def test_delayed_successful_observe_cannot_reopen_newer_admission(tmp_path, monkeypatch):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        async with completed_observe_barrier(case.writer, monkeypatch) as (entered, release):
+            refresh = asyncio.create_task(gate.refresh())
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await committed(case.registry, case.writer, event(occurred_at=NOW))
+                assert budget_rows(case.path)[0][0] == 1
+                assert not gate.ready
+            finally:
+                release.set()
+                await refresh
+        assert not gate.ready
+
+
+@pytest.mark.asyncio
+async def test_precommit_observation_cannot_grant_readiness(tmp_path, monkeypatch):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        await case.writer.owned_budget_request("observe", observation=None)
+        assert not gate.ready
+        entered, release = asyncio.Event(), asyncio.Event()
+        native_commit = case.writer._connection.commit
+
+        async def commit():
+            entered.set()
+            await release.wait()
+            await native_commit()
+
+        monkeypatch.setattr(case.writer._connection, "commit", commit)
+        refresh = asyncio.create_task(gate.refresh())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not gate.ready
+        finally:
+            release.set()
+            await refresh
+        assert gate.ready
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spend", ["0", "1.30"])
+@pytest.mark.parametrize("stage", ["before", "after"])
+async def test_commit_interval_only_restricts_committed_permit(
+    tmp_path,
+    monkeypatch,
+    spend,
+    stage,
+):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+
+        async def collect():
+            return observation(openrouter_reported_spend_usd=Decimal(spend))
+
+        gate.collect = collect
+        entered, release = asyncio.Event(), asyncio.Event()
+        native_commit = case.writer._connection.commit
+
+        async def commit():
+            if stage == "after":
+                await native_commit()
+            entered.set()
+            await release.wait()
+            if stage == "before":
+                await native_commit()
+
+        monkeypatch.setattr(case.writer._connection, "commit", commit)
+        refresh = asyncio.create_task(gate.refresh())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            if stage == "after":
+                assert budget_rows(case.path)[0][1] == spend
+            assert gate.permits(permit) is (spend == "0")
+            assert not gate.ready
+        finally:
+            release.set()
+            await refresh
