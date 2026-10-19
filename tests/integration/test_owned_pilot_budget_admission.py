@@ -126,9 +126,17 @@ async def test_one_native_permit_for_both_orders_duplicate_and_wss_race(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_last_affordable_permit_survives_advanced_counter(tmp_path):
+@pytest.mark.parametrize("restated", [False, True])
+async def test_last_affordable_permit_survives_advanced_counter(tmp_path, restated):
     async with registry_case(tmp_path) as case:
-        gate = await attach(case)
+        gate = await attach(case, fact=observation(
+            openrouter_reported_spend_usd=Decimal("1.1") if restated else Decimal("0"),
+        ))
+        if restated:
+            async def collect():
+                return observation(openrouter_reported_spend_usd=Decimal("0.2"))
+            gate.collect = collect
+            assert await gate.refresh()
         for number in range(3):
             control = f"call-{number}"
             assert (
@@ -158,6 +166,7 @@ async def test_last_affordable_permit_survives_advanced_counter(tmp_path):
         ).status_code == 503
         assert case.provider.actions == before
         assert budget_rows(case.path)[0][0] == 3
+        assert budget_rows(case.path)[0][1:3] == ("1.1" if restated else "0", "0")
 
 
 @pytest.mark.asyncio
@@ -181,7 +190,7 @@ async def test_restart_preserves_unknown_dispatch_and_no_reenrollment(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_report_lag_is_valid_regression_and_known_restore_are_closed(tmp_path):
+async def test_report_lag_and_restatement_keep_floor_and_known_restore_stays_closed(tmp_path):
     async with registry_case(tmp_path) as case:
         gate = await attach(case)
         await committed(case.registry, case.writer, event(occurred_at=NOW))
@@ -189,11 +198,307 @@ async def test_report_lag_is_valid_regression_and_known_restore_are_closed(tmp_p
         assert await case.writer.owned_budget_request("observe", observation=observation()) is False
         high = observation(openrouter_reported_spend_usd=Decimal("0.1"))
         assert await case.writer.owned_budget_request("observe", observation=high) is False
-        assert await case.writer.owned_budget_request("observe", observation=observation()) is None
+        assert await case.writer.owned_budget_request("observe", observation=observation()) is False
         assert budget_rows(case.path)[0][1] == "0.1"
         await case.writer.owned_budget_request("suspend")
         assert not await gate.refresh()
         assert budget_rows(case.path)[0][4] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,threshold",
+    [
+        ("openrouter_available_cash_usd", "4.680408"),
+        ("openrouter_limit_remaining_usd", "4.680408"),
+        ("telnyx_available_cash_usd", "4.22"),
+    ],
+)
+@pytest.mark.parametrize("shortfall", ["0", "0.000001"])
+async def test_restatement_uses_durable_floor_gap_at_native_paid_entry(
+    tmp_path, field, threshold, shortfall,
+):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, fact=observation(
+            openrouter_reported_spend_usd=Decimal("1.1"),
+            telnyx_reported_spend_usd=Decimal("3.5"),
+        ))
+
+        async def collect():
+            return observation(
+                openrouter_reported_spend_usd=Decimal("0.2"),
+                telnyx_reported_spend_usd=Decimal("0.5"),
+                **{field: Decimal(threshold) - Decimal(shortfall)},
+            )
+
+        gate.collect = collect
+        assert await gate.refresh() is (shortfall == "0")
+        assert budget_rows(case.path) == [(0, "1.1", "3.5", None, 0)]
+        result = await committed(case.registry, case.writer, event(occurred_at=NOW))
+        assert result.status_code == (200 if shortfall == "0" else 503)
+        assert [action[0] for action in case.provider.actions] == (
+            ["answer"] if shortfall == "0" else []
+        )
+        assert budget_rows(case.path)[0][:3] == (
+            int(shortfall == "0"), "1.1", "3.5",
+        )
+
+
+@pytest.mark.asyncio
+async def test_independent_reported_floors_survive_restatement_consumption_and_restart(tmp_path):
+    facts = [observation(openrouter_reported_spend_usd=Decimal("0.8"),
+                         telnyx_reported_spend_usd=Decimal("3.5"))]
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, fact=facts[0])
+        original = case.writer.owned_budget_snapshots()[0]
+
+        async def collect():
+            return facts[0]
+
+        gate.collect = collect
+        facts[0] = observation(openrouter_reported_spend_usd=Decimal("1.1"),
+                               telnyx_reported_spend_usd=Decimal("0.5"))
+        assert await gate.refresh()
+        assert budget_rows(case.path)[0][:3] == (0, "1.1", "3.5")
+        assert original.reported_floors == (Decimal("0.8"), Decimal("3.5"))
+        assert original.observation.openrouter_reported_spend_usd == Decimal("0.8")
+        facts[0] = observation(openrouter_reported_spend_usd=Decimal("0.2"),
+                               telnyx_reported_spend_usd=Decimal("0.5"))
+        assert await gate.refresh()
+        result = await committed(case.registry, case.writer, event(occurred_at=NOW))
+        assert result.status_code == 200
+        await committed(case.registry, case.writer, event("call.hangup", occurred_at=NOW))
+        assert await gate.refresh()
+        assert budget_rows(case.path) == [(1, "1.1", "3.5", None, 0)]
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, enrolled=False, fact=facts[0])
+        assert gate.ready
+        assert budget_rows(case.path) == [(1, "1.1", "3.5", None, 0)]
+        snapshot = case.writer.owned_budget_snapshots()[0]
+        assert snapshot.reported_floors == (Decimal("1.1"), Decimal("3.5"))
+        assert snapshot.observation.openrouter_reported_spend_usd == Decimal("0.2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,threshold",
+    [("openrouter_available_cash_usd", "4.680408"),
+     ("openrouter_limit_remaining_usd", "4.680408"),
+     ("telnyx_available_cash_usd", "4.22")],
+)
+async def test_current_permit_and_transactional_dispatch_recheck_floor_gap(
+    tmp_path, field, threshold,
+):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, fact=observation(
+            openrouter_reported_spend_usd=Decimal("1.1"),
+            telnyx_reported_spend_usd=Decimal("3.5"),
+        ))
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        for shortfall in ("0", "0.000001", "0"):
+            fact = observation(openrouter_reported_spend_usd=Decimal("0.2"),
+                               telnyx_reported_spend_usd=Decimal("0.5"),
+                               **{field: Decimal(threshold) - Decimal(shortfall)})
+            assert await case.writer.owned_budget_request("observe", observation=fact) is False
+            assert gate.permits(permit) is (shortfall == "0")
+            assert await case.writer.owned_budget_request("dispatch", permit=permit) is (
+                shortfall == "0"
+            )
+            assert budget_rows(case.path)[0][:3] == (1, "1.1", "3.5")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["stale", "identity", "expiry", "anchor", "suspended"])
+async def test_restatement_never_bypasses_original_paid_refusals(tmp_path, invalid):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetGate
+
+    policy = budget_policy(openrouter_anchor_usd=Decimal("0.1"))
+    fact = [observation(openrouter_reported_spend_usd=Decimal("1.1"))]
+
+    async def collect():
+        return fact[0]
+
+    async with registry_case(tmp_path) as case:
+        gate = OwnedPilotBudgetGate(case.writer, policy, collect, utcnow=lambda: NOW)
+        case.registry.set_owned_budget(gate)
+        assert await case.writer.owned_budget_request(
+            "enroll", observation=fact[0], predecessor_retired=True,
+        )
+        assert await gate.refresh()
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        fact[0] = observation(openrouter_reported_spend_usd=Decimal("0.2"))
+        await gate.refresh()
+        assert gate.permits(permit)
+        if invalid == "suspended":
+            await case.writer.owned_budget_request("suspend")
+        else:
+            changes = {
+                "stale": {"collection_started_at_utc": NOW - timedelta(seconds=61)},
+                "identity": {"identity": replace(policy.identity, connection_id="foreign")},
+                "expiry": {"openrouter_expires_at_utc": NOW},
+                "anchor": {"openrouter_reported_spend_usd": Decimal("0.099999")},
+            }
+            fact[0] = replace(fact[0], **changes[invalid])
+        assert not await gate.refresh()
+        assert not gate.permits(permit)
+        assert not await case.writer.owned_budget_request("dispatch", permit=permit)
+        assert budget_rows(case.path)[0][:3] == (1, "1.1", "0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,threshold",
+    [("openrouter_available_cash_usd", "4.680408"),
+     ("openrouter_limit_remaining_usd", "4.680408"),
+     ("telnyx_available_cash_usd", "4.22")],
+)
+@pytest.mark.parametrize("shortfall", ["0", "0.000001"])
+async def test_signed_http_ingress_uses_floor_gap_before_native_paid_entry(
+    tmp_path, monkeypatch, field, threshold, shortfall,
+):
+    from types import SimpleNamespace
+
+    import httpx
+
+    from projetv0_voice.app import create_app
+    from projetv0_voice.lifecycle import RuntimeSupervisor
+    from projetv0_voice.telnyx.webhooks import TelnyxWebhookProcessor
+    from tests.integration.test_health_and_bounds import _runtime_settings
+    from tests.unit.test_sparra_admission import DID
+    from tests.unit.test_telnyx_webhooks import event_body, verifier_for
+
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, fact=observation(
+            openrouter_reported_spend_usd=Decimal("1.1"),
+            telnyx_reported_spend_usd=Decimal("3.5"),
+        ))
+
+        async def collect():
+            return observation(openrouter_reported_spend_usd=Decimal("0.2"),
+                               telnyx_reported_spend_usd=Decimal("0.5"),
+                               **{field: Decimal(threshold) - Decimal(shortfall)})
+
+        gate.collect = collect
+        await gate.refresh()
+        body = event_body(occurred_at=NOW.isoformat(), payload={
+            "call_control_id": "original", "call_leg_id": "original-leg",
+            "call_session_id": "session", "connection_id": "fixture-connection", "to": DID,
+        })
+        verifier, headers = verifier_for(monkeypatch, body, timestamp=int(NOW.timestamp()))
+        supervisor = RuntimeSupervisor(writer=case.writer, registry=case.registry,
+                                       sparra_enabled=True, utcnow=lambda: NOW)
+        processor = TelnyxWebhookProcessor(verifier=verifier,
+            resolver=case.registry.resolve_webhook,
+            duplicate_resolver=case.registry.resolve_duplicate_webhook,
+            finalizer_owner=supervisor)
+        app = create_app(_runtime_settings(), SimpleNamespace())
+        app.state.runtime_graph = SimpleNamespace(webhook_processor=processor)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://offline.invalid", trust_env=False) as client:
+            response = await client.post("/telnyx/events", content=body, headers=headers)
+        assert response.status_code == (200 if shortfall == "0" else 503)
+        assert [action[0] for action in case.provider.actions] == (
+            ["answer"] if shortfall == "0" else []
+        )
+        assert budget_rows(case.path)[0][:3] == (int(shortfall == "0"), "1.1", "3.5")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["before", "after"])
+@pytest.mark.parametrize("improving", [False, True])
+async def test_restatement_commit_views_use_own_floors_and_only_restrict(
+    tmp_path, monkeypatch, stage, improving,
+):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, fact=observation(openrouter_reported_spend_usd=Decimal("1.1")))
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        low = observation(openrouter_reported_spend_usd=Decimal("0.2"),
+                          openrouter_available_cash_usd=Decimal("4.680407"))
+        if improving:
+            await case.writer.owned_budget_request("observe", observation=low)
+            assert not gate.permits(permit)
+        fact = replace(low, openrouter_available_cash_usd=Decimal("4.680408")) if improving else low
+
+        async def collect():
+            return fact
+
+        gate.collect = collect
+        entered, release = asyncio.Event(), asyncio.Event()
+        native_commit = case.writer._connection.commit
+
+        async def commit():
+            if stage == "after":
+                await native_commit()
+            entered.set()
+            await release.wait()
+            if stage == "before":
+                await native_commit()
+
+        monkeypatch.setattr(case.writer._connection, "commit", commit)
+        refresh = asyncio.create_task(gate.refresh())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            snapshots = case.writer.owned_budget_snapshots()
+            assert len(snapshots) == 2
+            assert all(s.reported_floors == (Decimal("1.1"), Decimal("0")) for s in snapshots)
+            assert snapshots[0].observation.openrouter_reported_spend_usd == (
+                Decimal("0.2") if improving else Decimal("1.1")
+            )
+            assert snapshots[1].observation.openrouter_reported_spend_usd == Decimal("0.2")
+            assert not gate.permits(permit)
+        finally:
+            release.set()
+            await refresh
+        assert gate.permits(permit) is improving
+        assert budget_rows(case.path)[0][:3] == (1, "1.1", "0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["before", "after"])
+async def test_commit_does_not_mix_new_floor_with_previous_raw_cash(tmp_path, monkeypatch, stage):
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, fact=observation(openrouter_reported_spend_usd=Decimal("1.1")))
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        lower = observation(openrouter_reported_spend_usd=Decimal("0.2"),
+                            openrouter_available_cash_usd=Decimal("4.680408"))
+        await case.writer.owned_budget_request("observe", observation=lower)
+        assert gate.permits(permit)
+
+        async def collect():
+            return observation(openrouter_reported_spend_usd=Decimal("1.15"),
+                               openrouter_available_cash_usd=Decimal("3.780408"))
+
+        gate.collect = collect
+        entered, release = asyncio.Event(), asyncio.Event()
+        native_commit = case.writer._connection.commit
+
+        async def commit():
+            if stage == "after":
+                await native_commit()
+            entered.set()
+            await release.wait()
+            if stage == "before":
+                await native_commit()
+
+        monkeypatch.setattr(case.writer._connection, "commit", commit)
+        refresh = asyncio.create_task(gate.refresh())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            previous, prepared = case.writer.owned_budget_snapshots()
+            assert previous.reported_floors == (Decimal("1.1"), Decimal("0"))
+            assert prepared.reported_floors == (Decimal("1.15"), Decimal("0"))
+            assert previous.observation.openrouter_reported_spend_usd == Decimal("0.2")
+            assert prepared.observation.openrouter_reported_spend_usd == Decimal("1.15")
+            assert gate.permits(permit)
+        finally:
+            release.set()
+            await refresh
+        assert gate.permits(permit)
+        assert budget_rows(case.path)[0][:3] == (1, "1.15", "0")
 
 
 @pytest.mark.asyncio
@@ -598,6 +903,48 @@ def saved_permit(path):
     with sqlite3.connect(path) as db:
         encoded = db.execute("SELECT budget_permit_json FROM call_leases").fetchone()[0]
     return OwnedPilotBudgetPermit.model_validate_json(encoded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("predicate", ["admission", "continuation"])
+async def test_missing_snapshot_floors_cannot_grant_authority(tmp_path, monkeypatch, predicate):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetSnapshot
+
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case)
+        await committed(case.registry, case.writer, event(occurred_at=NOW))
+        permit = saved_permit(case.path)
+        missing = OwnedPilotBudgetSnapshot(observation(), True)
+        monkeypatch.setattr(case.writer, "owned_budget_snapshots", lambda: (missing,))
+        if predicate == "admission":
+            assert not gate.ready
+        else:
+            assert not gate.permits(permit)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openrouter", "telnyx"])
+@pytest.mark.parametrize("invalid", ["NaN", "sNaN", "Infinity", "-0.1", "1e-25", "1e25",
+                                     "0." + "1" * 65, "not-money"])
+async def test_invalid_durable_floor_cannot_be_repaired_into_authority(tmp_path, provider, invalid):
+    fact = observation(openrouter_reported_spend_usd=Decimal("0.8"),
+                       telnyx_reported_spend_usd=Decimal("0.5"))
+    async with registry_case(tmp_path) as case:
+        await attach(case, fact=fact)
+    column = provider + "_floor"
+    with sqlite3.connect(tmp_path / "voice.sqlite") as db:
+        db.execute(f"UPDATE owned_pilot_budget SET {column}=?", (invalid,))
+    async with registry_case(tmp_path) as case:
+        gate = await attach(case, enrolled=False, fact=fact)
+        assert not gate.ready
+        assert await case.writer.owned_budget_request("state") is None
+        assert not case.writer.is_degraded
+        result = await committed(case.registry, case.writer, event(occurred_at=NOW))
+        assert result.status_code == 503
+        assert not case.provider.actions
+        row = budget_rows(case.path)[0]
+        assert row[0] == 0
+        assert row[1 if provider == "openrouter" else 2] == invalid
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from projetv0_voice.owned_pilot_budget import (
     OwnedPilotBudgetSnapshot,
     affordable,
     observation_valid,
+    reported_floors_valid,
 )
 
 if TYPE_CHECKING:
@@ -820,16 +821,16 @@ class PersistenceWriter:
     async def _prepare_owned_budget_snapshot(self) -> OwnedPilotBudgetSnapshot:
         policy, fact = self._owned_budget_policy, self._owned_budget_observation
         state = await self._owned_budget_command({"action": "state"})
-        if (policy is None or fact is None or not isinstance(state, tuple)
-                or fact.openrouter_reported_spend_usd < Decimal(state[1])
-                or fact.telnyx_reported_spend_usd < Decimal(state[2])):
+        if policy is None or fact is None or not isinstance(state, tuple):
             return OwnedPilotBudgetSnapshot()
+        floors = (Decimal(state[1]), Decimal(state[2]))
         cursor = await self._require_owner_connection().execute(
             "SELECT count(*) FROM call_leases WHERE state!='terminal'")
         busy = await cursor.fetchone()
         await cursor.close()
         return OwnedPilotBudgetSnapshot(
-            fact, state[3] is None and busy == (0,) and affordable(policy, fact, state[0]))
+            fact, state[3] is None and busy == (0,)
+            and affordable(policy, fact, state[0], reported_floors=floors), floors)
 
     async def _owned_budget_command(self, payload: Mapping[str, object]) -> object:
         connection = self._require_owner_connection()
@@ -848,6 +849,14 @@ class PersistenceWriter:
             await connection.execute("UPDATE owned_pilot_budget SET suspended=1 WHERE slot=?",
                                      (ORIGINAL_PILOT_SLOT,))
             return True
+        floors = None
+        if row is not None:
+            try:
+                floors = (Decimal(row[2]), Decimal(row[3]))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            if not reported_floors_valid(floors):
+                return None
         if action == "enroll":
             fact = payload.get("observation")
             cursor = await connection.execute(
@@ -871,7 +880,7 @@ class PersistenceWriter:
                  str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd)),
             )
             return True
-        if (row is None or row[0] != policy.sha256 or row[4]
+        if (row is None or floors is None or row[0] != policy.sha256 or row[4]
                 or row[6] != policy.model_dump_json()):
             return None
         if action == "state":
@@ -887,28 +896,29 @@ class PersistenceWriter:
             fact = payload.get("observation")
             self._owned_budget_observation = None
             if (not isinstance(fact, BudgetObservation)
-                    or not observation_valid(policy, fact, self._utcnow())
-                    or fact.openrouter_reported_spend_usd < Decimal(row[2])
-                    or fact.telnyx_reported_spend_usd < Decimal(row[3])):
+                    or not observation_valid(policy, fact, self._utcnow())):
                 return None
+            floors = (max(floors[0], fact.openrouter_reported_spend_usd),
+                      max(floors[1], fact.telnyx_reported_spend_usd))
             await connection.execute(
                 "UPDATE owned_pilot_budget SET openrouter_floor=?,telnyx_floor=? WHERE slot=?",
-                (str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd),
-                 ORIGINAL_PILOT_SLOT),
+                (str(floors[0]), str(floors[1]), ORIGINAL_PILOT_SLOT),
             )
             self._owned_budget_observation = fact
             cursor = await connection.execute(
                 "SELECT count(*) FROM call_leases WHERE state!='terminal'")
             busy = await cursor.fetchone()
             await cursor.close()
-            return row[5] is None and busy == (0,) and affordable(policy, fact, row[1])
+            return row[5] is None and busy == (0,) and affordable(
+                policy, fact, row[1], reported_floors=floors)
         if action == "dispatch":
             permit = payload.get("permit")
             fact = self._owned_budget_observation
             if (not isinstance(permit, OwnedPilotBudgetPermit) or fact is None
                     or not observation_valid(policy, fact, self._utcnow())
                     or permit.policy_sha256 != policy.sha256
-                    or not affordable(policy, fact, permit.ordinal - 1)):
+                    or not affordable(policy, fact, permit.ordinal - 1,
+                                      reported_floors=floors)):
                 return False
             cursor = await connection.execute(
                 "SELECT budget_permit_json,state FROM call_leases WHERE call_control_id=?",
@@ -939,9 +949,8 @@ class PersistenceWriter:
         state = await self._owned_budget_command({"action": "state"})
         if (not isinstance(state, tuple) or state[3] is not None
                 or not observation_valid(policy, fact, self._utcnow())
-                or not affordable(policy, fact, state[0])
-                or fact.openrouter_reported_spend_usd < Decimal(state[1])
-                or fact.telnyx_reported_spend_usd < Decimal(state[2])
+                or not affordable(policy, fact, state[0],
+                                  reported_floors=(Decimal(state[1]), Decimal(state[2])))
                 or (policy.paid_until - self._utcnow()).total_seconds()
                 < self._owned_budget_start_envelope
                 or facts.admission_generation is None
@@ -960,7 +969,8 @@ class PersistenceWriter:
         await connection.execute(
             "UPDATE owned_pilot_budget SET used_calls=used_calls+1,"
             "openrouter_floor=?,telnyx_floor=? WHERE slot=?",
-            (str(fact.openrouter_reported_spend_usd), str(fact.telnyx_reported_spend_usd),
+            (str(max(Decimal(state[1]), fact.openrouter_reported_spend_usd)),
+             str(max(Decimal(state[2]), fact.telnyx_reported_spend_usd)),
              ORIGINAL_PILOT_SLOT))
         return permit
 

@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, localcontext
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeGuard
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,6 +30,14 @@ def _exact_money(value: Decimal) -> bool:
         and len(parts.digits) <= 64
         and isinstance(parts.exponent, int)
         and -24 <= parts.exponent <= 24
+    )
+
+
+def reported_floors_valid(value: object) -> TypeGuard[tuple[Decimal, Decimal]]:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(amount, Decimal) and _exact_money(amount) for amount in value)
     )
 
 
@@ -108,6 +116,7 @@ class OwnedPilotBudgetSnapshot:
 
     observation: BudgetObservation | None = None
     admission_available: bool = False
+    reported_floors: tuple[Decimal, Decimal] | None = None
 
 
 def observation_valid(
@@ -131,29 +140,37 @@ def observation_valid(
             and fact.openrouter_limit_reset is None
             and fact.openrouter_limit_usd == 5
             and all(isinstance(v, Decimal) and _exact_money(v) for v in money)
+            and fact.openrouter_reported_spend_usd >= policy.openrouter_anchor_usd
+            and fact.telnyx_reported_spend_usd >= policy.telnyx_anchor_usd
         )
     except (ValueError, TypeError, ArithmeticError):
         return False
 
 
-def affordable(policy: OwnedPilotBudgetPolicy, fact: BudgetObservation, count: int) -> bool:
-    if type(count) is not int or not 0 <= count < policy.total_calls:
+def affordable(
+    policy: OwnedPilotBudgetPolicy, fact: BudgetObservation, count: int,
+    *, reported_floors: tuple[Decimal, Decimal],
+) -> bool:
+    if (not reported_floors_valid(reported_floors)
+            or type(count) is not int or not 0 <= count < policy.total_calls):
         return False
     with localcontext() as ctx:
         ctx.prec = 128
-        for anchor, spent, cash, reserve, forecast in zip(
+        for anchor, spent, cash, reserve, forecast, floor in zip(
             (policy.openrouter_anchor_usd, policy.telnyx_anchor_usd),
             (fact.openrouter_reported_spend_usd, fact.telnyx_reported_spend_usd),
             (fact.openrouter_available_cash_usd, fact.telnyx_available_cash_usd),
             RESERVES,
             FORECASTS,
+            reported_floors,
             strict=True,
         ):
-            effective = max(spent, anchor + count * forecast)
+            effective = max(floor, spent, anchor + count * forecast)
             if effective + reserve > 5 or cash - (effective - spent) < reserve:
                 return False
         gap = max(
-            fact.openrouter_reported_spend_usd, policy.openrouter_anchor_usd + count * FORECASTS[0]
+            reported_floors[0], fact.openrouter_reported_spend_usd,
+            policy.openrouter_anchor_usd + count * FORECASTS[0],
         )
         return (
             fact.openrouter_limit_remaining_usd - (gap - fact.openrouter_reported_spend_usd)
@@ -219,6 +236,7 @@ class OwnedPilotBudgetGate:
             and all(
                 snapshot.admission_available
                 and snapshot.observation is not None
+                and reported_floors_valid(snapshot.reported_floors)
                 and observation_valid(self.policy, snapshot.observation, now)
                 and not snapshot.observation.active_call_control_ids
                 for snapshot in snapshots
@@ -235,8 +253,10 @@ class OwnedPilotBudgetGate:
             and bool(snapshots)
             and all(
                 snapshot.observation is not None
+                and reported_floors_valid(snapshot.reported_floors)
                 and observation_valid(self.policy, snapshot.observation, self.utcnow())
-                and affordable(self.policy, snapshot.observation, permit.ordinal - 1)
+                and affordable(self.policy, snapshot.observation, permit.ordinal - 1,
+                               reported_floors=snapshot.reported_floors)
                 for snapshot in snapshots
             )
         )

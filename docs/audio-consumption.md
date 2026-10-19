@@ -109,16 +109,20 @@ rollback detection. Missing authority refuses paid work. Additive legacy10 and
 native-audio11 migrations preserve historical qualification rows and old logical
 contents; the new table and nullable lease permit do not reinterpret those rows.
 
-For each provider, new admission uses `E=max(S,A+n*d)` and requires `E+R<=5`
-and `cash-(E-S)>=R`, with remaining OpenRouter key headroom checked separately.
+For each provider, new admission uses `E=max(H,S,A+n*d)`, where `S` is the raw
+authenticated report and `H` is its durable reported high-water floor. It requires
+`E+R<=5` and `cash-(E-S)>=R`; OpenRouter also requires `key_remaining-(E-S)>=R`.
 The unchanged reserves are OR3.780408/Telnyx1.22; per-admission forecasts are
 OR0.505068/Telnyx0.12. Uncertainty is already included exactly once. The immutable
 lifetime ceiling is five, but the whole-envelope inequality can stop earlier:
 even a zero historical OR anchor permits at most three new admissions. The last
 admitted call checks its own ordinal minus one, so a closed next-admission gate
 does not reserve that call again. Reported high-water marks remain separate from
-the pessimistic forecast; lag cannot refund an admission or become a false
-reported-spending regression. These are operational forecasts, not invoice guarantees.
+the pessimistic forecast, updating only as `H'=max(H,S)`. A downward provider
+restatement can remain funded, but cannot lower that floor or refund an admission.
+Raw spend below the original policy anchor still refuses. Each frozen committed
+or pending writer view carries its own raw fact and floors. These are operational
+forecasts, not invoice guarantees.
 
 The existing writer commits receipt, pending lease, permit and increment together.
 Answered-first webhooks remain inert placeholders until initiated supplies native
