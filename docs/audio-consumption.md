@@ -35,3 +35,35 @@ single final result attempt before its owner closes it.
 The 16,000 total bounds requested ceilings, not provider token accounting. The
 250,000 native input-token allowance remains unqualified until the selected
 provider's exact prompt, schema and tokenizer transformations are established.
+
+`budget_observation.collect_budget_observation` is an inert account metadata
+reader. Its frozen identity binds the original credential SHA-256 fingerprints,
+OpenRouter creator-account and Telnyx charges user-account SHA-256 fingerprints,
+active DID/connection, original UTC midnight accounting start and exact key expiry.
+The caller supplies `SecretStr` credentials, UTC/monotonic clocks and owns the
+HTTPX client, whose transport and hooks must neither retry nor log secrets/bodies.
+It performs only fixed-origin GETs, disables redirects, limits each decoded body
+to 2 MiB and the whole acquisition to 15 seconds. Refusals have constant errors;
+cancellation propagates. No provider response body or secret is retained in facts.
+
+Facts include acquisition start/end UTC, exact Decimal spending/cash, the USD5
+OpenRouter key limit, remaining limit, no-reset state and expected expiry, complete
+active call-control IDs and a digest of the ordered request/body provenance.
+OpenRouter cash is account credits minus account usage, read separately from key
+headroom using the same bound inference credential. Missing/forbidden credits
+refuse observation; a management-key flag is not a capability test. Native-host
+capability remains a deployment qualification requirement.
+
+Telnyx spending preserves the seven original usage products (negative usage never
+refunds spend) plus absolute charges, with a separate USD wallet read. Both the
+original top-level charges response and the documented SDK `data` envelope have
+the same validated monetary/account contract. Date windows remain anchored to
+the original start and split at 31 days, the provider's maximum report interval.
+Usage uses the original flat `page_size`; numbers use native `page[size]`; active
+calls use `total_items`, `cursors.after/before` and top-level `next/previous` metadata.
+Only complete results of at most 100 rows per response are accepted; multipage or
+continuation results fail closed. Collection age starts at acquisition start,
+never the final request. The admission consumer must enforce its 60-second age,
+persist reported floors and apply its policy: these facts issue no grant, enroll
+no authority and write no ledger or file. Call-control IDs are sensitive and are
+excluded from the observation's repr; consumers must also keep them out of logs.
