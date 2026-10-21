@@ -24,10 +24,23 @@ def api(name):
         ("Oui, merci beaucoup !", True),
         ("D'accord, très bien, merci.", True),
         ("Ouais.", True),
+        ("Ouais, parfait. Merci.", True),
+        ("Oui ! Je confirme. Merci beaucoup !", True),
+        ("Oui, c'est bon.", True),
+        ("D’accord. C’est bon ! Merci.", True),
+        ("Je confirme, c'est bon, merci beaucoup.", True),
+        ("Ouais, c’est bon.", True),
         ("Oui, je ne confirme pas.", False),
         ("Ouais, parfait, merci, mais jeudi.", False),
         ("Oui si vous pouvez changer l'heure.", False),
         ("Oui ?", False),
+        ("Oui. Je ne confirme pas.", False),
+        ("Oui ! Mais jeudi.", False),
+        ("Oui. Si vous changez l'heure.", False),
+        ("Oui. C'est bon ? Merci.", False),
+        ('Oui. "Je confirme".', False),
+        ("Il a dit : oui, c'est bon.", False),
+        ("C'est bon.", False),
         ("Merci.", False),
         ("Parfait.", False),
         ("Allô ?", False),
@@ -41,6 +54,15 @@ def api(name):
 )
 def test_only_full_affirmative(text, expected):
     assert api("is_affirmative")(text) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Oui. Je confirme ?", True), ("D’accord, c’est bon ?", True),
+    ("Oui. Je ne confirme pas.", False), ("Oui ! Mais jeudi.", False),
+    ("Oui. Si vous changez l'heure.", False), ('Oui. "Je confirme".', False),
+])
+def test_clarification_preserves_whole_utterance_exclusions(text, expected):
+    assert calendar.needs_confirmation_clarification(text) is expected
 
 
 @pytest.mark.parametrize(
@@ -291,7 +313,10 @@ async def native_recap(fixture, sink, *, mixed=False):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mixed", [False, True])
-@pytest.mark.parametrize("affirmative", ["Oui, je confirme.", "Ouais, parfait, merci."])
+@pytest.mark.parametrize("affirmative", [
+    "Oui, je confirme.", "Ouais, parfait, merci.", "Ouais, parfait. Merci.",
+    "Oui ! Je confirme. Merci beaucoup !", "D’accord, c’est bon, merci.",
+])
 async def test_native_recap_ack_affirmative_submits_exact_persisted_rows_without_inference(
     mixed, affirmative,
 ):
@@ -545,7 +570,7 @@ async def test_delayed_identical_native_turn_callbacks_keep_exact_admission_rece
 @pytest.mark.parametrize(
     "case", [
         "missing_ack", "corrective_yes", "negated_yes", "conditional_yes",
-        "clear_after_ack", "stale_result", "hangup",
+        "clear_after_ack", "stale_result", "hangup", "question_yes", "quoted_yes", "reported_yes",
     ]
 )
 async def test_native_recap_rejects_missing_or_changed_consent_and_suppresses_stale_result(case):
@@ -573,6 +598,9 @@ async def test_native_recap_rejects_missing_or_changed_consent_and_suppresses_st
             "corrective_yes": "Ouais, parfait, merci, mais jeudi.",
             "negated_yes": "Oui, je ne confirme pas.",
             "conditional_yes": "Oui si vous pouvez changer l'heure.",
+            "question_yes": "Oui. C'est bon ? Merci.",
+            "quoted_yes": 'Oui. "Je confirme".',
+            "reported_yes": "Il a dit : oui, c'est bon.",
         }.get(case, "Oui.")
         await caller(fixture, reply)
         if case == "hangup":
@@ -590,7 +618,8 @@ async def test_native_recap_rejects_missing_or_changed_consent_and_suppresses_st
             assert len(sink.submitted) == 2
         else:
             assert not sink.booked.is_set()
-            if case in {"corrective_yes", "negated_yes", "conditional_yes"}:
+            if case in {"corrective_yes", "negated_yes", "conditional_yes",
+                        "quoted_yes", "reported_yes"}:
                 await until(lambda: len(fixture.peers.conversations) == 3)
                 assert fixture.session._calendar_playback.attempt is None
                 await caller(fixture, "Merci.")
@@ -630,10 +659,12 @@ def test_model_cannot_supply_proof_duration_or_unbounded_date_arguments(name, ar
 
 
 @pytest.mark.asyncio
-async def test_unknown_booking_retains_original_identity_and_refuses_overlapping_intent():
+async def test_unknown_booking_retains_original_identity_and_refuses_overlapping_intent(
+    monkeypatch,
+):
     import json
 
-    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_call_session import _native_sparra_opening, session_module
     from tests.integration.test_voice_action_authority import caller, tool
 
     sink = CalendarPeer()
@@ -653,6 +684,17 @@ async def test_unknown_booking_retains_original_identity_and_refuses_overlapping
         )
 
     sink.calendar_submit = uncertain
+    async def unknown_result(call_id, operation_id):
+        return calendar.CalendarResult.model_validate(
+            {"state": "unknown", "operationId": str(operation_id),
+             "reason": "appointment_to_confirm"}
+        )
+
+    async def shortened_waiter(*args):
+        return await calendar.await_calendar_result(*args, wait_seconds=0.05, poll_delay=0.001)
+
+    sink.calendar_result = unknown_result
+    monkeypatch.setattr(session_module, "await_calendar_result", shortened_waiter)
     async with _native_sparra_opening(calendar_sink=sink) as fixture:
         attempt = await native_recap(fixture, sink)
         await until(lambda: attempt.acknowledged_at is not None)
@@ -668,6 +710,85 @@ async def test_unknown_booking_retains_original_identity_and_refuses_overlapping
         frozen = fixture.session._calendar_pending_booking
         assert frozen[0] == sink.submitted[-1][0]
         assert frozen[1] == sink.submitted[-1][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("departure", ["current", "stale", "hangup", "capture_loss"])
+async def test_native_unknown_waits_for_verified_result_and_departed_scope_stays_silent(departure):
+    import asyncio
+
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller
+
+    class PendingPeer(CalendarPeer):
+        def __init__(self):
+            super().__init__()
+            self.polls = []
+            self.reading = asyncio.Event()
+
+        async def calendar_submit(self, call_id, operation_id, request):
+            if request["kind"] == "find_slots":
+                return await super().calendar_submit(call_id, operation_id, request)
+            self.submitted.append((operation_id, request))
+            self.booked.set()
+            return calendar.CalendarResult.model_validate(
+                {"state": "pending", "operationId": str(operation_id)}
+            )
+
+        async def calendar_result(self, call_id, operation_id):
+            self.polls.append((call_id, operation_id))
+            if len(self.polls) == 1:
+                return calendar.CalendarResult.model_validate(
+                    {"state": "unknown", "operationId": str(operation_id),
+                     "reason": "appointment_to_confirm"}
+                )
+            self.reading.set()
+            await self.release.wait()
+            return calendar.CalendarResult.model_validate({
+                "state": "confirmed", "operationId": str(operation_id),
+                "booking": {key: value for key, value in {
+                    **self.offer, "providerReference": "synthetic-verified-event",
+                }.items() if key not in {"offerId", "expiresAt"}},
+            })
+
+    sink = PendingPeer()
+    async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        try:
+            attempt = await native_recap(fixture, sink)
+            await until(lambda: attempt.acknowledged_at is not None)
+            await caller(fixture, "Ouais, parfait. Merci.")
+            await asyncio.wait_for(sink.reading.wait(), 3)
+            assert fixture.session._calendar_submitting
+            assert not any("reste à confirmer" in text for text in fixture.peers.texts)
+            fixture.peers.tool_calls = None
+            if departure == "stale":
+                await caller(fixture, "Attendez, je dois vérifier.")
+            elif departure == "hangup":
+                await fixture.session.request_drain()
+            elif departure == "capture_loss":
+                fixture.session._action_failure.signal("persistence_failed")
+            sink.release.set()
+            await asyncio.wait_for(
+                asyncio.gather(fixture.session._calendar_task, return_exceptions=True), 3
+            )
+            if departure == "current":
+                await until(lambda: any("Votre rendez-vous est confirmé" in text
+                                        for text in fixture.peers.texts))
+                assert fixture.session._calendar_pending_booking is None
+            else:
+                if departure != "stale":
+                    await asyncio.wait_for(
+                        asyncio.gather(fixture.running, return_exceptions=True), 3
+                    )
+                assert not any("Votre rendez-vous est confirmé" in text
+                               for text in fixture.peers.texts)
+                assert not any("reste à confirmer" in text for text in fixture.peers.texts)
+            assert len(sink.submitted) == 2
+            assert all(call_id == fixture.session._identity.call_id
+                       and operation_id == sink.submitted[-1][0]
+                       for call_id, operation_id in sink.polls)
+        finally:
+            sink.release.set()
 
 
 @pytest.mark.asyncio

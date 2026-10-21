@@ -90,12 +90,23 @@ def transfer_consumer():
 @pytest.mark.parametrize("text", [
     "J'ai dit au revoir.", "Au revoir, merci pour votre aide.",
     "Je vous demande de raccrocher maintenant.",
+    "Non merci, c'est tout pour moi.", "Non, ça va, merci.",
 ])
 async def test_current_native_end_tool_starts_owned_goodbye_after_its_single_callback(text):
     # The scripted SSE proves current-turn execution, not semantic model selection.
     assert direct_command(text) is None
     async with _native_sparra_opening(ack_end_call=False) as fixture:
         await active(fixture)
+        contextual = text in {"Non merci, c'est tout pour moi.", "Non, ça va, merci."}
+        if contextual:
+            fixture.peers.response_text = "Puis-je vous aider avec autre chose ?"
+            await caller(fixture, "Merci pour ces informations.")
+            for _ in range(300):
+                if fixture.peers.response_text in fixture.peers.texts:
+                    break
+                await asyncio.sleep(0.01)
+            assert fixture.peers.response_text in fixture.peers.texts
+            assert not fixture.final_mark_sent.is_set() and not fixture.running.done()
         fixture.peers.end_call = True
         results, order = [], []
         completed = asyncio.Event()
@@ -121,15 +132,16 @@ async def test_current_native_end_tool_starts_owned_goodbye_after_its_single_cal
         assert results == [({}, {"status": "ending"}, False)]
         await _opening_event(fixture.final_mark_sent, "current native tool did not play goodbye")
         assert order == ["callback", "programmed-goodbye"]
-        assert len(fixture.peers.conversations) == 1
-        request = fixture.peers.conversations[0]
+        assert len(fixture.peers.conversations) == (2 if contextual else 1)
+        request = fixture.peers.conversations[-1]
         instruction = request["messages"][0]["content"]
         description = request["tools"][0]["function"]["description"]
         assert all(word in instruction for word in ("intention présente", "citation", "négation"))
         assert "clarification" in instruction and "sans prononcer" in instruction
         assert "current caller turn" in description and "task completion" in description
         assert "without saying another" in description
-        assert fixture.peers.texts[2:] == ["Bonne journée, au revoir."]
+        expected = (["Puis-je vous aider avec autre chose ?"] if contextual else [])
+        assert fixture.peers.texts[2:] == [*expected, "Bonne journée, au revoir."]
         assert fixture.session._end_call_playback.pending
         assert not fixture.running.done()
         final_mark = fixture.sent[-1]

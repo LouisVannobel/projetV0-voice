@@ -191,6 +191,7 @@ async def await_calendar_result(
     frozen = copy.deepcopy(request)
     canonical = operation_id
     submit = True
+    last_unknown: CalendarResult | None = None
     try:
         async with asyncio.timeout(wait_seconds):
             while True:
@@ -200,22 +201,31 @@ async def await_calendar_result(
                         if submit
                         else await sink.calendar_result(call_id, canonical)
                     )
-                    canonical = result.operationId
-                    if result.state not in {"waiting_evidence", "missing", "pending", "running"}:
-                        return result
-                    submit = result.state in {"waiting_evidence", "missing"}
+                    # Once a possible send is observed, only read that operation.
+                    # A later response cannot redirect its identity or reopen submit.
+                    if last_unknown is None or result.operationId == canonical:
+                        canonical = result.operationId
+                        if result.state == "unknown":
+                            last_unknown = result
+                        elif result.state not in {
+                            "waiting_evidence", "missing", "pending", "running",
+                        }:
+                            return result
+                        submit = (
+                            last_unknown is None and result.state in {"waiting_evidence", "missing"}
+                        )
                 except (OperationSinkCommitAmbiguousError, OperationSinkTransientError):
-                    submit = True
+                    submit = last_unknown is None
                 except OperationSinkPermanentError:
                     return None
                 await asyncio.sleep(poll_delay)
     except TimeoutError:
-        return None
+        return last_unknown
 
 
 _AFFIRMATIVE = re.compile(
     r"(?:oui|ouais|je confirme|d'accord)"
-    r"(?: (?:je confirme|parfait|très bien))?"
+    r"(?: (?:je confirme|parfait|très bien|c'est bon))?"
     r"(?: merci(?: beaucoup)?)?"
 )
 
@@ -223,8 +233,8 @@ _AFFIRMATIVE = re.compile(
 def is_affirmative(text: str) -> bool:
     # Match the entire utterance: a correction, condition, question or negation
     # must never inherit consent from an affirmative prefix.
-    normalized = " ".join(text.casefold().replace("’", "'").replace(",", " ").split())
-    return _AFFIRMATIVE.fullmatch(normalized.rstrip(".! ")) is not None
+    normalized = " ".join(re.sub(r"[,.!]", " ", text.casefold().replace("’", "'")).split())
+    return _AFFIRMATIVE.fullmatch(normalized) is not None
 
 
 def needs_confirmation_clarification(text: str) -> bool:

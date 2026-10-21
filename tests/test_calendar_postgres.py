@@ -78,10 +78,12 @@ async def test_ambiguous_and_waiting_evidence_retry_frozen_payload_then_poll_can
                 }
             )
 
-    result = await await_calendar_result(Sink(), call, original, request, poll_delay=0)
+    result = await await_calendar_result(
+        Sink(), call, original, request, wait_seconds=0.1, poll_delay=0
+    )
     assert result.state == "unknown"
     assert submissions == [(call, original, request)] * 3
-    assert polls == [(call, canonical)]
+    assert polls and all(poll == (call, canonical) for poll in polls)
 
 
 @pytest.mark.asyncio
@@ -110,3 +112,133 @@ async def test_pending_poll_is_bounded_without_claiming_success_or_new_operation
         is None
     )
     assert calls == [operation]
+
+
+@pytest.mark.asyncio
+async def test_pending_unknown_confirmed_polls_one_canonical_submission():
+    from projetv0_voice.calendar import CalendarResult, await_calendar_result
+
+    original, canonical, call = uuid4(), uuid4(), uuid4()
+    submissions, polls = [], []
+    booking = {
+        "serviceId": "oil", "serviceName": "Vidange", "timezone": "Europe/Paris",
+        "start": "2026-10-26T08:00:00Z", "end": "2026-10-26T08:30:00Z",
+        "providerReference": "synthetic-verified-event",
+    }
+
+    class Sink:
+        async def calendar_submit(self, call_id, operation_id, request):
+            submissions.append((call_id, operation_id, request))
+            return CalendarResult.model_validate(
+                {"state": "pending", "operationId": str(canonical)}
+            )
+
+        async def calendar_result(self, call_id, operation_id):
+            polls.append((call_id, operation_id))
+            return CalendarResult.model_validate(
+                {"state": "unknown", "operationId": str(canonical),
+                 "reason": "appointment_to_confirm"}
+                if len(polls) == 1 else
+                {"state": "confirmed", "operationId": str(canonical), "booking": booking}
+            )
+
+    result = await await_calendar_result(Sink(), call, original, {}, poll_delay=0)
+    assert result.state == "confirmed"
+    assert result.booking.providerReference == "synthetic-verified-event"
+    assert submissions == [(call, original, {})]
+    assert polls == [(call, canonical)] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_unknown", [
+    "transient", "ambiguous", "missing", "waiting_evidence", "pending", "running",
+    "foreign_unknown", "foreign_confirmed",
+])
+async def test_unknown_latches_read_only_and_canonical_identity_until_deadline(after_unknown):
+    from projetv0_voice.calendar import CalendarResult, await_calendar_result
+    from projetv0_voice.persistence.postgres_sink import (
+        OperationSinkCommitAmbiguousError,
+        OperationSinkTransientError,
+    )
+
+    original, canonical, foreign, call = uuid4(), uuid4(), uuid4(), uuid4()
+    submissions, polls = [], []
+    unknown = CalendarResult.model_validate(
+        {"state": "unknown", "operationId": str(canonical), "reason": "appointment_to_confirm"}
+    )
+
+    class Sink:
+        async def calendar_submit(self, call_id, operation_id, request):
+            submissions.append((call_id, operation_id))
+            return unknown
+
+        async def calendar_result(self, call_id, operation_id):
+            polls.append((call_id, operation_id))
+            if after_unknown == "transient":
+                raise OperationSinkTransientError("operation_transient")
+            if after_unknown == "ambiguous":
+                raise OperationSinkCommitAmbiguousError("operation_commit_ambiguous")
+            response = {
+                "state": after_unknown.removeprefix("foreign_"),
+                "operationId": str(foreign if after_unknown.startswith("foreign_") else canonical),
+            }
+            if after_unknown == "foreign_confirmed":
+                response["booking"] = {
+                    "serviceId": "oil", "serviceName": "Vidange", "timezone": "Europe/Paris",
+                    "start": "2026-10-26T08:00:00Z", "end": "2026-10-26T08:30:00Z",
+                    "providerReference": "foreign-synthetic-event",
+                }
+            return CalendarResult.model_validate(response)
+
+    result = await await_calendar_result(
+        Sink(), call, original, {}, wait_seconds=0.03, poll_delay=0.001
+    )
+    assert result is unknown
+    assert submissions == [(call, original)]
+    assert polls and all(poll == (call, canonical) for poll in polls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_unknown", [False, True])
+async def test_waiter_permanent_failure_remains_failure(after_unknown):
+    from projetv0_voice.calendar import CalendarResult, await_calendar_result
+
+    operation = uuid4()
+
+    class Sink:
+        async def calendar_submit(self, *_args):
+            if not after_unknown:
+                raise OperationSinkPermanentError("operation_permanent")
+            return CalendarResult.model_validate(
+                {"state": "unknown", "operationId": str(operation)}
+            )
+
+        async def calendar_result(self, *_args):
+            raise OperationSinkPermanentError("operation_permanent")
+
+    assert await await_calendar_result(Sink(), uuid4(), operation, {}, poll_delay=0) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "unknown"])
+async def test_waiter_cancellation_propagates(state):
+    import asyncio
+
+    from projetv0_voice.calendar import CalendarResult, await_calendar_result
+
+    operation = uuid4()
+    reading = asyncio.Event()
+
+    class Sink:
+        async def calendar_submit(self, *_args):
+            return CalendarResult.model_validate({"state": state, "operationId": str(operation)})
+
+        async def calendar_result(self, *_args):
+            reading.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(await_calendar_result(Sink(), uuid4(), operation, {}, poll_delay=0))
+    await asyncio.wait_for(reading.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
