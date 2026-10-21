@@ -71,6 +71,7 @@ from projetv0_voice.inference.completion_strategy import (
     STT_USER_TURN_WATCHDOG_SECONDS,
     CompletionAwareTurnStopStrategy,
 )
+from projetv0_voice.inference.stt_diagnostics import STT_DIAGNOSTIC_KEY
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.models import BeginCallSnapshotV1
 from projetv0_voice.telnyx.frames import TelnyxInputDTMFFrame, TelnyxMarkFrame
@@ -707,7 +708,11 @@ class RuntimeMetricsObserver(BaseObserver):
             if reason is not None and not self.__stt_failure_recorded:
                 self.__stt_failure_recorded = True
                 with suppress(Exception):  # Preserve the existing observer forwarding policy.
-                    self._runtime_metrics.record_stt_failure(reason)
+                    self._runtime_metrics.record_stt_failure(
+                        reason,
+                        data.frame.metadata.get(STT_DIAGNOSTIC_KEY)
+                        if type(data.frame.metadata) is dict else None,
+                    )
             return
         if data.direction is not FrameDirection.DOWNSTREAM or type(data.frame) is not MetricsFrame:
             return

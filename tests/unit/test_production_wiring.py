@@ -476,7 +476,7 @@ def test_provider_factories_are_lazy_and_create_fresh_per_session_services(
         events.append(("http", (client, kwargs)))
         return client
 
-    monkeypatch.setattr(wiring, "DefaultAsyncHttpxClient", http_client_factory)
+    monkeypatch.setattr(wiring, "_SttHttpClient", http_client_factory)
     monkeypatch.setattr(
         wiring,
         "build_stt",
