@@ -408,6 +408,79 @@ async def test_native_cancellation_and_generator_close_clear_binding(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 200], ids=["failure", "transcript"])
+@pytest.mark.parametrize("exit_kind", ["cancel", "push_error"])
+async def test_native_consumer_closes_stt_during_interrupted_frame_push(status, exit_kind):
+    from projetv0_voice.production_wiring import _SttHttpClient
+
+    loop = asyncio.get_running_loop()
+    original_handler = loop.get_exception_handler()
+    finalizer_errors = []
+    loop.set_exception_handler(
+        lambda _loop, context: finalizer_errors.append(context.get("exception"))
+    )
+    client = _SttHttpClient(
+        trust_env=False,
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            status, json={"text": ""} if status == 200 else {"error": {"message": "offline"}}
+        )),
+    )
+    stt = _inference_factories(
+        SecretStr("offline-unit-key"), _real_profile(), "fr-FR", sparra_conversation=True
+    ).stt_factory(client)
+    assert stt._client.audio.transcriptions is not None
+    entered, release = asyncio.Event(), asyncio.Event()
+    binding_in_finally = []
+    forwarded = []
+
+    async def blocked_push(frame, *args, **kwargs):
+        forwarded.append(frame)
+        assert snapshot_stt_request().response_family == ("2xx" if status == 200 else "4xx")
+        entered.set()
+        await release.wait()
+        raise RuntimeError("offline-downstream-push-refused")
+
+    # Pause only forwarding of the actual native SDK/Pipecat-produced frame.
+    if status == 200:
+        stt.push_frame = blocked_push
+    else:
+        stt.push_error_frame = blocked_push
+
+    async def native_consumer():
+        try:
+            await stt.process_generator(stt.run_stt(_wav(80)))
+        finally:
+            binding_in_finally.append(snapshot_stt_request())
+
+    task = asyncio.create_task(native_consumer())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        if exit_kind == "cancel":
+            task.cancel()
+        else:
+            release.set()
+        result = await asyncio.gather(task, return_exceptions=True)
+        expected = asyncio.CancelledError if exit_kind == "cancel" else RuntimeError
+        assert len(result) == 1 and isinstance(result[0], expected)
+        assert len(forwarded) == 1
+        assert isinstance(forwarded[0], TranscriptionFrame if status == 200 else FatalErrorFrame)
+        await loop.shutdown_asyncgens()
+        await asyncio.sleep(0)
+        error_types = [type(error).__name__ for error in finalizer_errors]
+        assert (binding_in_finally, error_types) == ([None], [])
+        assert snapshot_stt_request() is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await stt.cleanup()
+        await client.aclose()
+        loop.set_exception_handler(original_handler)
+    assert client.is_closed
+
+
+@pytest.mark.asyncio
 async def test_real_session_stt_failure_cannot_revive_calendar_scope_after_budget_recovery(
     monkeypatch, tmp_path
 ):

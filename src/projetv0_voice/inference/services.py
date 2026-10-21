@@ -160,6 +160,12 @@ class _BoundedOpenAISTTService(OpenAISTTService):
                 self._accepted_segment += 1
         await super().process_frame(frame, direction)
 
+    async def process_generator(self, generator: AsyncGenerator[Frame | None]) -> None:
+        # Pipecat 1.12 can exit while forwarding a yielded frame. Close in this
+        # consuming task so run_stt resets its ContextVar in the original context.
+        async with aclosing(generator):
+            await super().process_generator(generator)
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame]:
         with stt_request_scope():
             if self._terminal:
