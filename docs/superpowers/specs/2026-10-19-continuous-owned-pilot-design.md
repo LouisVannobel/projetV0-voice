@@ -1,5 +1,10 @@
 # Continuous availability for the owned Sparra pilot
 
+The whole-reserve financial rule below is historical. The owner explicitly
+authorized the smaller remaining reserve on 21 October after delayed-charge
+risk disclosure; see [the superseding amendment](2026-10-21-remaining-pilot-reserve-design.md).
+All other original authority and history remain in force.
+
 The user authorized continuous availability under the existing independent USD5
 Telnyx and USD5 OpenRouter pilot caps, followed by Stripe with prices chosen by
 the commercial operator. No further human approval is required for the scoped
