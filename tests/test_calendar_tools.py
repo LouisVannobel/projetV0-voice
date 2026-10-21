@@ -240,6 +240,7 @@ async def native_recap(fixture, sink, *, mixed=False):
     ]
     await caller(fixture, "Je voudrais une vidange après-demain.")
     await until(lambda: any("Quel créneau" in text for text in fixture.peers.texts))
+    fixture.peers.text_before_tool = "Je vérifie le créneau." if mixed else None
     fixture.peers.tool_calls = [
         tool(
             "book_appointment",
@@ -297,6 +298,28 @@ async def test_native_recap_ack_affirmative_submits_exact_persisted_rows_without
         }
         recap, confirmation = rows[proof["recapTurnId"]], rows[proof["confirmationTurnId"]]
         assert recap.role == "assistant" and recap.source == "pipecat_assistant"
+        import base64
+
+        from projetv0_voice.crypto import EncryptedValue
+
+        def recorded_text(row):
+            return fixture.session._keyring.decrypt(
+                EncryptedValue(
+                    row.key_version,
+                    base64.b64decode(row.nonce_b64),
+                    base64.b64decode(row.ciphertext_b64),
+                ),
+                aad=f"turn:{row.turn_id}".encode("ascii"),
+            ).decode("utf-8")
+
+        assert recorded_text(recap) == attempt.speak_frame.text
+        if mixed:
+            assert "Je vérifie le créneau." in fixture.peers.texts
+            assert any(
+                recorded_text(row) == "Je vérifie le créneau."
+                for row in rows.values()
+                if row.role == "assistant" and row.turn_id != recap.turn_id
+            )
         assert confirmation.role == "user" and confirmation.source == "stt_final"
         ack = datetime.fromisoformat(proof["playbackAcknowledgedAt"])
         assert recap.ended_at <= ack <= confirmation.started_at <= confirmation.ended_at
@@ -467,9 +490,7 @@ async def test_unknown_booking_retains_original_identity_and_refuses_overlapping
         await caller(fixture, "Oui.")
         await until(lambda: sink.booked.is_set() and not fixture.session._calendar_submitting)
         fixture.peers.tool_calls = [
-            tool(
-                "book_appointment", "repeat-intent", json.dumps({"offerId": str(sink.offer_id)})
-            )
+            tool("book_appointment", "repeat-intent", json.dumps({"offerId": str(sink.offer_id)}))
         ]
         await caller(fixture, "Réessayez ce rendez-vous.")
         await until(lambda: len(fixture.peers.conversations) >= 3)
@@ -644,3 +665,122 @@ def test_appointment_labels_are_natural_and_dst_midnight_unambiguous(start, end,
 def test_calendar_instant_rejects_invalid_offset_minutes_instead_of_normalizing(value):
     with pytest.raises(ValueError):
         calendar.calendar_instant(value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "absent_recap_receipt",
+        "unadmitted_recap",
+        "unadmitted_caller",
+        "missing_offer",
+        "expired_offer",
+    ],
+)
+async def test_native_current_confirmation_preflight_failure_speaks_without_submission(
+    failure,
+    monkeypatch,
+):
+    import asyncio
+
+    from pipecat.frames.frames import TTSAudioRawFrame
+
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller
+
+    sink = CalendarPeer()
+    async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        attempt = await native_recap(fixture, sink)
+        await until(lambda: attempt.acknowledged_at is not None)
+        if failure == "absent_recap_receipt":
+            attempt.receipt = None
+        elif failure == "unadmitted_recap":
+            attempt.receipt = calendar.RecordedTurnReceipt(datetime.now(UTC))
+            attempt.receipt.settle(None)
+        elif failure == "unadmitted_caller":
+            original_admitted = calendar.RecordedTurnReceipt.admitted
+
+            async def reject_caller_receipt(receipt):
+                return None if receipt.expected_text is None else await original_admitted(receipt)
+
+            monkeypatch.setattr(calendar.RecordedTurnReceipt, "admitted", reject_caller_receipt)
+        elif failure == "missing_offer":
+            fixture.session._calendar_offers.clear()
+        else:
+            offer = fixture.session._calendar_offers[sink.offer_id]
+            fixture.session._calendar_offers[sink.offer_id] = offer.model_copy(
+                update={
+                    "expiresAt": datetime.now(UTC) - timedelta(seconds=1),
+                }
+            )
+        audible = asyncio.Event()
+
+        def observe_audio(_output, frame):
+            if isinstance(frame, TTSAudioRawFrame):
+                audible.set()
+
+        fixture.transport.output().add_event_handler("on_after_push_frame", observe_audio)
+        inference_count = len(fixture.peers.conversations)
+        await caller(fixture, "Oui, je confirme.")
+        await until(lambda: fixture.session._calendar_task is not None)
+        await asyncio.wait_for(asyncio.shield(fixture.session._calendar_task), 3)
+        from contextlib import suppress
+
+        with suppress(TimeoutError):
+            await asyncio.wait_for(audible.wait(), 3)
+        assert "Je n’ai pas pu confirmer ce rendez-vous. Je peux prendre un message." in (
+            fixture.peers.texts
+        ), "current pre-dispatch refusal consumed the affirmative without explaining it"
+        assert audible.is_set(), "fallback did not reach the actual paced audio output"
+        assert len(fixture.peers.conversations) == inference_count
+        assert len(sink.submitted) == 1 and not sink.booked.is_set()
+        assert fixture.session._calendar_pending_booking is None
+        assert not fixture.session._calendar_submitting
+        assert not any("Votre rendez-vous est confirmé" in text for text in fixture.peers.texts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("departure", ["stale", "hangup", "capture_loss"])
+async def test_native_preflight_refusal_after_scope_departure_is_silent(departure, monkeypatch):
+    import asyncio
+
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller
+
+    sink = CalendarPeer()
+    async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        attempt = await native_recap(fixture, sink)
+        await until(lambda: attempt.acknowledged_at is not None)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_admitted = calendar.RecordedTurnReceipt.admitted
+
+        async def defer_recap_receipt(receipt):
+            if receipt is attempt.receipt:
+                entered.set()
+                await release.wait()
+                return None
+            return await original_admitted(receipt)
+
+        monkeypatch.setattr(calendar.RecordedTurnReceipt, "admitted", defer_recap_receipt)
+        text_count = len(fixture.peers.texts)
+        try:
+            await caller(fixture, "Oui.")
+            await asyncio.wait_for(entered.wait(), 3)
+            if departure == "stale":
+                await caller(fixture, "Attendez, je dois vérifier.")
+            elif departure == "hangup":
+                await fixture.session.request_drain()
+            else:
+                fixture.session._action_failure.signal("persistence_failed")
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(fixture.session._calendar_task, return_exceptions=True), 3
+            )
+            if departure != "stale":
+                await asyncio.wait_for(asyncio.gather(fixture.running, return_exceptions=True), 3)
+            assert len(fixture.peers.texts) == text_count
+            assert len(sink.submitted) == 1 and not sink.booked.is_set()
+            assert fixture.session._calendar_pending_booking is None
+        finally:
+            release.set()

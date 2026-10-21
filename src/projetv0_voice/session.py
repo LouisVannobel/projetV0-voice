@@ -1110,19 +1110,22 @@ class CallSession:
     async def _book_calendar(self, scope: CallerScope, attempt: CalendarRecap) -> None:
         try:
             if attempt.receipt is None or self._calendar_sink is None:
+                await self._explain_calendar_confirmation_failure(scope)
                 return
             recap_id = await attempt.receipt.admitted()
             confirmation_id = await scope.receipt.admitted()
+            if not self._action_current(scope) or attempt.invalidated:
+                return
             if (
                 recap_id is None
                 or confirmation_id is None
                 or attempt.acknowledged_at is None
-                or not self._action_current(scope)
-                or attempt.invalidated
             ):
+                await self._explain_calendar_confirmation_failure(scope)
                 return
             offer = self._calendar_offers.get(attempt.offer_id)
             if offer is None or offer.expiresAt <= datetime.now(UTC):
+                await self._explain_calendar_confirmation_failure(scope)
                 return
             request: dict[str, object] = {
                 "kind": "book_appointment",
@@ -1163,6 +1166,13 @@ class CallSession:
             await self._services.llm.push_frame(TTSSpeakFrame(speech, append_to_context=True))
         finally:
             self._calendar_submitting = False
+
+    async def _explain_calendar_confirmation_failure(self, scope: CallerScope) -> None:
+        if self._action_current(scope):
+            await self._services.llm.push_frame(TTSSpeakFrame(
+                "Je n’ai pas pu confirmer ce rendez-vous. Je peux prendre un message.",
+                append_to_context=True,
+            ))
 
     async def _request_human_tool(self, params: FunctionCallParams) -> None:
         scope = self._consume_tool_scope(params)
