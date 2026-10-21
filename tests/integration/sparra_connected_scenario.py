@@ -1604,6 +1604,7 @@ class Scenario:
         """Actual native tool, recorder/outbox and PostgreSQL adapter; no SQL evidence seed."""
         assert self.audio_candidate, "native_calendar_v2_candidate"
         assert self.session._calendar_catalog is not None, "native_calendar_catalog_loaded"
+        before_texts = len(self.peers.texts)
         start = (now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         self.peers.tool_name = "find_slots"
         self.peers.tool_arguments = {
@@ -1613,7 +1614,7 @@ class Scenario:
         }
         await self.captured("Je voudrais un rendez-vous pour une vidange demain.")
         await eventually(
-            lambda: any("Quel créneau" in text for text in self.peers.texts),
+            lambda: any("Quel créneau" in text for text in self.peers.texts[before_texts:]),
             "calendar_search_result",
         )
         assert self.session._calendar_offers, "native_calendar_real_offers"
@@ -1645,6 +1646,14 @@ class Scenario:
             "recap_persisted": True,
             "recap_turn_id": str(attempt.receipt.turn_id),
             "playback_mark": attempt.mark_name,
+            "selected_start": (
+                self.session._calendar_offers[offer].start.isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            ),
+            "selected_end": (
+                self.session._calendar_offers[offer].end.isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            ),
         }
 
     async def calendar_confirm(self):
@@ -1670,6 +1679,40 @@ class Scenario:
             turn.role == "user" and turn.text == "Oui, je confirme." for turn in retained.turns
         ), "native_calendar_actual_affirmative"
         return {"confirmed": True, "no_confirmation_inference": True}
+
+    async def calendar_confirm_unconfirmed(self):
+        before = len(self.peers.requests)
+        before_texts = len(self.peers.texts)
+        await self.captured("Oui, je confirme.")
+        await eventually(
+            lambda: any(
+                "reste à confirmer" in text or "Votre rendez-vous est confirmé" in text
+                for text in self.peers.texts[before_texts:]
+            ),
+            "calendar_repeat_result",
+        )
+        assert not any(
+            "Votre rendez-vous est confirmé" in text for text in self.peers.texts[before_texts:]
+        ), "native_calendar_no_stale_confirmation"
+        assert len(self.peers.requests) == before, (
+            "native_calendar_no_repeat_confirmation_inference"
+        )
+        retained = await self.graph.writer.read_retained_call(self.call_id)
+        recap = next(turn for turn in retained.turns if turn.turn_id == self.calendar_recap_turn_id)
+        assert recap.role == "assistant" and "Confirmez-vous" in recap.text
+        assert any(
+            turn.role == "user"
+            and turn.text == "Oui, je confirme."
+            and turn.turn_no > recap.turn_no
+            for turn in retained.turns
+        ), "native_calendar_fresh_recorded_affirmative"
+        assert self.session._calendar_pending_booking is not None, "native_calendar_no_stale_result"
+        return {
+            "unconfirmed": True,
+            "no_stale_speech": True,
+            "no_stale_result": True,
+            "no_confirmation_inference": True,
+        }
 
     async def calendar_without_ack(self):
         self.media.ack_calendar = False
@@ -1699,9 +1742,10 @@ class Scenario:
         assert self.audio_candidate, "native_calendar_recovery_candidate"
         assert not self.peers.requests, "native_calendar_recovery_no_inference"
         assert not self.peers.texts, "native_calendar_recovery_no_speech"
-        assert await self.graph.writer.oldest_outbox_created_at() is None, (
-            "native_calendar_recovery_outbox_joined"
-        )
+        async def delivered():
+            return await self.graph.writer.oldest_outbox_created_at() is None
+
+        await eventually(delivered, "native_calendar_recovery_outbox_joined")
         return {"recovered": True, "no_inference": True, "no_speech": True}
 
     async def overflow(self):
