@@ -50,6 +50,11 @@ from projetv0_voice.inference.completion_strategy import (
     STT_REQUEST_TIMEOUT_SECONDS,
     STT_TERMINAL_PARTIAL_KEY,
 )
+from projetv0_voice.inference.stt_diagnostics import (
+    STT_DIAGNOSTIC_KEY,
+    snapshot_stt_request,
+    stt_request_scope,
+)
 from projetv0_voice.models import MessageResultV1
 from projetv0_voice.persistence.business_result import (
     ResultCompletionRejected,
@@ -109,7 +114,10 @@ class _BoundedOpenAISTTService(OpenAISTTService):
             return None
         self._terminal = True
         self._discard_batch()
-        return FatalErrorFrame(error=code, processor=self)
+        failure = FatalErrorFrame(error=code, processor=self)
+        if (diagnostic := snapshot_stt_request()) is not None:
+            failure.metadata[STT_DIAGNOSTIC_KEY] = diagnostic
+        return failure
 
     def _take_completed_batch(self) -> TranscriptionFrame | None:
         if self._pending_segments or self._caller_speaking or self._terminal:
@@ -152,64 +160,71 @@ class _BoundedOpenAISTTService(OpenAISTTService):
                 self._accepted_segment += 1
         await super().process_frame(frame, direction)
 
+    async def process_generator(self, generator: AsyncGenerator[Frame | None]) -> None:
+        # Pipecat 1.12 can exit while forwarding a yielded frame. Close in this
+        # consuming task so run_stt resets its ContextVar in the original context.
+        async with aclosing(generator):
+            await super().process_generator(generator)
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame]:
-        if self._terminal:
-            return
-        if self._sparra_audio_limits:
-            refusal = self._reserve_audio(audio)
-            if refusal is not None:
-                failure = self._fail_batch(refusal)
-                if failure is not None:
-                    yield failure
+        with stt_request_scope():
+            if self._terminal:
                 return
-        # Preserve public direct run_stt usage as a single segment, too.
-        if not self._pending_segments:
-            self._pending_segments = 1
-            self._accepted_segment += 1
-        try:
-            async with asyncio.timeout(_STT_TIMEOUT_SECONDS):
-                async with aclosing(super().run_stt(audio)) as frames:
-                    async for frame in frames:
-                        if self._terminal:
-                            return
-                        if isinstance(frame, ErrorFrame):
-                            failure = self._fail_batch("openrouter_stt_transport")
-                            if failure is not None:
-                                yield failure
-                            return
-                        if isinstance(frame, TranscriptionFrame):
-                            text = (
-                                f"{self._batch_text} {frame.text}".strip()
-                                if frame.text
-                                else self._batch_text
-                            )
-                            if len(text.encode("utf-8")) > _STT_MAX_BATCH_TEXT_BYTES:
-                                failure = self._fail_batch("openrouter_stt_text_limit")
+            if self._sparra_audio_limits:
+                refusal = self._reserve_audio(audio)
+                if refusal is not None:
+                    failure = self._fail_batch(refusal)
+                    if failure is not None:
+                        yield failure
+                    return
+            # Preserve public direct run_stt usage as a single segment, too.
+            if not self._pending_segments:
+                self._pending_segments = 1
+                self._accepted_segment += 1
+            try:
+                async with asyncio.timeout(_STT_TIMEOUT_SECONDS):
+                    async with aclosing(super().run_stt(audio)) as frames:
+                        async for frame in frames:
+                            if self._terminal:
+                                return
+                            if isinstance(frame, ErrorFrame):
+                                failure = self._fail_batch("openrouter_stt_transport")
                                 if failure is not None:
                                     yield failure
                                 return
-                            self._batch_text = text
-                            self._last_transcript = frame
-                        else:
-                            yield frame
-            if self._terminal:
-                return
-            self._pending_segments -= 1
-            # Native FIFO means successful exhaustion advances this frontier.
-            self._completed_segment = self._accepted_segment - self._pending_segments
-            completed = self._take_completed_batch()
-            if completed is not None:
-                yield completed
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            failure = self._fail_batch("openrouter_stt_timeout")
-            if failure is not None:
-                yield failure
-        except UnicodeError:
-            failure = self._fail_batch("openrouter_stt_text_invalid")
-            if failure is not None:
-                yield failure
+                            if isinstance(frame, TranscriptionFrame):
+                                text = (
+                                    f"{self._batch_text} {frame.text}".strip()
+                                    if frame.text
+                                    else self._batch_text
+                                )
+                                if len(text.encode("utf-8")) > _STT_MAX_BATCH_TEXT_BYTES:
+                                    failure = self._fail_batch("openrouter_stt_text_limit")
+                                    if failure is not None:
+                                        yield failure
+                                    return
+                                self._batch_text = text
+                                self._last_transcript = frame
+                            else:
+                                yield frame
+                if self._terminal:
+                    return
+                self._pending_segments -= 1
+                # Native FIFO means successful exhaustion advances this frontier.
+                self._completed_segment = self._accepted_segment - self._pending_segments
+                completed = self._take_completed_batch()
+                if completed is not None:
+                    yield completed
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                failure = self._fail_batch("openrouter_stt_timeout")
+                if failure is not None:
+                    yield failure
+            except UnicodeError:
+                failure = self._fail_batch("openrouter_stt_text_invalid")
+                if failure is not None:
+                    yield failure
 
     def _reserve_audio(self, audio: bytes) -> str | None:
         if not isinstance(audio, bytes) or len(audio) < 44:

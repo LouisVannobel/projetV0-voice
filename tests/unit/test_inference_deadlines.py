@@ -175,7 +175,10 @@ async def test_stt_native_http_failure_reaches_safe_counter_and_unchanged_public
                 VADUserStoppedSpeakingFrame(),
             ])
             await asyncio.wait_for(task, timeout=2)
-            assert _stt_failure_points(metrics) == [({"reason": reason}, 1)]
+            assert _stt_failure_points(metrics) == [({
+                "reason": reason, "paid_check": "not_checked", "response_family": "none",
+                "httpx_failure": "unobserved",
+            }, 1)]  # This fixture supplies a bare client without production boundary hooks.
             errors = [observed.get_nowait() for _ in range(observed.qsize())]
             errors = [frame for frame in errors if isinstance(frame, ErrorFrame)]
             assert len(errors) == 1
@@ -1163,7 +1166,8 @@ async def test_stt_pending_segment_limit_cancels_native_worker_without_transcrip
     observed = [received.get_nowait() for _ in range(received.qsize())]
     assert len(requests) == 1
     assert cancelled.is_set()
-    assert diagnostic == [({"reason": "segment_limit"}, 1)]
+    assert diagnostic == [({"reason": "segment_limit", "paid_check": "not_checked",
+                           "response_family": "none", "httpx_failure": "unobserved"}, 1)]
     assert [frame.error for frame in observed if isinstance(frame, FatalErrorFrame)] == [
         "openrouter_stt_segment_limit"
     ]
@@ -1223,7 +1227,8 @@ async def test_stt_end_drain_deadline_cancels_http_without_late_transcript(
 
     observed = [received.get_nowait() for _ in range(received.qsize())]
     assert cancelled.is_set()
-    assert diagnostic == [({"reason": "drain_timeout"}, 1)]
+    assert diagnostic == [({"reason": "drain_timeout", "paid_check": "not_checked",
+                           "response_family": "none", "httpx_failure": "unobserved"}, 1)]
     assert [frame.error for frame in observed if isinstance(frame, FatalErrorFrame)] == [
         "openrouter_stt_drain_timeout"
     ]

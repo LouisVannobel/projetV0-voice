@@ -955,6 +955,40 @@ def _diagnostic_stt_profile() -> InferenceProfileV1:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [None, [], {"projetv0_stt_request_diagnostic": "canary"}])
+async def test_stt_observer_malformed_metadata_still_counts_once_without_authority(metadata):
+    from projetv0_voice.inference.services import build_stt
+
+    stt = build_stt(_diagnostic_stt_profile(), SecretStr("offline-unit-key"), language="fr-FR")
+    llm, tts = FrameProcessor(name="llm"), FrameProcessor(name="tts")
+    owner = RuntimeMetrics.in_memory()
+    observer = pipeline_module.RuntimeMetricsObserver(
+        runtime_metrics=owner, stt=stt, llm=llm, tts=tts
+    )
+    try:
+        frame = stt._fail_batch("openrouter_stt_transport")
+        frame.metadata = metadata
+        data = FramePushed(stt, llm, frame, FrameDirection.UPSTREAM, 1)
+        await observer.on_push_frame(data)
+        await observer.on_push_frame(data)
+        points = list(_metric_map(owner)["projetv0.voice.stt.failures"].data.data_points)
+        assert [(dict(point.attributes), point.value) for point in points] == [({
+            "reason": "transport", "paid_check": "not_checked", "response_family": "none",
+            "httpx_failure": "unobserved",
+        }, 1)]
+        assert "canary" not in repr(points)
+        _, upstream = await run_test(
+            pipeline_module.InferenceErrorBoundary(stt=stt, llm=llm, tts=tts),
+            frames_to_send=[frame], frames_to_send_direction=FrameDirection.UPSTREAM,
+            expected_up_frames=[ErrorFrame],
+        )
+        assert upstream[0].error == "stt_failed" and upstream[0].metadata == {}
+    finally:
+        await stt._client.close()
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", [
     "timeout", "transport", "segment_limit", "text_limit", "text_invalid", "drain_timeout"
 ])
@@ -981,7 +1015,8 @@ async def test_runtime_metrics_observer_records_native_stt_failure_once_before_s
         await observer.on_push_frame(data)
         points = list(_metric_map(owner)["projetv0.voice.stt.failures"].data.data_points)
         assert [(dict(point.attributes), point.value) for point in points] == [
-            ({"reason": reason}, 1)
+            ({"reason": reason, "paid_check": "not_checked", "response_family": "none",
+              "httpx_failure": "unobserved"}, 1)
         ]
         _, upstream = await run_test(
             pipeline_module.InferenceErrorBoundary(stt=stt, llm=llm, tts=tts),

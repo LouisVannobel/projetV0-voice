@@ -22,6 +22,7 @@ from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
 from projetv0_voice.calendar import CalendarSink
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
+from projetv0_voice.inference.stt_diagnostics import observe_paid_check
 from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
 from projetv0_voice.models import CallUpsertPayloadV1, VoiceOperationV1
 from projetv0_voice.persistence.commands import PersistenceCommand
@@ -496,7 +497,13 @@ class ProcessSessionFactory:
             stack.push(stt_client_close)
             if grant.paid_work_permitted is not None:
                 async def guard_paid_request(_request: httpx.Request) -> None:
-                    if not grant.paid_work_permitted or not grant.paid_work_permitted():
+                    try:
+                        permitted = bool(grant.paid_work_permitted and grant.paid_work_permitted())
+                    except Exception:
+                        observe_paid_check("check_error")
+                        raise
+                    observe_paid_check("allowed" if permitted else "denied")
+                    if not permitted:
                         raise RuntimeError("owned_budget_paid_fence")
                 if not isinstance(stt_client, httpx.AsyncClient):
                     raise RuntimeError("owned_budget_stt_client_invalid")

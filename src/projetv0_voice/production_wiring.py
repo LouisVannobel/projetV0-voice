@@ -25,6 +25,7 @@ from projetv0_voice.config import AgentManifestV1, load_agent_manifest
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 from projetv0_voice.inference.services import build_llm, build_stt
+from projetv0_voice.inference.stt_diagnostics import observe_httpx_failure, observe_response_status
 from projetv0_voice.lifecycle import (
     RuntimeInferenceFactories,
     RuntimeProductionFactories,
@@ -676,6 +677,30 @@ def _call_control_factory(
     return CallControlClient(api_key=api_key.get_secret_value(), api_region="EU")
 
 
+class _SttHttpClient(DefaultAsyncHttpxClient):
+    """Observe public send failures, including buffered response body reads."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.event_hooks["response"].append(self._observe_status)
+
+    async def _observe_status(self, response: httpx.Response) -> None:
+        observe_response_status(response.status_code)
+
+    async def send(self, *args: Any, **kwargs: Any) -> httpx.Response:
+        try:
+            return await super().send(*args, **kwargs)
+        except httpx.TimeoutException:
+            observe_httpx_failure("timeout")
+            raise
+        except httpx.TransportError:
+            observe_httpx_failure("transport_error")
+            raise
+        except httpx.RequestError:
+            observe_httpx_failure("other_request_error")
+            raise
+
+
 def _inference_factories(
     api_key: SecretStr,
     deployment_profile: RuntimeDeploymentProfileV1,
@@ -696,7 +721,7 @@ def _inference_factories(
     profile = deployment_profile.inference
 
     def stt_http_client_factory() -> PublicSttHttpClient:
-        return cast(PublicSttHttpClient, DefaultAsyncHttpxClient(trust_env=False))
+        return cast(PublicSttHttpClient, _SttHttpClient(trust_env=False))
 
     def stt_factory(client: PublicSttHttpClient) -> Any:
         if sparra_conversation:

@@ -1026,13 +1026,73 @@ async def test_instrument_fault_is_fail_open_constant_safe_and_has_no_generic_su
 @pytest.mark.parametrize("reason", [
     "timeout", "transport", "segment_limit", "text_limit", "text_invalid", "drain_timeout"
 ])
-async def test_stt_failure_counter_accepts_only_fixed_reason_attribute(reason):
+async def test_stt_failure_counter_accepts_only_closed_reason_and_unknown_boundary(reason):
     owner = metrics_module.RuntimeMetrics.in_memory()
     try:
         owner.record_stt_failure(reason)
         values = _points(_metric_map(owner)[PREFIX + "stt.failures"])
-        assert set(values) == {(("reason", reason),)}
-        assert values[(("reason", reason),)].value == 1
+        labels = tuple(sorted({
+            "reason": reason, "paid_check": "not_checked", "response_family": "none",
+            "httpx_failure": "unobserved",
+        }.items()))
+        assert set(values) == {labels}
+        assert values[labels].value == 1
+        assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stt_diagnostic_dimensions_have_exactly_96_closed_combinations():
+    from itertools import product
+
+    from projetv0_voice.inference.stt_diagnostics import (
+        HTTPX_FAILURES,
+        PAID_CHECKS,
+        RESPONSE_FAMILIES,
+        STT_DIAGNOSTIC_CARDINALITY,
+        SttRequestDiagnostic,
+    )
+
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        for values in product(PAID_CHECKS, RESPONSE_FAMILIES, HTTPX_FAILURES):
+            owner.record_stt_failure("transport", SttRequestDiagnostic(*values))
+        owner.record_stt_failure("transport", {"paid_check": "canary"})
+        points = _points(_metric_map(owner)[PREFIX + "stt.failures"])
+        assert len(points) == STT_DIAGNOSTIC_CARDINALITY == 96
+        assert sum(point.value for point in points.values()) == 97
+        assert all(set(dict(labels)) == {
+            "reason", "paid_check", "response_family", "httpx_failure"
+        } for labels in points)
+        assert owner.failure_code is None
+    finally:
+        await owner.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [None, {}, {"paid_check": "canary"}, "canary", [], True])
+async def test_stt_malformed_snapshot_keeps_legacy_reason_and_closed_unknowns(malformed):
+    from projetv0_voice.inference.stt_diagnostics import SttRequestDiagnostic
+
+    owner = metrics_module.RuntimeMetrics.in_memory()
+    try:
+        owner.record_stt_failure("transport", malformed)
+        for invalid in (
+            SttRequestDiagnostic(paid_check="canary"),
+            SttRequestDiagnostic(response_family="canary"),
+            SttRequestDiagnostic(httpx_failure="canary"),
+            SttRequestDiagnostic(paid_check=[]),
+        ):
+            owner.record_stt_failure("transport", invalid)
+        points = _points(_metric_map(owner)[PREFIX + "stt.failures"])
+        labels = tuple(sorted({
+            "reason": "transport", "paid_check": "not_checked", "response_family": "none",
+            "httpx_failure": "unobserved",
+        }.items()))
+        assert set(points) == {labels}
+        assert points[labels].value == 5
+        assert "canary" not in repr(points)
         assert owner.failure_code is None
     finally:
         await owner.aclose()

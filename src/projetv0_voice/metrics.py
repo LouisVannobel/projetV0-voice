@@ -21,6 +21,7 @@ from opentelemetry.sdk.metrics.export import (
 )
 from opentelemetry.sdk.resources import Resource
 
+from projetv0_voice.inference.stt_diagnostics import diagnostic_attributes
 from projetv0_voice.observability_bootstrap import (
     ObservabilityBootstrapToken,
     _is_production_token,
@@ -577,11 +578,11 @@ class RuntimeMetrics:
             return
         self._record(self._service_ttfb, value, {"service": service})
 
-    def record_stt_failure(self, reason: object) -> None:
+    def record_stt_failure(self, reason: object, diagnostic: object = None) -> None:
         if not _closed(reason, _STT_FAILURE_REASONS):
             self._latch_failure()
             return
-        self._add(self._stt_failures, {"reason": reason})
+        self._add(self._stt_failures, {"reason": reason, **diagnostic_attributes(diagnostic)})
 
     def record_disclosure_ack(self, seconds: object) -> None:
         value = _nonnegative_number(seconds)

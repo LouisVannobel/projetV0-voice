@@ -593,7 +593,8 @@ async def test_refused_capture_keeps_first_producer_stt_diagnostic_and_no_late_r
             await _local_choice_wait(lambda: "projetv0.voice.stt.failures" in _metric_map(owner))
             points = list(_metric_map(owner)["projetv0.voice.stt.failures"].data.data_points)
             assert [(dict(point.attributes), point.value) for point in points] == [
-                ({"reason": reason}, 1)]
+                ({"reason": reason, "paid_check": "not_checked", "response_family": "none",
+                  "httpx_failure": "unobserved"}, 1)]
             assert case.capture.tap.state != "recording"
             assert captured_pcm(case) == b""
             assert owner.failure_code is None
