@@ -233,6 +233,8 @@ class Peers:
         self.deleted = []
         self.recordings = {}
         self.tool_arguments = None
+        self.tool_name = "request_human"
+        self.texts = []
         self.transfer = None
         self.before_transfer = None
 
@@ -262,6 +264,7 @@ class Peers:
         if path.endswith("/audio/transcriptions"):
             return httpx.Response(200, json={"text": self.stt_text}, request=request)
         if path.endswith("/audio/speech"):
+            self.texts.append(json.loads(request.content)["input"])
             return httpx.Response(
                 200, headers={"Content-Type": "audio/pcm"}, content=b"\0\0" * 2400, request=request
             )
@@ -283,10 +286,13 @@ class Peers:
                                 "tool_calls": [
                                     {
                                         "index": 0,
-                                        "id": "owned-human-tool",
+                                        "id": (
+                                            "owned-human-tool" if self.tool_name == "request_human"
+                                            else "owned-tool-" + uuid4().hex
+                                        ),
                                         "type": "function",
                                         "function": {
-                                            "name": "request_human",
+                                            "name": self.tool_name,
                                             "arguments": json.dumps(arguments),
                                         },
                                     }
@@ -387,6 +393,8 @@ class MediaPeer:
     def __init__(self, url, tls, control, stream):
         self.url, self.tls, self.control, self.stream = url, tls, control, stream
         self.messages = []
+        self.marks = []
+        self.ack_calendar = True
         self.task = None
         self.socket = None
 
@@ -430,6 +438,12 @@ class MediaPeer:
             value = json.loads(message)
             self.messages.append(value.get("event"))
             if value.get("event") == "mark":
+                self.marks.append(value["mark"]["name"])
+                if (
+                    value["mark"]["name"].startswith("sparra-calendar-recap-")
+                    and not self.ack_calendar
+                ):
+                    continue
                 await self.input({"event": "mark", "stream_id": self.stream, "mark": value["mark"]})
 
     async def close(self):
@@ -1585,6 +1599,110 @@ class Scenario:
             for operation in self.captures
             if operation.payload.turn_id in ids
         }, retained.loss_count
+
+    async def calendar_search(self):
+        """Actual native tool, recorder/outbox and PostgreSQL adapter; no SQL evidence seed."""
+        assert self.audio_candidate, "native_calendar_v2_candidate"
+        assert self.session._calendar_catalog is not None, "native_calendar_catalog_loaded"
+        start = (now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self.peers.tool_name = "find_slots"
+        self.peers.tool_arguments = {
+            "serviceId": "oil-change",
+            "windowStart": start.isoformat(),
+            "windowEnd": (start + timedelta(days=1)).isoformat(),
+        }
+        await self.captured("Je voudrais un rendez-vous pour une vidange demain.")
+        await eventually(
+            lambda: any("Quel créneau" in text for text in self.peers.texts),
+            "calendar_search_result",
+        )
+        assert self.session._calendar_offers, "native_calendar_real_offers"
+        return {"offered": True}
+
+    async def calendar_select(self):
+        before_marks = len(self.media.marks)
+        offer = next(iter(self.session._calendar_offers))
+        self.peers.tool_name = "book_appointment"
+        self.peers.tool_arguments = {"offerId": str(offer)}
+        await self.captured("Le premier créneau me convient.")
+        await eventually(
+            lambda: any(
+                mark.startswith("sparra-calendar-recap-")
+                for mark in self.media.marks[before_marks:]
+            ),
+            "calendar_recap_mark",
+        )
+        attempt = self.session._calendar_playback.attempt
+        assert attempt is not None, "native_calendar_recap_attempt"
+        if self.media.ack_calendar:
+            await eventually(lambda: attempt.acknowledged_at is not None, "calendar_recap_ack")
+        assert attempt.receipt is not None, "native_calendar_recap_receipt"
+        await attempt.receipt.settled.wait()
+        assert attempt.receipt.turn_id is not None, "native_calendar_recap_admitted"
+        self.calendar_recap_turn_id = attempt.receipt.turn_id
+        return {
+            "acknowledged": attempt.acknowledged_at is not None,
+            "recap_persisted": True,
+            "recap_turn_id": str(attempt.receipt.turn_id),
+            "playback_mark": attempt.mark_name,
+        }
+
+    async def calendar_confirm(self):
+        before = len(self.peers.requests)
+        await self.captured("Oui, je confirme.")
+        try:
+            await eventually(
+                lambda: any("Votre rendez-vous est confirmé" in text for text in self.peers.texts),
+                "calendar_verified_speech",
+            )
+        except AssertionError:
+            assert not self.session._services.tts._conversation_limit_exhausted, (
+                "native_calendar_verified_speech_consumption_limit"
+            )
+            raise
+        assert len(self.peers.requests) == before, "native_calendar_no_confirmation_inference"
+        retained = await self.graph.writer.read_retained_call(self.call_id)
+        recap = next(turn for turn in retained.turns if turn.turn_id == self.calendar_recap_turn_id)
+        assert recap.role == "assistant" and "Confirmez-vous" in recap.text, (
+            "native_calendar_exact_recorder_recap"
+        )
+        assert any(
+            turn.role == "user" and turn.text == "Oui, je confirme." for turn in retained.turns
+        ), "native_calendar_actual_affirmative"
+        return {"confirmed": True, "no_confirmation_inference": True}
+
+    async def calendar_without_ack(self):
+        self.media.ack_calendar = False
+        try:
+            result = await self.calendar_select()
+            assert not result["acknowledged"], "native_calendar_ack_withheld"
+            before = len(self.peers.requests)
+            await self.captured("Oui, je confirme.")
+            await eventually(lambda: len(self.peers.requests) > before, "calendar_untrusted_yes")
+            await eventually(
+                self.session._calendar_response_end.is_set, "calendar_untrusted_response_ended"
+            )
+            assert self.session._calendar_task is None, "native_calendar_no_unacked_booking"
+            assert not any("Votre rendez-vous est confirmé" in text for text in self.peers.texts)
+            return {"no_booking": True}
+        finally:
+            self.media.ack_calendar = True
+
+    async def calendar_confirm_start(self):
+        await self.captured("Oui, je confirme.")
+        await eventually(
+            lambda: self.session._calendar_task is not None, "calendar_booking_started"
+        )
+        return {"confirmation_started": True}
+
+    async def calendar_recovered(self):
+        assert self.audio_candidate, "native_calendar_recovery_candidate"
+        assert not self.peers.requests, "native_calendar_recovery_no_inference"
+        assert not self.peers.texts, "native_calendar_recovery_no_speech"
+        assert await self.graph.writer.oldest_outbox_created_at() is None, (
+            "native_calendar_recovery_outbox_joined"
+        )
+        return {"recovered": True, "no_inference": True, "no_speech": True}
 
     async def overflow(self):
         for _ in range(23):
