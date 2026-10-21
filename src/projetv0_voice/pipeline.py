@@ -8,8 +8,9 @@ import json
 import math
 from collections.abc import Callable, Coroutine, Sequence
 from contextlib import suppress
-from contextvars import Context
+from contextvars import Context, ContextVar
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
@@ -27,11 +28,15 @@ from pipecat.frames.frames import (
     InputDTMFFrame,
     InputTransportMessageFrame,
     InterruptionFrame,
+    LLMAssistantPushAggregationFrame,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     MetricsFrame,
     StartFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
+    TTSStartedFrame,
     UserSpeakingFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -61,6 +66,7 @@ from pipecat.workers.runner import WorkerRunner
 from projetv0_voice.action_authority import ActionAuthority, CallerScope, direct_command
 from projetv0_voice.audio_capture import BoundedAudioBufferTap
 from projetv0_voice.audio_contract import BeginCallSnapshotV2
+from projetv0_voice.calendar import CalendarPlayback, RecordedTurnReceipt, recorded_turn_context
 from projetv0_voice.inference.completion_strategy import (
     STT_USER_TURN_WATCHDOG_SECONDS,
     CompletionAwareTurnStopStrategy,
@@ -419,6 +425,7 @@ def build_input_gate(
     controller: GateController,
     first_failure: FirstFailure,
     end_call_playback: EndCallPlayback | None = None,
+    calendar_playback: CalendarPlayback | None = None,
 ) -> FunctionFilter:
     """Build the one direct, total, call-owned input/control gate."""
 
@@ -436,6 +443,13 @@ def build_input_gate(
 
     async def predicate(frame: Frame) -> bool:
         try:
+            if calendar_playback is not None:
+                if isinstance(frame, (EndFrame, CancelFrame, ErrorFrame)):
+                    calendar_playback.invalidate()
+                elif isinstance(frame, InterruptionFrame):
+                    calendar_playback.interrupted(
+                        min(frame.id, frame.broadcast_sibling_id or frame.id)
+                    )
             if isinstance(frame, (StartFrame, EndFrame, CancelFrame, ErrorFrame)):
                 if isinstance(frame, (CancelFrame, ErrorFrame)) and end_call_playback is not None:
                     end_call_playback.invalidate()
@@ -455,6 +469,8 @@ def build_input_gate(
                     if not isinstance(mark, dict) or not isinstance(mark.get("name"), str):
                         raise ValueError
                     if first_failure.code is None:
+                        if calendar_playback is not None:
+                            calendar_playback.accept_mark(mark["name"])
                         if end_call_playback is not None:
                             end_call_playback.accept_mark(mark["name"])
                         await controller.accept_mark(mark["name"])
@@ -502,18 +518,26 @@ class DisclosureOutputBarrier(FrameProcessor):
     """Keep the expected Telnyx mark behind observed standalone TTS audio."""
 
     def __init__(
-        self, *, controller: GateController, end_call_playback: EndCallPlayback | None = None
+        self, *, controller: GateController, end_call_playback: EndCallPlayback | None = None,
+        calendar_playback: CalendarPlayback | None = None,
     ) -> None:
         super().__init__(name="DisclosureOutputBarrier", enable_direct_mode=True)
         self._controller = controller
         self._end_call_playback = end_call_playback
+        self._calendar_playback = calendar_playback
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if direction is not FrameDirection.DOWNSTREAM:
             await self.push_frame(frame, direction)
             return
+        if self._calendar_playback is not None and isinstance(frame, InterruptionFrame):
+            self._calendar_playback.interrupted(
+                min(frame.id, frame.broadcast_sibling_id or frame.id)
+            )
         if isinstance(frame, TTSAudioRawFrame):
+            if self._calendar_playback is not None:
+                self._calendar_playback.note_audio(frame.context_id)
             if self._end_call_playback is not None:
                 self._end_call_playback.note_audio(frame.context_id)
             try:
@@ -526,6 +550,12 @@ class DisclosureOutputBarrier(FrameProcessor):
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, TelnyxMarkFrame):
+            if self._calendar_playback is not None and self._calendar_playback.owns_mark(
+                frame.mark_name
+            ):
+                if self._calendar_playback.arm_mark(frame.mark_name):
+                    await self.push_frame(frame, direction)
+                return
             if self._end_call_playback is not None and self._end_call_playback.owns_mark(
                 frame.mark_name
             ):
@@ -833,9 +863,9 @@ class _CallObservers:
 
 
 class PipelineTurnRecorder(Protocol):
-    def record_user(self, content: str | None, timestamp: str) -> None: ...
+    def record_user(self, content: str | None, timestamp: str) -> UUID | None: ...
 
-    def record_assistant(self, content: str, timestamp: str, interrupted: bool) -> None: ...
+    def record_assistant(self, content: str, timestamp: str, interrupted: bool) -> UUID | None: ...
 
 
 SPARRA_DISCLOSURE = "Bonjour, je suis l'assistant IA."
@@ -889,9 +919,14 @@ def build_pipeline(
     transfer_handler: FunctionCallHandler | None = None,
     end_call_handler: FunctionCallHandler | None = None,
     end_call_playback: EndCallPlayback | None = None,
+    calendar_playback: CalendarPlayback | None = None,
     on_user_turn_started: Callable[[], None] | None = None,
     action_authority: ActionAuthority | None = None,
     on_direct_command: Callable[[CallerScope, str], None] | None = None,
+    calendar_gate: Callable[[LLMContextFrame], bool] | None = None,
+    calendar_tools: list[FunctionSchema] | None = None,
+    calendar_context: str = "",
+    on_llm_turn_finished: Callable[[], None] | None = None,
 ) -> ObservedPipeline:
     """Compose exactly one Task 8 call pipeline from native processors."""
 
@@ -899,7 +934,8 @@ def build_pipeline(
     from projetv0_voice.inference.openrouter_tts import OpenRouterTTSService
 
     input_gate = build_input_gate(
-        controller=controller, first_failure=first_failure, end_call_playback=end_call_playback
+        controller=controller, first_failure=first_failure, end_call_playback=end_call_playback,
+        calendar_playback=calendar_playback,
     )
     inference_boundary = InferenceErrorBoundary(
         stt=services.stt,
@@ -912,7 +948,11 @@ def build_pipeline(
         else [
             {
                 "role": "system",
-                "content": SPARRA_SYSTEM_PROMPT
+                "content": (
+                    SPARRA_SYSTEM_PROMPT.replace("Ce service ne réserve aucun créneau. ", "")
+                    if calendar_tools
+                    else SPARRA_SYSTEM_PROMPT
+                )
                 + (
                     " L'outil end_call, sans arguments, termine cet appel seulement si le tour "
                     "actuel de l'appelant exprime son intention présente et explicite de "
@@ -977,6 +1017,9 @@ def build_pipeline(
             ),
             properties={}, required=[], handler=end_call_handler,
         ))
+    tool_schemas.extend(calendar_tools or [])
+    if messages is not None and calendar_context:
+        messages.append({"role": "system", "content": calendar_context})
     tools = ToolsSchema(standard_tools=tool_schemas) if tool_schemas else None
     context = (
         LLMContext(messages=messages, tools=tools)
@@ -1017,9 +1060,14 @@ def build_pipeline(
             on_user_turn_started()
         if action_authority is not None:
             if isinstance(frame, UserStartedSpeakingFrame):
+                recorded_turn_context.set(None)
+                previous = action_authority.started_id
                 action_authority.caller_started(context, frame)
+                if calendar_playback is not None and previous != action_authority.started_id:
+                    calendar_playback.caller_started(action_authority.started_id or 0)
             elif isinstance(frame, LLMContextFrame):
-                action_authority.capture(frame, context=context, origin=user_aggregator)
+                scope = action_authority.capture(frame, context=context, origin=user_aggregator)
+                recorded_turn_context.set(None if scope is None else scope.receipt)
 
     def record_user_turn(
         _aggregator: FrameProcessor,
@@ -1027,20 +1075,83 @@ def build_pipeline(
         message: UserTurnStoppedMessage,
     ) -> None:
         try:
-            turn_recorder.record_user(message.content, message.timestamp)
+            receipt = recorded_turn_context.get()
+            recorded_turn_context.set(None)
+            if receipt is not None and receipt.settled.is_set():
+                return
+            token = recorded_turn_context.set(receipt)
+            try:
+                turn_id = turn_recorder.record_user(message.content, message.timestamp)
+            finally:
+                recorded_turn_context.reset(token)
+            if receipt is not None:
+                receipt.settle(turn_id)
         except Exception:
             first_failure.signal("persistence_failed")
+
+    assistant_receipt: ContextVar[RecordedTurnReceipt | None] = ContextVar(
+        "calendar_assistant_receipt", default=None,
+    )
+
+    active_assistant_receipt: RecordedTurnReceipt | None = None
+
+    def observe_assistant_frame(_aggregator: FrameProcessor, frame: Frame) -> None:
+        nonlocal active_assistant_receipt
+        if isinstance(frame, (LLMFullResponseStartFrame, InterruptionFrame)):
+            active_assistant_receipt = None
+            assistant_receipt.set(None)
+        if isinstance(frame, TTSStartedFrame) and calendar_playback is not None:
+            attempt = calendar_playback.attempt
+            if active_assistant_receipt is not None:
+                calendar_playback.invalidate()
+            active_assistant_receipt = None
+            if attempt is not None and frame.context_id == attempt.context_id:
+                attempt.receipt = RecordedTurnReceipt(
+                    datetime.now(UTC), expected_text=attempt.speak_frame.text,
+                )
+                active_assistant_receipt = attempt.receipt
+        if isinstance(frame, LLMAssistantPushAggregationFrame):
+            # Bind the exact owned context receipt on the aggregation boundary;
+            # deferred callbacks inherit this task context, never a latest-text lookup.
+            assistant_receipt.set(active_assistant_receipt)
+            receipt = active_assistant_receipt
+            if receipt is not None:
+                captured_end = frame.metadata.get("sparra.recap_ended_at")
+                if isinstance(captured_end, datetime):
+                    receipt.ended_at = captured_end
+                else:
+                    receipt.expected_text = None
+
+    def assistant_frame_finished(_aggregator: FrameProcessor, frame: Frame) -> None:
+        nonlocal active_assistant_receipt
+        if isinstance(frame, LLMFullResponseEndFrame) and on_llm_turn_finished is not None:
+            on_llm_turn_finished()
+        if isinstance(frame, LLMAssistantPushAggregationFrame):
+            active_assistant_receipt = None
+            assistant_receipt.set(None)
 
     def record_assistant_turn(
         _aggregator: FrameProcessor,
         message: AssistantTurnStoppedMessage,
     ) -> None:
         try:
-            turn_recorder.record_assistant(
-                message.content,
-                message.timestamp,
-                message.interrupted,
+            receipt = assistant_receipt.get()
+            if receipt is not None and receipt.settled.is_set():
+                return
+            token = recorded_turn_context.set(
+                receipt if receipt is not None and receipt.expected_text is not None else None
             )
+            try:
+                turn_id = turn_recorder.record_assistant(
+                    message.content, message.timestamp, message.interrupted,
+                )
+            finally:
+                recorded_turn_context.reset(token)
+            if receipt is not None:
+                valid = (receipt.expected_text is not None
+                    and message.content.strip() == receipt.expected_text.strip()
+                    and not message.interrupted)
+                receipt.settle(turn_id if valid else None)
         except Exception:
             first_failure.signal("persistence_failed")
 
@@ -1069,6 +1180,7 @@ def build_pipeline(
             # This native synchronous hook runs before the aggregator's
             # terminal flush, even when the call owner is still joining it.
             inference_terminal = True
+            recorded_turn_context.set(None)
             if action_authority is not None:
                 action_authority.close()
 
@@ -1095,12 +1207,16 @@ def build_pipeline(
                         if action_authority.claim(scope):
                             on_direct_command(scope, command)
                         return False
+            if allowed and calendar_gate is not None:
+                return calendar_gate(frame)
             return allowed
         except Exception:
             first_failure.signal("input_gate_failed")
             return False
 
     async def disclosure_mark_sent(_output: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, TelnyxMarkFrame) and calendar_playback is not None:
+            calendar_playback.mark_forwarded(frame.mark_name)
         if isinstance(frame, TelnyxMarkFrame) and end_call_playback is not None:
             end_call_playback.mark_forwarded(frame.mark_name)
         if not isinstance(frame, TelnyxMarkFrame) or frame.mark_name != controller.mark_name:
@@ -1137,7 +1253,15 @@ def build_pipeline(
 
             services.llm.add_event_handler("on_before_process_frame", cancel_program_action)
     assistant_aggregator.add_event_handler("on_assistant_turn_stopped", record_assistant_turn)
+    assistant_aggregator.add_event_handler("on_before_process_frame", observe_assistant_frame)
+    assistant_aggregator.add_event_handler("on_after_process_frame", assistant_frame_finished)
     services.tts.add_event_handler("on_error", sanitize_tts_error)
+    if calendar_playback is not None and isinstance(services.tts, OpenRouterTTSService):
+        services.tts.observe_turn_context(calendar_playback.bind_context)
+        services.tts.add_event_handler("on_before_process_frame",
+            lambda _tts, frame: calendar_playback.before_tts_frame(frame))
+        services.tts.add_event_handler("on_after_process_frame",
+            lambda _tts, frame: calendar_playback.after_tts_frame(frame))
     if end_call_playback is not None and isinstance(services.tts, OpenRouterTTSService):
         # Native synchronous frame hooks select the exact owned TTSSpeakFrame.
         # The public context-creation callback runs before its synthesis starts.
@@ -1153,9 +1277,16 @@ def build_pipeline(
     if begin_snapshot is not None:
         services.llm.add_event_handler("on_error", abort_sparra_llm_error)
 
-    barrier = DisclosureOutputBarrier(controller=controller, end_call_playback=end_call_playback)
+    barrier = DisclosureOutputBarrier(controller=controller, end_call_playback=end_call_playback,
+        calendar_playback=calendar_playback)
     output = transport.output()
     # Native MediaSender pushes ordered marks only after send_message returns.
+    def capture_paced_recap_end(_output: FrameProcessor, frame: Frame) -> None:
+        attempt = None if calendar_playback is None else calendar_playback.attempt
+        if attempt is not None and frame is attempt.aggregation_frame:
+            frame.metadata["sparra.recap_ended_at"] = datetime.now(UTC)
+
+    output.add_event_handler("on_before_push_frame", capture_paced_recap_end)
     output.add_event_handler("on_after_push_frame", disclosure_mark_sent)
     return ObservedPipeline(
         [

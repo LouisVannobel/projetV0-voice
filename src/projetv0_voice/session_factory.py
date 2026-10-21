@@ -19,6 +19,7 @@ from projetv0_voice.admission import (
     _TerminalCapability,
 )
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
+from projetv0_voice.calendar import CalendarSink
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import RuntimeMetrics, _CallMetricLease
@@ -310,10 +311,12 @@ class ProcessSessionFactory:
         tts_factory: Callable[[], FrameProcessor],
         recording_factory: Callable[[CallIdentity], RecordingBoundary],
         recording_call_control_identity: object | None = None,
+        calendar_sink: CalendarSink | None = None,
         idle_timeout_seconds: float,
         session_factory: Callable[..., CallSession] = CallSession,
         cleanup_phase_timeout_seconds: float = 5.0,
     ) -> None:
+        self._calendar_sink = calendar_sink
         self._registry = registry
         self._registrar = registrar
         self._runtime_metrics = runtime_metrics
@@ -565,6 +568,7 @@ class ProcessSessionFactory:
                 recording=recording,
                 lease_terminalizer=terminalizer,
                 registry_terminalizer=terminalizer,
+                calendar_sink=self._calendar_sink,
                 metric_lease=metric_lease,
                 runtime_metrics=self._runtime_metrics,
                 observers=observers,

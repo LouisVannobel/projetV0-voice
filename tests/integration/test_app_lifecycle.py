@@ -1671,6 +1671,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         "FR" if manifest.sparra is not None and not foreign_line else None
     )
     assert graph.raw_call_control is not graph.measured_call_control
+    assert graph.session_factory._calendar_sink is graph.supervisor._sink
     assert graph.supervisor.call_control_facade is graph.measured_call_control
     assert graph.registry.call_control_identity is graph.measured_call_control
     assert (
@@ -1716,6 +1717,7 @@ async def test_production_composition_builds_ordered_graph_with_one_measured_con
         def construct(**values):
             session = native_constructor(**values)
             assert isinstance(session, session_module.CallSession)
+            assert session._calendar_sink is graph.supervisor._sink
             sessions.append(session)
             return session
 

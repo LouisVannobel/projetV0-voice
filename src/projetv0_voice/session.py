@@ -16,11 +16,13 @@ from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
     EndFrame,
     EndWorkerFrame,
     ErrorFrame,
     FunctionCallResultProperties,
+    LLMContextFrame,
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessor
@@ -36,6 +38,19 @@ from projetv0_voice.admission import (
 )
 from projetv0_voice.audio_capture import AudioCaptureSummary, AudioFinishReason, LocalAudioCapture
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
+from projetv0_voice.calendar import (
+    CalendarCatalog,
+    CalendarOffer,
+    CalendarPlayback,
+    CalendarRecap,
+    CalendarSink,
+    FindSlotsArguments,
+    SelectSlotArguments,
+    appointment_label,
+    await_calendar_result,
+    recorded_turn_context,
+    valid_calendar_arguments,
+)
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.metrics import (
@@ -377,8 +392,8 @@ class TurnRecorder:
     def close(self) -> None:
         self._accepting = False
 
-    def record_user(self, content: str | None, timestamp: str) -> None:
-        self._record(
+    def record_user(self, content: str | None, timestamp: str) -> UUID | None:
+        return self._record(
             role="user",
             source="stt_final",
             content=content,
@@ -386,8 +401,8 @@ class TurnRecorder:
             interrupted=False,
         )
 
-    def record_assistant(self, content: str, timestamp: str, interrupted: bool) -> None:
-        self._record(
+    def record_assistant(self, content: str, timestamp: str, interrupted: bool) -> UUID | None:
+        return self._record(
             role="assistant",
             source="pipecat_assistant",
             content=content,
@@ -403,9 +418,9 @@ class TurnRecorder:
         content: str | None,
         timestamp: str,
         interrupted: bool,
-    ) -> None:
+    ) -> UUID | None:
         if not self._accepting or content is None or content == "":
-            return
+            return None
         accepted = False
         capture_id = None
         try:
@@ -417,7 +432,7 @@ class TurnRecorder:
             encoded = content.encode("utf-8")
             plaintext = encoded[:bound].decode("utf-8", errors="ignore").encode("utf-8")
             if not plaintext:
-                return
+                return None
             accepted = True
             if capture_id is None:
                 self._turn_no += 1
@@ -430,7 +445,9 @@ class TurnRecorder:
                 aad=b"turn:" + str(turn_id).encode("ascii"),
             )
             event_time = self._parse_timestamp(timestamp)
-            occurred_at = max(self._utcnow().astimezone(UTC), event_time)
+            receipt = recorded_turn_context.get()
+            ended_at = event_time if receipt is None else receipt.ended_at
+            occurred_at = max(self._utcnow().astimezone(UTC), ended_at)
             payload = TurnUpsertPayloadV1(
                 turn_id=turn_id,
                 turn_no=self._turn_no,
@@ -441,7 +458,7 @@ class TurnRecorder:
                 nonce_b64=base64.b64encode(encrypted.nonce).decode("ascii"),
                 ciphertext_b64=base64.b64encode(encrypted.ciphertext).decode("ascii"),
                 started_at=event_time,
-                ended_at=event_time,
+                ended_at=ended_at,
                 interrupted=interrupted,
             )
             if isinstance(getattr(self._identity, "begin_snapshot", None), BeginCallSnapshotV2):
@@ -468,12 +485,16 @@ class TurnRecorder:
             if not enqueued:
                 self._record_turn_lost()
                 self._first_failure.signal("writer_failed")
+            else:
+                return turn_id
         except Exception:
             if self._identity.routing is not None and capture_id is not None:
                 cast(Any, self._writer).try_enqueue_capture_loss(self._identity.call_id, capture_id)
             if accepted:
                 self._record_turn_lost()
             self._first_failure.signal("persistence_failed")
+
+        return None
 
     def _record_turn_lost(self) -> None:
         try:
@@ -636,6 +657,7 @@ class CallSession:
         recording: RecordingBoundary,
         lease_terminalizer: LeaseTerminalizer,
         registry_terminalizer: RegistryTerminalizer | None = None,
+        calendar_sink: CalendarSink | None = None,
         metric_lease: _CallMetricLease | None = None,
         runtime_metrics: RuntimeMetrics,
         observers: _CallObservers,
@@ -675,6 +697,14 @@ class CallSession:
         self._keyring = keyring
         self._recording = recording
         self._lease_terminalizer = lease_terminalizer
+        self._calendar_sink = calendar_sink
+        self._calendar_catalog: CalendarCatalog | None = None
+        self._calendar_playback = CalendarPlayback()
+        self._calendar_offers: dict[UUID, CalendarOffer] = {}
+        self._calendar_response_end = asyncio.Event()
+        self._calendar_task: asyncio.Task[None] | None = None
+        self._calendar_submitting = False
+        self._calendar_pending_booking: tuple[UUID, dict[str, object]] | None = None
         self._registry_terminalizer = registry_terminalizer
         self._metric_lease = metric_lease
         self._runtime_metrics = runtime_metrics
@@ -863,26 +893,295 @@ class CallSession:
         )
 
     def _consume_tool_scope(self, params: FunctionCallParams) -> CallerScope | None:
+        if not isinstance(params, FunctionCallParams):
+            return None
         from projetv0_voice.inference.services import _TrustlessOpenRouterLLMService
 
         if (
-            not isinstance(params.arguments, dict) or params.arguments
-            or self._action_authority is None or not self._actions_active()
+            (
+                not isinstance(params.arguments, dict)
+                or (
+                    bool(params.arguments)
+                    if params.function_name in {"end_call", "request_human"}
+                    else not valid_calendar_arguments(params.function_name, params.arguments)
+                )
+            )
+            or self._action_authority is None
+            or not self._actions_active()
             or not isinstance(params.llm, _TrustlessOpenRouterLLMService)
             or params.llm is not self._services.llm
         ):
             return None
         return params.llm.consume_action_scope(
-            tool_call_id=params.tool_call_id, function_name=params.function_name,
+            tool_call_id=params.tool_call_id,
+            function_name=params.function_name,
             context=params.context,
         )
+
+    async def _load_calendar_catalog(self) -> None:
+        if self._calendar_sink is None or self._identity.begin_snapshot is None:
+            return
+        try:
+            async with asyncio.timeout(5.0):
+                self._calendar_catalog = await self._calendar_sink.calendar_catalog(
+                    self._identity.call_id,
+                )
+        except Exception:
+            self._calendar_catalog = None
+
+    def _calendar_tool_schemas(self) -> list[FunctionSchema]:
+        catalog = self._calendar_catalog
+        if catalog is None:
+            return []
+        return [
+            FunctionSchema(
+                name="find_slots",
+                description="Find actual appointment offers for a current caller request. "
+                "Use only a configured service and explicit preferred date window. "
+                "Times require a timezone offset. No booking confirmation.",
+                properties={
+                    "serviceId": {
+                        "type": "string",
+                        "enum": [item.service_id for item in catalog.services],
+                    },
+                    "windowStart": {"type": "string"},
+                    "windowEnd": {"type": "string"},
+                },
+                required=["serviceId", "windowStart", "windowEnd"],
+                handler=self._calendar_tool,
+            ),
+            FunctionSchema(
+                name="book_appointment",
+                description="Select the exact opaque offer chosen by the current caller. "
+                "The program reads a recap and obtains fresh spoken confirmation. "
+                "This tool does not submit a booking or supply consent; only the subsequent "
+                "trusted native caller confirmation can authorize creation.",
+                properties={"offerId": {"type": "string"}},
+                required=["offerId"],
+                handler=self._calendar_tool,
+            ),
+        ]
+
+    def _calendar_prompt(self) -> str:
+        catalog = self._calendar_catalog
+        if catalog is None:
+            return ""
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(UTC).astimezone(ZoneInfo(catalog.timezone))
+        return (
+            "Le programme peut maintenant proposer et réserver avec les outils Calendar. "
+            "Seul son résultat vérifié confirme un rendez-vous. Ne confirme jamais toi-même. "
+            "Date locale actuelle : "
+            + now.isoformat()
+            + "; fuseau IANA : "
+            + catalog.timezone
+            + ". Catalogue configuré : "
+            + catalog.model_dump_json()
+            + ". Interprète demain et les jours de semaine par rapport à cette date. "
+            "Si le service ou la préférence est ambigu, pose une seule question. "
+            "Après sélection, laisse le programme lire le récapitulatif et attendre la réponse."
+        )
+
+    async def _calendar_tool(self, params: FunctionCallParams) -> None:
+        scope = self._consume_tool_scope(params)
+        catalog, sink = self._calendar_catalog, self._calendar_sink
+        result: dict[str, object] = {"status": "unavailable_collect_message"}
+        speech: str | None = None
+        selected: CalendarOffer | None = None
+        if scope is not None and catalog is not None and sink is not None:
+            admitted = await scope.receipt.admitted()
+            if (
+                admitted is not None
+                and self._action_current(scope)
+                and not self._calendar_submitting
+                and self._calendar_pending_booking is None
+            ):
+                if params.function_name == "find_slots":
+                    arguments = FindSlotsArguments.model_validate(params.arguments)
+                    if (
+                        arguments.serviceId in {item.service_id for item in catalog.services}
+                        and arguments.windowStart < arguments.windowEnd
+                    ):
+                        self._calendar_playback.invalidate()
+                        self._calendar_offers.clear()
+                        request = {
+                            "kind": "find_slots",
+                            "policyRevision": catalog.policy_revision,
+                            **arguments.model_dump(mode="json"),
+                        }
+                        response = await await_calendar_result(
+                            sink,
+                            self._identity.call_id,
+                            self._uuid_factory(),
+                            request,
+                        )
+                        if (
+                            response is not None
+                            and self._action_current(scope)
+                            and response.state == "offered"
+                            and response.offers is not None
+                        ):
+                            valid = all(
+                                offer.serviceId == arguments.serviceId
+                                and offer.timezone == catalog.timezone
+                                for offer in response.offers
+                            )
+                            if valid:
+                                self._calendar_offers = {
+                                    offer.offerId: offer for offer in response.offers
+                                }
+                                result = response.model_dump(mode="json", exclude_none=True)
+                                speech = (
+                                    (
+                                        "Je peux proposer : "
+                                        + "; ou ".join(
+                                            appointment_label(offer) for offer in response.offers
+                                        )
+                                        + ". Quel créneau choisissez-vous ?"
+                                    )
+                                    if response.offers
+                                    else (
+                                        "Aucun créneau proposé sur cette période. "
+                                        "Quelle autre période vous conviendrait ?"
+                                    )
+                                )
+                elif params.function_name == "book_appointment":
+                    arguments_select = SelectSlotArguments.model_validate(params.arguments)
+                    selected = self._calendar_offers.get(arguments_select.offerId)
+                    if selected is not None and selected.expiresAt > datetime.now(UTC):
+                        result = {"status": "recap_required"}
+                    else:
+                        selected = None
+        await params.result_callback(result, properties=FunctionCallResultProperties(run_llm=False))
+        if scope is None or not self._action_current(scope):
+            return
+        # Standalone TTS must follow the native assistant response aggregation.
+        try:
+            await asyncio.wait_for(self._calendar_response_end.wait(), 5.0)
+        except TimeoutError:
+            return
+        if not self._action_current(scope):
+            return
+        if selected is not None:
+            attempt = self._calendar_playback.begin(
+                selected.offerId, appointment_label(selected) + ". Confirmez-vous ce rendez-vous ?"
+            )
+            await params.llm.push_frame(attempt.speak_frame)
+            if not self._action_current(scope):
+                self._calendar_playback.invalidate()
+                return
+            await params.llm.push_frame(attempt.aggregation_frame)
+            await params.llm.push_frame(TelnyxMarkFrame(attempt.mark_name))
+            await self._calendar_playback.wait_for_ack(
+                attempt, ack_timeout=self._profile.disclosure_mark_timeout_ms / 1000
+            )
+        else:
+            await params.llm.push_frame(TTSSpeakFrame(
+                speech or "Je ne peux pas proposer ce rendez-vous. Je peux prendre un message.",
+                append_to_context=True,
+            ))
+
+    def _calendar_inference_gate(self, frame: LLMContextFrame) -> bool:
+        if self._calendar_submitting:
+            return False
+        playback, authority = self._calendar_playback, self._action_authority
+        attempt = playback.attempt
+        if attempt is None or authority is None:
+            return True
+        if attempt.acknowledged_at is None:
+            return False
+        scope = authority.scope_for(frame)
+        if scope is None or not authority.current(scope):
+            return False
+        confirmation = playback.confirmation_for(scope.started_id, scope.text)
+        if confirmation is None:
+            return True
+        if not authority.claim(scope):
+            return False
+        authority.scope_for(frame, take=True)
+        self._calendar_submitting = True
+        self._calendar_task = self._services.llm.create_task(
+            self._book_calendar(scope, confirmation),
+            name="sparra-calendar-booking",
+        )
+        return False
+
+    async def _book_calendar(self, scope: CallerScope, attempt: CalendarRecap) -> None:
+        try:
+            if attempt.receipt is None or self._calendar_sink is None:
+                await self._explain_calendar_confirmation_failure(scope)
+                return
+            recap_id = await attempt.receipt.admitted()
+            confirmation_id = await scope.receipt.admitted()
+            if not self._action_current(scope) or attempt.invalidated:
+                return
+            if (
+                recap_id is None
+                or confirmation_id is None
+                or attempt.acknowledged_at is None
+            ):
+                await self._explain_calendar_confirmation_failure(scope)
+                return
+            offer = self._calendar_offers.get(attempt.offer_id)
+            if offer is None or offer.expiresAt <= datetime.now(UTC):
+                await self._explain_calendar_confirmation_failure(scope)
+                return
+            request: dict[str, object] = {
+                "kind": "book_appointment",
+                "offerId": str(attempt.offer_id),
+                "confirmation": {
+                    "recapTurnId": str(recap_id),
+                    "confirmationTurnId": str(confirmation_id),
+                    "playbackMark": attempt.mark_name,
+                    "playbackAcknowledgedAt": attempt.acknowledged_at.isoformat(),
+                },
+            }
+            # Retain the original identity/payload before the first possible dispatch.
+            operation_id = self._uuid_factory()
+            self._calendar_pending_booking = (operation_id, request)
+            response = await await_calendar_result(
+                self._calendar_sink, self._identity.call_id, operation_id, request
+            )
+            if response is not None and response.state in {"confirmed", "refused"}:
+                self._calendar_pending_booking = None
+                self._calendar_offers.pop(attempt.offer_id, None)
+            if not self._action_current(scope):
+                return
+            speech = (
+                "Le rendez-vous reste à confirmer. L’établissement devra vérifier votre demande."
+            )
+            if (
+                response is not None
+                and response.state == "confirmed"
+                and response.booking is not None
+                and response.booking.serviceId == offer.serviceId
+                and response.booking.start == offer.start
+                and response.booking.end == offer.end
+                and response.booking.timezone == offer.timezone
+            ):
+                speech = (
+                    "Votre rendez-vous est confirmé : " + appointment_label(response.booking) + "."
+                )
+            await self._services.llm.push_frame(TTSSpeakFrame(speech, append_to_context=True))
+        finally:
+            self._calendar_submitting = False
+
+    async def _explain_calendar_confirmation_failure(self, scope: CallerScope) -> None:
+        if self._action_current(scope):
+            await self._services.llm.push_frame(TTSSpeakFrame(
+                "Je n’ai pas pu confirmer ce rendez-vous. Je peux prendre un message.",
+                append_to_context=True,
+            ))
 
     async def _request_human_tool(self, params: FunctionCallParams) -> None:
         scope = self._consume_tool_scope(params)
         proposed = scope is not None and self._registry_terminalizer is not None
         await params.result_callback(
-            {"status": "command_required" if proposed else "unavailable_collect_message",
-             "human_identity_verified": False},
+            {
+                "status": "command_required" if proposed else "unavailable_collect_message",
+                "human_identity_verified": False,
+            },
             properties=FunctionCallResultProperties(run_llm=False),
         )
         if proposed and scope is not None and self._action_current(scope):
@@ -964,12 +1263,16 @@ class CallSession:
 
     def _note_caller_started(self) -> None:
         self._caller_started = True
+        self._calendar_response_end.clear()
         if self._program_action_task is not None:
             self._program_action_task.cancel()
         if self._end_call_playback is not None:
             self._end_call_playback.invalidate()
 
     def _close_actions(self) -> None:
+        self._calendar_playback.invalidate()
+        if self._calendar_task is not None:
+            self._calendar_task.cancel()
         if self._action_authority is not None:
             self._action_authority.close()
         if self._program_action_task is not None:
@@ -1077,6 +1380,7 @@ class CallSession:
                 controller=controller,
                 first_failure=first_failure,
             )
+            await self._load_calendar_catalog()
             pipeline = build_pipeline(
                 transport=handshake.transport,
                 services=self._services,
@@ -1087,6 +1391,11 @@ class CallSession:
                 end_call_handler=self._end_call_tool
                 if self._identity.begin_snapshot is not None else None,
                 end_call_playback=self._end_call_playback,
+                calendar_playback=self._calendar_playback,
+                calendar_gate=self._calendar_inference_gate,
+                calendar_tools=self._calendar_tool_schemas(),
+                calendar_context=self._calendar_prompt(),
+                on_llm_turn_finished=self._calendar_response_end.set,
                 capture_tap=None if local_capture is None else local_capture.tap,
                 transfer_handler=self._request_human_tool
                 if self._identity.begin_snapshot is not None
@@ -1423,6 +1732,8 @@ class CallSession:
         cancel_continuations: bool,
     ) -> None:
         self._close_actions()
+        if self._calendar_task is not None:
+            await asyncio.gather(self._calendar_task, return_exceptions=True)
         if self._program_action_task is not None:
             await asyncio.gather(self._program_action_task, return_exceptions=True)
         if self._end_call_playback is not None:

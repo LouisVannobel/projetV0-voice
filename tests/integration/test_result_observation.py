@@ -15,6 +15,7 @@ from openai import DefaultAsyncHttpxClient
 from opentelemetry.exporter.otlp.proto.common._internal.metrics_encoder import encode_metrics
 from pydantic import SecretStr
 
+from projetv0_voice.calendar import CalendarPlayback
 from projetv0_voice.inference import services
 from projetv0_voice.metrics import RuntimeMetrics
 from projetv0_voice.persistence.business_result import RetainedCall, RetainedTurn
@@ -71,6 +72,8 @@ def _session(metrics, inference, *, timeout=1):
     session._controller = session._recorder = None
     session._registry_terminalizer = session._end_call_playback = None
     session._action_authority = session._program_action_task = None
+    session._calendar_playback = CalendarPlayback()
+    session._calendar_task = None
     return session
 
 

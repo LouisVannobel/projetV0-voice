@@ -5,10 +5,13 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
 from pipecat.frames.frames import LLMContextFrame, UserStartedSpeakingFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
+
+from projetv0_voice.calendar import RecordedTurnReceipt
 
 Action = Literal["end_call", "request_human"]
 _FAREWELL = re.compile(
@@ -34,6 +37,8 @@ class CallerScope:
     context: LLMContext
     frame: LLMContextFrame
     origin: object
+    receipt: RecordedTurnReceipt
+    started_id: int
 
 
 class ActionAuthority:
@@ -50,6 +55,10 @@ class ActionAuthority:
         self._frames: dict[int, CallerScope] = {}
         self._origin: object | None = None
         self._last_start_id: int | None = None
+
+    @property
+    def started_id(self) -> int | None:
+        return self._last_start_id
 
     def current(self, scope: CallerScope) -> bool:
         return not self._terminal and self.epoch == scope.epoch and self._is_active()
@@ -82,26 +91,32 @@ class ActionAuthority:
         self.epoch += 1
         self._frames.clear()
 
-    def capture(self, frame: LLMContextFrame, *, context: LLMContext, origin: object) -> None:
+    def capture(
+        self, frame: LLMContextFrame, *, context: LLMContext, origin: object,
+    ) -> CallerScope | None:
         if (
             self._terminal or not self._is_active() or not self._completed
             or frame.speculation or frame.context is not context or len(self._frames) >= 8
             or len(context.messages) <= self._message_count
         ):
-            return
+            return None
         # The exact producer just appended this message. No backwards role search.
         message = context.messages[-1]
         self._message_count = len(context.messages)
         self._completed = False
         if not isinstance(message, dict) or message.get("role") != "user":
-            return
+            return None
         text = message.get("content")
         if not isinstance(text, str) or not text.strip():
-            return
+            return None
         self._origin = origin
-        scope = CallerScope(self.epoch, text, context, frame, origin)
+        scope = CallerScope(
+            self.epoch, text, context, frame, origin,
+            RecordedTurnReceipt(datetime.now(UTC)), self._last_start_id or 0,
+        )
         self._frames[frame.id] = scope
         frame.metadata["sparra.caller_scope"] = scope
+        return scope
 
     def scope_for(self, frame: LLMContextFrame, *, take: bool = False) -> CallerScope | None:
         scope = frame.metadata.get("sparra.caller_scope")
