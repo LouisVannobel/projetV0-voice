@@ -43,6 +43,7 @@ from pipecat.utils.errors import ErrorCategory
 from pydantic import SecretStr
 
 from projetv0_voice.action_authority import ActionAuthority, CallerScope
+from projetv0_voice.calendar import valid_calendar_arguments
 from projetv0_voice.inference.completion_strategy import (
     STT_COMPLETED_SEGMENT_KEY,
     STT_MAX_PENDING_SEGMENTS,
@@ -510,13 +511,27 @@ class _TrustlessOpenRouterLLMService(OpenRouterLLMService):
 
     async def run_function_calls(self, function_calls: Sequence[FunctionCallFromLLM]) -> None:
         authority, response = self._action_authority, self._response_scope.get()
-        actions = [fc for fc in function_calls if fc.function_name in {"end_call", "request_human"}]
+        actions = [
+            fc
+            for fc in function_calls
+            if fc.function_name
+            in {"end_call", "request_human", "find_slots", "book_appointment"}
+        ]
         ids = [fc.tool_call_id for fc in actions]
         valid = (
-            authority is not None and response is not None and response[1] is not None
-            and authority.current(response[1]) and len(actions) == 1
-            and len(self._seen_action_ids) < 256 and len(self._tool_scopes) < 8
-            and all(isinstance(fc.arguments, dict) and not fc.arguments for fc in actions)
+            authority is not None
+            and response is not None
+            and response[1] is not None
+            and authority.current(response[1])
+            and len(actions) == 1
+            and len(self._seen_action_ids) < 256
+            and len(self._tool_scopes) < 8
+            and all(
+                (isinstance(fc.arguments, dict) and not fc.arguments)
+                if fc.function_name in {"end_call", "request_human"}
+                else valid_calendar_arguments(fc.function_name, fc.arguments)
+                for fc in actions
+            )
             and all(tool_id and tool_id not in self._seen_action_ids for tool_id in ids)
         )
         for tool_id in ids:

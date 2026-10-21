@@ -70,6 +70,7 @@ class OpenRouterTTSService(TTSService):
         self._owns_client = http_client is None
         self._failed_contexts: dict[str, str] = {}
         self._end_call_context_binder: Callable[[str], bool | None] | None = None
+        self._turn_context_observer: Callable[[str], None] | None = None
         self._enforce_consumption_limits = enforce_consumption_limits
         self._tts_characters_reserved = 0
         self._conversation_limit_exhausted = False
@@ -82,10 +83,16 @@ class OpenRouterTTSService(TTSService):
 
     async def on_turn_context_created(self, context_id: str) -> None:
         await super().on_turn_context_created(context_id)
+        if self._turn_context_observer is not None:
+            self._turn_context_observer(context_id)
         if self._end_call_context_binder is not None:
             owned = self._end_call_context_binder(context_id)
             if owned is True and self._farewell_context_id is None:
                 self._farewell_context_id = context_id
+
+    def observe_turn_context(self, observer: Callable[[str], None]) -> None:
+        """Observe ordinary synthesis without granting final-goodbye allowance."""
+        self._turn_context_observer = observer
 
     def _reserve_input(self, body: dict[str, Any], context_id: str) -> bool:
         paid_guard = getattr(self, "paid_work_permitted", None)

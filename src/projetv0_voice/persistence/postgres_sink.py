@@ -16,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from pydantic import ValidationError
 
 from projetv0_voice.audio_contract import BeginCallSnapshotV2, VoiceOperationV2
+from projetv0_voice.calendar import CalendarCatalog, CalendarResult, validate_calendar_request
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     RoutingV1,
@@ -24,6 +25,10 @@ from projetv0_voice.models import (
     validate_deployment_id,
 )
 from projetv0_voice.persistence.commands import canonical_operation_bytes
+
+CALENDAR_CATALOG_SQL = "SELECT voice.calendar_catalog_v1(%s)"
+CALENDAR_SUBMIT_SQL = "SELECT voice.calendar_submit_v1(%s,%s,%s::jsonb)"
+CALENDAR_RESULT_SQL = "SELECT voice.calendar_result_v1(%s,%s)"
 
 INGEST_SQL = "SELECT voice.ingest_operation_v1(%s::jsonb)"
 INGEST_V2_SQL = "SELECT voice.ingest_operation_v2(%s::jsonb)"
@@ -715,6 +720,56 @@ class PsycopgOperationSink:
             map_purge_ack_sqlstates=True,
         )
 
+    async def calendar_catalog(self, call_id: UUID) -> CalendarCatalog | None:
+        result = await self._calendar_rpc(CALENDAR_CATALOG_SQL, (call_id,), call_id=call_id)
+        return result if isinstance(result, CalendarCatalog) else None
+
+    async def calendar_submit(
+        self, call_id: UUID, operation_id: UUID, request: dict[str, object],
+    ) -> CalendarResult:
+        try:
+            validate_calendar_request(request)
+        except (ValueError, TypeError):
+            raise OperationSinkContractError("calendar_request_invalid") from None
+        result = await self._calendar_rpc(
+            CALENDAR_SUBMIT_SQL, (call_id, operation_id, Jsonb(request)), call_id=call_id,
+        )
+        if not isinstance(result, CalendarResult):
+            raise OperationSinkContractError("calendar_result_invalid")
+        return result
+
+    async def calendar_result(self, call_id: UUID, operation_id: UUID) -> CalendarResult:
+        result = await self._calendar_rpc(
+            CALENDAR_RESULT_SQL, (call_id, operation_id), call_id=call_id,
+        )
+        if not isinstance(result, CalendarResult):
+            raise OperationSinkContractError("calendar_result_invalid")
+        return result
+
+    async def _calendar_rpc(
+        self, sql: str, params: tuple[object, ...], *, call_id: UUID,
+    ) -> CalendarCatalog | CalendarResult | None:
+        result: CalendarCatalog | CalendarResult | None = None
+
+        def validate(rows: Sequence[tuple[object, ...]]) -> None:
+            nonlocal result
+            if sql == CALENDAR_CATALOG_SQL and list(rows) == [(None,)]:
+                return
+            value = _one_json_object(rows, "calendar_result_invalid")
+            try:
+                result = (CalendarCatalog.model_validate(value) if sql == CALENDAR_CATALOG_SQL
+                    else CalendarResult.model_validate(value))
+                if isinstance(result, CalendarCatalog) and result.call_id != call_id:
+                    raise ValueError("calendar_call_invalid")
+            except (ValueError, TypeError, KeyError):
+                raise OperationSinkContractError("calendar_result_invalid") from None
+
+        failure = await self._execute_result(sql, params, validate, map_purge_ack_sqlstates=False)
+        if failure is not None:
+            del self, sql, params, result, call_id, validate
+            _raise_safe_failure(failure)
+        return result
+
     async def _execute_result(
         self,
         sql: str,
@@ -751,7 +806,8 @@ class PsycopgOperationSink:
                             map_purge_ack_sqlstates=map_purge_ack_sqlstates,
                             map_erased_sqlstate=sql in {INGEST_SQL, INGEST_V2_SQL},
                             map_contract_sqlstate=sql in {
-                                BEGIN_CALL_SQL, BEGIN_CALL_V2_SQL, LEASE_CALL_ERASURES_SQL
+                                BEGIN_CALL_SQL, BEGIN_CALL_V2_SQL, LEASE_CALL_ERASURES_SQL,
+                                CALENDAR_CATALOG_SQL, CALENDAR_SUBMIT_SQL, CALENDAR_RESULT_SQL
                             },
                         )
                     if rollback is not None:
@@ -774,7 +830,8 @@ class PsycopgOperationSink:
                     map_purge_ack_sqlstates=map_purge_ack_sqlstates,
                     map_erased_sqlstate=sql in {INGEST_SQL, INGEST_V2_SQL},
                     map_contract_sqlstate=sql in {
-                        BEGIN_CALL_SQL, BEGIN_CALL_V2_SQL, LEASE_CALL_ERASURES_SQL
+                        BEGIN_CALL_SQL, BEGIN_CALL_V2_SQL, LEASE_CALL_ERASURES_SQL,
+                                CALENDAR_CATALOG_SQL, CALENDAR_SUBMIT_SQL, CALENDAR_RESULT_SQL
                     },
                 )
         finally:

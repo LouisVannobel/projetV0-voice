@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from projetv0_voice.calendar import CalendarPlayback
 from projetv0_voice.models import CallUpsertPayloadV1, TurnUpsertPayloadV1, VoiceOperationV1
 from tests.unit.test_sparra_admission import NOW, committed, event, persist_original_start, start
 
@@ -284,6 +285,8 @@ async def test_session_result_inference_is_joined_when_ai_stops(tmp_path):
         session = CallSession.__new__(CallSession)
         session._runtime_metrics = metrics
         session._action_authority = session._program_action_task = None
+        session._calendar_playback = CalendarPlayback()
+        session._calendar_task = None
         session._identity = SimpleNamespace(
             call_id=call_id, routing=SimpleNamespace(from_e164=None)
         )

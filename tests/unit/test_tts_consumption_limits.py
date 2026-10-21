@@ -239,3 +239,26 @@ async def test_other_voice_consumers_keep_default_unbounded_behavior(peer: _HTTP
         await _collect(service, "x" * (CHARACTER_LIMIT + 1), "other-project")
         assert len(peer.requests) == 1
         assert len(peer.requests[0]["input"]) == CHARACTER_LIMIT + 1
+
+
+@pytest.mark.asyncio
+async def test_calendar_context_observer_debits_ordinary_budget_and_preserves_farewell(peer):
+    async with httpx.AsyncClient(trust_env=False) as client:
+        service = _service(client)
+        observed = []
+        service.observe_turn_context(observed.append)
+        await service.on_turn_context_created("calendar-recap")
+        assert observed == ["calendar-recap"]
+        assert service._farewell_context_id is None
+        await _collect(service, "Recap", "calendar-recap")
+        assert service._tts_characters_reserved == 5
+        await _collect(service, "x" * (CONVERSATION_LIMIT - 5), "ordinary-remainder")
+        _assert_limit(await _collect(service, "Recap", "another-recap"))
+        assert len(peer.requests) == 2
+        service.bind_end_call_context(lambda context: context == "goodbye")
+        await service.on_turn_context_created("goodbye")
+        await _collect(service, END_CALL_GOODBYE, "goodbye")
+        assert service._farewell_request_reserved
+        assert [len(request["input"]) for request in peer.requests] == [
+            5, CONVERSATION_LIMIT - 5, FAREWELL_RESERVE,
+        ]

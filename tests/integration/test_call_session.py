@@ -375,13 +375,15 @@ def test_turn_recorder_allocates_shared_fifo_encrypts_exact_aad_and_never_keeps_
         utcnow=lambda: NOW + timedelta(seconds=2),
     )
 
-    recorder.record_user("bonjour-secret", NOW.isoformat())
-    recorder.record_assistant("reponse-secret", NOW.isoformat(), False)
+    user_receipt = recorder.record_user("bonjour-secret", NOW.isoformat())
+    assistant_receipt = recorder.record_assistant("reponse-secret", NOW.isoformat(), False)
     recorder.record_assistant("interrompu-secret", NOW.isoformat(), True)
     recorder.record_user(None, NOW.isoformat())
     recorder.record_user("", NOW.isoformat())
 
     assert len(writer.operations) == 3
+    assert user_receipt == writer.operations[0].payload.turn_id
+    assert assistant_receipt == writer.operations[1].payload.turn_id
     for turn_no, (operation, plaintext) in enumerate(
         zip(
             writer.operations,
@@ -1296,6 +1298,7 @@ class _OpeningPeers:
         self.end_call = False
         self.duplicate_end_call = False
         self.tool_calls = None
+        self.separate_tool_chunks = False
         self.delayed_response = False
         self.delayed_entered = asyncio.Event()
         self.delayed_release = asyncio.Event()
@@ -1310,6 +1313,7 @@ class _OpeningPeers:
         self.instruction_entered = asyncio.Event()
         self.instruction_release = asyncio.Event()
         self.stt_text = "Question synthétique"
+        self.recap_pcm_samples = 2400
         self.fail_goodbye = False
         self.llm_requested = asyncio.Event()
         self.llm_release = asyncio.Event()
@@ -1339,7 +1343,9 @@ class _OpeningPeers:
                         self.invitation_cancelled.set()
                         raise
             return httpx.Response(
-                200, headers={"Content-Type": "audio/pcm"}, content=b"\x01\x00" * 2400,
+                200, headers={"Content-Type": "audio/pcm"},
+                content=b"\x01\x00" * (self.recap_pcm_samples
+                    if "Confirmez-vous ce rendez-vous" in text else 2400),
             )
         assert request.url.path.endswith("/chat/completions")
         assert body["stream"] is True
@@ -1366,6 +1372,10 @@ class _OpeningPeers:
         if self.tool_calls is not None:
             chunk["choices"][0]["delta"] = {"tool_calls": self.tool_calls}
             chunk["choices"][0]["finish_reason"] = "tool_calls"
+            if self.separate_tool_chunks:
+                chunks = [{**chunk, "choices": [{"index": 0,
+                    "delta": {"tool_calls": [item]}, "finish_reason": "tool_calls"}]}
+                    for item in self.tool_calls]
         if self.end_call and self.duplicate_end_call:
             chunks.append({**chunk, "choices": [{"index": 0, "delta": {"tool_calls": [{
                 "index": 1, "id": "offline-end-call-two", "type": "function",
@@ -1444,7 +1454,8 @@ def _opening_plaintext(operation: VoiceOperationV1) -> str:
 
 
 @asynccontextmanager
-async def _native_sparra_opening(*, ack_end_call: bool = True, registry_terminalizer=None):
+async def _native_sparra_opening(*, ack_end_call: bool = True, registry_terminalizer=None,
+                                 calendar_sink=None, ack_calendar=True):
     events: list[str] = []
     writer = _OpeningWriter(events)
     peers = _OpeningPeers(writer)
@@ -1460,6 +1471,8 @@ async def _native_sparra_opening(*, ack_end_call: bool = True, registry_terminal
             wire = json.loads(message["text"])
             sent.append(wire)
             if wire.get("event") == "mark":
+                if wire["mark"]["name"].startswith("sparra-calendar-recap-") and not ack_calendar:
+                    return
                 if wire["mark"]["name"].startswith("pv0-end-call-"):
                     final_mark_sent.set()
                     if not ack_end_call:
@@ -1518,7 +1531,7 @@ async def _native_sparra_opening(*, ack_end_call: bool = True, registry_terminal
         recording=_RecordingBoundary(events), lease_terminalizer=_LeaseTerminalizer(events),
         runtime_metrics=_TEST_RUNTIME_METRICS, observers=_session_observers(services),
         idle_timeout_seconds=60, cleanup_phase_timeout_seconds=0.5,
-        registry_terminalizer=registry_terminalizer,
+        registry_terminalizer=registry_terminalizer, calendar_sink=calendar_sink,
         utcnow=lambda: NOW + timedelta(seconds=5), uuid_factory=_uuid_factory(),
     )
     handshake = AuthenticatedTelnyxHandshake(

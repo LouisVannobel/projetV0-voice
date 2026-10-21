@@ -2062,6 +2062,7 @@ async def build_production_runtime(
         session_factory = ProcessSessionFactory(
             registry=cast(Any, registry),
             registrar=supervisor.call_lifecycle_owners,
+            calendar_sink=cast(Any, sink),
             runtime_metrics=metrics,
             manifest=manifest,
             profile=selection.profile,
