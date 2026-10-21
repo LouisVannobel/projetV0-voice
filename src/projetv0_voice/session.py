@@ -23,6 +23,8 @@ from pipecat.frames.frames import (
     ErrorFrame,
     FunctionCallResultProperties,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessor
@@ -48,6 +50,7 @@ from projetv0_voice.calendar import (
     SelectSlotArguments,
     appointment_label,
     await_calendar_result,
+    needs_confirmation_clarification,
     recorded_turn_context,
     valid_calendar_arguments,
 )
@@ -1064,23 +1067,39 @@ class CallSession:
         if not self._action_current(scope):
             return
         if selected is not None:
-            attempt = self._calendar_playback.begin(
-                selected.offerId, appointment_label(selected) + ". Confirmez-vous ce rendez-vous ?"
-            )
-            await params.llm.push_frame(attempt.speak_frame)
-            if not self._action_current(scope):
-                self._calendar_playback.invalidate()
-                return
-            await params.llm.push_frame(attempt.aggregation_frame)
-            await params.llm.push_frame(TelnyxMarkFrame(attempt.mark_name))
-            await self._calendar_playback.wait_for_ack(
-                attempt, ack_timeout=self._profile.disclosure_mark_timeout_ms / 1000
-            )
+            await self._play_calendar_recap(scope, selected)
         else:
             await params.llm.push_frame(TTSSpeakFrame(
                 speech or "Je ne peux pas proposer ce rendez-vous. Je peux prendre un message.",
                 append_to_context=True,
             ))
+
+    async def _play_calendar_recap(
+        self, scope: CallerScope, offer: CalendarOffer, *, standalone: bool = False,
+    ) -> None:
+        if standalone:
+            # Native TTS otherwise auto-flushes a standalone TTSSpeakFrame
+            # before our exact paced aggregation can bind its receipt.
+            await self._services.llm.push_frame(LLMFullResponseStartFrame())
+        try:
+            if not self._action_current(scope):
+                return
+            attempt = self._calendar_playback.begin(
+                offer.offerId, appointment_label(offer) + ". Confirmez-vous ce rendez-vous ?"
+            )
+            await self._services.llm.push_frame(attempt.speak_frame)
+            if not self._action_current(scope):
+                if self._calendar_playback.attempt is attempt:
+                    self._calendar_playback.invalidate()
+                return
+            await self._services.llm.push_frame(attempt.aggregation_frame)
+        finally:
+            if standalone:
+                await self._services.llm.push_frame(LLMFullResponseEndFrame())
+        await self._services.llm.push_frame(TelnyxMarkFrame(attempt.mark_name))
+        await self._calendar_playback.wait_for_ack(
+            attempt, ack_timeout=self._profile.disclosure_mark_timeout_ms / 1000
+        )
 
     def _calendar_inference_gate(self, frame: LLMContextFrame) -> bool:
         if self._calendar_submitting:
@@ -1089,23 +1108,44 @@ class CallSession:
         attempt = playback.attempt
         if attempt is None or authority is None:
             return True
-        if attempt.acknowledged_at is None:
-            return False
         scope = authority.scope_for(frame)
         if scope is None or not authority.current(scope):
             return False
+        interrupted = attempt.invalidated and attempt.confirmation_start_id == scope.started_id
+        if attempt.acknowledged_at is None and not interrupted:
+            return False
         confirmation = playback.confirmation_for(scope.started_id, scope.text)
-        if confirmation is None:
+        retry = confirmation is None and needs_confirmation_clarification(scope.text)
+        if confirmation is None and not retry:
             return True
         if not authority.claim(scope):
             return False
         authority.scope_for(frame, take=True)
         self._calendar_submitting = True
         self._calendar_task = self._services.llm.create_task(
-            self._book_calendar(scope, confirmation),
-            name="sparra-calendar-booking",
+            self._book_calendar(scope, confirmation) if confirmation is not None
+            else self._repeat_calendar_confirmation(scope, attempt),
+            name="sparra-calendar-confirmation" if retry else "sparra-calendar-booking",
         )
         return False
+
+    async def _repeat_calendar_confirmation(
+        self, scope: CallerScope, attempt: CalendarRecap,
+    ) -> None:
+        try:
+            admitted = await scope.receipt.admitted()
+            if not self._action_current(scope):
+                return
+            if admitted is None:
+                await self._explain_calendar_confirmation_failure(scope)
+                return
+            offer = self._calendar_offers.get(attempt.offer_id)
+            if offer is None or offer.expiresAt <= datetime.now(UTC):
+                await self._explain_calendar_confirmation_failure(scope)
+                return
+            await self._play_calendar_recap(scope, offer, standalone=True)
+        finally:
+            self._calendar_submitting = False
 
     async def _book_calendar(self, scope: CallerScope, attempt: CalendarRecap) -> None:
         try:
