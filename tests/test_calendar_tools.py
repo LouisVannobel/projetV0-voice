@@ -20,6 +20,17 @@ def api(name):
         ("Oui.", True),
         ("Oui, je confirme.", True),
         ("D’accord", True),
+        ("Ouais, parfait, merci.", True),
+        ("Oui, merci beaucoup !", True),
+        ("D'accord, très bien, merci.", True),
+        ("Ouais.", True),
+        ("Oui, je ne confirme pas.", False),
+        ("Ouais, parfait, merci, mais jeudi.", False),
+        ("Oui si vous pouvez changer l'heure.", False),
+        ("Oui ?", False),
+        ("Merci.", False),
+        ("Parfait.", False),
+        ("Allô ?", False),
         ("oui mais jeudi", False),
         ("non", False),
         ("Il a dit oui", False),
@@ -219,6 +230,21 @@ async def until(predicate):
         raise AssertionError("native observation deadline")
 
 
+def recorded_text(fixture, row):
+    import base64
+
+    from projetv0_voice.crypto import EncryptedValue
+
+    return fixture.session._keyring.decrypt(
+        EncryptedValue(
+            row.key_version,
+            base64.b64decode(row.nonce_b64),
+            base64.b64decode(row.ciphertext_b64),
+        ),
+        aad=f"turn:{row.turn_id}".encode("ascii"),
+    ).decode("utf-8")
+
+
 async def native_recap(fixture, sink, *, mixed=False):
     import json
 
@@ -265,19 +291,38 @@ async def native_recap(fixture, sink, *, mixed=False):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mixed", [False, True])
-async def test_native_recap_ack_affirmative_submits_exact_persisted_rows_without_inference(mixed):
+@pytest.mark.parametrize("affirmative", ["Oui, je confirme.", "Ouais, parfait, merci."])
+async def test_native_recap_ack_affirmative_submits_exact_persisted_rows_without_inference(
+    mixed, affirmative,
+):
+    from dataclasses import replace
+
     from tests.integration.test_call_session import _native_sparra_opening
     from tests.integration.test_voice_action_authority import caller
 
     sink = CalendarPeer()
     async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        callbacks, finished = [], []
+        handler = fixture.session._calendar_tool
+
+        async def observe_callback(params):
+            async def callback(result, *, properties):
+                callbacks.append((params.function_name, properties.run_llm))
+                await params.result_callback(result, properties=properties)
+
+            await handler(replace(params, result_callback=callback))
+            finished.append(params.function_name)
+
+        fixture.llm.register_function("find_slots", observe_callback)
+        fixture.llm.register_function("book_appointment", observe_callback)
         attempt = await native_recap(fixture, sink, mixed=mixed)
         await until(lambda: attempt.acknowledged_at is not None)
+        await until(lambda: len(finished) == 2)
+        assert callbacks == [("find_slots", False), ("book_appointment", False)]
         assert attempt.receipt is not None, "native recap receipt was not bound"
-        assert attempt.receipt.settled.is_set(), "native recap receipt not settled"
-        assert attempt.receipt.turn_id is not None, "native recap row rejected"
+        assert await attempt.receipt.admitted() is not None, "native recap row rejected"
         before = len(fixture.peers.conversations)
-        await caller(fixture, "Oui, je confirme.")
+        await caller(fixture, affirmative)
         assert fixture.session._calendar_task is not None, (
             "confirmation was not consumed",
             attempt.confirmation_start_id,
@@ -298,34 +343,137 @@ async def test_native_recap_ack_affirmative_submits_exact_persisted_rows_without
         }
         recap, confirmation = rows[proof["recapTurnId"]], rows[proof["confirmationTurnId"]]
         assert recap.role == "assistant" and recap.source == "pipecat_assistant"
-        import base64
-
-        from projetv0_voice.crypto import EncryptedValue
-
-        def recorded_text(row):
-            return fixture.session._keyring.decrypt(
-                EncryptedValue(
-                    row.key_version,
-                    base64.b64decode(row.nonce_b64),
-                    base64.b64decode(row.ciphertext_b64),
-                ),
-                aad=f"turn:{row.turn_id}".encode("ascii"),
-            ).decode("utf-8")
-
-        assert recorded_text(recap) == attempt.speak_frame.text
+        assert recorded_text(fixture, recap) == attempt.speak_frame.text
         if mixed:
             assert "Je vérifie le créneau." in fixture.peers.texts
             assert any(
-                recorded_text(row) == "Je vérifie le créneau."
+                recorded_text(fixture, row) == "Je vérifie le créneau."
                 for row in rows.values()
                 if row.role == "assistant" and row.turn_id != recap.turn_id
             )
         assert confirmation.role == "user" and confirmation.source == "stt_final"
+        assert recorded_text(fixture, confirmation) == affirmative
+        assert proof["playbackMark"] == attempt.mark_name
         ack = datetime.fromisoformat(proof["playbackAcknowledgedAt"])
         assert recap.ended_at <= ack <= confirmation.started_at <= confirmation.ended_at
         assert confirmation.turn_no == recap.turn_no + 1
         assert not recap.interrupted and not confirmation.interrupted
         assert fixture.tts._farewell_context_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", ["Peut-être.", "Allô ?", "Merci.", "Oui ?"])
+async def test_native_ambiguous_reply_replays_recap_and_only_new_ack_and_turn_can_book(reply):
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller
+
+    sink = CalendarPeer()
+    async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        first = await native_recap(fixture, sink)
+        await until(lambda: first.acknowledged_at is not None)
+        before = len(fixture.peers.conversations)
+        await caller(fixture, reply)
+        await until(lambda: fixture.session._calendar_playback.attempt not in (None, first))
+        retry = fixture.session._calendar_playback.attempt
+        assert retry is not first
+        await until(lambda: retry.acknowledged_at is not None)
+        assert retry.mark_name != first.mark_name
+        await until(lambda: retry.receipt.settled.is_set())
+        assert retry.receipt.turn_id is not None, "fresh native recap receipt was not admitted"
+        assert retry.receipt.turn_id != first.receipt.turn_id
+        assert not sink.booked.is_set()
+        assert len(fixture.peers.conversations) == before
+        assert "Confirmez-vous ce rendez-vous ?" in fixture.peers.texts[-1]
+        await caller(fixture, "Ouais, parfait, merci.")
+        await until(lambda: fixture.session._calendar_task.done())
+        assert sink.booked.is_set(), (
+            retry.invalidated, retry.confirmation_start_id,
+            fixture.session._action_authority.started_id,
+            retry.receipt.turn_id, fixture.peers.texts,
+            fixture.session._calendar_task.exception(),
+        )
+        proof = sink.submitted[-1][1]["confirmation"]
+        assert proof["playbackMark"] == retry.mark_name
+        assert proof["recapTurnId"] == str(retry.receipt.turn_id)
+        rows = {str(op.payload.turn_id): op.payload for op in fixture.writer.turns}
+        recap, confirmation = rows[proof["recapTurnId"]], rows[proof["confirmationTurnId"]]
+        assert recorded_text(fixture, recap) == retry.speak_frame.text
+        assert recorded_text(fixture, confirmation) == "Ouais, parfait, merci."
+        assert confirmation.turn_no == recap.turn_no + 1
+        ack = datetime.fromisoformat(proof["playbackAcknowledgedAt"])
+        assert recap.ended_at <= ack <= confirmation.started_at <= confirmation.ended_at
+        assert not recap.interrupted and not confirmation.interrupted
+        assert len(sink.submitted) == 2
+
+
+@pytest.mark.asyncio
+async def test_native_interrupted_confirmation_replays_without_reusing_late_ack():
+    import json
+
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller
+
+    sink = CalendarPeer()
+    async with _native_sparra_opening(calendar_sink=sink, ack_calendar=False) as fixture:
+        first = await native_recap(fixture, sink)
+        fixture.peers.tool_calls = None
+        before = len(fixture.peers.conversations)
+        await caller(fixture, "Ouais, parfait, merci.")
+        await until(lambda: fixture.session._calendar_playback.attempt not in (None, first))
+        retry = fixture.session._calendar_playback.attempt
+        assert retry is not first
+        await until(lambda: retry.forwarded.is_set())
+
+        async def acknowledge(attempt):
+            await fixture.incoming.put({
+                "type": "websocket.receive",
+                "text": json.dumps({"event": "mark", "stream_id": "stream-1",
+                                    "mark": {"name": attempt.mark_name}}),
+            })
+
+        await acknowledge(first)
+        assert first.invalidated and first.acknowledged_at is None
+        assert retry.acknowledged_at is None
+        assert not sink.booked.is_set()
+        await acknowledge(retry)
+        await until(lambda: retry.acknowledged_at is not None)
+        await caller(fixture, "Oui.")
+        await until(lambda: sink.booked.is_set())
+        proof = sink.submitted[-1][1]["confirmation"]
+        assert proof["playbackMark"] == retry.mark_name
+        assert proof["recapTurnId"] == str(retry.receipt.turn_id)
+        assert len(fixture.peers.conversations) == before
+
+
+@pytest.mark.asyncio
+async def test_native_replay_closes_response_boundary_when_its_scope_departs():
+    from pipecat.frames.frames import (
+        LLMFullResponseEndFrame,
+        LLMFullResponseStartFrame,
+        TTSSpeakFrame,
+    )
+
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller
+
+    sink = CalendarPeer()
+    async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        first = await native_recap(fixture, sink)
+        await until(lambda: first.acknowledged_at is not None)
+        boundaries = []
+
+        def revoke_after_speak(_llm, frame):
+            if isinstance(frame, (LLMFullResponseStartFrame, LLMFullResponseEndFrame)):
+                boundaries.append(type(frame))
+            if isinstance(frame, TTSSpeakFrame):
+                fixture.session._action_authority.invalidate_response()
+
+        fixture.llm.add_event_handler("on_after_push_frame", revoke_after_speak)
+        await caller(fixture, "Merci.")
+        await until(lambda: fixture.session._calendar_task.done())
+        assert boundaries == [LLMFullResponseStartFrame, LLMFullResponseEndFrame]
+        assert not sink.booked.is_set()
+        assert fixture.session._calendar_pending_booking is None
 
 
 @pytest.mark.asyncio
@@ -387,7 +535,10 @@ async def test_delayed_identical_native_turn_callbacks_keep_exact_admission_rece
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "case", ["missing_ack", "corrective_yes", "clear_after_ack", "stale_result", "hangup"]
+    "case", [
+        "missing_ack", "corrective_yes", "negated_yes", "conditional_yes",
+        "clear_after_ack", "stale_result", "hangup",
+    ]
 )
 async def test_native_recap_rejects_missing_or_changed_consent_and_suppresses_stale_result(case):
     import json
@@ -410,7 +561,12 @@ async def test_native_recap_rejects_missing_or_changed_consent_and_suppresses_st
         if case in {"stale_result", "hangup"}:
             sink.hold_booking = True
         fixture.peers.tool_calls = None
-        await caller(fixture, "Oui mais jeudi." if case == "corrective_yes" else "Oui.")
+        reply = {
+            "corrective_yes": "Ouais, parfait, merci, mais jeudi.",
+            "negated_yes": "Oui, je ne confirme pas.",
+            "conditional_yes": "Oui si vous pouvez changer l'heure.",
+        }.get(case, "Oui.")
+        await caller(fixture, reply)
         if case == "hangup":
             await until(lambda: sink.booked.is_set())
             await fixture.session.request_drain()
@@ -426,6 +582,11 @@ async def test_native_recap_rejects_missing_or_changed_consent_and_suppresses_st
             assert len(sink.submitted) == 2
         else:
             assert not sink.booked.is_set()
+            if case in {"corrective_yes", "negated_yes", "conditional_yes"}:
+                await until(lambda: len(fixture.peers.conversations) == 3)
+                assert fixture.session._calendar_playback.attempt is None
+                await caller(fixture, "Merci.")
+                assert not sink.booked.is_set()
             if case == "missing_ack":
                 await fixture.incoming.put(
                     {
@@ -676,6 +837,8 @@ def test_calendar_instant_rejects_invalid_offset_minutes_instead_of_normalizing(
         "unadmitted_caller",
         "missing_offer",
         "expired_offer",
+        "unadmitted_clarification",
+        "expired_clarification",
     ],
 )
 async def test_native_current_confirmation_preflight_failure_speaks_without_submission(
@@ -698,7 +861,7 @@ async def test_native_current_confirmation_preflight_failure_speaks_without_subm
         elif failure == "unadmitted_recap":
             attempt.receipt = calendar.RecordedTurnReceipt(datetime.now(UTC))
             attempt.receipt.settle(None)
-        elif failure == "unadmitted_caller":
+        elif failure in {"unadmitted_caller", "unadmitted_clarification"}:
             original_admitted = calendar.RecordedTurnReceipt.admitted
 
             async def reject_caller_receipt(receipt):
@@ -722,7 +885,7 @@ async def test_native_current_confirmation_preflight_failure_speaks_without_subm
 
         fixture.transport.output().add_event_handler("on_after_push_frame", observe_audio)
         inference_count = len(fixture.peers.conversations)
-        await caller(fixture, "Oui, je confirme.")
+        await caller(fixture, "Merci." if "clarification" in failure else "Oui, je confirme.")
         await until(lambda: fixture.session._calendar_task is not None)
         await asyncio.wait_for(asyncio.shield(fixture.session._calendar_task), 3)
         from contextlib import suppress

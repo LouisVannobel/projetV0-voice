@@ -213,9 +213,26 @@ async def await_calendar_result(
         return None
 
 
+_AFFIRMATIVE = re.compile(
+    r"(?:oui|ouais|je confirme|d'accord)"
+    r"(?: (?:je confirme|parfait|très bien))?"
+    r"(?: merci(?: beaucoup)?)?"
+)
+
+
 def is_affirmative(text: str) -> bool:
-    normalized = " ".join(text.casefold().replace("’", "'").split()).rstrip(".! ")
-    return normalized in {"oui", "oui, je confirme", "oui je confirme", "je confirme", "d'accord"}
+    # Match the entire utterance: a correction, condition, question or negation
+    # must never inherit consent from an affirmative prefix.
+    normalized = " ".join(text.casefold().replace("’", "'").replace(",", " ").split())
+    return _AFFIRMATIVE.fullmatch(normalized.rstrip(".! ")) is not None
+
+
+def needs_confirmation_clarification(text: str) -> bool:
+    normalized = " ".join(text.casefold().split()).rstrip(".!? ")
+    return is_affirmative(text.rstrip("? ")) or normalized in {
+        "peut-être", "peut être", "je ne sais pas", "allô", "allo",
+        "merci", "merci beaucoup", "parfait",
+    }
 
 
 _DAYS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -378,12 +395,18 @@ class CalendarPlayback:
             or datetime.now(UTC) <= attempt.acknowledged_at
         ):
             self.invalidate()
+            # Retain only the rejected attempt for this exact native caller
+            # turn's clarification. It can never provide booking authority.
+            attempt.confirmation_start_id = started_id
+            self.attempt = attempt
         else:
             attempt.confirmation_start_id = started_id
 
     def interrupted(self, frame_id: int = -1) -> None:
         attempt = self.attempt
         if attempt is None:
+            return
+        if attempt.invalidated:
             return
         # Only the normal interruption accompanying the exact first post-ACK
         # start preserves completed playback. An independent clear revokes it.
