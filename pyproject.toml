@@ -42,6 +42,12 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/projetv0_voice"]
 
+[tool.uv]
+# Temporary audio-only security exception; see docs/security/pillow-13-exception.md.
+override-dependencies = [
+  { package = { name = "pipecat-ai", version = "1.12.0" }, dependencies = ["pillow==13.0.0"] },
+]
+
 [tool.mypy]
 python_version = "3.13"
 strict = true
