@@ -446,7 +446,8 @@ async def test_native_interrupted_confirmation_replays_without_reusing_late_ack(
 
 
 @pytest.mark.asyncio
-async def test_native_replay_closes_response_boundary_when_its_scope_departs():
+@pytest.mark.parametrize("departure", ["start", "speak"])
+async def test_native_replay_closes_response_boundary_when_its_scope_departs(departure):
     from pipecat.frames.frames import (
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
@@ -460,18 +461,25 @@ async def test_native_replay_closes_response_boundary_when_its_scope_departs():
     async with _native_sparra_opening(calendar_sink=sink) as fixture:
         first = await native_recap(fixture, sink)
         await until(lambda: first.acknowledged_at is not None)
-        boundaries = []
+        boundaries, spoken = [], []
 
-        def revoke_after_speak(_llm, frame):
+        def revoke_during_replay(_llm, frame):
             if isinstance(frame, (LLMFullResponseStartFrame, LLMFullResponseEndFrame)):
                 boundaries.append(type(frame))
-            if isinstance(frame, TTSSpeakFrame):
+            if departure == "start" and isinstance(frame, LLMFullResponseStartFrame):
                 fixture.session._action_authority.invalidate_response()
+            if isinstance(frame, TTSSpeakFrame):
+                spoken.append(frame.text)
+                if departure == "speak":
+                    fixture.session._action_authority.invalidate_response()
 
-        fixture.llm.add_event_handler("on_after_push_frame", revoke_after_speak)
+        fixture.llm.add_event_handler("on_after_push_frame", revoke_during_replay)
         await caller(fixture, "Merci.")
         await until(lambda: fixture.session._calendar_task.done())
         assert boundaries == [LLMFullResponseStartFrame, LLMFullResponseEndFrame]
+        if departure == "start":
+            assert spoken == [], "scope departed during Start but still spoke a new recap"
+            assert fixture.session._calendar_playback.attempt is None
         assert not sink.booked.is_set()
         assert fixture.session._calendar_pending_booking is None
 

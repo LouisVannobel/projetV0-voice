@@ -1082,6 +1082,8 @@ class CallSession:
             # before our exact paced aggregation can bind its receipt.
             await self._services.llm.push_frame(LLMFullResponseStartFrame())
         try:
+            if not self._action_current(scope):
+                return
             attempt = self._calendar_playback.begin(
                 offer.offerId, appointment_label(offer) + ". Confirmez-vous ce rendez-vous ?"
             )
