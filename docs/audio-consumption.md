@@ -109,16 +109,23 @@ rollback detection. Missing authority refuses paid work. Additive legacy10 and
 native-audio11 migrations preserve historical qualification rows and old logical
 contents; the new table and nullable lease permit do not reinterpret those rows.
 
-For each provider, new admission uses `E=max(H,S,A+n*d)`, where `S` is the raw
-authenticated report and `H` is its durable reported high-water floor. It requires
-`E+R<=5` and `cash-(E-S)>=R`; OpenRouter also requires `key_remaining-(E-S)>=R`.
-The unchanged reserves are OR3.780408/Telnyx1.22; per-admission forecasts are
-OR0.505068/Telnyx0.12. Uncertainty is already included exactly once. The immutable
-lifetime ceiling is five, but the whole-envelope inequality can stop earlier:
-even a zero historical OR anchor permits at most three new admissions. The last
-admitted call checks its own ordinal minus one, so a closed next-admission gate
-does not reserve that call again. Reported high-water marks remain separate from
-the pessimistic forecast, updating only as `H'=max(H,S)`. A downward provider
+The owner authorized the remaining-reserve amendment on 21 October after
+disclosure of reduced protection against delayed charges. For each provider,
+use `E=max(H,S,A+m*d)` and `R(m)=R0-m*d`, where `S` is the raw authenticated report
+and `H` is its durable reported high-water floor. New admission uses committed
+count `m=n<5`; a current permit of ordinal `k` uses `m=k-1`. It requires
+`E+R(m)<=5` and `cash-(E-S)>=R(m)`; OpenRouter separately requires
+`key_remaining-(E-S)>=R(m)`. Preserve `R0=6*d+uncertainty`, with original R0
+OR3.780408/Telnyx1.22 and forecasts OR0.505068/Telnyx0.12. Uncertainty remains
+included exactly once; minimum admitted-index reserves at m=4 are
+OR1.760136/Telnyx0.74. These are separate USD5 control caps and a lifetime ceiling
+of five admissions, not five guaranteed affordable calls. The fifth permit may
+finish after new admission closes, subject to its own checks. A larger global
+count can loosen money checks, so it cannot replace a permit's ordinal minus one.
+This new policy lowers retained headroom even when reported spending dominates;
+it supersedes the deliberately conservative whole-reserve rule. It does not
+establish final billing or an invoice ceiling. Reported high-water marks remain
+separate from the pessimistic forecast, updating only as `H'=max(H,S)`. A downward provider
 restatement can remain funded, but cannot lower that floor or refund an admission.
 Raw spend below the original policy anchor still refuses. Each frozen committed
 or pending writer view carries its own raw fact and floors. These are operational

@@ -166,7 +166,9 @@ def affordable(
             strict=True,
         ):
             effective = max(floor, spent, anchor + count * forecast)
-            if effective + reserve > 5 or cash - (effective - spent) < reserve:
+            remaining_reserve = reserve - count * forecast
+            if (effective + remaining_reserve > 5
+                    or cash - (effective - spent) < remaining_reserve):
                 return False
         gap = max(
             reported_floors[0], fact.openrouter_reported_spend_usd,
@@ -174,7 +176,7 @@ def affordable(
         )
         return (
             fact.openrouter_limit_remaining_usd - (gap - fact.openrouter_reported_spend_usd)
-            >= RESERVES[0]
+            >= RESERVES[0] - count * FORECASTS[0]
         )
 
 

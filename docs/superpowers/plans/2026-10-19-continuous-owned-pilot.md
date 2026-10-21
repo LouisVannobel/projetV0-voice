@@ -1,5 +1,9 @@
 # Continuous owned-pilot phone implementation
 
+The whole-reserve constraint below is historical and is superseded by the
+owner-authorized [21 October remaining-reserve plan](2026-10-21-remaining-pilot-reserve.md).
+The original qualification evidence and all other authority remain unchanged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Execute task-by-task with fresh implementer and independent review; the user's standing mandate removes human approval pauses.
 
 **Goal:** Keep the owned phone listener available between calls while every new paid call consumes persistent authority under the unchanged original budgets.

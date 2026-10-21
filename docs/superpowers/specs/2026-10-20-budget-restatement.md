@@ -1,5 +1,10 @@
 # Preserve authority across provider spend restatements
 
+The reserve-preserving rule below records this repair's historical contract.
+The separately authorized [21 October remaining-reserve amendment](2026-10-21-remaining-pilot-reserve-design.md)
+supersedes only that reserve rule after disclosure of reduced delayed-charge
+protection. The high-water/raw distinction and other financial authority remain.
+
 This narrow amendment supersedes the 19 October design's refusal of every raw
 reported-spend decrease. It preserves the original financial authority and the
 accepted Pipecat/Telnyx conversation. No reserve, cap, forecast, identity, count,
