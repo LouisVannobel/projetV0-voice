@@ -71,6 +71,20 @@ pipeline_module = import_module("projetv0_voice.pipeline")
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial,expected", [
+    ("llm_failed", "llm_failed"),
+    ("incomplete_turn_stop", "incomplete_turn_stop"),
+    ("unknown-private-error", "call_failed"),
+])
+async def test_first_failure_preserves_safe_first_reason_and_redacts_unknown(initial, expected):
+    failure = pipeline_module.FirstFailure()
+    failure.signal(initial)
+    failure.signal("writer_failed")
+    assert await failure.wait() == expected
+    assert failure.code == expected
+
+
+@pytest.mark.asyncio
 async def test_end_call_playback_requires_current_audio_wire_send_and_ack() -> None:
     failure = pipeline_module.FirstFailure()
     playback = pipeline_module.EndCallPlayback(generation=UUID(int=1), first_failure=failure)
@@ -795,6 +809,68 @@ async def test_terminal_context_never_reaches_llm_provider_stage(closed_by: str)
         ],
     )
     assert contexts == [], "a closed call started work at the LLM stage"
+
+
+@pytest.mark.asyncio
+async def test_build_pipeline_incomplete_stop_retains_reason_without_llm_or_stt_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_params = pipeline_module.LLMUserAggregatorParams
+
+    def short_watchdog(**kwargs: object) -> object:
+        return native_params(**(kwargs | {"user_turn_stop_timeout": 0.05}))
+
+    monkeypatch.setattr(pipeline_module, "LLMUserAggregatorParams", short_watchdog)
+    stages = SimpleNamespace(
+        stt=_SetupProbe("stt"), llm=_SetupProbe("llm"), tts=_SetupProbe("tts")
+    )
+    failure = pipeline_module.FirstFailure()
+    pipeline = pipeline_module.build_pipeline(
+        transport=_Transport(), services=stages, controller=_GateController(active=True),
+        turn_recorder=_Turns(), first_failure=failure,
+    )
+    user = next(
+        processor for processor in pipeline.processors if isinstance(processor, LLMUserAggregator)
+    )
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    def note_user(_processor: FrameProcessor, frame: Frame) -> None:
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            stopped.set()
+
+    async def note_started(_worker: PipelineWorker, _frame: StartFrame) -> None:
+        started.set()
+
+    observers, metrics = _call_observers(stt=stages.stt, llm=stages.llm, tts=stages.tts)
+    user.add_event_handler("on_after_push_frame", note_user)
+    worker = PipelineWorker(
+        pipeline, params=PipelineParams(audio_in_sample_rate=8000),
+        observers=observers._consume(), enable_rtvi=False, cancel_on_idle_timeout=False,
+    )
+    worker.add_event_handler("on_pipeline_started", note_started)
+    runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
+    await runner.add_workers(worker)
+    running = asyncio.create_task(runner.run())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        # Nonempty text is unfinished until its stopped VAD segment's receipt arrives.
+        await worker.queue_frames([
+            VADUserStartedSpeakingFrame(),
+            TranscriptionFrame(text="unfinished input", user_id="", timestamp="unit"),
+            VADUserStoppedSpeakingFrame(),
+        ])
+        assert await asyncio.wait_for(failure.wait(), timeout=2) == "incomplete_turn_stop"
+        await asyncio.wait_for(stopped.wait(), timeout=2)
+        assert "projetv0.voice.stt.failures" not in _metric_map(metrics)
+        assert metrics.failure_code is None
+    finally:
+        if not running.done():
+            await worker.queue_frame(EndFrame())
+        await asyncio.wait_for(running, timeout=2)
+        await metrics.aclose()
+
+    assert not any(isinstance(frame, LLMContextFrame) for frame in stages.llm.frames)
+    assert user.context.get_messages() == [{"role": "user", "content": "unfinished input"}]
 
 
 @pytest.mark.asyncio

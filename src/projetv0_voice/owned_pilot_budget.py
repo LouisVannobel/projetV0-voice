@@ -46,7 +46,7 @@ class OwnedPilotBudgetPolicy(BaseModel):
     policy_id: UUID
     identity: BudgetObservationIdentity = Field(repr=False)
     cost_scope: Literal["original-dedicated-account-key"] = "original-dedicated-account-key"
-    total_calls: Literal[5] = 5
+    total_calls: Literal[5, 6] = 5
     openrouter_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     telnyx_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     paid_until: datetime
@@ -96,7 +96,7 @@ class OwnedPilotBudgetPolicy(BaseModel):
 class OwnedPilotBudgetPermit(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
     policy_sha256: str
-    ordinal: int = Field(ge=1, le=5, strict=True)
+    ordinal: int = Field(ge=1, le=6, strict=True)
     call_id: UUID
     call_control_id: str
     call_leg_id: str | None

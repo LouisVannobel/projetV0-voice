@@ -7,6 +7,7 @@ import gc
 import hashlib
 import sqlite3
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,7 +45,7 @@ async def no_unretrieved_owner_futures():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["enroll", "suspend-restored"])
+@pytest.mark.parametrize("action", ["enroll", "suspend-restored", "extend-sixth-call"])
 @pytest.mark.parametrize("release_late_commit", [True, False])
 async def test_operator_timeout_joins_writer_without_claiming_non_commit(
     tmp_path,
@@ -78,7 +79,10 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         inference_profile_sha256=settings.inference_profile_sha256,
         qualified_profile_sha256=canonical_qualified_profile_sha256(profile),
     )
-    fact = replace(observation(), identity=identity)
+    predecessor = policy
+    if action == "extend-sixth-call":
+        policy = policy.model_copy(update={"total_calls": 6})
+    fact = replace(observation(), identity=identity, openrouter_reported_spend_usd=Decimal("1.40"))
     keyring = CryptoKeyring({1: KEY}, active_version=1)
     manifest = SimpleNamespace(
         agent_id="fixture",
@@ -106,7 +110,7 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
             writer, policy, collect, utcnow=lambda: NOW
         ),
     )
-    if action == "suspend-restored":
+    if action in {"suspend-restored", "extend-sixth-call"}:
         seed = PersistenceWriter(
             settings.sqlite_path,
             keyring,
@@ -115,12 +119,15 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
             process_deployment_id=settings.deployment_id,
             utcnow=lambda: NOW,
         )
-        seed.set_owned_budget(policy)
+        seed.set_owned_budget(predecessor)
         owner = asyncio.create_task(seed.run())
         assert await seed.wait_ready()
         assert await seed.owned_budget_request("enroll", observation=fact, predecessor_retired=True)
         await seed.drain(2)
         await owner
+        if action == "extend-sixth-call":
+            with sqlite3.connect(settings.sqlite_path) as db:
+                db.execute("UPDATE owned_pilot_budget SET used_calls=5,openrouter_floor='1.10'")
 
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -145,7 +152,9 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
 
     monkeypatch.setattr(cli, "PersistenceWriter", make_writer)
     monkeypatch.setattr(cli, "_WRITER_CLOSE_SECONDS", 0.05)
-    operation = asyncio.create_task(cli.operate(action, predecessor_retired=True))
+    operation = asyncio.create_task(
+        cli.operate(action, predecessor_retired=True, expected_policy_sha256=predecessor.sha256)
+    )
     try:
         await asyncio.wait_for(entered.wait(), 2)
         writer = instances[0]
@@ -159,6 +168,19 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         assert writer._owner_task.done()
         assert writer._closed_event.is_set() and writer._connection is None
         with sqlite3.connect(settings.sqlite_path) as db:
+            if action == "extend-sixth-call":
+                assert db.execute(
+                    "SELECT used_calls,openrouter_floor,policy_sha256 FROM owned_pilot_budget"
+                ).fetchall() == [
+                    (
+                        5,
+                        "1.40" if release_late_commit else "1.10",
+                        policy.sha256 if release_late_commit else predecessor.sha256,
+                    )
+                ]
+                assert db.execute("PRAGMA user_version").fetchone() == (
+                    13 if release_late_commit else 11,
+                )
             expected = (
                 [(0, 1 if action == "suspend-restored" else 0)]
                 if release_late_commit
@@ -166,10 +188,43 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
                 if action == "enroll"
                 else [(0, 0)]
             )
-            assert (
+            assert action == "extend-sixth-call" or (
                 db.execute("SELECT used_calls,suspended FROM owned_pilot_budget").fetchall()
                 == expected
             )
+        if action == "extend-sixth-call":
+            restarted = PersistenceWriter(
+                settings.sqlite_path,
+                keyring,
+                contract_version=2,
+                process_agent_id="fixture",
+                process_deployment_id=settings.deployment_id,
+                utcnow=lambda: NOW,
+            )
+            restarted.set_owned_budget(policy)
+            restart_owner = asyncio.create_task(restarted.run())
+            try:
+                assert await restarted.wait_ready()
+                assert bool(
+                    await restarted.owned_budget_request(
+                        action,
+                        observation=fact,
+                        predecessor_retired=True,
+                        expected_policy_sha256=predecessor.sha256,
+                    )
+                ) is (not release_late_commit)
+                assert not await restarted.owned_budget_request(
+                    action,
+                    observation=fact,
+                    predecessor_retired=True,
+                    expected_policy_sha256=predecessor.sha256,
+                )
+                assert await restarted.owned_budget_request("observe", observation=fact)
+                state = await restarted.owned_budget_request("state")
+                assert state[:3] == (5, "1.40", "0")
+            finally:
+                await restarted.drain(2)
+                await restart_owner
     finally:
         release.set()
         if instances and not instances[0]._closed_event.is_set():
@@ -245,3 +300,59 @@ asyncio.run(main())
     assert result.stdout == "owned_budget_transition_unknown\n"
     with sqlite3.connect(tmp_path / "stuck.sqlite") as db:
         assert db.execute("SELECT count(*) FROM owned_pilot_budget").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        ([], "requires --predecessor-retired"),
+        (["--predecessor-retired"], "requires --expected-policy-sha256"),
+        (
+            ["--predecessor-retired", "--expected-policy-sha256", "F" * 64],
+            "requires --expected-policy-sha256",
+        ),
+    ],
+)
+def test_sixth_operator_requires_explicit_flags_before_runtime(
+    monkeypatch, capsys, options, message
+):
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["budget", "extend-sixth-call", *options])
+    monkeypatch.setattr(
+        cli,
+        "capture_runtime_environment",
+        lambda _: pytest.fail("must validate explicit flags before runtime"),
+    )
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+    assert result.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_sixth_operator_forwards_exact_expected_hash(monkeypatch, capsys):
+    import sys
+
+    calls = []
+
+    async def operate(action, **values):
+        calls.append((action, values))
+        return True
+
+    monkeypatch.setattr(cli, "operate", operate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "budget",
+            "extend-sixth-call",
+            "--predecessor-retired",
+            "--expected-policy-sha256",
+            "e" * 64,
+        ],
+    )
+    assert cli.main() == 0
+    assert calls == [
+        ("extend-sixth-call", {"predecessor_retired": True, "expected_policy_sha256": "e" * 64})
+    ]
+    assert capsys.readouterr().out == "owned_budget_transition_accepted\n"

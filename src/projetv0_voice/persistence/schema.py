@@ -298,3 +298,23 @@ OWNED_BUDGET_SCHEMA_SQL = SCHEMA_SQL.replace(
 OWNED_AUDIO_BUDGET_SCHEMA_SQL = LOCAL_AUDIO_TERMINAL_SCHEMA_SQL.replace(
     "lifecycle_json TEXT,", "lifecycle_json TEXT, budget_permit_json TEXT,", 1,
 ).replace("PRAGMA user_version = 9;", OWNED_BUDGET_SQL + "PRAGMA user_version = 11;")
+
+# Only the explicit exhausted-five transition installs these forward schemas.
+# Historical V10/V11 retain their original five-call constraint and meaning.
+SIXTH_BUDGET_SCHEMA_VERSION = 12
+SIXTH_AUDIO_BUDGET_SCHEMA_VERSION = 13
+_SIXTH_BUDGET_SQL = OWNED_BUDGET_SQL.replace(
+    "used_calls BETWEEN 0 AND 5", "used_calls BETWEEN 0 AND 6",
+)
+SIXTH_BUDGET_SCHEMA_SQL = OWNED_BUDGET_SCHEMA_SQL.replace(
+    OWNED_BUDGET_SQL, _SIXTH_BUDGET_SQL,
+).replace("PRAGMA user_version = 10;", "PRAGMA user_version = 12;")
+SIXTH_AUDIO_BUDGET_SCHEMA_SQL = OWNED_AUDIO_BUDGET_SCHEMA_SQL.replace(
+    OWNED_BUDGET_SQL, _SIXTH_BUDGET_SQL,
+).replace("PRAGMA user_version = 11;", "PRAGMA user_version = 13;")
+SIXTH_BUDGET_MIGRATION_SQL = (
+    "ALTER TABLE owned_pilot_budget RENAME TO owned_pilot_budget_v5;\n"
+    + _SIXTH_BUDGET_SQL
+    + "INSERT INTO owned_pilot_budget SELECT * FROM owned_pilot_budget_v5;\n"
+    "DROP TABLE owned_pilot_budget_v5;\n"
+)

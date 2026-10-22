@@ -2018,7 +2018,7 @@ async def test_sparra_native_llm_http_error_ends_active_call_without_fabricated_
         assert fixture.running.done(), (
             "LLM HTTP error left the disclosed call ACTIVE instead of a controlled end"
         )
-        with pytest.raises(session_module.CallSessionError, match="^call_failed$"):
+        with pytest.raises(session_module.CallSessionError, match="^llm_failed$"):
             await fixture.running
         assert not fixture.session._controller.is_active()
         assert not fixture.admission.allows_audio()
@@ -2036,7 +2036,7 @@ async def test_sparra_native_llm_http_error_ends_active_call_without_fabricated_
             if isinstance(command, VoiceOperationV1) and command.kind == "call.upsert"
             and command.payload.status == "failed"
         )
-        assert terminal.payload.end_reason == "call_failed"
+        assert terminal.payload.end_reason == "llm_failed"
         assert terminal.payload.message_result is None
         before = len(fixture.sent)
         assert await fixture.serializer.deserialize(json.dumps({

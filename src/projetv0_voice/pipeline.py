@@ -88,8 +88,10 @@ class FirstFailure:
             "disclosure_timeout",
             "end_call_failed",
             "end_call_timeout",
+            "incomplete_turn_stop",
             "input_gate_failed",
             "lease_terminalization_failed",
+            "llm_failed",
             "persistence_failed",
             "pipeline_cleanup_failed",
             "pipeline_task_failed",
@@ -1048,7 +1050,9 @@ def build_pipeline(
                 stop=[
                     CompletionAwareTurnStopStrategy(
                         turn_analyzer=LocalSmartTurnAnalyzerV3(),
-                        on_incomplete_turn_stop=lambda: first_failure.signal("call_failed"),
+                        on_incomplete_turn_stop=lambda: first_failure.signal(
+                            "incomplete_turn_stop"
+                        ),
                         on_completed_turn=None if action_authority is None
                         else action_authority.caller_completed,
                     )
@@ -1184,7 +1188,7 @@ def build_pipeline(
 
     def abort_sparra_llm_error(_llm: FrameProcessor, error: ErrorFrame) -> None:
         _sanitize_inline_error(error, "llm_failed")
-        first_failure.signal("call_failed")
+        first_failure.signal("llm_failed")
 
     inference_terminal = False
 
