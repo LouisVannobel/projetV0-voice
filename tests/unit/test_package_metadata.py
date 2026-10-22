@@ -176,7 +176,7 @@ def assert_packaging_orchestration(workflow: dict[str, object]) -> None:
     }
     assert steps[1] == {
         "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-        "with": {"version": "0.12.4", "python-version": "3.13.15"},
+        "with": {"version": "0.13.5", "python-version": "3.13.17"},
     }
     assert steps[6] == {
         "name": "Upload pre-image handoff",
@@ -282,7 +282,7 @@ def assert_handoff_orchestration(workflow: dict[str, object]) -> None:
     }
     assert steps[1] == {
         "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-        "with": {"version": "0.12.4", "python-version": "3.13.15"},
+        "with": {"version": "0.13.5", "python-version": "3.13.17"},
     }
     assert steps[4] == {
         "name": "Download the validated SBOM",
@@ -492,7 +492,7 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
         },
         {
             "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-            "with": {"version": "0.12.4", "python-version": "3.13.15"},
+            "with": {"version": "0.13.5", "python-version": "3.13.17"},
         },
         {"run": "uv sync --all-groups --frozen"},
         {"run": "uv run pytest -q"},
@@ -521,7 +521,7 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
                 "sudo chmod -R a+rX /opt/sparra-hold-python\n"
                 "sudo /opt/sparra-hold-python/bin/python3.13 -c "
                 "'import os, sys; sys.exit(0 if sys.platform == \"linux\" "
-                "and os.geteuid() == 0 and sys.version_info[:3] == (3, 13, 15) else 1)'\n"
+                "and os.geteuid() == 0 and sys.version_info[:3] == (3, 13, 17) else 1)'\n"
                 'sudo env "PYTHONPATH=$hold_pytest_site" PYTHONDONTWRITEBYTECODE=1 '
                 "/opt/sparra-hold-python/bin/python3.13 -m pytest "
                 "tests/unit/test_material_hold.py -q -p no:cacheprovider\n"
@@ -542,7 +542,7 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
         },
         {
             "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-            "with": {"version": "0.12.4", "python-version": "3.13.15"},
+            "with": {"version": "0.13.5", "python-version": "3.13.17"},
         },
         {"run": "uv lock --check"},
         {"run": "uv sync --all-groups --frozen"},
@@ -629,7 +629,7 @@ def test_manual_release_builds_once_on_default_main_and_assembles_handoff() -> N
     }
     assert steps[1] == {
         "uses": "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-        "with": {"version": "0.12.4", "python-version": "3.13.15"},
+        "with": {"version": "0.13.5", "python-version": "3.13.17"},
     }
     commands = "\n".join(str(step.get("run", "")) for step in steps)
     assert "uv lock --check" in commands

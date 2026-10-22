@@ -13,7 +13,7 @@ uv run ruff check .
 uv run mypy src
 ```
 
-Python 3.13.15 and all direct dependencies are pinned. Default development and test commands must not contact live providers.
+Python 3.13.17 and all direct dependencies are pinned. Default development and test commands must not contact live providers.
 
 ## Packaging and release
 

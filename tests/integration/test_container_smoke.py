@@ -18,12 +18,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 PYTHON_IMAGE = (
-    "python:3.13.15-slim-bookworm"
-    "@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e"
+    "python:3.13.17-slim-bookworm"
+    "@sha256:ac411330d543edd1cc55be253a783cff743082feddfa07957a4574ad1ea01a6b"
 )
 UV_IMAGE = (
-    "ghcr.io/astral-sh/uv:0.12.4"
-    "@sha256:d0a6eca6c669dc7e9c51218707b8438a3d30402733d739dcc00adb3e213e8f5c"
+    "ghcr.io/astral-sh/uv:0.13.5"
+    "@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff"
 )
 POSTGRES_IMAGE = (
     "postgres:16.15-bookworm"
