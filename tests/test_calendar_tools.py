@@ -432,6 +432,91 @@ async def test_native_ambiguous_reply_replays_recap_and_only_new_ack_and_turn_ca
 
 
 @pytest.mark.asyncio
+async def test_connected_without_ack_observes_native_replay_then_fresh_selection_can_book():
+    import json
+    from types import SimpleNamespace
+
+    from tests.integration.sparra_connected_scenario import Scenario
+    from tests.integration.test_call_session import _native_sparra_opening
+    from tests.integration.test_voice_action_authority import caller, tool
+
+    sink = CalendarPeer()
+    async with _native_sparra_opening(calendar_sink=sink, ack_calendar=False) as fixture:
+        class MediaObservation:
+            ack_calendar = True
+
+            @property
+            def marks(self):
+                return [
+                    wire["mark"]["name"] for wire in fixture.sent if wire.get("event") == "mark"
+                ]
+
+        async def select():
+            attempt = await native_recap(fixture, sink)
+            await until(lambda: attempt.receipt is not None and attempt.receipt.settled.is_set())
+            return {"acknowledged": attempt.acknowledged_at is not None}
+
+        async def captured(text):
+            await caller(fixture, text)
+
+        async def retained(_call_id):
+            # Adapt actual encrypted recorder operations, never seed a turn or receipt.
+            return SimpleNamespace(turns=[
+                SimpleNamespace(**{
+                    "turn_id": op.payload.turn_id, "turn_no": op.payload.turn_no,
+                    "role": op.payload.role, "text": recorded_text(fixture, op.payload),
+                    "interrupted": op.payload.interrupted,
+                }) for op in fixture.writer.turns
+            ])
+
+        media = MediaObservation()
+        probe = SimpleNamespace(
+            session=fixture.session, media=media, calendar_select=select, captured=captured,
+            peers=SimpleNamespace(requests=fixture.peers.conversations, texts=fixture.peers.texts),
+            graph=SimpleNamespace(writer=SimpleNamespace(read_retained_call=retained)),
+            call_id=fixture.session._identity.call_id,
+        )
+        assert await Scenario.calendar_without_ack(probe) == {"no_booking": True}
+        assert media.ack_calendar is True
+        assert [request["kind"] for _, request in sink.submitted] == ["find_slots"]
+        assert not sink.booked.is_set()
+        repeat_task = fixture.session._calendar_task
+        assert repeat_task is not None and repeat_task.done()
+        assert not repeat_task.cancelled() and repeat_task.exception() is None
+
+        # A new native selection and real inbound mark ACK are required to book.
+        fixture.peers.tool_calls = [tool(
+            "book_appointment", "select-after-unacked", json.dumps({"offerId": str(sink.offer_id)}),
+        )]
+        before_marks = len(media.marks)
+        await caller(fixture, "Ce créneau me convient.")
+        await until(lambda: any(
+            mark.startswith("sparra-calendar-recap-") for mark in media.marks[before_marks:]
+        ))
+        selected = fixture.session._calendar_playback.attempt
+        assert selected is not None and selected.acknowledged_at is None
+        await fixture.incoming.put({
+            "type": "websocket.receive",
+            "text": json.dumps({"event": "mark", "stream_id": "stream-1",
+                                "mark": {"name": selected.mark_name}}),
+        })
+        await until(lambda: selected.acknowledged_at is not None)
+        before = len(fixture.peers.conversations)
+        await caller(fixture, "Oui, je confirme.")
+        await until(lambda: any(
+            "Votre rendez-vous est confirmé" in text for text in fixture.peers.texts
+        ))
+        assert len(fixture.peers.conversations) == before
+        assert [request["kind"] for _, request in sink.submitted] == [
+            "find_slots", "book_appointment",
+        ]
+        proof = sink.submitted[-1][1]["confirmation"]
+        assert proof["playbackMark"] == selected.mark_name
+        assert proof["recapTurnId"] == str(selected.receipt.turn_id)
+        assert sink.booked.is_set()
+
+
+@pytest.mark.asyncio
 async def test_native_interrupted_confirmation_replays_without_reusing_late_ack():
     import json
 

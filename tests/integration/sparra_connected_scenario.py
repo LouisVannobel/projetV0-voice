@@ -1719,13 +1719,62 @@ class Scenario:
         try:
             result = await self.calendar_select()
             assert not result["acknowledged"], "native_calendar_ack_withheld"
+            first = self.session._calendar_playback.attempt
+            assert first is not None and first.receipt is not None
             before = len(self.peers.requests)
+            before_marks = len(self.media.marks)
+            before_texts = len(self.peers.texts)
+            previous_task = self.session._calendar_task
             await self.captured("Oui, je confirme.")
-            await eventually(lambda: len(self.peers.requests) > before, "calendar_untrusted_yes")
+            await eventually(
+                lambda: self.session._calendar_task is not None
+                and self.session._calendar_task is not previous_task,
+                "calendar_unacked_repeat_started",
+            )
+            task = self.session._calendar_task
+            await eventually(
+                lambda: self.session._calendar_playback.attempt not in (None, first),
+                "calendar_unacked_repeat_attempt",
+            )
+            retry = self.session._calendar_playback.attempt
+            assert retry.offer_id == first.offer_id and retry.mark_name != first.mark_name
+            await eventually(
+                lambda: retry.mark_name in self.media.marks[before_marks:],
+                "calendar_unacked_repeat_mark",
+            )
+            assert retry.forwarded.is_set(), "native_calendar_repeat_forwarded"
+            await eventually(task.done, "calendar_unacked_repeat_completed")
+            assert not task.cancelled(), "native_calendar_repeat_not_cancelled"
+            task.result()
             await eventually(
                 self.session._calendar_response_end.is_set, "calendar_untrusted_response_ended"
             )
-            assert self.session._calendar_task is None, "native_calendar_no_unacked_booking"
+            assert len(self.peers.requests) == before, "native_calendar_no_unacked_inference"
+            assert first.acknowledged_at is None and retry.acknowledged_at is None
+            assert first.invalidated and retry.invalidated, "native_calendar_unacked_revoked"
+            assert not self.session._calendar_submitting
+            assert self.session._calendar_pending_booking is None, (
+                "native_calendar_no_unacked_booking"
+            )
+            assert retry.receipt is not None, "native_calendar_repeat_receipt"
+            await eventually(retry.receipt.settled.is_set, "calendar_unacked_repeat_recorded")
+            assert retry.receipt.turn_id is not None
+            assert retry.receipt.turn_id != first.receipt.turn_id
+            retained = await self.graph.writer.read_retained_call(self.call_id)
+            recap = next(turn for turn in retained.turns if turn.turn_id == retry.receipt.turn_id)
+            original = next(
+                turn for turn in retained.turns if turn.turn_id == first.receipt.turn_id
+            )
+            assert recap.role == "assistant" and recap.text == retry.speak_frame.text
+            assert not recap.interrupted, "native_calendar_repeat_exact_recorder_recap"
+            assert recap.text in self.peers.texts[before_texts:], (
+                "native_calendar_repeat_native_tts"
+            )
+            assert any(
+                turn.role == "user" and turn.text == "Oui, je confirme."
+                and original.turn_no < turn.turn_no < recap.turn_no
+                for turn in retained.turns
+            ), "native_calendar_unacked_actual_affirmative"
             assert not any("Votre rendez-vous est confirmé" in text for text in self.peers.texts)
             return {"no_booking": True}
         finally:
