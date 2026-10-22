@@ -90,7 +90,8 @@ python -m projetv0_voice.owned_pilot_budget_cli enroll --predecessor-retired
 This command reads authenticated metadata and refuses active/unsettled authority.
 It neither buys credit nor changes provider resources. Startup never enrolls or
 repairs authority. Same-policy enrollment cannot reset consumption; a different
-UUID/hash/anchor/consumer cannot replace the original slot. Before starting from
+UUID/hash/anchor/consumer cannot replace the original slot through enrollment.
+Before starting from
 a known restored store, the operator must suspend it explicitly:
 
 ```
@@ -109,17 +110,62 @@ rollback detection. Missing authority refuses paid work. Additive legacy10 and
 native-audio11 migrations preserve historical qualification rows and old logical
 contents; the new table and nullable lease permit do not reinterpret those rows.
 
+### One explicit sixth-call transition
+
+The default original policy retains its lifetime limit of five admissions. An
+explicit extended policy with `total_calls=6` can authorize exactly ordinal6
+under the same separate USD5 provider caps. It cannot enroll an empty store,
+reset the count, increase either monetary cap, or authorize ordinal7. There is
+no periodic renewal, new budget identity, or automatic startup transition.
+
+After retiring the predecessor and qualifying the exact new image/profile,
+configure the strict operator environment with that extended policy and its
+new canonical policy SHA-256, then use the **original policy's** exact hash:
+
+```
+python -m projetv0_voice.owned_pilot_budget_cli extend-sixth-call --predecessor-retired --expected-policy-sha256 ORIGINAL_POLICY_SHA256
+```
+
+The writer requires the original permanent slot at exactly `used_calls=5`,
+the matching predecessor hash and policy JSON, no suspension, no active local
+lease or carrier call, and no unsettled paid dispatch. The original financial
+UUID, account/credential identity, accounting start, anchors, paid/key expiry,
+bundle and inference profile must match. Only the finite limit and qualified
+profile/runtime/image/deployment binding may change; any changed artifact must
+have its truthful newly qualified digest. Fresh matching observations must pass
+the original monetary, cash, remaining-key and full start-envelope checks.
+
+The same transaction preserves all historical rows and count5, advances each
+reported floor only to `max(H,S)`, replaces the exact policy binding, and rebuilds
+only the budget table with a maximum count6. Legacy10 advances to12 and native
+audio11 advances to13; historical schemas10/11 keep their original meaning.
+Refusal leaves the schema and authority unchanged. Startup recognizes the exact
+new schemas without extending authority; older images refuse those versions,
+so keep the predecessor retired. A fresh observation is required before runtime
+readiness. Duplicate transitions refuse and never grant another admission.
+If the outcome is unknown, inspect that same durable store: the whole migration
+and transition either committed together or rolled back. Never delete/reset a
+ledger or retry with a new identity to resolve uncertainty.
+
+The reserve formula and constants below remain unchanged. At count5, retained
+reserves are OR1.255068/Telnyx0.62; actual affordability still requires fresh
+provider observations. A committed sixth permit remains subject to its own
+ordinal-minus-one checks after admission closes. This source capability does
+not establish a deployed transition, a successful real call, or final invoices.
+
 The owner authorized the remaining-reserve amendment on 21 October after
 disclosure of reduced protection against delayed charges. For each provider,
 use `E=max(H,S,A+m*d)` and `R(m)=R0-m*d`, where `S` is the raw authenticated report
 and `H` is its durable reported high-water floor. New admission uses committed
-count `m=n<5`; a current permit of ordinal `k` uses `m=k-1`. It requires
+count `m=n<total_calls` (default5, explicitly extended6); a current permit of
+ordinal `k` uses `m=k-1`. It requires
 `E+R(m)<=5` and `cash-(E-S)>=R(m)`; OpenRouter separately requires
 `key_remaining-(E-S)>=R(m)`. Preserve `R0=6*d+uncertainty`, with original R0
 OR3.780408/Telnyx1.22 and forecasts OR0.505068/Telnyx0.12. Uncertainty remains
 included exactly once; minimum admitted-index reserves at m=4 are
 OR1.760136/Telnyx0.74. These are separate USD5 control caps and a lifetime ceiling
-of five admissions, not five guaranteed affordable calls. The fifth permit may
+of five admissions by default, or six after the single explicit transition,
+not guaranteed affordable calls. The last permit may
 finish after new admission closes, subject to its own checks. A larger global
 count can loosen money checks, so it cannot replace a permit's ordinal minus one.
 This new policy lowers retained headroom even when reported spending dominates;

@@ -48,7 +48,8 @@ async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[
         raise RuntimeError("owned_budget_writer_close_failed") from None
 
 
-async def operate(action: str, *, predecessor_retired: bool) -> bool:
+async def operate(action: str, *, predecessor_retired: bool,
+                  expected_policy_sha256: str | None = None) -> bool:
     settings = parse_runtime_settings(capture_runtime_environment(os.environ))
     if settings.runtime_mode != "strict":
         raise RuntimeError("owned_budget_operator_refused")
@@ -95,12 +96,20 @@ async def operate(action: str, *, predecessor_retired: bool) -> bool:
         if action == "suspend-restored":
             submitted = True
             return await writer.owned_budget_request("suspend") is True
-        if action != "enroll" or not predecessor_retired:
+        if action not in {"enroll", "extend-sixth-call"} or not predecessor_retired:
+            return False
+        if action == "extend-sixth-call" and (
+            expected_policy_sha256 is None or len(expected_policy_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
+        ):
             return False
         fact = await gate.collect()
         submitted = True
         return (
-            await writer.owned_budget_request("enroll", observation=fact, predecessor_retired=True)
+            await writer.owned_budget_request(
+                action, observation=fact, predecessor_retired=True,
+                expected_policy_sha256=expected_policy_sha256,
+            )
             is True
         )
     except Exception:
@@ -129,17 +138,26 @@ async def operate(action: str, *, predecessor_retired: bool) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Original Sparra budget operator transition")
-    parser.add_argument("action", choices=("enroll", "suspend-restored"))
+    parser.add_argument("action", choices=("enroll", "suspend-restored", "extend-sixth-call"))
+    parser.add_argument("--expected-policy-sha256")
     parser.add_argument(
         "--predecessor-retired",
         action="store_true",
         help="Confirm predecessor is fenced and prior exposure is settled",
     )
     args = parser.parse_args()
-    if args.action == "enroll" and not args.predecessor_retired:
-        parser.error("enroll requires --predecessor-retired")
+    if args.action in {"enroll", "extend-sixth-call"} and not args.predecessor_retired:
+        parser.error(f"{args.action} requires --predecessor-retired")
+    if args.action == "extend-sixth-call" and (
+        args.expected_policy_sha256 is None or len(args.expected_policy_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in args.expected_policy_sha256)
+    ):
+        parser.error("extend-sixth-call requires --expected-policy-sha256 (64 lowercase hex)")
     try:
-        accepted = asyncio.run(operate(args.action, predecessor_retired=args.predecessor_retired))
+        accepted = asyncio.run(operate(
+            args.action, predecessor_retired=args.predecessor_retired,
+            expected_policy_sha256=args.expected_policy_sha256,
+        ))
     except OwnedPilotBudgetOutcomeUnknown:
         print("owned_budget_transition_unknown")
         return 1
