@@ -203,7 +203,7 @@ class RoutingV1(_StrictFrozenModel):
 
 class BusinessKnowledgeV1(_StrictFrozenModel):
     business_name: StrictStr
-    sector: Literal["garage", "controle-technique"]
+    sector: Literal["garage", "controle-technique", "diagnostic-immobilier"]
     opening_hours: StrictStr
     services: StrictStr
     prices: StrictStr

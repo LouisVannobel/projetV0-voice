@@ -1,9 +1,38 @@
+import asyncio
+from contextlib import contextmanager
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 
 from projetv0_voice.persistence.postgres_sink import OperationSinkPermanentError
 from tests.contract.test_postgres_sink import SqlstateError, sink_with_rows
+
+
+@contextmanager
+def _calendar_timeout_after_delays(delays_before_timeout):
+    """Schedule unit branches before the real timeout; do not measure wall time."""
+    loop = asyncio.get_running_loop()
+    native_sleep = asyncio.sleep
+    now = loop.time()
+    delays = 0
+
+    async def controlled_sleep(delay):
+        nonlocal now, delays
+        assert delay == 0.001
+        delays += 1
+        if delays > delays_before_timeout:
+            now += 0.031
+            # Let the native timeout callback cancel this task once due.
+            await native_sleep(0)
+            await native_sleep(0)
+            raise AssertionError("native Calendar timeout did not cancel")
+        await native_sleep(0)
+
+    with patch.object(loop, "time", side_effect=lambda: now), patch.object(
+        asyncio, "sleep", controlled_sleep,
+    ):
+        yield
 
 
 @pytest.mark.asyncio
@@ -190,12 +219,43 @@ async def test_unknown_latches_read_only_and_canonical_identity_until_deadline(a
                 }
             return CalendarResult.model_validate(response)
 
-    result = await await_calendar_result(
-        Sink(), call, original, {}, wait_seconds=0.03, poll_delay=0.001
-    )
+    # Two polls also exercise the next iteration after each post-unknown branch.
+    with _calendar_timeout_after_delays(2):
+        result = await await_calendar_result(
+            Sink(), call, original, {}, wait_seconds=0.03, poll_delay=0.001
+        )
     assert result is unknown
     assert submissions == [(call, original)]
     assert polls and all(poll == (call, canonical) for poll in polls)
+    assert polls == [(call, canonical)] * 2
+
+
+@pytest.mark.asyncio
+async def test_unknown_is_retained_when_deadline_expires_before_first_poll():
+    from projetv0_voice.calendar import CalendarResult, await_calendar_result
+
+    original, canonical, call = uuid4(), uuid4(), uuid4()
+    submissions, polls = [], []
+    unknown = CalendarResult.model_validate(
+        {"state": "unknown", "operationId": str(canonical), "reason": "appointment_to_confirm"}
+    )
+
+    class Sink:
+        async def calendar_submit(self, call_id, operation_id, request):
+            submissions.append((call_id, operation_id))
+            return unknown
+
+        async def calendar_result(self, call_id, operation_id):
+            polls.append((call_id, operation_id))
+            raise AssertionError("Calendar read after deadline")
+
+    with _calendar_timeout_after_delays(0):
+        result = await await_calendar_result(
+            Sink(), call, original, {}, wait_seconds=0.03, poll_delay=0.001
+        )
+    assert result is unknown
+    assert submissions == [(call, original)]
+    assert polls == []
 
 
 @pytest.mark.asyncio

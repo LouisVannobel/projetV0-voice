@@ -495,7 +495,7 @@ def test_voice_runtime_ci_composes_pinned_shared_and_linux_runtime_gates() -> No
             "with": {"version": "0.13.5", "python-version": "3.13.17"},
         },
         {"run": "uv sync --all-groups --frozen"},
-        {"run": "uv run pytest -q"},
+        {"run": "uv run pytest -vv"},
         {
             "name": "Run privileged Linux descriptor cases",
             "run": (

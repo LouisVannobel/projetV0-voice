@@ -17,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from projetv0_voice import models
+from projetv0_voice.audio_contract import BeginCallSnapshotV2
 from projetv0_voice.crypto import CryptoKeyring, EncryptedValue
 from projetv0_voice.persistence.commands import (
     EncryptedCommandTooLarge,
@@ -246,6 +247,47 @@ def test_begin_snapshot_is_exact_strict_reply():
     ]:
         with pytest.raises(ValidationError):
             model("BeginCallSnapshotV1").model_validate(snapshot(**updates))
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("sector", ["garage", "controle-technique", "diagnostic-immobilier"])
+def test_all_business_sectors_round_trip_through_both_pinned_snapshots(version, sector):
+    value = snapshot(configuration_revision=7)
+    value["knowledge"]["sector"] = sector
+    value["knowledge"]["instructions"] = "Quel type de bien est concerné ?"
+    snapshot_type = models.BeginCallSnapshotV1 if version == 1 else BeginCallSnapshotV2
+    if version == 2:
+        value.update(
+            schema_version=2,
+            workspace_id=str(UUID(int=4)),
+            recording_policy="local_30d",
+            recording_contact_phone=None,
+            audio_available=True,
+            recording_id=str(UUID(int=5)),
+        )
+    parsed = snapshot_type.model_validate(value)
+    assert parsed.knowledge.model_dump(mode="json") == value["knowledge"]
+    assert parsed.configuration_revision == 7
+    assert parsed.schema_version == version
+    assert snapshot_type.model_validate_json(parsed.model_dump_json()) == parsed
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_both_pinned_snapshots_reject_unknown_business_sector(version):
+    value = snapshot()
+    value["knowledge"]["sector"] = "diagnostic-inconnu"
+    snapshot_type = models.BeginCallSnapshotV1 if version == 1 else BeginCallSnapshotV2
+    if version == 2:
+        value.update(
+            schema_version=2,
+            workspace_id=str(UUID(int=4)),
+            recording_policy="off",
+            recording_contact_phone=None,
+            audio_available=False,
+            recording_id=None,
+        )
+    with pytest.raises(ValidationError, match="knowledge.sector"):
+        snapshot_type.model_validate(value)
 
 
 def disclosure(**updates):
