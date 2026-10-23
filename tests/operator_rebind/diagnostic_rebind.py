@@ -224,16 +224,18 @@ def rebind(
             return Outcome("refused", "invalid_request")
     except Exception:
         return Outcome("refused", "unsupported_connection")
-    old_digest, new_digest, committing = preimage.state_sha256, None, False
+    old_digest, new_digest, committing = None, None, False
     try:
         connection.execute("BEGIN IMMEDIATE")
         before = _snapshot(connection)
+        observed_digest = before.sha256
         if (
-            before.sha256 != old_digest
+            observed_digest != preimage.state_sha256
             or before.schema_sha256 != preimage.schema_sha256
             or before.header[0] != preimage.schema_version
         ):
             raise Refusal("preimage_mismatch")
+        old_digest = observed_digest
         old, row = _installed_policy(connection, before)
         target = OwnedPilotBudgetPolicy.model_validate(
             old.model_dump()

@@ -619,6 +619,55 @@ def test_invalid_preimage_never_echoes_unvalidated_metadata(tmp_path):
         assert full_state(db) == before
 
 
+def test_valid_hex_preimage_secret_is_not_published_on_mismatch(tmp_path):
+    from dataclasses import replace
+
+    synthetic_secret = "d00df00d" * 8
+    with sqlite3.connect(tmp_path / "synthetic.sqlite") as db:
+        seed(db)
+        before = full_state(db)
+        preimage = component.capture_preimage(db)
+        assert preimage.state_sha256 != synthetic_secret
+        untrusted = replace(preimage, state_sha256=synthetic_secret)
+        result = apply(db, untrusted)
+        assert result.status == "refused"
+        assert result.old_state_sha256 is None and result.new_state_sha256 is None
+        assert synthetic_secret not in vars(result).values()
+        assert synthetic_secret not in repr(result)
+        assert full_state(db) == before and not db.in_transaction
+
+
+@pytest.mark.parametrize("fail_at", ["begin", "snapshot"])
+def test_valid_hex_preimage_secret_is_not_published_on_early_sql_failure(tmp_path, fail_at):
+    from dataclasses import replace
+
+    class EarlyFailureConnection(sqlite3.Connection):
+        fail_at = None
+
+        def execute(self, sql, parameters=()):
+            if (self.fail_at == "begin" and sql == "BEGIN IMMEDIATE") or (
+                self.fail_at == "snapshot" and sql.startswith("SELECT * FROM temp.sqlite_master")
+            ):
+                raise sqlite3.OperationalError("synthetic early SQL failure")
+            return super().execute(sql, parameters)
+
+    synthetic_secret = "d00df00d" * 8
+    with sqlite3.connect(tmp_path / "synthetic.sqlite", factory=EarlyFailureConnection) as db:
+        seed(db)
+        before = full_state(db)
+        preimage = component.capture_preimage(db)
+        assert preimage.state_sha256 != synthetic_secret
+        untrusted = replace(preimage, state_sha256=synthetic_secret)
+        db.fail_at = fail_at
+        result = apply(db, untrusted)
+        db.fail_at = None
+        assert result.status == "rolled_back"
+        assert result.old_state_sha256 is None and result.new_state_sha256 is None
+        assert synthetic_secret not in vars(result).values()
+        assert synthetic_secret not in repr(result)
+        assert full_state(db) == before and not db.in_transaction
+
+
 @pytest.mark.parametrize("version,total,used", MATRIX)
 def test_native_writer_gate_reopened_twice_preserves_authority_and_rejects_old_permit(
     tmp_path, version, total, used
