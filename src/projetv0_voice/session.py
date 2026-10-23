@@ -956,10 +956,17 @@ class CallSession:
             FunctionSchema(
                 name="book_appointment",
                 description="Select the exact opaque offer chosen by the current caller. "
+                "Call this tool as soon as the caller unambiguously chooses a current "
+                "find_slots offer, including by its position. Use that offer's offerId. "
+                "Emit only this tool call, without accompanying speech "
+                "or implementation narration. "
                 "The program reads a recap and obtains fresh spoken confirmation. "
                 "This tool does not submit a booking or supply consent; only the subsequent "
                 "trusted native caller confirmation can authorize creation.",
-                properties={"offerId": {"type": "string"}},
+                properties={"offerId": {
+                    "type": "string",
+                    "description": "Copy the exact offerId of the chosen current find_slots offer.",
+                }},
                 required=["offerId"],
                 handler=self._calendar_tool,
             ),
@@ -983,7 +990,15 @@ class CallSession:
             + catalog.model_dump_json()
             + ". Interprète demain et les jours de semaine par rapport à cette date. "
             "Si le service ou la préférence est ambigu, pose une seule question. "
-            "Après sélection, laisse le programme lire le récapitulatif et attendre la réponse."
+            "Pour chercher des disponibilités, appelle find_slots. Dès que l'appelant "
+            "choisit sans ambiguïté une offre retournée, y compris par son rang comme "
+            "le premier créneau, appelle une seule fois book_appointment avec son offerId exact. "
+            "Commenter le choix ou promettre une sélection ne déclenche aucune action. "
+            "Pour ce tour, émets seulement cet appel d'outil, sans texte avant ou après : "
+            "le parcours natif lit ensuite le "
+            "récapitulatif et attend une nouvelle réponse de confirmation. "
+            "Laisse-le parler et attendre cette réponse. N'explique pas le programme ni "
+            "le fonctionnement interne à l'appelant."
         )
 
     async def _calendar_tool(self, params: FunctionCallParams) -> None:
