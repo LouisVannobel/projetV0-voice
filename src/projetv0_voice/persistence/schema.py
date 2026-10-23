@@ -318,3 +318,19 @@ SIXTH_BUDGET_MIGRATION_SQL = (
     + "INSERT INTO owned_pilot_budget SELECT * FROM owned_pilot_budget_v5;\n"
     "DROP TABLE owned_pilot_budget_v5;\n"
 )
+
+# Only the explicit exhausted-six V2 transition installs schema14.
+# V10-V13 keep their original constraints; there is no V1 seventh successor.
+SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION = 14
+_SEVENTH_BUDGET_SQL = OWNED_BUDGET_SQL.replace(
+    "used_calls BETWEEN 0 AND 5", "used_calls BETWEEN 0 AND 7",
+)
+SEVENTH_AUDIO_BUDGET_SCHEMA_SQL = SIXTH_AUDIO_BUDGET_SCHEMA_SQL.replace(
+    _SIXTH_BUDGET_SQL, _SEVENTH_BUDGET_SQL,
+).replace("PRAGMA user_version = 13;", "PRAGMA user_version = 14;")
+SEVENTH_BUDGET_MIGRATION_SQL = (
+    "ALTER TABLE owned_pilot_budget RENAME TO owned_pilot_budget_v6;\n"
+    + _SEVENTH_BUDGET_SQL
+    + "INSERT INTO owned_pilot_budget SELECT * FROM owned_pilot_budget_v6;\n"
+    "DROP TABLE owned_pilot_budget_v6;\n"
+)

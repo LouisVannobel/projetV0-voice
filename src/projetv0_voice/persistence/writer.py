@@ -110,6 +110,9 @@ from projetv0_voice.persistence.schema import (
     RECORDING_ARCHIVE_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SEVENTH_AUDIO_BUDGET_SCHEMA_SQL,
+    SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION,
+    SEVENTH_BUDGET_MIGRATION_SQL,
     SIXTH_AUDIO_BUDGET_SCHEMA_SQL,
     SIXTH_AUDIO_BUDGET_SCHEMA_VERSION,
     SIXTH_BUDGET_MIGRATION_SQL,
@@ -196,6 +199,7 @@ _EXPECTED_BUDGET_SCHEMA = _expected_schema_objects(OWNED_BUDGET_SCHEMA_SQL)
 _EXPECTED_AUDIO_BUDGET_SCHEMA = _expected_schema_objects(OWNED_AUDIO_BUDGET_SCHEMA_SQL)
 _EXPECTED_SIXTH_BUDGET_SCHEMA = _expected_schema_objects(SIXTH_BUDGET_SCHEMA_SQL)
 _EXPECTED_SIXTH_AUDIO_BUDGET_SCHEMA = _expected_schema_objects(SIXTH_AUDIO_BUDGET_SCHEMA_SQL)
+_EXPECTED_SEVENTH_AUDIO_BUDGET_SCHEMA = _expected_schema_objects(SEVENTH_AUDIO_BUDGET_SCHEMA_SQL)
 if set(_EXPECTED_V1_SCHEMA_OBJECTS) != {
     ("table", "call_leases"),
     ("table", "webhook_receipts"),
@@ -864,10 +868,14 @@ class PersistenceWriter:
                 return None
             if not reported_floors_valid(floors):
                 return None
-        if action == "extend-sixth-call":
+        if action in {"extend-sixth-call", "extend-seventh-call"}:
+            seventh = action == "extend-seventh-call"
+            if seventh and self._contract_version != 2:
+                return False
+            consumed = 6 if seventh else 5
             fact = payload.get("observation")
-            if (row is None or floors is None or policy.total_calls != 6
-                    or row[1] != 5 or row[4] or row[5] is not None
+            if (row is None or floors is None or policy.total_calls != consumed + 1
+                    or row[1] != consumed or row[4] or row[5] is not None
                     or payload.get("predecessor_retired") is not True
                     or payload.get("expected_policy_sha256") != row[0]):
                 return False
@@ -877,7 +885,10 @@ class PersistenceWriter:
                 return False
             release_fields = {"total_calls", "qualified_profile_sha256",
                               "runtime_contract_sha256", "image_digest", "deployment_id"}
-            if (predecessor.total_calls != 5 or predecessor.sha256 != row[0]
+            if seventh:
+                # One coalesced V2 transition may rebind only the final image/profile.
+                release_fields = {"total_calls", "qualified_profile_sha256", "image_digest"}
+            if (predecessor.total_calls != consumed or predecessor.sha256 != row[0]
                     or predecessor.model_dump_json() != row[6]
                     or predecessor.model_dump(exclude=release_fields)
                     != policy.model_dump(exclude=release_fields)
@@ -886,7 +897,7 @@ class PersistenceWriter:
                     or fact.active_call_control_ids
                     or (policy.paid_until - self._utcnow()).total_seconds()
                     < self._owned_budget_start_envelope
-                    or not affordable(policy, fact, 5, reported_floors=floors)):
+                    or not affordable(policy, fact, consumed, reported_floors=floors)):
                 return False
             cursor = await connection.execute(
                 "SELECT count(*) FROM call_leases WHERE state!='terminal'")
@@ -896,30 +907,38 @@ class PersistenceWriter:
                        else OWNED_BUDGET_SCHEMA_VERSION)
             expected = (_EXPECTED_AUDIO_BUDGET_SCHEMA if self._contract_version == 2
                         else _EXPECTED_BUDGET_SCHEMA)
+            if seventh:
+                version, expected = (SIXTH_AUDIO_BUDGET_SCHEMA_VERSION,
+                                     _EXPECTED_SIXTH_AUDIO_BUDGET_SCHEMA)
             if (busy != (0,) or self._pragma_int(await self._pragma_scalar("user_version"))
                     != version or await self._application_schema_objects() != expected):
                 return False
-            for statement in SIXTH_BUDGET_MIGRATION_SQL.split(";"):
+            migration = SEVENTH_BUDGET_MIGRATION_SQL if seventh else SIXTH_BUDGET_MIGRATION_SQL
+            for statement in migration.split(";"):
                 if statement.strip():
                     await connection.execute(statement)
             target = (SIXTH_AUDIO_BUDGET_SCHEMA_VERSION if self._contract_version == 2
                       else SIXTH_BUDGET_SCHEMA_VERSION)
+            if seventh:
+                target = SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION
             await connection.execute(f"PRAGMA user_version = {target}")
             expected = (_EXPECTED_SIXTH_AUDIO_BUDGET_SCHEMA if self._contract_version == 2
                         else _EXPECTED_SIXTH_BUDGET_SCHEMA)
+            if seventh:
+                expected = _EXPECTED_SEVENTH_AUDIO_BUDGET_SCHEMA
             if await self._application_schema_objects() != expected:
                 raise FatalPersistenceError("sqlite_schema_mismatch")
             cursor = await connection.execute(
                 "UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=?,"
                 "openrouter_floor=?,telnyx_floor=? "
-                "WHERE slot=? AND policy_sha256=? AND policy_json=? AND used_calls=5 "
+                "WHERE slot=? AND policy_sha256=? AND policy_json=? AND used_calls=? "
                 "AND suspended=0 AND paid_call_control_id IS NULL",
                 (policy.model_dump_json(), policy.sha256,
                  row[2] if floors[0] >= fact.openrouter_reported_spend_usd
                  else str(fact.openrouter_reported_spend_usd),
                  row[3] if floors[1] >= fact.telnyx_reported_spend_usd
                  else str(fact.telnyx_reported_spend_usd),
-                 ORIGINAL_PILOT_SLOT, row[0], row[6]),
+                 ORIGINAL_PILOT_SLOT, row[0], row[6], consumed),
             )
             if cursor.rowcount != 1:
                 raise FatalPersistenceError("owned_budget_extension_conflict")
@@ -3862,7 +3881,7 @@ class PersistenceWriter:
             self._pragma_int(await self._pragma_scalar("user_version"))
             in {LOCAL_AUDIO_SCHEMA_VERSION, LOCAL_AUDIO_CHOICE_SCHEMA_VERSION,
                 LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION, OWNED_AUDIO_BUDGET_SCHEMA_VERSION,
-                SIXTH_AUDIO_BUDGET_SCHEMA_VERSION}
+                SIXTH_AUDIO_BUDGET_SCHEMA_VERSION, SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION}
         ):
             raise FatalPersistenceError("writer_contract_mismatch")
         connection = self._require_owner_connection()
@@ -3964,6 +3983,7 @@ class PersistenceWriter:
                 LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION: _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS,
                 OWNED_AUDIO_BUDGET_SCHEMA_VERSION: _EXPECTED_AUDIO_BUDGET_SCHEMA,
                 SIXTH_AUDIO_BUDGET_SCHEMA_VERSION: _EXPECTED_SIXTH_AUDIO_BUDGET_SCHEMA,
+                SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION: _EXPECTED_SEVENTH_AUDIO_BUDGET_SCHEMA,
             }.get(version)
             if (
                 expected is None or schema != expected
@@ -4020,6 +4040,7 @@ class PersistenceWriter:
                     (LOCAL_AUDIO_TERMINAL_SCHEMA_VERSION, _EXPECTED_AUDIO_TERMINAL_SCHEMA_OBJECTS),
                     (OWNED_AUDIO_BUDGET_SCHEMA_VERSION, _EXPECTED_AUDIO_BUDGET_SCHEMA),
                     (SIXTH_AUDIO_BUDGET_SCHEMA_VERSION, _EXPECTED_SIXTH_AUDIO_BUDGET_SCHEMA),
+                    (SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION, _EXPECTED_SEVENTH_AUDIO_BUDGET_SCHEMA),
                 ):
             raise FatalPersistenceError("sqlite_schema_mismatch")
         self.pragma_state = {
@@ -4039,7 +4060,9 @@ class PersistenceWriter:
                   else OWNED_BUDGET_SCHEMA_VERSION)
         extended_target = (SIXTH_AUDIO_BUDGET_SCHEMA_VERSION if self._contract_version == 2
                            else SIXTH_BUDGET_SCHEMA_VERSION)
-        if self._pragma_int(await self._pragma_scalar("user_version")) in {target, extended_target}:
+        if (self._pragma_int(await self._pragma_scalar("user_version"))
+                in ({target, extended_target, SEVENTH_AUDIO_BUDGET_SCHEMA_VERSION}
+                    if self._contract_version == 2 else {target, extended_target})):
             return
         await connection.execute("BEGIN IMMEDIATE")
         try:
