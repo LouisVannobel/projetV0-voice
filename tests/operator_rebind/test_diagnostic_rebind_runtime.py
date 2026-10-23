@@ -416,10 +416,11 @@ def test_runtime_supervisor_v2_rebind_preserves_history(
         try:
             await _start(old_binding, ready=False)
             assert not await old_binding.budget.refresh()
-            assert await old_binding.writer.owned_budget_request("observe", observation=_fact()) is None
-            attempted = event(
-                occurred_at=NOW, call_control_id="refused-old-binding-admission"
+            assert (
+                await old_binding.writer.owned_budget_request("observe", observation=_fact())
+                is None
             )
+            attempted = event(occurred_at=NOW, call_control_id="refused-old-binding-admission")
             resolution = await old_binding.registry.resolve_webhook(attempted)
             refusal = await old_binding.supervisor.start_webhook_finalization(
                 attempted, resolution
