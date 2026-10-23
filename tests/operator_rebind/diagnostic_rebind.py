@@ -18,7 +18,6 @@ from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPolicy, reported_f
 from projetv0_voice.persistence import schema
 from projetv0_voice.persistence.writer import _expected_schema_objects, _normalize_schema_sql
 
-
 _SCHEMAS = {
     10: (5, schema.OWNED_BUDGET_SCHEMA_SQL),
     11: (5, schema.OWNED_AUDIO_BUDGET_SCHEMA_SQL),
@@ -89,13 +88,17 @@ def _digest(value):
         if type(item) is str:
             return ["text", item]
         raise Refusal("unsupported_sqlite_value")
+
     raw = json.dumps(typed(value), ensure_ascii=True, separators=(",", ":")).encode()
     return hashlib.sha256(raw).hexdigest()
 
 
 def _connection_shape(connection):
-    if (not isinstance(connection, sqlite3.Connection)
-            or connection.row_factory is not None or connection.text_factory is not str):
+    if (
+        not isinstance(connection, sqlite3.Connection)
+        or connection.row_factory is not None
+        or connection.text_factory is not str
+    ):
         raise Refusal("unsupported_connection")
 
 
@@ -105,13 +108,17 @@ def _snapshot(connection):
     if {row[1] for row in connection.execute("PRAGMA database_list")} - {"main", "temp"}:
         raise Refusal("attached_database")
     objects = tuple(connection.execute("SELECT * FROM main.sqlite_master ORDER BY type,name"))
-    header = tuple(connection.execute(f"PRAGMA main.{name}").fetchone()[0] for name in
-                   ("user_version", "schema_version", "application_id", "encoding"))
+    header = tuple(
+        connection.execute(f"PRAGMA main.{name}").fetchone()[0]
+        for name in ("user_version", "schema_version", "application_id", "encoding")
+    )
     tables = {}
     for kind, name, _, _, _ in objects:
         if kind == "table":
             quoted = '"' + name.replace('"', '""') + '"'
-            tables[name] = tuple(connection.execute(f"SELECT rowid,* FROM main.{quoted} ORDER BY rowid"))
+            tables[name] = tuple(
+                connection.execute(f"SELECT rowid,* FROM main.{quoted} ORDER BY rowid")
+            )
     return _State(header, objects, temp, tables)
 
 
@@ -143,12 +150,14 @@ def _installed_policy(connection, state):
     total, native_sql = _SCHEMAS[version]
     actual = {
         (kind, name): _normalize_schema_sql(sql)
-        for kind, name, _, _, sql in state.objects if not name.startswith("sqlite_")
+        for kind, name, _, _, sql in state.objects
+        if not name.startswith("sqlite_")
     }
     if actual != _expected_schema_objects(native_sql):
         raise Refusal("schema_mismatch")
     if version in (11, 13) and connection.execute(
-            "SELECT singleton,contract_version FROM local_audio_contract").fetchall() != [(1, 2)]:
+        "SELECT singleton,contract_version FROM local_audio_contract"
+    ).fetchall() != [(1, 2)]:
         raise Refusal("contract_marker")
     rows = state.tables["owned_pilot_budget"]
     if len(rows) != 1:
@@ -162,9 +171,14 @@ def _installed_policy(connection, state):
         floors = (Decimal(floor_or), Decimal(floor_tel))
     except (ValueError, TypeError, ArithmeticError):
         raise Refusal("invalid_stored_policy") from None
-    if (policy.model_dump_json() != raw or policy.sha256 != fingerprint
-            or policy.total_calls != total or type(used) is not int or not 0 <= used <= total
-            or not reported_floors_valid(floors)):
+    if (
+        policy.model_dump_json() != raw
+        or policy.sha256 != fingerprint
+        or policy.total_calls != total
+        or type(used) is not int
+        or not 0 <= used <= total
+        or not reported_floors_valid(floors)
+    ):
         raise Refusal("invalid_stored_policy")
     busy_queries = (
         "SELECT 1 FROM call_leases WHERE state!='terminal' LIMIT 1",
@@ -179,8 +193,13 @@ def _installed_policy(connection, state):
     return policy, row
 
 
-def rebind(connection: sqlite3.Connection, preimage: Preimage, *,
-           image_digest: str, qualified_profile_sha256: str) -> Outcome:
+def rebind(
+    connection: sqlite3.Connection,
+    preimage: Preimage,
+    *,
+    image_digest: str,
+    qualified_profile_sha256: str,
+) -> Outcome:
     """One attempt only; change exactly the stored policy's image/profile pair.
 
     A COMMIT exception is always uncertain, even when a rollback appears possible.
@@ -190,15 +209,18 @@ def rebind(connection: sqlite3.Connection, preimage: Preimage, *,
         _connection_shape(connection)
         if connection.in_transaction:
             return Outcome("refused", "existing_transaction")
-        if (not isinstance(preimage, Preimage)
-                or type(preimage.schema_version) is not int
-                or not isinstance(preimage.state_sha256, str)
-                or _HASH.fullmatch(preimage.state_sha256) is None
-                or not isinstance(preimage.schema_sha256, str)
-                or _HASH.fullmatch(preimage.schema_sha256) is None
-                or not isinstance(image_digest, str) or _IMAGE.fullmatch(image_digest) is None
-                or not isinstance(qualified_profile_sha256, str)
-                or _HASH.fullmatch(qualified_profile_sha256) is None):
+        if (
+            not isinstance(preimage, Preimage)
+            or type(preimage.schema_version) is not int
+            or not isinstance(preimage.state_sha256, str)
+            or _HASH.fullmatch(preimage.state_sha256) is None
+            or not isinstance(preimage.schema_sha256, str)
+            or _HASH.fullmatch(preimage.schema_sha256) is None
+            or not isinstance(image_digest, str)
+            or _IMAGE.fullmatch(image_digest) is None
+            or not isinstance(qualified_profile_sha256, str)
+            or _HASH.fullmatch(qualified_profile_sha256) is None
+        ):
             return Outcome("refused", "invalid_request")
     except Exception:
         return Outcome("refused", "unsupported_connection")
@@ -206,12 +228,17 @@ def rebind(connection: sqlite3.Connection, preimage: Preimage, *,
     try:
         connection.execute("BEGIN IMMEDIATE")
         before = _snapshot(connection)
-        if (before.sha256 != old_digest or before.schema_sha256 != preimage.schema_sha256
-                or before.header[0] != preimage.schema_version):
+        if (
+            before.sha256 != old_digest
+            or before.schema_sha256 != preimage.schema_sha256
+            or before.header[0] != preimage.schema_version
+        ):
             raise Refusal("preimage_mismatch")
         old, row = _installed_policy(connection, before)
-        target = OwnedPilotBudgetPolicy.model_validate(old.model_dump() | dict(
-            image_digest=image_digest, qualified_profile_sha256=qualified_profile_sha256))
+        target = OwnedPilotBudgetPolicy.model_validate(
+            old.model_dump()
+            | dict(image_digest=image_digest, qualified_profile_sha256=qualified_profile_sha256)
+        )
         if target.sha256 == old.sha256:
             raise Refusal("unchanged_target")
         new_row = (row[0], row[1], target.model_dump_json(), target.sha256, *row[4:])
@@ -247,8 +274,11 @@ def rebind(connection: sqlite3.Connection, preimage: Preimage, *,
 
 def classify(connection: sqlite3.Connection, outcome: Outcome) -> str:
     """Separate read-only observation of exact logical old/new/other; never retry."""
-    if (not isinstance(outcome, Outcome) or outcome.old_state_sha256 is None
-            or outcome.new_state_sha256 is None):
+    if (
+        not isinstance(outcome, Outcome)
+        or outcome.old_state_sha256 is None
+        or outcome.new_state_sha256 is None
+    ):
         return "other"
     try:
         observed = _read_state(connection).sha256
