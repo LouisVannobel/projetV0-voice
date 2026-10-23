@@ -219,7 +219,7 @@ def test_original_anchor_remains_a_raw_observation_fence(provider):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("total_calls", 7),
+        ("total_calls", 8),
         ("cost_scope", "different"),
         ("openrouter_anchor_usd", D("NaN")),
         ("telnyx_anchor_usd", D("-1")),
