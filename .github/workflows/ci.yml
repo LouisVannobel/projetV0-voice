@@ -24,7 +24,7 @@ jobs:
           version: "0.13.5"
           python-version: "3.13.17"
       - run: uv sync --all-groups --frozen
-      - run: uv run pytest -q
+      - run: uv run pytest -vv
       - name: Run privileged Linux descriptor cases
         run: sudo env "PATH=$PATH" PROJETV0_PRIVILEGED_FILES_GATE=1 uv run pytest tests/unit/test_runtime_config.py tests/unit/test_qualified_profile.py tests/unit/test_production_wiring.py -q -k "linux_kernel or fifo or socket or grows"
       - name: Run native startup hold with real Linux ownership
