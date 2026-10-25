@@ -16,7 +16,7 @@
 - New mode total_calls:null only; legacy JSON/hashes/arithmetic remain unchanged.
 - New reserve max(R0-m*d,u), same operands in cap/cash/key checks; no negative reserve.
 - V2 schema14/N7/used7 -> schema15/null via one explicit native CAS; no startup upgrade.
-- No dependency, transport, audio, Calendar, Inbox, worker or schema qualification_runs change.
+- No dependency change except the required single-record filelock security correction in Task2; no transport, audio, Calendar, Inbox, worker or schema qualification_runs change.
 - Tests run sequentially with fresh >=2GiB physical and virtual RAM; use only this worktree's pinned environment.
 
 ## Review focus
@@ -48,6 +48,20 @@ Preserve all other public/native interfaces.
 - [ ] Run affected offline tests, ruff, mypy and frozen lock validation. The full offline suite is required on the exact source before merge, using canonical hosted CI. A local full run may substitute only if proportionate; preserve any partial/interrupted local run honestly and never rerun it merely to duplicate the required hosted gate. No container/provider/phone test locally.
 - [ ] Self-review diff and commit the scoped implementation. Record exact SHA/tree, RED/GREEN commands/results and any qualification limit.
 - [ ] Independent spec/quality review and any focused repair before release.
+
+### Task2: Required filelock security prerequisite
+
+**Files:** Modify only uv.lock's existing filelock record and these root-owned
+spec/plan amendments. Exact brief: ignored task-2-brief.md under this plan's SDD
+workspace. Source feature2de7a9a already has independent SPEC PASS/QUALITY APPROVE.
+
+- [ ] Verify actual HIGH CVE-2026-112940 failure and maintainer/PyPI sources.
+- [ ] Resolve filelock3.32.4 to current fixed stable4.2.4; prove every other
+  package record/direct pin unchanged. No suppression or graph-wide upgrade.
+- [ ] Frozen sync the owned pinned environment; verify hashes/metadata and used
+  consumer lock/context/contention/release paths offline on temporary owned paths.
+- [ ] Commit only the lock/security scope; independent review, then exact-head
+  mandatory full hosted CI/scan. No duplicate full local run.
 
 ### Delivery through the sole operator
 

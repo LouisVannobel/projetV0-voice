@@ -78,3 +78,19 @@ schema/CAS atomically; and reject ordinal overflow before increment. These are
 implementation/qualification requirements, not executed evidence. User has already authorized
 autonomous implementation, review, qualification and owned deployment; no extra
 approval loop is required. Source tests do not prove provider/phone acceptance.
+
+## Required security prerequisite discovered during exact-source CI
+
+The first candidate's mandatory repository scan reported HIGH CVE-2026-112940
+in existing transitive filelock3.32.4. The maintainer advisory confirms the
+affected range and fix4.2.1; current stable PyPI is4.2.4 (Python>=3.11). Narrowly
+allow this existing dependency to resolve to4.2.4 in uv.lock, with every other
+package record and all direct pins unchanged. This necessary security
+prerequisite supersedes only the no-dependency-change sentence above. No scanner
+suppression, provider/model change, override patch or general upgrade is allowed.
+Verify official provenance, actual consumer compatibility and frozen installation;
+the exact final source must pass the unmodified mandatory scan and full hosted CI.
+
+Primary sources:
+- https://github.com/tox-dev/filelock/security/advisories/GHSA-v4x8-3wr5-3wq8
+- https://pypi.org/project/filelock/4.2.4/
