@@ -47,6 +47,7 @@ async def no_unretrieved_owner_futures():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", [
     "enroll", "suspend-restored", "extend-sixth-call", "extend-seventh-call",
+    "enable-budgeted-calls",
 ])
 @pytest.mark.parametrize("release_late_commit", [True, False])
 @pytest.mark.parametrize("cancel_request", [False, True])
@@ -84,13 +85,18 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         qualified_profile_sha256=canonical_qualified_profile_sha256(profile),
     )
     predecessor = policy
-    if action in {"extend-sixth-call", "extend-seventh-call"}:
-        if action == "extend-seventh-call":
+    extensions = {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"}
+    if action in extensions:
+        if action in {"extend-seventh-call", "enable-budgeted-calls"}:
             predecessor = policy.model_copy(update={
-                "total_calls": 6, "image_digest": "fixture@sha256:" + "b" * 64,
+                "total_calls": 7 if action == "enable-budgeted-calls" else 6,
+                "image_digest": "fixture@sha256:" + "b" * 64,
                 "qualified_profile_sha256": "a" * 64,
             })
-        policy = policy.model_copy(update={"total_calls": predecessor.total_calls + 1})
+        policy = policy.model_copy(update={
+            "total_calls": None if action == "enable-budgeted-calls"
+            else predecessor.total_calls + 1,
+        })
     fact = replace(observation(), identity=identity, openrouter_reported_spend_usd=Decimal("1.40"))
     keyring = CryptoKeyring({1: KEY}, active_version=1)
     manifest = SimpleNamespace(
@@ -119,7 +125,7 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
             writer, policy, collect, utcnow=lambda: NOW
         ),
     )
-    if action in {"suspend-restored", "extend-sixth-call", "extend-seventh-call"}:
+    if action in extensions | {"suspend-restored"}:
         seed = PersistenceWriter(
             settings.sqlite_path,
             keyring,
@@ -134,12 +140,16 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         assert await seed.owned_budget_request("enroll", observation=fact, predecessor_retired=True)
         await seed.drain(2)
         await owner
-        if action in {"extend-sixth-call", "extend-seventh-call"}:
+        if action in extensions:
             with sqlite3.connect(settings.sqlite_path) as db:
-                if action == "extend-seventh-call":
+                if action in {"extend-seventh-call", "enable-budgeted-calls"}:
                     from projetv0_voice.persistence.schema import SIXTH_BUDGET_MIGRATION_SQL
                     db.executescript(SIXTH_BUDGET_MIGRATION_SQL)
                     db.execute("PRAGMA user_version=13")
+                    if action == "enable-budgeted-calls":
+                        from projetv0_voice.persistence.schema import SEVENTH_BUDGET_MIGRATION_SQL
+                        db.executescript(SEVENTH_BUDGET_MIGRATION_SQL)
+                        db.execute("PRAGMA user_version=14")
                     db.execute("UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=?",
                                (predecessor.model_dump_json(), predecessor.sha256))
                 db.execute("UPDATE owned_pilot_budget SET used_calls=?,openrouter_floor='1.10'",
@@ -197,7 +207,7 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         assert writer._owner_task.done()
         assert writer._closed_event.is_set() and writer._connection is None
         with sqlite3.connect(settings.sqlite_path) as db:
-            if action in {"extend-sixth-call", "extend-seventh-call"}:
+            if action in extensions:
                 assert db.execute(
                     "SELECT used_calls,openrouter_floor,policy_sha256 FROM owned_pilot_budget"
                 ).fetchall() == [
@@ -207,10 +217,12 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
                         policy.sha256 if release_late_commit else predecessor.sha256,
                     )
                 ]
+                old_version, new_version = {
+                    "extend-sixth-call": (11, 13), "extend-seventh-call": (13, 14),
+                    "enable-budgeted-calls": (14, 15),
+                }[action]
                 assert db.execute("PRAGMA user_version").fetchone() == (
-                    (14 if release_late_commit else 13) if action == "extend-seventh-call"
-                    else 13 if release_late_commit else 11,
-                )
+                    new_version if release_late_commit else old_version,)
             expected = (
                 [(0, 1 if action == "suspend-restored" else 0)]
                 if release_late_commit
@@ -218,11 +230,11 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
                 if action == "enroll"
                 else [(0, 0)]
             )
-            assert action in {"extend-sixth-call", "extend-seventh-call"} or (
+            assert action in extensions or (
                 db.execute("SELECT used_calls,suspended FROM owned_pilot_budget").fetchall()
                 == expected
             )
-        if action in {"extend-sixth-call", "extend-seventh-call"}:
+        if action in extensions:
             after_rows = all_rows(settings.sqlite_path)
             for table, rows in before_rows.items():
                 if table != "owned_pilot_budget":
@@ -375,7 +387,9 @@ asyncio.run(main())
         ),
     ],
 )
-@pytest.mark.parametrize("action", ["extend-sixth-call", "extend-seventh-call"])
+@pytest.mark.parametrize("action", [
+    "extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
+])
 def test_extension_operator_requires_explicit_flags_before_runtime(
     monkeypatch, capsys, options, message, action
 ):
@@ -393,7 +407,9 @@ def test_extension_operator_requires_explicit_flags_before_runtime(
     assert message in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("action", ["extend-sixth-call", "extend-seventh-call"])
+@pytest.mark.parametrize("action", [
+    "extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
+])
 def test_extension_operator_forwards_exact_expected_hash(monkeypatch, capsys, action):
     import sys
 
@@ -423,7 +439,8 @@ def test_extension_operator_forwards_exact_expected_hash(monkeypatch, capsys, ac
 
 
 @pytest.mark.asyncio
-async def test_seventh_operator_rejects_v1_before_writer_or_credentials(monkeypatch):
+@pytest.mark.parametrize("action", ["extend-seventh-call", "enable-budgeted-calls"])
+async def test_seventh_operator_rejects_v1_before_writer_or_credentials(monkeypatch, action):
     profile = QualifiedDeploymentProfileV1.model_validate_json(
         (Path(__file__).parents[1] / "fixtures/qualified-deployment-profile-v1.json").read_text()
     )
@@ -439,5 +456,5 @@ async def test_seventh_operator_rejects_v1_before_writer_or_credentials(monkeypa
     monkeypatch.setattr(cli, "PersistenceWriter", lambda *_args, **_kwargs: pytest.fail(
         "seventh V1 must be refused before writer creation"))
     with pytest.raises(RuntimeError, match="^owned_budget_operator_refused$"):
-        await cli.operate("extend-seventh-call", predecessor_retired=True,
+        await cli.operate(action, predecessor_retired=True,
                           expected_policy_sha256="e" * 64)

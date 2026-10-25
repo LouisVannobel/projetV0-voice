@@ -334,3 +334,19 @@ SEVENTH_BUDGET_MIGRATION_SQL = (
     + "INSERT INTO owned_pilot_budget SELECT * FROM owned_pilot_budget_v6;\n"
     "DROP TABLE owned_pilot_budget_v6;\n"
 )
+
+# Only explicit schema14/N7/used7 enablement removes the commercial count bound.
+# SQLite's integer maximum remains a technical bound, never an allowance.
+BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION = 15
+_BUDGETED_BUDGET_SQL = OWNED_BUDGET_SQL.replace(
+    "used_calls BETWEEN 0 AND 5", "used_calls BETWEEN 0 AND 9223372036854775807",
+)
+BUDGETED_AUDIO_BUDGET_SCHEMA_SQL = SEVENTH_AUDIO_BUDGET_SCHEMA_SQL.replace(
+    _SEVENTH_BUDGET_SQL, _BUDGETED_BUDGET_SQL,
+).replace("PRAGMA user_version = 14;", "PRAGMA user_version = 15;")
+BUDGETED_BUDGET_MIGRATION_SQL = (
+    "ALTER TABLE owned_pilot_budget RENAME TO owned_pilot_budget_v7;\n"
+    + _BUDGETED_BUDGET_SQL
+    + "INSERT INTO owned_pilot_budget SELECT * FROM owned_pilot_budget_v7;\n"
+    "DROP TABLE owned_pilot_budget_v7;\n"
+)

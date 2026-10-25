@@ -177,6 +177,34 @@ Raw spend below the original policy anchor still refuses. Each frozen committed
 or pending writer view carries its own raw fact and floors. These are operational
 forecasts, not invoice guarantees.
 
+### Explicit budget-only continuous admission
+
+For V2 only, the qualified policy may explicitly set `total_calls:null`. After
+retiring the predecessor, configure the strict operator with the qualified new
+policy/image/profile, then run:
+
+```
+python -m projetv0_voice.owned_pilot_budget_cli enable-budgeted-calls --predecessor-retired --expected-policy-sha256 SEVENTH_POLICY_SHA256
+```
+
+The sole predecessor is exact schema14 with canonical `total_calls:7` and
+`used_calls=7`. The transaction preserves the original identity, independent
+USD5 caps, anchors, expiry, count and all history, changes only the count mode
+and qualified image/profile bindings, advances floors only by reported spend,
+and rebuilds only the budget table as schema15. All existing quiescence, fresh
+funding, paid-intent and 335-second start-envelope gates apply. A fresh observation
+is required after the transition. Startup and repeated enablement never regrant
+admissions. Unknown outcomes require inspection of that same store; never
+restore an earlier ledger or retry with another identity.
+
+Only this null mode uses `R=max(R0-m*d,u)`, with the existing constants above
+and `u=0.75` OpenRouter / `0.50` Telnyx. The same reserve and raw-spend deficit
+`E-S` apply to cap, cash and key comparisons in each writer view. Count and
+permit ordinals have only SQLite's signed integer technical maximum; admission
+refuses before an increment would overflow. A permit still uses its own `k-1`
+after new admissions close. These forecasts promise neither a number of calls
+nor a final invoice ceiling, and this source capability is not live acceptance.
+
 The existing writer commits receipt, pending lease, permit and increment together.
 Answered-first webhooks remain inert placeholders until initiated supplies native
 routing, then reuse the same permit for streaming without an extra Answer. Native
