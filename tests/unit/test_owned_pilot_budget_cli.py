@@ -181,6 +181,7 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
 
     entered, release = asyncio.Event(), asyncio.Event()
     native_committed, drain_timed_out = asyncio.Event(), asyncio.Event()
+    close_safety_seconds = cli._WRITER_CLOSE_SECONDS
 
     async def pause(name):
         if name == "after_mutation_before_commit":
@@ -201,9 +202,15 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         native_drain = writer.drain
 
         async def drain(timeout_seconds):
+            if not release_late_commit:
+                # Model the drain deadline at the held mutation, not via fsync timing.
+                assert entered.is_set()
+                drain_timed_out.set()
+                raise TimeoutError("offline mutation drain timeout")
             if force_close_timeout:
                 # The transaction is real; lose only its bounded close acknowledgement.
-                await native_committed.wait()
+                async with asyncio.timeout(close_safety_seconds):
+                    await native_committed.wait()
                 drain_timed_out.set()
                 raise TimeoutError("offline close acknowledgement timeout")
             try:
@@ -217,7 +224,13 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
         return writer
 
     monkeypatch.setattr(cli, "PersistenceWriter", make_writer)
-    monkeypatch.setattr(cli, "_WRITER_CLOSE_SECONDS", 0.05)
+
+    def forbid_parent_exit(_status):
+        pytest.fail(
+            "operator matrix must not hard-exit pytest; exercise it in the owned subprocess"
+        )
+
+    monkeypatch.setattr(cli.os, "_exit", forbid_parent_exit)
     operation = asyncio.create_task(
         cli.operate(action, predecessor_retired=True, expected_policy_sha256=predecessor.sha256)
     )
@@ -242,8 +255,9 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
             operation.cancel()
         if release_late_commit:
             release.set()
-        done, _ = await asyncio.wait({operation}, timeout=0.5)
+        done, _ = await asyncio.wait({operation}, timeout=2 * close_safety_seconds + 1)
         assert operation in done, "operator left the degraded writer waiting forever"
+        assert drain_timed_out.is_set() is (not release_late_commit or force_close_timeout)
         if cancel_request and release_late_commit and not drain_timed_out.is_set():
             with pytest.raises(asyncio.CancelledError):
                 operation.result()
@@ -317,9 +331,11 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
                 await restart_owner
     finally:
         release.set()
-        if instances and not instances[0]._closed_event.is_set():
-            await instances[0].drain(2)
-        await asyncio.gather(operation, return_exceptions=True)
+        async with asyncio.timeout(2 * close_safety_seconds + 1):
+            if instances and not instances[0]._closed_event.is_set():
+                # Cleanup itself uses the real bounded drain, not the injected failure.
+                await PersistenceWriter.drain(instances[0], close_safety_seconds)
+            await asyncio.gather(operation, return_exceptions=True)
 
 
 def test_operator_unknown_outcome_is_not_printed_as_refusal(monkeypatch, capsys):
