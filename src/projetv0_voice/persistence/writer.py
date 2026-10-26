@@ -56,6 +56,7 @@ from projetv0_voice.crypto import (
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     CallUpsertPayloadV1,
+    CollectionV1,
     DisclosureEvidenceV1,
     MessageResultV1,
     RecordingArchiveReceiptV1,
@@ -2158,6 +2159,7 @@ class PersistenceWriter:
     async def freeze_call_publication_v2(
         self, operation: VoiceOperationV2, result: MessageResultV1 | None, *, generation: UUID,
         provider_callback: str | None, result_permitted: Callable[[], bool] | None = None,
+        collection_quiesced: bool = False, result_outcome: str | None = None,
     ) -> VoiceOperationV2 | None:
         if (
             self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
@@ -2168,7 +2170,8 @@ class PersistenceWriter:
             raise PersistenceError("final_call_v2_refused")
         value = await self._content_request("freeze_v2", call_id=operation.call_id,
             operation=operation, message_result=result, generation=generation,
-            provider_callback=provider_callback, result_permitted=result_permitted)
+            provider_callback=provider_callback, result_permitted=result_permitted,
+            collection_quiesced=collection_quiesced, result_outcome=result_outcome)
         if value is False:
             raise PersistenceError("final_call_v2_refused")
         if value is not None and not isinstance(value, VoiceOperationV2):
@@ -2673,7 +2676,47 @@ class PersistenceWriter:
                 )
             except ValueError:
                 return False
-        payload_values = payload.model_dump(mode="python", exclude={"message_result"})
+        # Only the joined session may attest producer quiescence. Recovery freezes omit it.
+        if values.get("collection_quiesced") is True and values.get("result_outcome") is not None:
+            audio: dict[str, object] | None = None
+            gaps = ["transcript_loss"] if retained.loss_count else []
+            if pin.policy == "off":
+                audio = {"state": "off"}
+            elif not pin.available:
+                audio = {"state": "unavailable"}
+            elif pin.denied and pin.choice_state == "off":
+                audio = {"state": "declined"}
+            elif pin.terminal_finished:
+                cursor = await connection.execute(
+                    "SELECT op_id,deployment_id,key_version,nonce,ciphertext "
+                    "FROM local_audio_terminal WHERE call_id=? AND kind='audio.finish'",
+                    (str(call_id),))
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row is not None:
+                    aad = operation_aad_from_metadata({"schema_version": 2,
+                        "operation_id": row[0], "deployment_id": row[1],
+                        "call_id": str(call_id), "kind": "audio.finish"})
+                    terminal = decode_operation_v2(self._keyring.decrypt(
+                        EncryptedValue(row[2], row[3], row[4]), aad=aad))
+                    if isinstance(terminal.payload, AudioFinishPayloadV2):
+                        audio = {"state": "terminal", "recording_id": pin.recording_id,
+                            "last_sequence": terminal.payload.last_sequence,
+                            "total_samples": terminal.payload.total_samples,
+                            "reason": terminal.payload.reason}
+                        if terminal.payload.reason != "complete":
+                            gaps.append("audio_partial")
+            if audio is not None:
+                outcome = ("present" if "message_result" in changes else "fenced"
+                    if facts.transfer_fenced or values.get("result_outcome") == "fenced"
+                    else "absent" if values.get("result_outcome") == "empty" else "failed")
+                if outcome in {"failed", "fenced"}:
+                    gaps.append("result_unavailable")
+                changes["collection"] = CollectionV1.model_validate({"schema_version": 1,
+                    "episode_id": generation,
+                    "expected_turn_ids": sorted((t.turn_id for t in retained.turns), key=str),
+                    "result_outcome": outcome, "audio": audio, "gaps": sorted(gaps)})
+        payload_values = payload.model_dump(mode="python", exclude={"message_result", "collection"})
         payload_values.update(changes)
         operation = VoiceOperationV2.model_validate({
             **operation.model_dump(mode="python"),

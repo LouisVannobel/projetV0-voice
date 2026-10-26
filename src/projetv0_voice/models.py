@@ -374,6 +374,57 @@ class MessageResultEnvelopeV1(_StrictFrozenModel):
         return value
 
 
+class CollectionAudioV1(_StrictFrozenModel):
+    state: Literal["off", "unavailable", "declined", "terminal"]
+    recording_id: UUID | None = None
+    last_sequence: (
+        Annotated[int, Field(ge=0, le=599), BeforeValidator(_require_exact_int)] | None
+    ) = None
+    total_samples: (
+        Annotated[int, Field(ge=0, le=4_800_000), BeforeValidator(_require_exact_int)] | None
+    ) = None
+    reason: Literal["complete", "transfer", "interrupted", "limit", "failure"] | None = None
+
+    @model_validator(mode="after")
+    def terminal_shape(self) -> Self:
+        if self.state == "terminal":
+            if self.recording_id is None or self.total_samples is None or self.reason is None:
+                raise ValueError("collection audio terminal required")
+            if (self.total_samples == 0) != (self.last_sequence is None):
+                raise ValueError("collection audio sequence required")
+            if self.last_sequence is not None and not (
+                self.last_sequence + 1 <= self.total_samples <= (self.last_sequence + 1) * 8000
+            ):
+                raise ValueError("collection audio sample boundary")
+        elif self.model_fields_set != {"state"}:
+            raise ValueError("non-terminal audio has no fragments")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_audio(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        value: dict[str, object] = handler(self)
+        return value if self.state == "terminal" else {"state": self.state}
+
+
+class CollectionV1(_StrictFrozenModel):
+    schema_version: SchemaVersionV1
+    episode_id: UUID
+    expected_turn_ids: Annotated[list[UUID], Field(max_length=200)]
+    result_outcome: Literal["present", "absent", "failed", "fenced"]
+    audio: CollectionAudioV1
+    gaps: Annotated[
+        list[Literal["transcript_loss", "result_unavailable", "audio_partial"]], Field(max_length=3)
+    ]
+
+    @model_validator(mode="after")
+    def canonical_manifest(self) -> Self:
+        if self.expected_turn_ids != sorted(set(self.expected_turn_ids), key=str):
+            raise ValueError("collection turn IDs must be canonical and unique")
+        if self.gaps != sorted(set(self.gaps)):
+            raise ValueError("collection gaps must be canonical and unique")
+        return self
+
+
 class CallUpsertPayloadV1(_StrictFrozenModel):
     telnyx_call_control_id: str = Field(min_length=1)
     telnyx_call_leg_id: str | None
@@ -387,9 +438,11 @@ class CallUpsertPayloadV1(_StrictFrozenModel):
     message_result: MessageResultEnvelopeV1 | None = None
     disclosure_evidence: DisclosureEvidenceV1 | None = None
     transcript_loss_count: LossCount | None = None
+    collection: CollectionV1 | None = None
 
     @field_validator(
-        "message_result", "disclosure_evidence", "transcript_loss_count", mode="before"
+        "message_result", "disclosure_evidence", "transcript_loss_count", "collection",
+        mode="before"
     )
     @classmethod
     def reject_explicit_null_extension(cls, value: object) -> object:
@@ -400,7 +453,9 @@ class CallUpsertPayloadV1(_StrictFrozenModel):
     @model_serializer(mode="wrap")
     def serialize_extensions(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         serialized: dict[str, object] = handler(self)
-        for name in ("message_result", "disclosure_evidence", "transcript_loss_count"):
+        for name in (
+            "message_result", "disclosure_evidence", "transcript_loss_count", "collection"
+        ):
             if name not in self.model_fields_set:
                 serialized.pop(name, None)
         return serialized
@@ -414,6 +469,11 @@ class CallUpsertPayloadV1(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
+        if self.collection is not None and (
+            self.status not in {"closing", "closed", "failed"}
+            or (self.collection.result_outcome == "present") != (self.message_result is not None)
+        ):
+            raise ValueError("collection requires final result outcome")
         if self.status == "pending":
             if (
                 self.started_at is not None
