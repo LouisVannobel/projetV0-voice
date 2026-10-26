@@ -381,7 +381,7 @@ async def test_native_cleanup_outer_deadline_is_observed_but_keeps_first_failure
     try:
         await session._cleanup_owned_state(
             controller=SimpleNamespace(terminalize_and_join=nothing, cleanup_termination=nothing,
-                                       disclosure_completed=True),
+                                       disclosure_completed=True, collection_audio_quiesced=False),
             recorder=SimpleNamespace(close=lambda: None), first_failure=first_failure,
             transport=SimpleNamespace(input=lambda: peer, output=lambda: peer),
             pipeline=None, runtime=None, runner_task=None, failure_task=None,
@@ -389,6 +389,7 @@ async def test_native_cleanup_outer_deadline_is_observed_but_keeps_first_failure
         )
         assert joined.is_set() and session._result_inference_task.cancelled()
         assert session._partial_result is None
+        assert session._collection_quiesced is False
         assert first_failure.code is None and terminal.reason == "closed"
         _assert_observed(metrics, "outer_timeout")
     finally:
