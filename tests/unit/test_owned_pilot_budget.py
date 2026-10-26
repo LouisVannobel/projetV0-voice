@@ -244,3 +244,121 @@ def test_operator_command_requires_retirement_before_reading_runtime(tmp_path):
     assert result.returncode == 2
     assert "enroll requires --predecessor-retired" in result.stderr
     assert not list(tmp_path.iterdir())
+
+
+def budgeted_policy(**changes):
+    return budget_policy(**{
+        "total_calls": None, "openrouter_anchor_usd": D("0.30"),
+        "telnyx_anchor_usd": D("3.28"), **changes,
+    })
+
+
+def budgeted_observation(**changes):
+    return observation(**{
+        "openrouter_reported_spend_usd": D("0.33"),
+        "telnyx_reported_spend_usd": D("3.30"), **changes,
+    })
+
+
+def test_explicit_null_budget_retains_forecast_after_a_cheap_eighth_call():
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    policy = budgeted_policy()
+    assert '"total_calls":null' in policy.model_dump_json()
+    assert affordable(policy, budgeted_observation(), 7, reported_floors=(D("0.33"), D("3.30")))
+    assert not affordable(policy, budgeted_observation(), 8,
+                          reported_floors=(D("0.33"), D("3.30")))
+    assert budget_policy().total_calls == 5
+
+
+@pytest.mark.parametrize("provider,guard", [
+    ("openrouter", "cash"), ("openrouter", "cap"), ("openrouter", "key"),
+    ("telnyx", "cash"), ("telnyx", "cap"),
+])
+@pytest.mark.parametrize("dominant", ["forecast", "raw", "floor"])
+def test_budgeted_reserve_floor_exact_boundaries_use_raw_spend(provider, dominant, guard):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    index = provider == "telnyx"
+    reserve = D("0.50" if index else "0.75")
+    raw = D("3.30" if index else "0.33")
+    effective = D("4.12" if index else "3.835476") if dominant == "forecast" else D("4.20")
+    if guard == "cap":
+        effective = 5 - reserve
+    for shortfall, allowed in ((D("0"), True), (D("0.000001"), False)):
+        changes = {}
+        floors = [D("0.33"), D("3.30")]
+        if dominant == "raw" or guard == "cap" and dominant == "forecast":
+            raw = effective + (shortfall if guard == "cap" else 0)
+            changes[provider + "_reported_spend_usd"] = raw
+        if dominant == "floor":
+            floors[index] = effective + (shortfall if guard == "cap" else 0)
+        if guard != "cap":
+            field = provider + ("_available_cash_usd" if guard == "cash"
+                                else "_limit_remaining_usd")
+            changes[field] = effective - raw + reserve - shortfall
+        assert affordable(budgeted_policy(), budgeted_observation(**changes), 7,
+                          reported_floors=tuple(floors)) is allowed
+
+
+def test_budgeted_openrouter_key_rejects_old_declining_reserve():
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    fact = budgeted_observation(openrouter_limit_remaining_usd=D("4.005476"))
+    # E - rawS = 3.505476; only .50 remains, below the new .75 minimum.
+    assert not affordable(budgeted_policy(), fact, 7,
+                          reported_floors=(D("0.33"), D("3.30")))
+
+
+@pytest.mark.parametrize("count", [True, False, -1, 1.0, "7", None, 2**63 - 1, 2**63])
+def test_budgeted_invalid_count_or_maximum_never_admits(count):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    assert not affordable(budgeted_policy(), budgeted_observation(), count,
+                          reported_floors=(D("0.33"), D("3.30")))
+
+
+@pytest.mark.parametrize("ordinal", [1, 7, 8, 2**63 - 1])
+def test_budget_permit_strict_sqlite_ordinal_range(ordinal):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPermit
+
+    permit = OwnedPilotBudgetPermit(policy_sha256="a" * 64, ordinal=ordinal,
+        call_id=UUID(int=1), call_control_id="offline", call_leg_id=None,
+        call_session_id=None, generation=UUID(int=2), paid_until=budget_policy().paid_until)
+    assert permit.ordinal == ordinal
+
+
+@pytest.mark.parametrize("ordinal", [True, False, 0, -1, 1.0, "8", 2**63])
+def test_budget_permit_rejects_invalid_ordinal(ordinal):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPermit
+
+    with pytest.raises(ValueError):
+        OwnedPilotBudgetPermit(policy_sha256="a" * 64, ordinal=ordinal,
+            call_id=UUID(int=1), call_control_id="offline", call_leg_id=None,
+            call_session_id=None, generation=UUID(int=2), paid_until=budget_policy().paid_until)
+
+
+@pytest.mark.parametrize("limit,digest", [
+    (5, "bdfb9e53f74bcb51e84e8d4341e7234d58b6a4dac9b034cdd30bd9b4b1884673"),
+    (6, "04df8ec5e2c0dea5979c8795402912344435bb930cd0213fa71e3fecb38026f4"),
+    (7, "02ac7a62e10ee271ba838011b7484226ae448f8314f2158ca63bdd92d5a000ae"),
+])
+def test_legacy_policy_canonical_json_hashes_and_finite_arithmetic_stay_fixed(limit, digest):
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPolicy, affordable
+
+    policy = budget_policy(total_calls=limit)
+    assert policy.sha256 == digest
+    assert OwnedPilotBudgetPolicy.model_validate_json(policy.model_dump_json()) == policy
+    assert f'"total_calls":{limit}' in policy.model_dump_json()
+    for count in range(limit):
+        for cash in (D("3.780407"), D("3.780408"), D("5")):
+            fact = observation(openrouter_available_cash_usd=cash)
+            assert affordable(policy, fact, count, reported_floors=(D("0"), D("0"))) is (
+                cash >= D("3.780408"))
+            assert affordable(policy, fact, count, reported_floors=(D("0"), D("0"))) == (
+                affordable(budget_policy(total_calls=None), fact, count,
+                           reported_floors=(D("0"), D("0"))))
+    assert not affordable(policy, observation(), limit, reported_floors=(D("0"), D("0")))
+    without_limit = policy.model_dump()
+    without_limit.pop("total_calls")
+    assert OwnedPilotBudgetPolicy.model_validate(without_limit).total_calls == 5

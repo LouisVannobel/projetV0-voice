@@ -59,7 +59,8 @@ async def operate(action: str, *, predecessor_retired: bool,
     selection = factories.load_profile(settings, manifest, datetime.now(UTC))
     if manifest.sparra is None or not isinstance(selection.profile, QualifiedDeploymentProfileV1):
         raise RuntimeError("owned_budget_operator_refused")
-    if action == "extend-seventh-call" and manifest.sparra.operation_contract_version != 2:
+    if (action in {"extend-seventh-call", "enable-budgeted-calls"}
+            and manifest.sparra.operation_contract_version != 2):
         raise RuntimeError("owned_budget_operator_refused")
     keyring = factories.load_keyring(settings)
     writer = PersistenceWriter(
@@ -98,10 +99,11 @@ async def operate(action: str, *, predecessor_retired: bool,
         if action == "suspend-restored":
             submitted = True
             return await writer.owned_budget_request("suspend") is True
-        if (action not in {"enroll", "extend-sixth-call", "extend-seventh-call"}
+        if (action not in {"enroll", "extend-sixth-call", "extend-seventh-call",
+                           "enable-budgeted-calls"}
                 or not predecessor_retired):
             return False
-        if action in {"extend-sixth-call", "extend-seventh-call"} and (
+        if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"} and (
             expected_policy_sha256 is None or len(expected_policy_sha256) != 64
             or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
         ):
@@ -143,6 +145,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Original Sparra budget operator transition")
     parser.add_argument("action", choices=(
         "enroll", "suspend-restored", "extend-sixth-call", "extend-seventh-call",
+        "enable-budgeted-calls",
     ))
     parser.add_argument("--expected-policy-sha256")
     parser.add_argument(
@@ -151,10 +154,11 @@ def main() -> int:
         help="Confirm predecessor is fenced and prior exposure is settled",
     )
     args = parser.parse_args()
-    if (args.action in {"enroll", "extend-sixth-call", "extend-seventh-call"}
+    if (args.action in {"enroll", "extend-sixth-call", "extend-seventh-call",
+                       "enable-budgeted-calls"}
             and not args.predecessor_retired):
         parser.error(f"{args.action} requires --predecessor-retired")
-    if args.action in {"extend-sixth-call", "extend-seventh-call"} and (
+    if args.action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"} and (
         args.expected_policy_sha256 is None or len(args.expected_policy_sha256) != 64
         or any(c not in "0123456789abcdef" for c in args.expected_policy_sha256)
     ):

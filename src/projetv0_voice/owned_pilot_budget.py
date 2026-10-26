@@ -1,4 +1,4 @@
-"""Finite original-pilot authority; metadata is evidence, never a bearer grant."""
+"""Original-pilot budget authority; metadata is evidence, never a bearer grant."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ from projetv0_voice.budget_observation import BudgetObservation, BudgetObservati
 ORIGINAL_PILOT_SLOT = "sparra-original-pilot"
 RESERVES = (Decimal("3.780408"), Decimal("1.22"))
 FORECASTS = (Decimal("0.505068"), Decimal("0.12"))
+MINIMUM_RESERVES = (Decimal("0.75"), Decimal("0.50"))
+MAX_BUDGET_CALLS = 2**63 - 1
 
 
 def _exact_money(value: Decimal) -> bool:
@@ -46,7 +48,7 @@ class OwnedPilotBudgetPolicy(BaseModel):
     policy_id: UUID
     identity: BudgetObservationIdentity = Field(repr=False)
     cost_scope: Literal["original-dedicated-account-key"] = "original-dedicated-account-key"
-    total_calls: Literal[5, 6, 7] = 5
+    total_calls: Literal[5, 6, 7] | None = 5
     openrouter_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     telnyx_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     paid_until: datetime
@@ -96,7 +98,7 @@ class OwnedPilotBudgetPolicy(BaseModel):
 class OwnedPilotBudgetPermit(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
     policy_sha256: str
-    ordinal: int = Field(ge=1, le=7, strict=True)
+    ordinal: int = Field(ge=1, le=MAX_BUDGET_CALLS, strict=True)
     call_id: UUID
     call_control_id: str
     call_leg_id: str | None
@@ -152,21 +154,28 @@ def affordable(
     *, reported_floors: tuple[Decimal, Decimal],
 ) -> bool:
     if (not reported_floors_valid(reported_floors)
-            or type(count) is not int or not 0 <= count < policy.total_calls):
+            or type(count) is not int or not 0 <= count < MAX_BUDGET_CALLS
+            or policy.total_calls is not None and count >= policy.total_calls):
         return False
     with localcontext() as ctx:
         ctx.prec = 128
-        for anchor, spent, cash, reserve, forecast, floor in zip(
+        remaining_reserves = tuple(
+            max(reserve - count * forecast, minimum) if policy.total_calls is None
+            else reserve - count * forecast
+            for reserve, forecast, minimum in zip(
+                RESERVES, FORECASTS, MINIMUM_RESERVES, strict=True,
+            )
+        )
+        for anchor, spent, cash, remaining_reserve, forecast, floor in zip(
             (policy.openrouter_anchor_usd, policy.telnyx_anchor_usd),
             (fact.openrouter_reported_spend_usd, fact.telnyx_reported_spend_usd),
             (fact.openrouter_available_cash_usd, fact.telnyx_available_cash_usd),
-            RESERVES,
+            remaining_reserves,
             FORECASTS,
             reported_floors,
             strict=True,
         ):
             effective = max(floor, spent, anchor + count * forecast)
-            remaining_reserve = reserve - count * forecast
             if (effective + remaining_reserve > 5
                     or cash - (effective - spent) < remaining_reserve):
                 return False
@@ -176,7 +185,7 @@ def affordable(
         )
         return (
             fact.openrouter_limit_remaining_usd - (gap - fact.openrouter_reported_spend_usd)
-            >= RESERVES[0] - count * FORECASTS[0]
+            >= remaining_reserves[0]
         )
 
 
