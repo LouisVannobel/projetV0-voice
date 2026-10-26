@@ -49,14 +49,20 @@ async def no_unretrieved_owner_futures():
     "enroll", "suspend-restored", "extend-sixth-call", "extend-seventh-call",
     "enable-budgeted-calls",
 ])
-@pytest.mark.parametrize("release_late_commit", [True, False])
-@pytest.mark.parametrize("cancel_request", [False, True])
+@pytest.mark.parametrize("cancel_request,release_late_commit,force_close_timeout", [
+    pytest.param(False, True, False, id="late-commit"),
+    pytest.param(False, False, False, id="blocked"),
+    pytest.param(True, True, False, id="cancel-commit"),
+    pytest.param(True, False, False, id="cancel-blocked"),
+    pytest.param(True, True, True, id="cancel-commit-close-timeout"),
+])
 async def test_operator_timeout_joins_writer_without_claiming_non_commit(
     tmp_path,
     monkeypatch,
     action,
     release_late_commit,
     cancel_request,
+    force_close_timeout,
 ):
     profile = QualifiedDeploymentProfileV1.model_validate_json(
         (Path(__file__).parents[1] / "fixtures/qualified-deployment-profile-v1.json").read_text()
@@ -161,8 +167,20 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
     if before_rows:
         with sqlite3.connect(settings.sqlite_path) as db:
             before_schema = db.execute("SELECT * FROM sqlite_master ORDER BY name").fetchall()
+    old_budget = before_rows.get("owned_pilot_budget", [])
+    if action == "enroll":
+        new_budget = [("sparra-original-pilot", policy.model_dump_json(), policy.sha256,
+                       0, "1.40", "0", 0, None)]
+    else:
+        row = list(old_budget[0])
+        if action == "suspend-restored":
+            row[6] = 1
+        else:
+            row[1], row[2], row[4] = policy.model_dump_json(), policy.sha256, "1.40"
+        new_budget = [tuple(row)]
 
     entered, release = asyncio.Event(), asyncio.Event()
+    native_committed, drain_timed_out = asyncio.Event(), asyncio.Event()
 
     async def pause(name):
         if name == "after_mutation_before_commit":
@@ -180,6 +198,21 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
             control_commit_timeout_seconds=0.03,
             failpoint=pause,
         )
+        native_drain = writer.drain
+
+        async def drain(timeout_seconds):
+            if force_close_timeout:
+                # The transaction is real; lose only its bounded close acknowledgement.
+                await native_committed.wait()
+                drain_timed_out.set()
+                raise TimeoutError("offline close acknowledgement timeout")
+            try:
+                await native_drain(timeout_seconds)
+            except TimeoutError:
+                drain_timed_out.set()
+                raise
+
+        monkeypatch.setattr(writer, "drain", drain)
         instances.append(writer)
         return writer
 
@@ -191,55 +224,60 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
     try:
         await asyncio.wait_for(entered.wait(), 2)
         writer = instances[0]
+        if action == "enroll":
+            # Initial V2 schema/contract creation precedes the paused enrollment.
+            # This reader sees only that committed baseline, never its pending row.
+            before_rows = all_rows(settings.sqlite_path)
+            assert before_rows["owned_pilot_budget"] == old_budget
         await asyncio.wait_for(writer.fatal_event.wait(), 2)
+        if force_close_timeout:
+            native_commit = writer._connection.commit
+
+            async def commit():
+                await native_commit()
+                native_committed.set()
+
+            monkeypatch.setattr(writer._connection, "commit", commit)
         if cancel_request:
             operation.cancel()
         if release_late_commit:
             release.set()
         done, _ = await asyncio.wait({operation}, timeout=0.5)
         assert operation in done, "operator left the degraded writer waiting forever"
-        if cancel_request and release_late_commit:
+        if cancel_request and release_late_commit and not drain_timed_out.is_set():
             with pytest.raises(asyncio.CancelledError):
                 operation.result()
         else:
-            with pytest.raises(RuntimeError, match="^owned_budget_transition_unknown$"):
+            with pytest.raises(cli.OwnedPilotBudgetOutcomeUnknown,
+                               match="^owned_budget_transition_unknown$"):
                 operation.result()
         assert writer._owner_task.done()
         assert writer._closed_event.is_set() and writer._connection is None
+        after_rows = all_rows(settings.sqlite_path)
+        # Releasing a failpoint is not a COMMIT receipt. A close timeout can
+        # interrupt before or after COMMIT, but never leave a mixed authority.
+        assert after_rows["owned_pilot_budget"] in (old_budget, new_budget)
+        committed = after_rows["owned_pilot_budget"] == new_budget
+        if not release_late_commit or not drain_timed_out.is_set():
+            assert committed is release_late_commit
+        if force_close_timeout:
+            assert native_committed.is_set() and drain_timed_out.is_set() and committed
+        assert after_rows.keys() == before_rows.keys()
+        for table, rows in after_rows.items():
+            if table != "owned_pilot_budget":
+                assert rows == before_rows.get(table, [])
         with sqlite3.connect(settings.sqlite_path) as db:
             if action in extensions:
-                assert db.execute(
-                    "SELECT used_calls,openrouter_floor,policy_sha256 FROM owned_pilot_budget"
-                ).fetchall() == [
-                    (
-                        predecessor.total_calls,
-                        "1.40" if release_late_commit else "1.10",
-                        policy.sha256 if release_late_commit else predecessor.sha256,
-                    )
-                ]
                 old_version, new_version = {
                     "extend-sixth-call": (11, 13), "extend-seventh-call": (13, 14),
                     "enable-budgeted-calls": (14, 15),
                 }[action]
                 assert db.execute("PRAGMA user_version").fetchone() == (
-                    new_version if release_late_commit else old_version,)
-            expected = (
-                [(0, 1 if action == "suspend-restored" else 0)]
-                if release_late_commit
-                else []
-                if action == "enroll"
-                else [(0, 0)]
-            )
-            assert action in extensions or (
-                db.execute("SELECT used_calls,suspended FROM owned_pilot_budget").fetchall()
-                == expected
-            )
+                    new_version if committed else old_version,)
+            else:
+                assert db.execute("PRAGMA user_version").fetchone() == (11,)
         if action in extensions:
-            after_rows = all_rows(settings.sqlite_path)
-            for table, rows in before_rows.items():
-                if table != "owned_pilot_budget":
-                    assert after_rows[table] == rows
-            if not release_late_commit:
+            if not committed:
                 assert after_rows == before_rows
                 with sqlite3.connect(settings.sqlite_path) as db:
                     assert db.execute("SELECT * FROM sqlite_master ORDER BY name").fetchall() == (
@@ -264,7 +302,7 @@ async def test_operator_timeout_joins_writer_without_claiming_non_commit(
                         predecessor_retired=True,
                         expected_policy_sha256=predecessor.sha256,
                     )
-                ) is (not release_late_commit)
+                ) is (not committed)
                 assert not await restarted.owned_budget_request(
                     action,
                     observation=fact,
