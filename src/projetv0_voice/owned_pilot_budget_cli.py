@@ -7,8 +7,9 @@ import asyncio
 import hashlib
 import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.production_wiring import _budget_factory, build_production_factories
@@ -49,7 +50,19 @@ async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[
 
 
 async def operate(action: str, *, predecessor_retired: bool,
-                  expected_policy_sha256: str | None = None) -> bool:
+                  expected_policy_sha256: str | None = None,
+                  predecessor_qualified_profile_path: str | None = None,
+                  predecessor_image_digest: str | None = None) -> bool:
+    if action == "rebind-release" and (
+        not predecessor_retired or expected_policy_sha256 is None
+        or len(expected_policy_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
+        or predecessor_qualified_profile_path is None
+        or not (PurePosixPath(predecessor_qualified_profile_path).is_absolute()
+                or Path(predecessor_qualified_profile_path).is_absolute())
+        or not predecessor_image_digest
+    ):
+        return False
     settings = parse_runtime_settings(capture_runtime_environment(os.environ))
     if settings.runtime_mode != "strict":
         raise RuntimeError("owned_budget_operator_refused")
@@ -59,9 +72,26 @@ async def operate(action: str, *, predecessor_retired: bool,
     selection = factories.load_profile(settings, manifest, datetime.now(UTC))
     if manifest.sparra is None or not isinstance(selection.profile, QualifiedDeploymentProfileV1):
         raise RuntimeError("owned_budget_operator_refused")
-    if (action in {"extend-seventh-call", "enable-budgeted-calls"}
+    if (action in {"extend-seventh-call", "enable-budgeted-calls", "rebind-release"}
             and manifest.sparra.operation_contract_version != 2):
         raise RuntimeError("owned_budget_operator_refused")
+    predecessor_profile_sha256 = None
+    if action == "rebind-release":
+        assert predecessor_qualified_profile_path is not None
+        assert predecessor_image_digest is not None
+        predecessor_settings = replace(
+            settings,
+            qualified_profile_path=PurePosixPath(Path(predecessor_qualified_profile_path).as_posix()),
+            image_digest=predecessor_image_digest,
+        )
+        predecessor_factories = build_production_factories(predecessor_settings)
+        predecessor_factories.validate_artifacts(predecessor_settings)
+        predecessor_manifest = predecessor_factories.load_manifest(predecessor_settings)
+        previous = predecessor_factories.load_profile(
+            predecessor_settings, predecessor_manifest, datetime.now(UTC))
+        if not isinstance(previous.profile, QualifiedDeploymentProfileV1):
+            raise RuntimeError("owned_budget_operator_refused")
+        predecessor_profile_sha256 = canonical_qualified_profile_sha256(previous.profile)
     keyring = factories.load_keyring(settings)
     writer = PersistenceWriter(
         Path(str(settings.sqlite_path)),
@@ -69,6 +99,7 @@ async def operate(action: str, *, predecessor_retired: bool,
         contract_version=manifest.sparra.operation_contract_version,
         process_agent_id=manifest.agent_id,
         process_deployment_id=settings.deployment_id,
+        release_rebind_only=action == "rebind-release",
     )
     or_key = factories.read_secret(settings.openrouter_api_key_file)
     tel_key = factories.read_secret(settings.telnyx_api_key_file)
@@ -95,21 +126,33 @@ async def operate(action: str, *, predecessor_retired: bool,
     submitted = False
     try:
         if not await writer.wait_ready():
+            if action == "rebind-release":
+                # The refusal event precedes connection close; join startup cleanup
+                # before asking the unchanged shutdown path to drain a closed owner.
+                await asyncio.wait({owner}, timeout=_WRITER_CLOSE_SECONDS)
             return False
         if action == "suspend-restored":
             submitted = True
             return await writer.owned_budget_request("suspend") is True
         if (action not in {"enroll", "extend-sixth-call", "extend-seventh-call",
-                           "enable-budgeted-calls"}
+                           "enable-budgeted-calls", "rebind-release"}
                 or not predecessor_retired):
             return False
-        if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"} and (
+        if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
+                      "rebind-release"} and (
             expected_policy_sha256 is None or len(expected_policy_sha256) != 64
             or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
         ):
             return False
         fact = await gate.collect()
         submitted = True
+        if action == "rebind-release":
+            return await writer.owned_budget_request(
+                action, observation=fact, predecessor_retired=True,
+                expected_policy_sha256=expected_policy_sha256,
+                predecessor_qualified_profile_sha256=predecessor_profile_sha256,
+                predecessor_image_digest=predecessor_image_digest,
+            ) is True
         return (
             await writer.owned_budget_request(
                 action, observation=fact, predecessor_retired=True,
@@ -145,9 +188,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Original Sparra budget operator transition")
     parser.add_argument("action", choices=(
         "enroll", "suspend-restored", "extend-sixth-call", "extend-seventh-call",
-        "enable-budgeted-calls",
+        "enable-budgeted-calls", "rebind-release",
     ))
     parser.add_argument("--expected-policy-sha256")
+    parser.add_argument("--predecessor-qualified-profile-path")
+    parser.add_argument("--predecessor-image-digest")
     parser.add_argument(
         "--predecessor-retired",
         action="store_true",
@@ -155,19 +200,35 @@ def main() -> int:
     )
     args = parser.parse_args()
     if (args.action in {"enroll", "extend-sixth-call", "extend-seventh-call",
-                       "enable-budgeted-calls"}
+                       "enable-budgeted-calls", "rebind-release"}
             and not args.predecessor_retired):
         parser.error(f"{args.action} requires --predecessor-retired")
-    if args.action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"} and (
+    if args.action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
+                       "rebind-release"} and (
         args.expected_policy_sha256 is None or len(args.expected_policy_sha256) != 64
         or any(c not in "0123456789abcdef" for c in args.expected_policy_sha256)
     ):
         parser.error(f"{args.action} requires --expected-policy-sha256 (64 lowercase hex)")
+    if args.action == "rebind-release":
+        if (not args.predecessor_qualified_profile_path
+                or not (PurePosixPath(args.predecessor_qualified_profile_path).is_absolute()
+                        or Path(args.predecessor_qualified_profile_path).is_absolute())):
+            parser.error("rebind-release requires --predecessor-qualified-profile-path (absolute)")
+        if not args.predecessor_image_digest:
+            parser.error("rebind-release requires --predecessor-image-digest")
     try:
-        accepted = asyncio.run(operate(
-            args.action, predecessor_retired=args.predecessor_retired,
-            expected_policy_sha256=args.expected_policy_sha256,
-        ))
+        if args.action == "rebind-release":
+            accepted = asyncio.run(operate(
+                args.action, predecessor_retired=args.predecessor_retired,
+                expected_policy_sha256=args.expected_policy_sha256,
+                predecessor_qualified_profile_path=args.predecessor_qualified_profile_path,
+                predecessor_image_digest=args.predecessor_image_digest,
+            ))
+        else:
+            accepted = asyncio.run(operate(
+                args.action, predecessor_retired=args.predecessor_retired,
+                expected_policy_sha256=args.expected_policy_sha256,
+            ))
     except OwnedPilotBudgetOutcomeUnknown:
         print("owned_budget_transition_unknown")
         return 1

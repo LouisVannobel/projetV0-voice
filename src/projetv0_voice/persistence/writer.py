@@ -519,7 +519,11 @@ class PersistenceWriter:
         process_agent_id: str | None = None,
         process_deployment_id: str | None = None,
         default_phone_region: Literal["FR"] | None = None,
+        release_rebind_only: bool = False,
     ) -> None:
+        if type(release_rebind_only) is not bool or release_rebind_only and contract_version != 2:
+            raise ValueError("invalid_release_rebind_contract")
+        self._release_rebind_only = release_rebind_only
         if default_phone_region not in (None, "FR"):
             raise ValueError("invalid_result_phone_region")
         self._default_phone_region: Literal["FR"] | None = default_phone_region
@@ -873,6 +877,55 @@ class PersistenceWriter:
                 return None
             if not reported_floors_valid(floors):
                 return None
+        if action == "rebind-release":
+            fact = payload.get("observation")
+            if (self._contract_version != 2 or row is None or floors is None
+                    or policy.total_calls is not None or row[4] or row[5] is not None
+                    or payload.get("predecessor_retired") is not True
+                    or payload.get("expected_policy_sha256") != row[0]
+                    or policy.sha256 == row[0]):
+                return False
+            try:
+                predecessor = OwnedPilotBudgetPolicy.model_validate_json(row[6])
+                validated = OwnedPilotBudgetPolicy.model_validate_json(policy.model_dump_json())
+            except ValueError:
+                return False
+            release_fields = {"qualified_profile_sha256", "image_digest"}
+            if (predecessor.total_calls is not None or predecessor.sha256 != row[0]
+                    or predecessor.model_dump_json() != row[6] or validated != policy
+                    or predecessor.qualified_profile_sha256
+                    != payload.get("predecessor_qualified_profile_sha256")
+                    or predecessor.image_digest != payload.get("predecessor_image_digest")
+                    or predecessor.model_dump(mode="json", exclude=release_fields)
+                    != policy.model_dump(mode="json", exclude=release_fields)
+                    or not isinstance(fact, BudgetObservation)
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or fact.active_call_control_ids):
+                return False
+            cursor = await connection.execute(
+                "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+            busy = await cursor.fetchone()
+            await cursor.close()
+            if (busy != (0,) or self._pragma_int(await self._pragma_scalar("user_version"))
+                    != BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION
+                    or await self._application_schema_objects()
+                    != _EXPECTED_BUDGETED_AUDIO_BUDGET_SCHEMA):
+                return False
+            # This release rotation cannot finance a call or advance spend floors.
+            # Both columns change in the existing owner's atomic transaction only.
+            cursor = await connection.execute(
+                "UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=? "
+                "WHERE slot=? AND policy_sha256=? AND policy_json=? AND used_calls=? "
+                "AND openrouter_floor=? AND telnyx_floor=? "
+                "AND suspended=0 AND paid_call_control_id IS NULL",
+                (policy.model_dump_json(), policy.sha256, ORIGINAL_PILOT_SLOT,
+                 row[0], row[6], row[1], row[2], row[3]),
+            )
+            if cursor.rowcount != 1:
+                raise FatalPersistenceError("owned_budget_release_conflict")
+            await cursor.close()
+            self._owned_budget_observation = None
+            return True
         if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"}:
             seventh = action == "extend-seventh-call"
             budgeted = action == "enable-budgeted-calls"
@@ -3806,8 +3859,18 @@ class PersistenceWriter:
         current_command: PersistenceCommand | None = None
         current_owned = False
         try:
-            self._database_path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = await aiosqlite.connect(self._database_path)
+            if self._release_rebind_only:
+                # A release command cannot create a store or run startup migrations.
+                self._connection = await aiosqlite.connect(
+                    self._database_path.resolve().as_uri() + "?mode=rw", uri=True)
+                if (self._pragma_int(await self._pragma_scalar("user_version"))
+                        != BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION
+                        or await self._application_schema_objects()
+                        != _EXPECTED_BUDGETED_AUDIO_BUDGET_SCHEMA):
+                    raise FatalPersistenceError("writer_contract_mismatch")
+            else:
+                self._database_path.parent.mkdir(parents=True, exist_ok=True)
+                self._connection = await aiosqlite.connect(self._database_path)
             await self._initialize_owner_connection()
             await self._initialize_budget_schema()
             await self._discover_stale_leases()
