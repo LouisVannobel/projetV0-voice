@@ -19,7 +19,7 @@ dependencies = [
   "opentelemetry-sdk==1.44.0",
   "phonenumberslite==9.0.41",
   "pipecat-ai[openai,openrouter,silero,websocket]==1.12.0",
-  "psycopg[binary,pool]==3.3.4",
+  "psycopg[binary,pool]==3.3.6",
   "pydantic==2.13.4",
   "pynacl==1.6.2",
   "pyyaml==6.0.3",
