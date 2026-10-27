@@ -26,7 +26,11 @@ FROM ${PYTHON_IMAGE} AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
-    && apt-get install -y --no-install-recommends --only-upgrade libpcre2-8-0=10.42-1+deb12u2 perl-base=5.36.0-7+deb12u4 \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+        libpcre2-8-0=10.42-1+deb12u2 \
+        perl-base=5.36.0-7+deb12u4 \
+        libssl3=3.0.22-1~deb12u2 \
+        openssl=3.0.22-1~deb12u2 \
     && rm -rf /var/lib/apt/lists/*
 
 # The final runtime never installs packages; remove base-image installers and vendored payloads.
