@@ -12,7 +12,10 @@ import pytest
 
 from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetGate
 from projetv0_voice.persistence.commands import FatalPersistenceError
-from projetv0_voice.persistence.schema import SEVENTH_AUDIO_BUDGET_SCHEMA_SQL
+from projetv0_voice.persistence.schema import (
+    BUDGETED_AUDIO_BUDGET_SCHEMA_SQL,
+    SEVENTH_AUDIO_BUDGET_SCHEMA_SQL,
+)
 from tests.integration.test_fixed_v2_process import NOW, registry_case
 from tests.integration.test_owned_pilot_budget_admission import budget_rows, committed, saved_permit
 from tests.integration.test_owned_pilot_seventh_call import authority, native_call
@@ -418,3 +421,184 @@ async def test_suspended_restored_budgeted_store_has_no_regrant_path(tmp_path):
         assert not await case.writer.owned_budget_request(
             "enroll", observation=budgeted_observation(), predecessor_retired=True)
         assert not gate.ready and authority(path) == before
+
+
+def seed_release(path, *, policy=None, **changes):
+    previous = policy or candidate()
+    with sqlite3.connect(path) as db:
+        db.executescript(BUDGETED_AUDIO_BUDGET_SCHEMA_SQL)
+        values = dict(policy_json=previous.model_dump_json(), policy_sha256=previous.sha256,
+                      used_calls=7, openrouter_floor="0.33", telnyx_floor="3.30", suspended=0,
+                      paid_call_control_id=None) | changes
+        db.execute("INSERT INTO owned_pilot_budget VALUES(?,?,?,?,?,?,?,?)",
+                   ("sparra-original-pilot", *values.values()))
+        db.execute("INSERT INTO qualification_runs(run_id,consumed_at) VALUES(?,?)",
+                   (str(UUID(int=99)), NOW.isoformat()))
+
+
+def release_candidate(**changes):
+    return candidate(qualified_profile_sha256="e" * 64,
+                     image_digest="fixture@sha256:" + "f" * 64, **changes)
+
+
+async def rebind_release(writer, **changes):
+    return await writer.owned_budget_request("rebind-release", **{
+        "observation": budgeted_observation(), "predecessor_retired": True,
+        "expected_policy_sha256": candidate().sha256,
+        "predecessor_qualified_profile_sha256": candidate().qualified_profile_sha256,
+        "predecessor_image_digest": candidate().image_digest, **changes,
+    })
+
+
+@pytest.mark.asyncio
+async def test_release_rebind_preserves_native_history_schema_and_every_budget_column(tmp_path):
+    await exhausted_seven(tmp_path)
+    async with registry_case(tmp_path) as case:
+        await bind_budgeted(case)
+        assert await enable(case.writer)
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case, policy=release_candidate())
+        before_rows, schema, version = authority(case.path)
+        fact = budgeted_observation(openrouter_reported_spend_usd=Decimal("0.99"),
+                                   telnyx_reported_spend_usd=Decimal("3.90"))
+        assert await rebind_release(case.writer, observation=fact)
+        after_rows, after_schema, after_version = authority(case.path)
+        expected = dict(before_rows)
+        row = list(before_rows["owned_pilot_budget"][0])
+        row[1:3] = [release_candidate().model_dump_json(), release_candidate().sha256]
+        expected["owned_pilot_budget"] = [tuple(row)]
+        assert after_rows == expected and after_schema == schema
+        assert after_version == version == (15,)
+        assert not gate.ready and not case.provider.actions and not case.begins
+        assert not await rebind_release(case.writer)
+        assert authority(case.path) == (after_rows, after_schema, after_version)
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case, policy=release_candidate())
+        before = authority(case.path)
+        assert not gate.ready and not await rebind_release(case.writer)
+        assert authority(case.path) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", ["funds", "start_window"])
+async def test_release_rebind_does_not_finance_or_reopen_a_closed_budget(tmp_path, closed):
+    changes = {"paid_until": NOW + timedelta(seconds=334)} if closed == "start_window" else {}
+    previous, policy = candidate(**changes), release_candidate(**changes)
+    seed_release(tmp_path / "voice.sqlite", policy=previous,
+                 openrouter_floor="4.26" if closed == "funds" else "0.33")
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case, policy=policy)
+        before = all_rows(case.path)["owned_pilot_budget"][0]
+        assert await rebind_release(case.writer, expected_policy_sha256=previous.sha256)
+        assert not gate.ready and not await gate.refresh()
+        assert (await committed(case.registry, case.writer,
+                    event(occurred_at=NOW, call_control_id="unfunded-release"))).status_code == 503
+        after = all_rows(case.path)["owned_pilot_budget"][0]
+        assert after[3:] == before[3:]
+        assert not case.provider.actions and not case.begins
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [
+    "cas", "retired", "profile", "image", "finite", "identity", "anchor", "paid_until",
+    "runtime", "deployment", "bundle", "inference", "equivalent_anchor",
+    "active_local", "active_carrier",
+    "unsettled", "suspended", "stale", "fact_identity", "cap", "schema", "noncanonical",
+])
+async def test_release_rebind_refuses_ambiguity_without_any_persistent_change(tmp_path, invalid):
+    path = tmp_path / "voice.sqlite"
+    seed_release(path, **{
+        "unsettled": {"paid_call_control_id": "unsettled"}, "suspended": {"suspended": 1},
+        "noncanonical": {"policy_json": candidate().model_dump_json(indent=2)},
+    }.get(invalid, {}))
+    changes = {
+        "finite": {"total_calls": 7},
+        "identity": {"identity": replace(candidate().identity, telnyx_account_sha256="a" * 64)},
+        "anchor": {"openrouter_anchor_usd": Decimal("0.31")},
+        "equivalent_anchor": {"openrouter_anchor_usd": Decimal("0.300")},
+        "paid_until": {"paid_until": NOW + timedelta(hours=23)},
+        "runtime": {"runtime_contract_sha256": "a" * 64},
+        "deployment": {"deployment_id": "other"}, "bundle": {"agent_bundle_sha256": "a" * 64},
+        "inference": {"inference_profile_sha256": "a" * 64},
+    }
+    async with registry_case(tmp_path) as case:
+        await bind_budgeted(case, policy=release_candidate(**changes.get(invalid, {})))
+        if invalid == "active_local":
+            with sqlite3.connect(path) as db:
+                db.execute("INSERT INTO call_leases(call_control_id,call_id,tenant_id,agent_id,"
+                           "state,token_hash,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)",
+                           ("active", str(UUID(int=7)), "fixture", "fixture", "pending", bytes(32),
+                            NOW.isoformat(), (NOW + timedelta(minutes=1)).isoformat()))
+        if invalid == "schema":
+            with sqlite3.connect(path) as db:
+                db.execute("PRAGMA user_version=14")
+        before = authority(path)
+        facts = {
+            "active_carrier": {"active_call_control_ids": frozenset({"active"})},
+            "stale": {"collection_started_at_utc": NOW - timedelta(seconds=61)},
+            "fact_identity": {"identity": replace(candidate().identity, did="+33102030406")},
+            "cap": {"openrouter_limit_usd": Decimal("6")},
+        }
+        assert not await rebind_release(case.writer, **{
+            "observation": budgeted_observation(**facts.get(invalid, {})),
+            **{"cas": {"expected_policy_sha256": "a" * 64},
+               "retired": {"predecessor_retired": False},
+               "profile": {"predecessor_qualified_profile_sha256": "a" * 64},
+               "image": {"predecessor_image_digest": "fixture@sha256:" + "a" * 64},
+               }.get(invalid, {}),
+        })
+        assert authority(path) == before
+
+
+@pytest.mark.asyncio
+async def test_release_rebind_rolls_back_both_policy_columns_on_native_commit_failure(tmp_path):
+    path = tmp_path / "voice.sqlite"
+    seed_release(path)
+    fail = False
+
+    async def rollback(name):
+        if fail and name == "after_mutation_before_commit":
+            cursor = await case.writer._connection.execute(
+                "SELECT policy_sha256 FROM owned_pilot_budget")
+            updated = await cursor.fetchone()
+            await cursor.close()
+            if updated == (release_candidate().sha256,):
+                raise RuntimeError("offline release rollback")
+
+    async with registry_case(tmp_path, failpoint=rollback) as case:
+        gate = await bind_budgeted(case, policy=release_candidate())
+        before = authority(path)
+        fail = True
+        with pytest.raises(FatalPersistenceError):
+            await rebind_release(case.writer)
+        assert authority(path) == before and not gate.ready
+
+
+@pytest.mark.asyncio
+async def test_release_rebind_two_native_owners_commit_only_one_cas(tmp_path):
+    from projetv0_voice.crypto import CryptoKeyring
+    from projetv0_voice.persistence.writer import PersistenceWriter
+    from tests.integration.test_fixed_v2_process import KEY
+
+    path = tmp_path / "voice.sqlite"
+    seed_release(path)
+    writers = [PersistenceWriter(path, CryptoKeyring({1: KEY}, active_version=1),
+               contract_version=2, utcnow=lambda: NOW, process_agent_id="fixture",
+               process_deployment_id="fixture") for _ in range(2)]
+    for writer in writers:
+        writer.set_owned_budget(release_candidate())
+    owners = [asyncio.create_task(writer.run()) for writer in writers]
+    try:
+        assert all(await asyncio.gather(*(writer.wait_ready() for writer in writers)))
+        before = authority(path)
+        outcomes = await asyncio.gather(*(rebind_release(writer) for writer in writers))
+        assert outcomes.count(True) == 1
+        after = authority(path)
+        assert after[0]["owned_pilot_budget"][0][3:] == before[0]["owned_pilot_budget"][0][3:]
+        assert after[1:] == before[1:]
+        assert not any(await asyncio.gather(*(rebind_release(writer) for writer in writers)))
+        assert authority(path) == after
+    finally:
+        for writer in writers:
+            await writer.drain(2)
+        await asyncio.gather(*owners)

@@ -8,7 +8,7 @@ import hashlib
 import sqlite3
 from dataclasses import replace
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -493,7 +493,9 @@ def test_extension_operator_forwards_exact_expected_hash(monkeypatch, capsys, ac
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["extend-seventh-call", "enable-budgeted-calls"])
+@pytest.mark.parametrize("action", [
+    "extend-seventh-call", "enable-budgeted-calls", "rebind-release",
+])
 async def test_seventh_operator_rejects_v1_before_writer_or_credentials(monkeypatch, action):
     profile = QualifiedDeploymentProfileV1.model_validate_json(
         (Path(__file__).parents[1] / "fixtures/qualified-deployment-profile-v1.json").read_text()
@@ -511,4 +513,142 @@ async def test_seventh_operator_rejects_v1_before_writer_or_credentials(monkeypa
         "seventh V1 must be refused before writer creation"))
     with pytest.raises(RuntimeError, match="^owned_budget_operator_refused$"):
         await cli.operate(action, predecessor_retired=True,
-                          expected_policy_sha256="e" * 64)
+                          expected_policy_sha256="e" * 64, **({
+                              "predecessor_qualified_profile_path": "/secure/previous.json",
+                              "predecessor_image_digest": "fixture@sha256:" + "a" * 64,
+                          } if action == "rebind-release" else {}))
+
+
+@pytest.mark.parametrize("missing", ["retired", "cas", "profile", "image"])
+def test_release_operator_requires_all_explicit_flags_before_runtime(monkeypatch, capsys, missing):
+    import sys
+
+    options = {
+        "retired": ["--predecessor-retired"],
+        "cas": ["--expected-policy-sha256", "e" * 64],
+        "profile": ["--predecessor-qualified-profile-path", "/secure/previous-profile.json"],
+        "image": ["--predecessor-image-digest", "fixture@sha256:" + "a" * 64],
+    }
+    monkeypatch.setattr(sys, "argv", ["budget", "rebind-release", *[
+        argument for key, arguments in options.items() if key != missing
+        for argument in arguments]])
+    monkeypatch.setattr(cli, "capture_runtime_environment",
+                        lambda _: pytest.fail("explicit release flags must precede runtime"))
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+    assert result.value.code == 2
+    assert "requires --" in capsys.readouterr().err
+
+
+def test_release_operator_forwards_the_exact_predecessor_tuple_and_cas(monkeypatch, capsys):
+    import sys
+
+    calls = []
+
+    async def operate(action, **values):
+        calls.append((action, values))
+        return True
+
+    monkeypatch.setattr(cli, "operate", operate)
+    monkeypatch.setattr(sys, "argv", ["budget", "rebind-release", "--predecessor-retired",
+        "--expected-policy-sha256", "e" * 64, "--predecessor-qualified-profile-path",
+        "/secure/previous-profile.json", "--predecessor-image-digest",
+        "fixture@sha256:" + "a" * 64])
+    assert cli.main() == 0
+    assert calls == [("rebind-release", {"predecessor_retired": True,
+        "expected_policy_sha256": "e" * 64,
+        "predecessor_qualified_profile_path": "/secure/previous-profile.json",
+        "predecessor_image_digest": "fixture@sha256:" + "a" * 64})]
+    assert capsys.readouterr().out == "owned_budget_transition_accepted\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [
+    None, "previous_image", "previous_runtime", "missing_store", "legacy_store", "malformed_store",
+])
+async def test_release_operator_loads_both_native_profile_bindings_before_real_cas(
+    tmp_path, monkeypatch, invalid,
+):
+    from projetv0_voice import production_wiring as wiring
+    from tests.integration.test_owned_pilot_budgeted_calls import seed_release
+
+    profile = QualifiedDeploymentProfileV1.model_validate_json(
+        (Path(__file__).parents[1] / "fixtures/qualified-deployment-profile-v1.json").read_text())
+    old_image = "ghcr.io/example/voice@sha256:" + "b" * 64
+    old_profile = profile.model_copy(update={"image_digest": old_image,
+        **({"runtime_contract_sha256": "f" * 64} if invalid == "previous_runtime" else {})})
+    current_path, previous_path = tmp_path / "current.json", tmp_path / "previous.json"
+    current_path.write_text(profile.model_dump_json())
+    previous_path.write_text(old_profile.model_dump_json())
+    settings = replace(_settings(), sqlite_path=tmp_path / "voice.sqlite",
+        deployment_id=profile.deployment_id,
+        qualified_profile_path=PurePosixPath(current_path.as_posix()),
+        runtime_contract_sha256=profile.runtime_contract_sha256,
+        image_digest=profile.image_digest, agent_bundle_sha256=profile.agent_bundle_sha256,
+        inference_profile_sha256=profile.inference_profile_sha256)
+    identity = replace(observation().identity,
+        openrouter_credential_sha256=hashlib.sha256(b"offline-or").hexdigest(),
+        telnyx_credential_sha256=hashlib.sha256(b"offline-tel").hexdigest())
+    policy = budget_policy(total_calls=None, identity=identity,
+        deployment_id=settings.deployment_id,
+        runtime_contract_sha256=settings.runtime_contract_sha256,
+        image_digest=settings.image_digest, agent_bundle_sha256=settings.agent_bundle_sha256,
+        inference_profile_sha256=settings.inference_profile_sha256,
+        qualified_profile_sha256=canonical_qualified_profile_sha256(profile))
+    previous_policy = policy.model_copy(update={"image_digest": old_image,
+        "qualified_profile_sha256": canonical_qualified_profile_sha256(old_profile)})
+    if invalid not in {"missing_store", "legacy_store"}:
+        seed_release(settings.sqlite_path, policy=previous_policy)
+    if invalid == "legacy_store":
+        from projetv0_voice.persistence.schema import LOCAL_AUDIO_SCHEMA_SQL
+        with sqlite3.connect(settings.sqlite_path) as db:
+            db.executescript(LOCAL_AUDIO_SCHEMA_SQL)
+    if invalid == "malformed_store":
+        with sqlite3.connect(settings.sqlite_path) as db:
+            db.execute("PRAGMA user_version=16")
+    from tests.integration.test_owned_pilot_seventh_call import authority
+    before = authority(settings.sqlite_path) if settings.sqlite_path.exists() else None
+    frozen = settings.sqlite_path.read_bytes() if before else None
+    manifest = SimpleNamespace(agent_id="fixture", dids=[identity.did],
+        sparra=SimpleNamespace(operation_contract_version=2, connection_id=identity.connection_id))
+    validated = []
+    monkeypatch.setattr(wiring, "_validate_artifacts", lambda received: validated.append(received))
+    monkeypatch.setattr(wiring, "load_agent_manifest", lambda *_args, **_kwargs: manifest)
+    monkeypatch.setattr(wiring, "_root_owned_regular", lambda _: True)
+    keyring = CryptoKeyring({1: KEY}, active_version=1)
+    monkeypatch.setattr(wiring, "_decode_keyring_secret", lambda _: keyring)
+    monkeypatch.setattr(wiring, "read_runtime_secret", lambda path: SecretStr(
+        "offline-or" if path == settings.openrouter_api_key_file else "offline-tel"))
+    monkeypatch.setattr(cli, "capture_runtime_environment", lambda _: None)
+    monkeypatch.setattr(cli, "parse_runtime_settings", lambda _: settings)
+    monkeypatch.setattr(cli, "PersistenceWriter", lambda path, keys, **values:
+        PersistenceWriter(path, keys, **values, utcnow=lambda: NOW))
+
+    async def collect():
+        return replace(observation(), identity=identity)
+
+    monkeypatch.setattr(cli, "_budget_factory", lambda _settings, writer, *_args:
+        OwnedPilotBudgetGate(writer, policy, collect, utcnow=lambda: NOW))
+    arguments = dict(predecessor_retired=True, expected_policy_sha256=previous_policy.sha256,
+        predecessor_qualified_profile_path=str(previous_path),
+        predecessor_image_digest="wrong-image" if invalid == "previous_image" else old_image)
+    if invalid in {"previous_image", "previous_runtime"}:
+        with pytest.raises(ValueError, match="does not match the injected value"):
+            await cli.operate("rebind-release", **arguments)
+        assert authority(settings.sqlite_path) == before
+    elif invalid:
+        assert not await cli.operate("rebind-release", **arguments)
+        if before:
+            assert authority(settings.sqlite_path) == before
+            assert settings.sqlite_path.read_bytes() == frozen
+        else:
+            assert not settings.sqlite_path.exists()
+    else:
+        assert await cli.operate("rebind-release", **arguments)
+        rows, schema, version = authority(settings.sqlite_path)
+        assert schema == before[1] and version == before[2] == (15,)
+        assert rows["owned_pilot_budget"][0][1:3] == (policy.model_dump_json(), policy.sha256)
+        assert rows["owned_pilot_budget"][0][3:] == before[0]["owned_pilot_budget"][0][3:]
+    assert validated == [settings, replace(settings,
+        qualified_profile_path=PurePosixPath(previous_path.as_posix()),
+        image_digest=arguments["predecessor_image_digest"])]

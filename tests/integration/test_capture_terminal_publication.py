@@ -94,6 +94,9 @@ async def test_capture_terminal_native_normal_tail_exact_finish_relay_and_restar
         summary = await case.capture.finish("complete")
         assert not summary.pending and not summary.partial
         assert summary.committed_samples == 80 and summary.last_sequence == 0
+        assert not case.controller.collection_audio_quiesced
+        await case.controller.cleanup_termination("closed")
+        assert case.controller.collection_audio_quiesced
         operation = terminal_operation(case, "audio.finish")
         assert (operation.payload.reason, operation.payload.last_sequence,
                 operation.payload.total_samples) == ("complete", 0, 80)
@@ -341,3 +344,64 @@ async def test_capture_terminal_accepted_external_cancel_preserves_interrupted_f
         assert summary.partial and not summary.pending and summary.committed_samples == 80
         assert case.failure.code is None and not case.writer.is_degraded
         assert (await case.writer.read_call_lifecycle(CALL)).original_ended_at is None
+
+@pytest.mark.asyncio
+async def test_collection_session_cleanup_distinguishes_settled_and_captured_pending(tmp_path):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from projetv0_voice.calendar import CalendarPlayback
+    from projetv0_voice.session import CallSession, TurnRecorder, _TerminalOutcome
+    from tests.integration.test_disclosure import _TEST_RUNTIME_METRICS
+
+    def recorder(identity, writer, keyring, failure):
+        return TurnRecorder(identity=identity, writer=writer, keyring=keyring,
+            first_failure=failure, runtime_metrics=_TEST_RUNTIME_METRICS, utcnow=lambda: NOW)
+
+    async def inference(_context, **_options):
+        return '{"result":null}'
+
+    async def close(*_args, **_options):
+        return None
+
+    for settled in (False, True):
+        async with capture_case(tmp_path / str(settled), terminal_publication=True,
+                                recorder_factory=recorder) as case:
+            await accept_local(case)
+            await caller_frames(case, 1, samples=80)
+            await case.runtime.worker.queue_frame(EndFrame())
+            await asyncio.wait_for(case.runner, 2)
+            if not settled:
+                async def pending(_reason):
+                    return replace(await case.capture.quiesce(), pending=True)
+                case.controller._local_audio_finish = pending
+            session = CallSession.__new__(CallSession)
+            session._identity = case.controller._identity
+            session._writer, session._controller = case.writer, case.controller
+            session._utcnow, session._uuid_factory = lambda: NOW, uuid4
+            session._terminal_publication = session._partial_result = None
+            session._result_inference_task = session._registry_terminalizer = None
+            session._metric_lease = session._end_call_playback = None
+            session._calendar_task = session._program_action_task = None
+            session._calendar_playback, session._action_authority = CalendarPlayback(), None
+            session._no_new_ai = session._result_inference_fenced = False
+            session._runtime_metrics = _TEST_RUNTIME_METRICS
+            session._cleanup_phase_timeout_seconds = 2
+            session._lease_terminalizer = SimpleNamespace(terminalize=close)
+            session._services = SimpleNamespace(llm=SimpleNamespace(run_inference=inference),
+                                                 aclose=close)
+            await session._cleanup_owned_state(
+                controller=case.controller, recorder=case.turn_recorder,
+                first_failure=case.failure, transport=None, pipeline=None, runtime=case.runtime,
+                runner_task=case.runner, failure_task=None,
+                terminal_outcome=_TerminalOutcome('closed'),
+                cancel_continuations=False)
+            frozen = await case.writer.read_frozen_call_publication_v2(CALL,generation=GENERATION)
+            assert session._collection_quiesced is settled
+            if settled:
+                assert frozen.payload.collection.audio.total_samples == 80
+                assert frozen.payload.collection.result_outcome == 'absent'
+            else:
+                assert case.failure.code == 'recording_cleanup_failed'
+                assert 'collection' not in frozen.payload.model_dump(mode='json')

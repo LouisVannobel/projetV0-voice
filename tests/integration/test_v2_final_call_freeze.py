@@ -217,7 +217,8 @@ async def test_final_call_v2_real_codec_ack_restart_reuses_frozen_result_and_cip
         base = fresh_final(case, authority)
         frozen = await case.writer.freeze_call_publication_v2(base, case.session._partial_result,
             generation=case.grant.generation.generation, provider_callback="+33102030407",
-            result_permitted=lambda: True)
+            result_permitted=lambda: True, collection_quiesced=True, result_outcome="valid")
+        assert frozen.payload.collection.result_outcome == "present"
         before = frozen_bytes(case)
         native_ingest = case.sink.ingest_v2
 
@@ -353,3 +354,36 @@ async def test_final_call_v2_expiry_erase_and_cancelled_commit_keep_original_aut
             reason=authority.reason, disclosure_completed=True,
             operation_id=authority.completion_token, ended_at=authority._closed_at)
         assert frozen_bytes(case) == before and len(case.requests) == 1
+
+@pytest.mark.asyncio
+async def test_collection_freeze_requires_explicit_quiescence_and_replays_manifest(tmp_path):
+    async with final_case(tmp_path) as case:
+        await case.session._prepare_partial_result()
+        base = fresh_final(case, await reserve(case))
+        frozen = await case.writer.freeze_call_publication_v2(base, case.session._partial_result,
+            generation=case.grant.generation.generation, provider_callback='+33102030407',
+            collection_quiesced=True, result_outcome='valid')
+        collection = frozen.payload.collection
+        retained = await case.writer.read_retained_call(case.grant.call_id)
+        assert collection.expected_turn_ids == [t.turn_id for t in retained.turns]
+        assert collection.episode_id == case.grant.generation.generation
+        assert collection.audio.state == 'off' and collection.result_outcome == 'present'
+        assert 'collection' in frozen.payload.model_dump(mode='json')
+        from pydantic import ValidationError
+        for invalid in (
+            {**frozen.payload.model_dump(), "status": "active", "ended_at": None,
+                "end_reason": None},
+            {**frozen.payload.model_dump(), "message_result": None},
+        ):
+            with pytest.raises(ValidationError):
+                CallUpsertPayloadV1.model_validate(invalid)
+        assert await case.writer.freeze_call_publication_v2(base, None,
+            generation=case.grant.generation.generation, provider_callback=None) == frozen
+    async with final_case(tmp_path / 'unproven') as case:
+        frozen = await case.writer.freeze_call_publication_v2(
+            fresh_final(case, await reserve(case)), None,
+            generation=case.grant.generation.generation, provider_callback=None)
+        assert 'collection' not in frozen.payload.model_dump(mode='json')
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            CallUpsertPayloadV1.model_validate({**frozen.payload.model_dump(), 'collection': None})

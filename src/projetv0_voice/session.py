@@ -758,6 +758,8 @@ class CallSession:
     def stop_result_inference(self) -> None:
         """A takeover intent irreversibly revokes this call's result request."""
         self._result_inference_fenced = True
+        self._collection_quiesced = False
+        self._result_finalization_outcome: str | None = None
         self._partial_result = None
         if self._result_inference_task is not None:
             self._result_inference_task.cancel()
@@ -881,6 +883,7 @@ class CallSession:
                 )
             raise
         finally:
+            self._result_finalization_outcome = outcome
             self._runtime_metrics.record_result_outcome(
                 outcome, started_at=started_at,
                 invalid_reason=invalid_reason if outcome == "invalid" else None,
@@ -1913,6 +1916,10 @@ class CallSession:
             first_failure,
             "recording_cleanup_failed",
         )
+        self._collection_quiesced = (
+            first_failure.code is None
+            and controller.collection_audio_quiesced
+        )
         # Share the actual outer deadline only with result observation. Keep the
         # existing _attempt failure policy, including consumed inference cancellation.
         try:
@@ -2109,6 +2116,8 @@ class CallSession:
                 frozen = await cast(Any, self._writer).freeze_call_publication_v2(
                     operation, self._partial_result,
                     generation=self._identity.generation.generation,
+                    collection_quiesced=getattr(self, "_collection_quiesced", False),
+                    result_outcome=getattr(self, "_result_finalization_outcome", None),
                     provider_callback=self._identity.routing.from_e164,
                     result_permitted=lambda: (
                         not self._no_new_ai and not self._result_inference_fenced
@@ -2261,6 +2270,7 @@ class DisclosureController:
         self.disclosure_completed = False
         self.recording_may_be_active = False
         self._input_closed = False
+        self.collection_audio_quiesced = False
         self._audio_observed = False
         self._timeout_task: asyncio.Task[None] | None = None
         self._mark_armed_at: float | None = None
@@ -2778,6 +2788,7 @@ class DisclosureController:
             )
 
     async def cleanup_termination(self, reason: str) -> None:
+        self.collection_audio_quiesced = False
         try:
             if self._local_snapshot is not None:
                 if (
@@ -2800,6 +2811,7 @@ class DisclosureController:
                     if summary.pending:
                         raise RuntimeError("local_audio_terminal_pending")
                     self._local_quiesced = True
+                self.collection_audio_quiesced = self._local_quiesced
                 return
             await self._recording.cleanup(
                 self._identity,

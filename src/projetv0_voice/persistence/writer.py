@@ -56,6 +56,7 @@ from projetv0_voice.crypto import (
 from projetv0_voice.models import (
     BeginCallSnapshotV1,
     CallUpsertPayloadV1,
+    CollectionV1,
     DisclosureEvidenceV1,
     MessageResultV1,
     RecordingArchiveReceiptV1,
@@ -518,7 +519,11 @@ class PersistenceWriter:
         process_agent_id: str | None = None,
         process_deployment_id: str | None = None,
         default_phone_region: Literal["FR"] | None = None,
+        release_rebind_only: bool = False,
     ) -> None:
+        if type(release_rebind_only) is not bool or release_rebind_only and contract_version != 2:
+            raise ValueError("invalid_release_rebind_contract")
+        self._release_rebind_only = release_rebind_only
         if default_phone_region not in (None, "FR"):
             raise ValueError("invalid_result_phone_region")
         self._default_phone_region: Literal["FR"] | None = default_phone_region
@@ -872,6 +877,55 @@ class PersistenceWriter:
                 return None
             if not reported_floors_valid(floors):
                 return None
+        if action == "rebind-release":
+            fact = payload.get("observation")
+            if (self._contract_version != 2 or row is None or floors is None
+                    or policy.total_calls is not None or row[4] or row[5] is not None
+                    or payload.get("predecessor_retired") is not True
+                    or payload.get("expected_policy_sha256") != row[0]
+                    or policy.sha256 == row[0]):
+                return False
+            try:
+                predecessor = OwnedPilotBudgetPolicy.model_validate_json(row[6])
+                validated = OwnedPilotBudgetPolicy.model_validate_json(policy.model_dump_json())
+            except ValueError:
+                return False
+            release_fields = {"qualified_profile_sha256", "image_digest"}
+            if (predecessor.total_calls is not None or predecessor.sha256 != row[0]
+                    or predecessor.model_dump_json() != row[6] or validated != policy
+                    or predecessor.qualified_profile_sha256
+                    != payload.get("predecessor_qualified_profile_sha256")
+                    or predecessor.image_digest != payload.get("predecessor_image_digest")
+                    or predecessor.model_dump(mode="json", exclude=release_fields)
+                    != policy.model_dump(mode="json", exclude=release_fields)
+                    or not isinstance(fact, BudgetObservation)
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or fact.active_call_control_ids):
+                return False
+            cursor = await connection.execute(
+                "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+            busy = await cursor.fetchone()
+            await cursor.close()
+            if (busy != (0,) or self._pragma_int(await self._pragma_scalar("user_version"))
+                    != BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION
+                    or await self._application_schema_objects()
+                    != _EXPECTED_BUDGETED_AUDIO_BUDGET_SCHEMA):
+                return False
+            # This release rotation cannot finance a call or advance spend floors.
+            # Both columns change in the existing owner's atomic transaction only.
+            cursor = await connection.execute(
+                "UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=? "
+                "WHERE slot=? AND policy_sha256=? AND policy_json=? AND used_calls=? "
+                "AND openrouter_floor=? AND telnyx_floor=? "
+                "AND suspended=0 AND paid_call_control_id IS NULL",
+                (policy.model_dump_json(), policy.sha256, ORIGINAL_PILOT_SLOT,
+                 row[0], row[6], row[1], row[2], row[3]),
+            )
+            if cursor.rowcount != 1:
+                raise FatalPersistenceError("owned_budget_release_conflict")
+            await cursor.close()
+            self._owned_budget_observation = None
+            return True
         if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls"}:
             seventh = action == "extend-seventh-call"
             budgeted = action == "enable-budgeted-calls"
@@ -2158,6 +2212,7 @@ class PersistenceWriter:
     async def freeze_call_publication_v2(
         self, operation: VoiceOperationV2, result: MessageResultV1 | None, *, generation: UUID,
         provider_callback: str | None, result_permitted: Callable[[], bool] | None = None,
+        collection_quiesced: bool = False, result_outcome: str | None = None,
     ) -> VoiceOperationV2 | None:
         if (
             self._contract_version != 2 or not isinstance(operation, VoiceOperationV2)
@@ -2168,7 +2223,8 @@ class PersistenceWriter:
             raise PersistenceError("final_call_v2_refused")
         value = await self._content_request("freeze_v2", call_id=operation.call_id,
             operation=operation, message_result=result, generation=generation,
-            provider_callback=provider_callback, result_permitted=result_permitted)
+            provider_callback=provider_callback, result_permitted=result_permitted,
+            collection_quiesced=collection_quiesced, result_outcome=result_outcome)
         if value is False:
             raise PersistenceError("final_call_v2_refused")
         if value is not None and not isinstance(value, VoiceOperationV2):
@@ -2673,7 +2729,47 @@ class PersistenceWriter:
                 )
             except ValueError:
                 return False
-        payload_values = payload.model_dump(mode="python", exclude={"message_result"})
+        # Only the joined session may attest producer quiescence. Recovery freezes omit it.
+        if values.get("collection_quiesced") is True and values.get("result_outcome") is not None:
+            audio: dict[str, object] | None = None
+            gaps = ["transcript_loss"] if retained.loss_count else []
+            if pin.policy == "off":
+                audio = {"state": "off"}
+            elif not pin.available:
+                audio = {"state": "unavailable"}
+            elif pin.denied and pin.choice_state == "off":
+                audio = {"state": "declined"}
+            elif pin.terminal_finished:
+                cursor = await connection.execute(
+                    "SELECT op_id,deployment_id,key_version,nonce,ciphertext "
+                    "FROM local_audio_terminal WHERE call_id=? AND kind='audio.finish'",
+                    (str(call_id),))
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row is not None:
+                    aad = operation_aad_from_metadata({"schema_version": 2,
+                        "operation_id": row[0], "deployment_id": row[1],
+                        "call_id": str(call_id), "kind": "audio.finish"})
+                    terminal = decode_operation_v2(self._keyring.decrypt(
+                        EncryptedValue(row[2], row[3], row[4]), aad=aad))
+                    if isinstance(terminal.payload, AudioFinishPayloadV2):
+                        audio = {"state": "terminal", "recording_id": pin.recording_id,
+                            "last_sequence": terminal.payload.last_sequence,
+                            "total_samples": terminal.payload.total_samples,
+                            "reason": terminal.payload.reason}
+                        if terminal.payload.reason != "complete":
+                            gaps.append("audio_partial")
+            if audio is not None:
+                outcome = ("present" if "message_result" in changes else "fenced"
+                    if facts.transfer_fenced or values.get("result_outcome") == "fenced"
+                    else "absent" if values.get("result_outcome") == "empty" else "failed")
+                if outcome in {"failed", "fenced"}:
+                    gaps.append("result_unavailable")
+                changes["collection"] = CollectionV1.model_validate({"schema_version": 1,
+                    "episode_id": generation,
+                    "expected_turn_ids": sorted((t.turn_id for t in retained.turns), key=str),
+                    "result_outcome": outcome, "audio": audio, "gaps": sorted(gaps)})
+        payload_values = payload.model_dump(mode="python", exclude={"message_result", "collection"})
         payload_values.update(changes)
         operation = VoiceOperationV2.model_validate({
             **operation.model_dump(mode="python"),
@@ -3763,8 +3859,18 @@ class PersistenceWriter:
         current_command: PersistenceCommand | None = None
         current_owned = False
         try:
-            self._database_path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = await aiosqlite.connect(self._database_path)
+            if self._release_rebind_only:
+                # A release command cannot create a store or run startup migrations.
+                self._connection = await aiosqlite.connect(
+                    self._database_path.resolve().as_uri() + "?mode=rw", uri=True)
+                if (self._pragma_int(await self._pragma_scalar("user_version"))
+                        != BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION
+                        or await self._application_schema_objects()
+                        != _EXPECTED_BUDGETED_AUDIO_BUDGET_SCHEMA):
+                    raise FatalPersistenceError("writer_contract_mismatch")
+            else:
+                self._database_path.parent.mkdir(parents=True, exist_ok=True)
+                self._connection = await aiosqlite.connect(self._database_path)
             await self._initialize_owner_connection()
             await self._initialize_budget_schema()
             await self._discover_stale_leases()
