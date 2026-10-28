@@ -235,6 +235,9 @@ class _FailingAllowedValueMapping(Mapping[str, object]):
         "LOGURU_DIAGNOSE",
         "TELNYX_LOG",
         "TELNYX_BASE_URL",
+        "TELNYX_CLIENT_ID",
+        "TELNYX_CLIENT_SECRET",
+        "TELNYX_CUSTOM_HEADERS",
         "OPENAI_LOG",
     ],
 )
@@ -257,6 +260,22 @@ def test_ambient_base_url_forbidden_before_capture(value: str) -> None:
     with pytest.raises(RuntimeError, match="^runtime_environment_forbidden$"):
         runtime_config.capture_runtime_environment(mapping)
     assert mapping.reads == {}
+
+
+@pytest.mark.parametrize(
+    "key", ["TELNYX_CLIENT_ID", "TELNYX_CLIENT_SECRET", "TELNYX_CUSTOM_HEADERS"]
+)
+@pytest.mark.parametrize("value", ["", "fake-ambient-sdk-value"])
+def test_ambient_sdk_auth_input_forbidden_before_capture(key: str, value: str) -> None:
+    runtime_config = _runtime_config()
+    mapping = _CountingMapping({**valid_environment(), key: value})
+
+    with pytest.raises(RuntimeError, match="^runtime_environment_forbidden$") as caught:
+        runtime_config.capture_runtime_environment(mapping)
+
+    assert mapping.reads == {}
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_capture_reads_every_allowed_value_exactly_once_and_no_unknown_value() -> None:
