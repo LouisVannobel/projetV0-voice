@@ -132,6 +132,62 @@ def test_invalid_api_region_never_constructs_client(monkeypatch, region):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", ["https://api.telnyx.com/v2", "https://api.telnyx.eu/v2"])
+@pytest.mark.parametrize(
+    ("environment", "uses_oauth", "authorization", "custom_header"),
+    [
+        (
+            {"TELNYX_CLIENT_ID": "fake-client-id", "TELNYX_CLIENT_SECRET": "fake-client-secret"},
+            True,
+            f"Bearer {API_KEY}",
+            None,
+        ),
+        (
+            {
+                "TELNYX_CUSTOM_HEADERS": (
+                    "Authorization: Bearer fake-ambient-header\nX-Fake-Ambient: fake-header"
+                )
+            },
+            False,
+            "Bearer fake-ambient-header",
+            "fake-header",
+        ),
+    ],
+)
+async def test_real_pinned_sdk_explicit_options_still_inherit_ambient_auth_inputs(
+    monkeypatch, base_url, environment, uses_oauth, authorization, custom_header
+):
+    # Give only the SDK a synthetic environment without inspecting or copying the process one.
+    sdk_module = importlib.import_module("telnyx._client")
+    monkeypatch.setattr(sdk_module, "os", SimpleNamespace(environ=environment))
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        raise AssertionError("constructor characterization must not issue requests")
+
+    http_client = telnyx.DefaultAsyncHttpxClient(
+        trust_env=False, transport=httpx.MockTransport(handler)
+    )
+    client = telnyx.AsyncTelnyx(
+        api_key=API_KEY, base_url=base_url, max_retries=0, http_client=http_client
+    )
+    try:
+        assert client.api_key == API_KEY
+        assert str(client.base_url) == f"{base_url}/"
+        assert client.max_retries == 0
+        assert http_client.trust_env is False
+        assert client.client_id == ("fake-client-id" if uses_oauth else None)
+        assert client.client_secret == ("fake-client-secret" if uses_oauth else None)
+        assert isinstance(client.custom_auth, httpx.Auth) is uses_oauth
+        assert client.default_headers["Authorization"] == authorization
+        assert client.default_headers.get("X-Fake-Ambient") == custom_header
+        assert requests == []
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("region", "host"),
     [(None, "api.telnyx.com"), ("global", "api.telnyx.com"), ("EU", "api.telnyx.eu")],
