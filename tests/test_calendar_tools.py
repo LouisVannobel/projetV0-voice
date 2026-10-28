@@ -30,7 +30,34 @@ def api(name):
         ("D’accord. C’est bon ! Merci.", True),
         ("Je confirme, c'est bon, merci beaucoup.", True),
         ("Ouais, c’est bon.", True),
+        ("Oui, nickel, merci.", True),
+        ("Ouais, super, merci beaucoup !", True),
+        ("Oui, c'est bon, oui.", True),
+        ("Oui, oui, je confirme.", True),
+        ("Oui… je confirme… merci !", True),
+        ("Oui, je confirme. C'est un peu long.", True),
+        ("Ouais, je confirme. Ça devient long.", True),
+        ("Ouais, je confirme, c'est chiant.", True),
+        ("Oui, je confirme. Mince, c'est chiant.", True),
+        ("Oui, je confirme. Purée, c'est un peu long, là.", True),
+        ("Ouais, je confirme. Purée, ça devient long là.", True),
         ("Oui, je ne confirme pas.", False),
+        ("Oui, nickel, merci, mais vendredi.", False),
+        ("Ouais, super, merci si c'est à onze heures.", False),
+        ("Oui, c'est bon, oui, plutôt demain.", False),
+        ("Oui, oui, je ne confirme pas.", False),
+        ("Oui… je ne confirme pas.", False),
+        ("Oui… si vous décalez d'une heure.", False),
+        ("Oui, je confirme. C'est un peu long ?", False),
+        ("Ouais, je confirme. Ça devient long, annulez.", False),
+        ("Oui, je confirme. Mince, c'est chiant, annulez.", False),
+        ("Oui, mince, c'est chiant.", False),
+        ("Oui, je confirme. Purée, c'est un peu long, là, mais vendredi.", False),
+        ("Ouais, je confirme. Purée, ça devient long là ?", False),
+        ("Oui, je confirme. C'est un peu cher.", False),
+        ("Oui, c'est un peu long.", False),
+        ('Oui. "Super". Merci.', False),
+        ("Il a dit oui, nickel, merci.", False),
         ("Ouais, parfait, merci, mais jeudi.", False),
         ("Oui si vous pouvez changer l'heure.", False),
         ("Oui ?", False),
@@ -58,6 +85,9 @@ def test_only_full_affirmative(text, expected):
 
 @pytest.mark.parametrize("text,expected", [
     ("Oui. Je confirme ?", True), ("D’accord, c’est bon ?", True),
+    ("Oui, nickel, merci ?", True), ("Oui, c'est bon, oui ?", True),
+    ("Oui, je confirme. C'est un peu long ?", True),
+    ("Ouais, je confirme. Ça devient long, annulez.", False),
     ("Oui. Je ne confirme pas.", False), ("Oui ! Mais jeudi.", False),
     ("Oui. Si vous changez l'heure.", False), ('Oui. "Je confirme".', False),
 ])
@@ -316,6 +346,8 @@ async def native_recap(fixture, sink, *, mixed=False):
 @pytest.mark.parametrize("affirmative", [
     "Oui, je confirme.", "Ouais, parfait, merci.", "Ouais, parfait. Merci.",
     "Oui ! Je confirme. Merci beaucoup !", "D’accord, c’est bon, merci.",
+    "Oui, nickel, merci.", "Oui, c'est bon, oui.",
+    "Ouais, je confirme. Purée, ça devient long là.",
 ])
 async def test_native_recap_ack_affirmative_submits_exact_persisted_rows_without_inference(
     mixed, affirmative,
@@ -1159,5 +1191,138 @@ async def test_native_preflight_refusal_after_scope_departure_is_silent(departur
             assert len(fixture.peers.texts) == text_count
             assert len(sink.submitted) == 1 and not sink.booked.is_set()
             assert fixture.session._calendar_pending_booking is None
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "day,utc_hour,offset,date_label,suppress_speech",
+    [
+        ("2031-01-15", 14, "+01:00", "mercredi 15 janvier", False),
+        ("2031-07-17", 13, "+02:00", "jeudi 17 juillet", True),
+    ],
+    ids=["winter-announced", "summer-interrupted-before-announcement"],
+)
+async def test_next_caller_context_keeps_local_calendar_offers_even_without_native_announcement(
+    monkeypatch, day, utc_hour, offset, date_label, suppress_speech,
+):
+    import asyncio
+    import json
+    from dataclasses import replace
+
+    from tests.integration.test_call_session import _native_sparra_opening, session_module
+    from tests.integration.test_voice_action_authority import active, caller, tool
+
+    fixed_now = datetime.fromisoformat(f"{day}T{utc_hour - 1:02d}:30:00+00:00")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(session_module, "datetime", Clock)
+    offers = [
+        {
+            "offerId": str(uuid4()), "serviceId": "lamp-check",
+            "serviceName": "Réglage des phares", "timezone": "Europe/Paris",
+            "start": f"{day}T{utc_hour + index // 2:02d}:{index % 2 * 30:02d}:00Z",
+            "end": f"{day}T{utc_hour + (index + 1) // 2:02d}:{(index + 1) % 2 * 30:02d}:00Z",
+            "expiresAt": (fixed_now + timedelta(minutes=5)).isoformat(),
+        }
+        for index in range(3)
+    ]
+
+    class Sink:
+        def __init__(self):
+            self.submitted = []
+
+        async def calendar_catalog(self, call_id):
+            return calendar.CalendarCatalog.model_validate({
+                "schema_version": 1, "call_id": str(call_id), "policy_revision": 1,
+                "timezone": "Europe/Paris", "services": [{
+                    "service_id": "lamp-check", "name": "Réglage des phares",
+                    "duration_minutes": 30,
+                }],
+            })
+
+        async def calendar_submit(self, _call_id, operation_id, request):
+            self.submitted.append(request)
+            assert request["kind"] == "find_slots", "an offer context must never create a booking"
+            return calendar.CalendarResult.model_validate({
+                "state": "offered", "operationId": str(operation_id), "offers": offers,
+            })
+
+    sink = Sink()
+    async with _native_sparra_opening(calendar_sink=sink) as fixture:
+        await active(fixture)
+        context_ready, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        callbacks = []
+        handler = fixture.session._calendar_tool
+
+        async def observe_callback(params):
+            async def callback(result, *, properties):
+                callbacks.append(properties.run_llm)
+
+                async def on_context_updated():
+                    context_ready.set()
+
+                await params.result_callback(
+                    result, properties=replace(properties, on_context_updated=on_context_updated),
+                )
+                if suppress_speech:
+                    await release.wait()
+
+            try:
+                await handler(replace(params, result_callback=callback))
+            finally:
+                finished.set()
+
+        fixture.llm.register_function("find_slots", observe_callback)
+        fixture.peers.tool_calls = [tool("find_slots", "fictional-local-offers", json.dumps({
+            "serviceId": "lamp-check", "windowStart": f"{day}T00:00:00{offset}",
+            "windowEnd": f"{day}T23:59:59{offset}",
+        }))]
+        try:
+            await caller(fixture, "Quelles heures proposez-vous aujourd’hui pour les phares ?")
+            await asyncio.wait_for(context_ready.wait(), 3)
+            if not suppress_speech:
+                await until(lambda: any(
+                    "Quel créneau choisissez-vous" in text for text in fixture.peers.texts
+                ))
+                await asyncio.wait_for(finished.wait(), 3)
+            assert len(fixture.peers.conversations) == 1
+            fixture.peers.tool_calls = None
+            await caller(fixture, "Rappelez-moi les trois heures proposées pour aujourd’hui.")
+            await until(lambda: len(fixture.peers.conversations) == 2)
+            release.set()
+            await asyncio.wait_for(finished.wait(), 3)
+            messages = fixture.peers.conversations[-1]["messages"]
+            retained = next(
+                json.loads(message["content"]) for message in messages
+                if message.get("role") == "tool"
+                and message.get("tool_call_id") == "fictional-local-offers"
+            )
+            assert retained["state"] == "offered"
+            assert len(retained["offers"]) == 3
+            expected_hours = [("15:00:00", "15:30:00"), ("15:30:00", "16:00:00"),
+                              ("16:00:00", "16:30:00")]
+            expected_speech = ["de 15 h à 15 h 30", "de 15 h 30 à 16 h", "de 16 h à 16 h 30"]
+            for index, (start, end) in enumerate(expected_hours):
+                offer = retained["offers"][index]
+                assert offer["start"] == offers[index]["start"]
+                assert offer["end"] == offers[index]["end"]
+                assert offer["offerId"] == offers[index]["offerId"]
+                assert offer["startLocal"] == f"{day}T{start}{offset}"
+                assert offer["endLocal"] == f"{day}T{end}{offset}"
+                assert offer["appointmentLabel"] == (
+                    f"Réglage des phares, {date_label} {expected_speech[index]}, heure de Paris"
+                )
+            assert callbacks == [False]
+            assert len(sink.submitted) == 1
+            assert fixture.session._calendar_playback.attempt is None
+            assert fixture.session._calendar_pending_booking is None
+            if suppress_speech:
+                assert not any("Je peux proposer" in text for text in fixture.peers.texts)
         finally:
             release.set()

@@ -15,6 +15,7 @@ from enum import Enum, auto
 from importlib.metadata import version
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
@@ -979,8 +980,6 @@ class CallSession:
         catalog = self._calendar_catalog
         if catalog is None:
             return ""
-        from zoneinfo import ZoneInfo
-
         now = datetime.now(UTC).astimezone(ZoneInfo(catalog.timezone))
         return (
             "Le programme peut maintenant proposer et réserver avec les outils Calendar. "
@@ -1053,6 +1052,18 @@ class CallSession:
                                     offer.offerId: offer for offer in response.offers
                                 }
                                 result = response.model_dump(mode="json", exclude_none=True)
+                                # Tool results remain in later caller context even when
+                                # interruption suppresses the separate native announcement.
+                                zone = ZoneInfo(catalog.timezone)
+                                result["offers"] = [
+                                    {
+                                        **offer.model_dump(mode="json"),
+                                        "startLocal": offer.start.astimezone(zone).isoformat(),
+                                        "endLocal": offer.end.astimezone(zone).isoformat(),
+                                        "appointmentLabel": appointment_label(offer),
+                                    }
+                                    for offer in response.offers
+                                ]
                                 speech = (
                                     (
                                         "Je peux proposer : "

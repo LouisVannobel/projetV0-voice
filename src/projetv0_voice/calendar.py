@@ -224,16 +224,19 @@ async def await_calendar_result(
 
 
 _AFFIRMATIVE = re.compile(
-    r"(?:oui|ouais|je confirme|d'accord)"
-    r"(?: (?:je confirme|parfait|très bien|c'est bon))?"
+    r"(?:(?:oui|ouais|je confirme|d'accord)"
+    r"(?: (?:oui|ouais|je confirme|parfait|très bien|c'est bon|nickel|super)){0,2}"
     r"(?: merci(?: beaucoup)?)?"
+    # These exact asides require an explicit confirmation, never just a yes prefix.
+    r"|(?:oui|ouais) je confirme (?:(?:mince|purée) )?"
+    r"(?:c'est un peu long|ça devient long|c'est chiant)(?: là)?)"
 )
 
 
 def is_affirmative(text: str) -> bool:
     # Match the entire utterance: a correction, condition, question or negation
     # must never inherit consent from an affirmative prefix.
-    normalized = " ".join(re.sub(r"[,.!]", " ", text.casefold().replace("’", "'")).split())
+    normalized = " ".join(re.sub(r"[,.!…]", " ", text.casefold().replace("’", "'")).split())
     return _AFFIRMATIVE.fullmatch(normalized) is not None
 
 
