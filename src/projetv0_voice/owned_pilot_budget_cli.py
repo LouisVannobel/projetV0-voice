@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
+from projetv0_voice.owned_pilot_budget import MAX_BUDGET_CALLS
 from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.production_wiring import _budget_factory, build_production_factories
 from projetv0_voice.qualified_profile import (
@@ -51,8 +52,16 @@ async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[
 
 async def operate(action: str, *, predecessor_retired: bool,
                   expected_policy_sha256: str | None = None,
+                  expected_used_calls: int | None = None,
                   predecessor_qualified_profile_path: str | None = None,
                   predecessor_image_digest: str | None = None) -> bool:
+    if action == "enable-reported-spend" and (
+        not predecessor_retired or expected_policy_sha256 is None
+        or len(expected_policy_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
+        or type(expected_used_calls) is not int or not 0 <= expected_used_calls < MAX_BUDGET_CALLS
+    ):
+        return False
     if action == "rebind-release" and (
         not predecessor_retired or expected_policy_sha256 is None
         or len(expected_policy_sha256) != 64
@@ -72,7 +81,8 @@ async def operate(action: str, *, predecessor_retired: bool,
     selection = factories.load_profile(settings, manifest, datetime.now(UTC))
     if manifest.sparra is None or not isinstance(selection.profile, QualifiedDeploymentProfileV1):
         raise RuntimeError("owned_budget_operator_refused")
-    if (action in {"extend-seventh-call", "enable-budgeted-calls", "rebind-release"}
+    if (action in {"extend-seventh-call", "enable-budgeted-calls", "rebind-release",
+                   "enable-reported-spend"}
             and manifest.sparra.operation_contract_version != 2):
         raise RuntimeError("owned_budget_operator_refused")
     predecessor_profile_sha256 = None
@@ -100,6 +110,7 @@ async def operate(action: str, *, predecessor_retired: bool,
         process_agent_id=manifest.agent_id,
         process_deployment_id=settings.deployment_id,
         release_rebind_only=action == "rebind-release",
+        existing_budget_only=action == "enable-reported-spend",
     )
     or_key = factories.read_secret(settings.openrouter_api_key_file)
     tel_key = factories.read_secret(settings.telnyx_api_key_file)
@@ -126,7 +137,7 @@ async def operate(action: str, *, predecessor_retired: bool,
     submitted = False
     try:
         if not await writer.wait_ready():
-            if action == "rebind-release":
+            if action in {"rebind-release", "enable-reported-spend"}:
                 # The refusal event precedes connection close; join startup cleanup
                 # before asking the unchanged shutdown path to drain a closed owner.
                 await asyncio.wait({owner}, timeout=_WRITER_CLOSE_SECONDS)
@@ -135,17 +146,23 @@ async def operate(action: str, *, predecessor_retired: bool,
             submitted = True
             return await writer.owned_budget_request("suspend") is True
         if (action not in {"enroll", "extend-sixth-call", "extend-seventh-call",
-                           "enable-budgeted-calls", "rebind-release"}
+                           "enable-budgeted-calls", "rebind-release", "enable-reported-spend"}
                 or not predecessor_retired):
             return False
         if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
-                      "rebind-release"} and (
+                      "rebind-release", "enable-reported-spend"} and (
             expected_policy_sha256 is None or len(expected_policy_sha256) != 64
             or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
         ):
             return False
         fact = await gate.collect()
         submitted = True
+        if action == "enable-reported-spend":
+            return await writer.owned_budget_request(
+                action, observation=fact, predecessor_retired=True,
+                expected_policy_sha256=expected_policy_sha256,
+                expected_used_calls=expected_used_calls,
+            ) is True
         if action == "rebind-release":
             return await writer.owned_budget_request(
                 action, observation=fact, predecessor_retired=True,
@@ -188,9 +205,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Original Sparra budget operator transition")
     parser.add_argument("action", choices=(
         "enroll", "suspend-restored", "extend-sixth-call", "extend-seventh-call",
-        "enable-budgeted-calls", "rebind-release",
+        "enable-budgeted-calls", "rebind-release", "enable-reported-spend",
     ))
     parser.add_argument("--expected-policy-sha256")
+    parser.add_argument("--expected-used-calls", type=int)
     parser.add_argument("--predecessor-qualified-profile-path")
     parser.add_argument("--predecessor-image-digest")
     parser.add_argument(
@@ -200,15 +218,19 @@ def main() -> int:
     )
     args = parser.parse_args()
     if (args.action in {"enroll", "extend-sixth-call", "extend-seventh-call",
-                       "enable-budgeted-calls", "rebind-release"}
+                       "enable-budgeted-calls", "rebind-release", "enable-reported-spend"}
             and not args.predecessor_retired):
         parser.error(f"{args.action} requires --predecessor-retired")
     if args.action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
-                       "rebind-release"} and (
+                       "rebind-release", "enable-reported-spend"} and (
         args.expected_policy_sha256 is None or len(args.expected_policy_sha256) != 64
         or any(c not in "0123456789abcdef" for c in args.expected_policy_sha256)
     ):
         parser.error(f"{args.action} requires --expected-policy-sha256 (64 lowercase hex)")
+    if args.action == "enable-reported-spend" and (
+        args.expected_used_calls is None or not 0 <= args.expected_used_calls < MAX_BUDGET_CALLS
+    ):
+        parser.error("enable-reported-spend requires --expected-used-calls within SQLite bounds")
     if args.action == "rebind-release":
         if (not args.predecessor_qualified_profile_path
                 or not (PurePosixPath(args.predecessor_qualified_profile_path).is_absolute()
@@ -217,7 +239,13 @@ def main() -> int:
         if not args.predecessor_image_digest:
             parser.error("rebind-release requires --predecessor-image-digest")
     try:
-        if args.action == "rebind-release":
+        if args.action == "enable-reported-spend":
+            accepted = asyncio.run(operate(
+                args.action, predecessor_retired=args.predecessor_retired,
+                expected_policy_sha256=args.expected_policy_sha256,
+                expected_used_calls=args.expected_used_calls,
+            ))
+        elif args.action == "rebind-release":
             accepted = asyncio.run(operate(
                 args.action, predecessor_retired=args.predecessor_retired,
                 expected_policy_sha256=args.expected_policy_sha256,

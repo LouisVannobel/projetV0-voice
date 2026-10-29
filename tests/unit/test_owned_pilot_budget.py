@@ -271,6 +271,45 @@ def test_explicit_null_budget_retains_forecast_after_a_cheap_eighth_call():
     assert budget_policy().total_calls == 5
 
 
+def test_reported_mode_is_explicit_and_preserves_legacy_policy_hash():
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    previous = budgeted_policy()
+    assert previous.sha256 == "9554376b0a27e543dad98ef03a74458d0ebd36deacf0e7e1d2abc1d3afc30e0d"
+    assert "admission_accounting" not in previous.model_dump_json()
+    policy = budgeted_policy(admission_accounting="reported")
+    assert policy.sha256 != previous.sha256
+    assert affordable(policy, budgeted_observation(), 8,
+                      reported_floors=(D("0.33"), D("3.30")))
+    assert not affordable(previous, budgeted_observation(), 8,
+                          reported_floors=(D("0.33"), D("3.30")))
+    for limit in (5, 6, 7):
+        with pytest.raises(ValueError):
+            budgeted_policy(total_calls=limit, admission_accounting="reported")
+
+
+@pytest.mark.parametrize("provider,guard", [
+    ("openrouter", "cash"), ("openrouter", "cap"), ("openrouter", "key"),
+    ("telnyx", "cash"), ("telnyx", "cap"),
+])
+def test_reported_mode_keeps_independent_cap_cash_and_key_checks(provider, guard):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    policy = budgeted_policy(admission_accounting="reported")
+    index = provider == "telnyx"
+    reserve = D("0.50" if index else "0.75")
+    raw = D("3.30" if index else "0.33")
+    effective = 5 - reserve if guard == "cap" else D("4.20")
+    for shortfall, allowed in ((D("0"), True), (D("0.000001"), False)):
+        floors = [D("0.33"), D("3.30")]
+        floors[index] = effective + (shortfall if guard == "cap" else 0)
+        field = provider + ("_available_cash_usd" if guard == "cash"
+                            else "_limit_remaining_usd")
+        changes = {} if guard == "cap" else {field: effective - raw + reserve - shortfall}
+        assert affordable(policy, budgeted_observation(**changes), 8,
+                          reported_floors=tuple(floors)) is allowed
+
+
 @pytest.mark.parametrize("provider,guard", [
     ("openrouter", "cash"), ("openrouter", "cap"), ("openrouter", "key"),
     ("telnyx", "cash"), ("telnyx", "cap"),

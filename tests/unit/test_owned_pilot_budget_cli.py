@@ -350,6 +350,96 @@ def test_operator_unknown_outcome_is_not_printed_as_refusal(monkeypatch, capsys)
     assert capsys.readouterr().out == "owned_budget_transition_unknown\n"
 
 
+def test_reported_operator_forwards_exact_hash_and_count(monkeypatch, capsys):
+    import sys
+
+    calls = []
+
+    async def operate(action, **values):
+        calls.append((action, values))
+        return True
+
+    monkeypatch.setattr(cli, "operate", operate)
+    monkeypatch.setattr(sys, "argv", ["budget", "enable-reported-spend",
+        "--predecessor-retired", "--expected-policy-sha256", "e" * 64,
+        "--expected-used-calls", "8"])
+    assert cli.main() == 0
+    assert calls == [("enable-reported-spend", {
+        "predecessor_retired": True, "expected_policy_sha256": "e" * 64,
+        "expected_used_calls": 8,
+    })]
+    assert capsys.readouterr().out == "owned_budget_transition_accepted\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_exists", [False, True])
+async def test_reported_operator_requires_existing_store_and_uses_real_native_cas(
+    tmp_path, monkeypatch, store_exists,
+):
+    from projetv0_voice.persistence.schema import BUDGETED_AUDIO_BUDGET_SCHEMA_SQL
+
+    profile = QualifiedDeploymentProfileV1.model_validate_json(
+        (Path(__file__).parents[1] / "fixtures/qualified-deployment-profile-v1.json").read_text()
+    )
+    settings = replace(_settings(), sqlite_path=tmp_path / "voice.sqlite",
+        runtime_contract_sha256=profile.runtime_contract_sha256, image_digest=profile.image_digest,
+        agent_bundle_sha256=profile.agent_bundle_sha256,
+        inference_profile_sha256=profile.inference_profile_sha256)
+    secrets = (SecretStr("offline-or"), SecretStr("offline-tel"))
+    identity = replace(observation().identity,
+        openrouter_credential_sha256=hashlib.sha256(b"offline-or").hexdigest(),
+        telnyx_credential_sha256=hashlib.sha256(b"offline-tel").hexdigest())
+    previous = budget_policy(total_calls=None, identity=identity,
+        deployment_id=settings.deployment_id,
+        runtime_contract_sha256=settings.runtime_contract_sha256,
+        image_digest=settings.image_digest, agent_bundle_sha256=settings.agent_bundle_sha256,
+        inference_profile_sha256=settings.inference_profile_sha256,
+        qualified_profile_sha256=canonical_qualified_profile_sha256(profile))
+    policy = previous.model_copy(update={"admission_accounting": "reported"})
+    if store_exists:
+        with sqlite3.connect(settings.sqlite_path) as db:
+            db.executescript(BUDGETED_AUDIO_BUDGET_SCHEMA_SQL)
+            db.execute("INSERT INTO owned_pilot_budget VALUES(?,?,?,?,?,?,?,?)", (
+                "sparra-original-pilot", previous.model_dump_json(), previous.sha256,
+                8, "0", "0", 0, None))
+    factories = SimpleNamespace(
+        validate_artifacts=lambda _: None,
+        load_manifest=lambda _: SimpleNamespace(agent_id="fixture", dids=[identity.did],
+            sparra=SimpleNamespace(operation_contract_version=2,
+                                  connection_id=identity.connection_id)),
+        load_profile=lambda *_: SimpleNamespace(profile=profile),
+        load_keyring=lambda _: CryptoKeyring({1: KEY}, active_version=1),
+        read_secret=lambda path: (
+            secrets[0] if path == settings.openrouter_api_key_file else secrets[1]),
+    )
+    monkeypatch.setattr(cli, "capture_runtime_environment", lambda _: None)
+    monkeypatch.setattr(cli, "parse_runtime_settings", lambda _: settings)
+    monkeypatch.setattr(cli, "build_production_factories", lambda _: factories)
+    flags = []
+
+    def writer(path, keyring, **values):
+        flags.append(values["existing_budget_only"])
+        return PersistenceWriter(path, keyring, **values, utcnow=lambda: NOW)
+
+    async def collect():
+        return replace(observation(), identity=identity)
+
+    monkeypatch.setattr(cli, "PersistenceWriter", writer)
+    monkeypatch.setattr(cli, "_budget_factory", lambda _settings, writer, *_:
+        OwnedPilotBudgetGate(writer, policy, collect, utcnow=lambda: NOW))
+    assert await cli.operate("enable-reported-spend", predecessor_retired=True,
+        expected_policy_sha256=previous.sha256, expected_used_calls=8) is store_exists
+    assert flags == [True]
+    if store_exists:
+        with sqlite3.connect(settings.sqlite_path) as db:
+            assert db.execute("PRAGMA user_version").fetchone() == (15,)
+            row = db.execute("SELECT policy_json,policy_sha256,used_calls,openrouter_floor,"
+                "telnyx_floor,suspended,paid_call_control_id FROM owned_pilot_budget").fetchone()
+            assert row == (policy.model_dump_json(), policy.sha256, 8, "0", "0", 0, None)
+    else:
+        assert not settings.sqlite_path.exists()
+
+
 @pytest.mark.parametrize("action", ["enroll", "extend-seventh-call"])
 def test_operator_hard_exit_is_bounded_when_real_owner_cannot_join(tmp_path, action):
     import os
@@ -442,7 +532,7 @@ asyncio.run(main())
     ],
 )
 @pytest.mark.parametrize("action", [
-    "extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
+    "extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls", "enable-reported-spend",
 ])
 def test_extension_operator_requires_explicit_flags_before_runtime(
     monkeypatch, capsys, options, message, action

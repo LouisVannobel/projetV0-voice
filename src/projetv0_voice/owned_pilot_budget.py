@@ -49,6 +49,9 @@ class OwnedPilotBudgetPolicy(BaseModel):
     identity: BudgetObservationIdentity = Field(repr=False)
     cost_scope: Literal["original-dedicated-account-key"] = "original-dedicated-account-key"
     total_calls: Literal[5, 6, 7] | None = 5
+    admission_accounting: Literal["reported"] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     openrouter_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     telnyx_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     paid_until: datetime
@@ -72,6 +75,7 @@ class OwnedPilotBudgetPolicy(BaseModel):
             or self.paid_until > self.identity.openrouter_expires_at_utc
             or not self.image_digest
             or not self.deployment_id
+            or self.admission_accounting is not None and self.total_calls is not None
             or not _exact_money(self.openrouter_anchor_usd)
             or not _exact_money(self.telnyx_anchor_usd)
             or any(
@@ -159,6 +163,7 @@ def affordable(
         return False
     with localcontext() as ctx:
         ctx.prec = 128
+        forecast_count = 0 if policy.admission_accounting == "reported" else count
         remaining_reserves = tuple(
             max(reserve - count * forecast, minimum) if policy.total_calls is None
             else reserve - count * forecast
@@ -175,13 +180,13 @@ def affordable(
             reported_floors,
             strict=True,
         ):
-            effective = max(floor, spent, anchor + count * forecast)
+            effective = max(floor, spent, anchor + forecast_count * forecast)
             if (effective + remaining_reserve > 5
                     or cash - (effective - spent) < remaining_reserve):
                 return False
         gap = max(
             reported_floors[0], fact.openrouter_reported_spend_usd,
-            policy.openrouter_anchor_usd + count * FORECASTS[0],
+            policy.openrouter_anchor_usd + forecast_count * FORECASTS[0],
         )
         return (
             fact.openrouter_limit_remaining_usd - (gap - fact.openrouter_reported_spend_usd)
