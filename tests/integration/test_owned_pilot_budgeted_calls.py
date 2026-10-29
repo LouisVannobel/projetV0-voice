@@ -248,13 +248,29 @@ async def test_enablement_rollback_keeps_exact_schema14_and_history(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["before", "after"])
+@pytest.mark.parametrize("reported", [False, True])
 async def test_pending_eighth_admission_restricts_committed_without_publishing_permit(
-    tmp_path, monkeypatch, stage,
+    tmp_path, monkeypatch, stage, reported,
 ):
-    seed_seven(tmp_path / "voice.sqlite")
-    async with registry_case(tmp_path) as case:
-        gate = await bind_budgeted(case)
-        assert await enable(case.writer) and await gate.refresh()
+    policy = candidate(admission_accounting="reported" if reported else None)
+    clock = [NOW]
+    if reported:
+        seed_release(tmp_path / "voice.sqlite", policy=policy, used_calls=8)
+    else:
+        seed_seven(tmp_path / "voice.sqlite")
+    async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
+        gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
+        if reported:
+            clock[0] += timedelta(microseconds=1)
+
+            async def collect():
+                return budgeted_observation(collection_started_at_utc=clock[0],
+                                            collection_finished_at_utc=clock[0])
+
+            gate.collect = collect
+        else:
+            assert await enable(case.writer)
+        assert await gate.refresh()
         entered, release = asyncio.Event(), asyncio.Event()
         native_commit = case.writer._connection.commit
 
@@ -275,13 +291,13 @@ async def test_pending_eighth_admission_restricts_committed_without_publishing_p
             assert previous.admission_available and not pending.admission_available
             assert not gate.ready and not case.provider.actions and not case.begins
             assert not admission.done()
-            assert budget_rows(case.path)[0][0] == (8 if stage == "after" else 7)
+            assert budget_rows(case.path)[0][0] == (8 if stage == "after" else 7) + reported
         finally:
             release.set()
             assert (await admission).status_code == 200
         monkeypatch.setattr(case.writer._connection, "commit", native_commit)
         permit = saved_permit(case.path, "eighth")
-        assert permit.ordinal == 8 and gate.permits(permit) and not gate.ready
+        assert permit.ordinal == 8 + reported and gate.permits(permit) and not gate.ready
 
 
 @pytest.mark.asyncio
@@ -448,6 +464,163 @@ async def rebind_release(writer, **changes):
         "predecessor_qualified_profile_sha256": candidate().qualified_profile_sha256,
         "predecessor_image_digest": candidate().image_digest, **changes,
     })
+
+
+async def enable_reported(writer, **changes):
+    return await writer.owned_budget_request("enable-reported-spend", **{
+        "observation": budgeted_observation(), "predecessor_retired": True,
+        "expected_policy_sha256": candidate().sha256, "expected_used_calls": 8, **changes,
+    })
+
+
+@pytest.mark.asyncio
+async def test_reported_opt_in_conserves_eight_native_calls_and_requires_new_collection(tmp_path):
+    await exhausted_seven(tmp_path)
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case)
+        assert await enable(case.writer) and await gate.refresh()
+        await native_call(case, 8)
+    before_rows, schema, version = authority(tmp_path / "voice.sqlite")
+    policy = candidate(admission_accounting="reported")
+    clock = [NOW]
+
+    async def collect():
+        return budgeted_observation(collection_started_at_utc=clock[0],
+                                    collection_finished_at_utc=clock[0])
+
+    async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
+        gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
+        gate.collect = collect
+        assert not gate.ready
+        assert await enable_reported(case.writer)
+        expected = dict(before_rows)
+        row = list(before_rows["owned_pilot_budget"][0])
+        row[1:3] = [policy.model_dump_json(), policy.sha256]
+        expected["owned_pilot_budget"] = [tuple(row)]
+        assert authority(case.path) == (expected, schema, version)
+        assert version == (15,) and budget_rows(case.path)[0][0] == 8
+        assert not await enable_reported(case.writer)
+        assert not gate.ready and not await gate.refresh()
+        clock[0] += timedelta(microseconds=1)
+        assert await gate.refresh()
+        await native_call(case, 9)
+        assert budget_rows(case.path)[0][0] == 9 and not gate.ready
+        clock[0] += timedelta(microseconds=1)
+        assert await gate.refresh()
+    before_restart = authority(tmp_path / "voice.sqlite")
+    async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
+        gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
+        gate.collect = collect
+        assert authority(case.path) == before_restart
+        assert not gate.ready and not await gate.refresh()
+        clock[0] += timedelta(microseconds=1)
+        assert await gate.refresh()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [
+    "hash", "count", "retired", "paid_intent", "suspended", "carrier", "stale",
+    "anchor", "schema", "rebind_only",
+])
+async def test_reported_opt_in_refuses_wrong_predecessor_or_exposure(tmp_path, invalid):
+    path = tmp_path / "voice.sqlite"
+    seed_release(path, used_calls=8, **{
+        "paid_intent": {"paid_call_control_id": "unknown"},
+        "suspended": {"suspended": 1},
+    }.get(invalid, {}))
+    policy = candidate(admission_accounting="reported", **{
+        "anchor": {"openrouter_anchor_usd": Decimal("0.31")},
+    }.get(invalid, {}))
+    async with registry_case(tmp_path) as case:
+        await bind_budgeted(case, policy=policy)
+        if invalid == "schema":
+            with sqlite3.connect(path) as db:
+                db.execute("PRAGMA user_version=14")
+        before = authority(path)
+        changes = {
+            "hash": {"expected_policy_sha256": "a" * 64},
+            "count": {"expected_used_calls": 7},
+            "retired": {"predecessor_retired": False},
+            "carrier": {"observation": budgeted_observation(
+                active_call_control_ids=frozenset({"active"}))},
+            "stale": {"observation": budgeted_observation(
+                collection_started_at_utc=NOW - timedelta(seconds=61))},
+        }.get(invalid, {})
+        if invalid == "rebind_only":
+            assert not await rebind_release(case.writer)
+        else:
+            assert not await enable_reported(case.writer, **changes)
+        assert authority(path) == before
+
+
+@pytest.mark.asyncio
+async def test_reported_late_collection_cannot_survive_later_paid_intent_resolution(
+    tmp_path, monkeypatch,
+):
+    policy = candidate(admission_accounting="reported")
+    seed_release(tmp_path / "voice.sqlite", policy=policy, used_calls=8)
+    clock = [NOW]
+
+    async def collect():
+        return budgeted_observation(collection_started_at_utc=clock[0],
+                                    collection_finished_at_utc=clock[0])
+
+    async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
+        gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
+        gate.collect = collect
+        clock[0] += timedelta(microseconds=1)
+        assert await gate.refresh()
+        assert (await committed(case.registry, case.writer,
+                    event(occurred_at=NOW, call_control_id="ninth"))).status_code == 200
+        permit = saved_permit(case.path, "ninth")
+        assert permit.ordinal == 9 and gate.permits(permit)
+        assert await gate.dispatch(permit)
+        assert not gate.ready
+        assert await case.writer.owned_budget_request("settled", call_control_id="foreign")
+        assert gate.permits(permit), "foreign settlement must preserve an active observation"
+        native_command = case.writer._owned_budget_command
+
+        async def defer_settlement(payload):
+            if payload.get("action") == "settled":
+                return True
+            return await native_command(payload)
+
+        monkeypatch.setattr(case.writer, "_owned_budget_command", defer_settlement)
+        clock[0] += timedelta(seconds=1)
+        await committed(case.registry, case.writer,
+            event("call.hangup", occurred_at=NOW, call_control_id="ninth"))
+        assert budget_rows(case.path)[0][3] == "ninth"
+        clock[0] += timedelta(microseconds=1)
+        late = await collect()  # Started after terminalization, before paid-intent resolution.
+        monkeypatch.setattr(case.writer, "_owned_budget_command", native_command)
+        clock[0] += timedelta(seconds=1)
+        assert await case.writer.owned_budget_request("settled", call_control_id="ninth")
+        assert budget_rows(case.path)[0][3] is None
+        assert not await case.writer.owned_budget_request("observe", observation=late)
+        assert not gate.ready
+        clock[0] += timedelta(microseconds=1)
+        assert await gate.refresh(), "unchanged spending may reopen only after a new collection"
+        assert await case.writer.owned_budget_request("settled", call_control_id="ninth")
+        assert gate.ready, "a repeated settlement must not invalidate the new observation"
+        assert budget_rows(case.path)[0][0] == 9
+
+
+@pytest.mark.asyncio
+async def test_reported_unknown_paid_intent_survives_restart_and_cheap_observations(tmp_path):
+    policy = candidate(admission_accounting="reported")
+    path = tmp_path / "voice.sqlite"
+    seed_release(path, policy=policy, used_calls=8, paid_call_control_id="unknown")
+    before = authority(path)
+    clock = [NOW]
+    for _ in range(2):
+        async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
+            gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
+            clock[0] += timedelta(seconds=1)
+            fact = budgeted_observation(collection_started_at_utc=clock[0],
+                                        collection_finished_at_utc=clock[0])
+            assert not await case.writer.owned_budget_request("observe", observation=fact)
+            assert not gate.ready and authority(path) == before
+            assert not case.provider.actions and not case.begins
 
 
 @pytest.mark.asyncio

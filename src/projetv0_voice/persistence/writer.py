@@ -520,10 +520,15 @@ class PersistenceWriter:
         process_deployment_id: str | None = None,
         default_phone_region: Literal["FR"] | None = None,
         release_rebind_only: bool = False,
+        existing_budget_only: bool = False,
     ) -> None:
         if type(release_rebind_only) is not bool or release_rebind_only and contract_version != 2:
             raise ValueError("invalid_release_rebind_contract")
         self._release_rebind_only = release_rebind_only
+        if (type(existing_budget_only) is not bool
+                or existing_budget_only and contract_version != 2):
+            raise ValueError("invalid_existing_budget_contract")
+        self._existing_budget_only = existing_budget_only
         if default_phone_region not in (None, "FR"):
             raise ValueError("invalid_result_phone_region")
         self._default_phone_region: Literal["FR"] | None = default_phone_region
@@ -557,6 +562,7 @@ class PersistenceWriter:
         self._utcnow = utcnow
         self._owned_budget_policy: OwnedPilotBudgetPolicy | None = None
         self._owned_budget_observation: BudgetObservation | None = None
+        self._owned_budget_observe_after: datetime | None = None
         self._owned_budget_start_envelope = 335.0
         self._owned_budget_snapshot = OwnedPilotBudgetSnapshot()
         self._owned_budget_pending_snapshot: OwnedPilotBudgetSnapshot | None = None
@@ -814,9 +820,24 @@ class PersistenceWriter:
         if self._owned_budget_policy is not None and self._owned_budget_policy != policy:
             raise ValueError("owned_budget_binding_changed")
         self._owned_budget_policy = policy
+        self._invalidate_reported_budget_observation()
         if not math.isfinite(start_envelope_seconds) or start_envelope_seconds < 300:
             raise ValueError("owned_budget_envelope_invalid")
         self._owned_budget_start_envelope = start_envelope_seconds
+
+    def _invalidate_reported_budget_observation(self) -> None:
+        if (self._owned_budget_policy is not None
+                and self._owned_budget_policy.admission_accounting == "reported"):
+            self._owned_budget_observation = None
+            now = self._utcnow()
+            self._owned_budget_observe_after = max(self._owned_budget_observe_after or now, now)
+
+    def _owned_budget_collection_current(self, fact: BudgetObservation) -> bool:
+        policy = self._owned_budget_policy
+        return policy is None or policy.admission_accounting is None or (
+            self._owned_budget_observe_after is not None
+            and fact.collection_started_at_utc > self._owned_budget_observe_after
+        )
 
     async def owned_budget_request(self, action: str, **values: object) -> object:
         result: asyncio.Future[object] = asyncio.get_running_loop().create_future()
@@ -849,7 +870,7 @@ class PersistenceWriter:
         busy = await cursor.fetchone()
         await cursor.close()
         return OwnedPilotBudgetSnapshot(
-            fact, state[3] is None and busy == (0,)
+            fact, state[3] is None and busy == (0,) and self._owned_budget_collection_current(fact)
             and affordable(policy, fact, state[0], reported_floors=floors), floors)
 
     async def _owned_budget_command(self, payload: Mapping[str, object]) -> object:
@@ -877,6 +898,54 @@ class PersistenceWriter:
                 return None
             if not reported_floors_valid(floors):
                 return None
+        if action == "enable-reported-spend":
+            fact = payload.get("observation")
+            if (self._contract_version != 2 or row is None or floors is None
+                    or policy.total_calls is not None or policy.admission_accounting != "reported"
+                    or row[4] or row[5] is not None
+                    or payload.get("predecessor_retired") is not True
+                    or payload.get("expected_policy_sha256") != row[0]
+                    or type(payload.get("expected_used_calls")) is not int
+                    or payload.get("expected_used_calls") != row[1]):
+                return False
+            try:
+                predecessor = OwnedPilotBudgetPolicy.model_validate_json(row[6])
+                validated = OwnedPilotBudgetPolicy.model_validate_json(policy.model_dump_json())
+            except ValueError:
+                return False
+            if (predecessor.admission_accounting is not None or predecessor.total_calls is not None
+                    or predecessor.sha256 != row[0] or validated != policy
+                    or predecessor.model_dump_json() != row[6]
+                    or policy.model_dump_json(exclude={"admission_accounting"}) != row[6]
+                    or not isinstance(fact, BudgetObservation)
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or fact.active_call_control_ids
+                    or (policy.paid_until - self._utcnow()).total_seconds()
+                    < self._owned_budget_start_envelope
+                    or not affordable(policy, fact, row[1], reported_floors=floors)):
+                return False
+            cursor = await connection.execute(
+                "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+            busy = await cursor.fetchone()
+            await cursor.close()
+            if (busy != (0,) or self._pragma_int(await self._pragma_scalar("user_version"))
+                    != BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION
+                    or await self._application_schema_objects()
+                    != _EXPECTED_BUDGETED_AUDIO_BUDGET_SCHEMA):
+                return False
+            cursor = await connection.execute(
+                "UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=? "
+                "WHERE slot=? AND policy_sha256=? AND policy_json=? AND used_calls=? "
+                "AND openrouter_floor=? AND telnyx_floor=? "
+                "AND suspended=0 AND paid_call_control_id IS NULL",
+                (policy.model_dump_json(), policy.sha256, ORIGINAL_PILOT_SLOT,
+                 row[0], row[6], row[1], row[2], row[3]),
+            )
+            if cursor.rowcount != 1:
+                raise FatalPersistenceError("owned_budget_accounting_conflict")
+            await cursor.close()
+            self._invalidate_reported_budget_observation()
+            return True
         if action == "rebind-release":
             fact = payload.get("observation")
             if (self._contract_version != 2 or row is None or floors is None
@@ -1046,17 +1115,22 @@ class PersistenceWriter:
         if action == "state":
             return (row[1], row[2], row[3], row[5])
         if action == "settled":
-            await connection.execute(
+            cursor = await connection.execute(
                 "UPDATE owned_pilot_budget SET paid_call_control_id=NULL "
                 "WHERE slot=? AND paid_call_control_id=?",
                 (ORIGINAL_PILOT_SLOT, payload.get("call_control_id")),
             )
+            changed = cursor.rowcount == 1
+            await cursor.close()
+            if changed:
+                self._invalidate_reported_budget_observation()
             return True
         if action == "observe":
             fact = payload.get("observation")
             self._owned_budget_observation = None
             if (not isinstance(fact, BudgetObservation)
-                    or not observation_valid(policy, fact, self._utcnow())):
+                    or not observation_valid(policy, fact, self._utcnow())
+                    or not self._owned_budget_collection_current(fact)):
                 return None
             floors = (max(floors[0], fact.openrouter_reported_spend_usd),
                       max(floors[1], fact.telnyx_reported_spend_usd))
@@ -1109,6 +1183,7 @@ class PersistenceWriter:
         state = await self._owned_budget_command({"action": "state"})
         if (not isinstance(state, tuple) or state[3] is not None
                 or not observation_valid(policy, fact, self._utcnow())
+                or not self._owned_budget_collection_current(fact)
                 or not affordable(policy, fact, state[0],
                                   reported_floors=(Decimal(state[1]), Decimal(state[2])))
                 or (policy.paid_until - self._utcnow()).total_seconds()
@@ -3859,7 +3934,7 @@ class PersistenceWriter:
         current_command: PersistenceCommand | None = None
         current_owned = False
         try:
-            if self._release_rebind_only:
+            if self._release_rebind_only or self._existing_budget_only:
                 # A release command cannot create a store or run startup migrations.
                 self._connection = await aiosqlite.connect(
                     self._database_path.resolve().as_uri() + "?mode=rw", uri=True)
@@ -3877,6 +3952,7 @@ class PersistenceWriter:
             if not await self._perform_quick_check():
                 raise FatalPersistenceError("quick_check_failed")
             self._check_storage_limit()
+            self._invalidate_reported_budget_observation()
             self._queue_watchdog_task = asyncio.create_task(
                 self._watch_queue_age(),
                 name="voice-persistence-queue-watchdog",
@@ -5136,6 +5212,16 @@ class PersistenceWriter:
             """,
             (state, _iso(expires_at), _iso(closed_at) if closed_at else None, call_control_id),
         )
+        if (state == "terminal" and self._owned_budget_policy is not None
+                and self._owned_budget_policy.admission_accounting == "reported"):
+            cursor = await connection.execute(
+                "SELECT budget_permit_json FROM call_leases WHERE call_control_id=?",
+                (call_control_id,),
+            )
+            budgeted = await cursor.fetchone()
+            await cursor.close()
+            if budgeted is not None and budgeted[0] is not None:
+                self._invalidate_reported_budget_observation()
 
     async def _discover_stale_leases(self) -> None:
         connection = self._require_owner_connection()
