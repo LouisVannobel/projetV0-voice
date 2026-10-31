@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import importlib
+import json
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -334,7 +335,14 @@ async def test_documented_charges_data_wrapper_has_same_arithmetic():
 @pytest.mark.asyncio
 async def test_original_accounting_scope_is_chunked_without_gaps_after_31_days():
     now = datetime(2026, 11, 15, 12, tzinfo=UTC)
-    observation, requests = await collect(utcnow=lambda: now)
+
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            return httpx.Response(200, json=response_for(request), headers={
+                "x-ratelimit-remaining": "1", "x-ratelimit-reset": "1",
+            })
+
+    observation, requests = await collect(handler, utcnow=lambda: now)
     usage = [r for r in requests if r.url.path == "/v2/usage_reports"
              and r.url.params["product"] == "call-control"]
     assert [(r.url.params["start_date"], r.url.params["end_date"]) for r in usage] == [
@@ -346,6 +354,174 @@ async def test_original_accounting_scope_is_chunked_without_gaps_after_31_days()
         ("2026-09-30", "2026-10-31"), ("2026-10-31", "2026-11-16"),
     ]
     assert observation.telnyx_reported_spend_usd == Decimal("0.74")
+
+
+class CollectionClock:
+    def __init__(self):
+        self.tick = 100.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.tick
+
+    async def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.tick += seconds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header_prefixes", [("x-ratelimit",), ("ratelimit",),
+                                           ("x-ratelimit", "ratelimit")])
+@pytest.mark.parametrize("body_seconds", [0, 0.4, 1.2])
+async def test_charge_ranges_respect_provider_window_from_header_receipt(
+    monkeypatch, header_prefixes, body_seconds,
+):
+    clock = CollectionClock()
+    monkeypatch.setattr(api().asyncio, "sleep", clock.sleep)
+    charge_ticks = []
+
+    class ChargeBody(httpx.AsyncByteStream):
+        def __init__(self, request):
+            self.body = json.dumps(response_for(request)).encode()
+
+        async def __aiter__(self):
+            clock.tick += body_seconds
+            yield self.body
+
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            charge_ticks.append(clock.tick)
+            if len(charge_ticks) > 1 and charge_ticks[-1] - charge_ticks[-2] < 1:
+                return httpx.Response(429, text="synthetic exhausted charge-report window")
+            # The final response needs no metadata because no further range is requested.
+            headers = {f"{prefix}-{name}": value
+                       for prefix in header_prefixes
+                       for name, value in (("limit", "1, 1;w=1"), ("remaining", "0"),
+                                           ("reset", "1"))} if len(charge_ticks) == 1 else {}
+            return httpx.Response(200, headers=headers, stream=ChargeBody(request))
+
+    now = datetime(2026, 10, 31, 12, tzinfo=UTC)
+    observation, requests = await collect(handler, utcnow=lambda: now,
+                                          monotonic=clock.monotonic)
+    assert charge_ticks == pytest.approx([100, 100 + max(1, body_seconds)])
+    assert clock.sleeps == pytest.approx([1 - body_seconds] if body_seconds < 1 else [])
+    charges = [r for r in requests if r.url.path == "/v2/charges_breakdown"]
+    assert [(r.url.params["start_date"], r.url.params["end_date"]) for r in charges] == [
+        ("2026-09-30", "2026-10-31"), ("2026-10-31", "2026-11-01"),
+    ]
+    assert {r.url.params["product"] for r in requests
+            if r.url.path == "/v2/usage_reports"} == set(PRODUCTS)
+    assert observation.telnyx_reported_spend_usd == Decimal("0.74")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+    {},
+    {"x-ratelimit-remaining": "0"},
+    {"x-ratelimit-reset": "1"},
+    {"x-ratelimit-remaining": "-1", "x-ratelimit-reset": "1"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "-1"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1.5"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "NaN"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "Infinity"},
+    {"x-ratelimit-remaining": "0, 1", "x-ratelimit-reset": "1"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1", "ratelimit-reset": "2"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1", "ratelimit-remaining": "1"},
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1", "ratelimit-reset": "invalid"},
+])
+async def test_unsafe_charge_pacing_metadata_refuses_before_next_range(headers):
+    charges = []
+
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            charges.append(request)
+            return httpx.Response(200, json=response_for(request), headers=headers)
+
+    with pytest.raises(api().BudgetObservationUnavailable) as error:
+        await collect(handler, utcnow=lambda: datetime(2026, 10, 31, 12, tzinfo=UTC))
+    assert str(error.value) == "Budget observation unavailable"
+    assert error.value.__suppress_context__
+    assert len(charges) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_charge_range_does_not_require_pacing_metadata():
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            return httpx.Response(200, json=response_for(request), headers={
+                "x-ratelimit-remaining": "invalid", "x-ratelimit-reset": "invalid",
+            })
+
+    observation, requests = await collect(handler)
+    assert observation.telnyx_reported_spend_usd == Decimal("0.37")
+    assert len([r for r in requests if r.url.path == "/v2/charges_breakdown"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["does_not_fit", "sleep_exhausts_deadline", "cancelled"])
+async def test_charge_cooldown_stops_before_second_get_on_deadline_or_cancellation(
+    monkeypatch, kind,
+):
+    clock = CollectionClock()
+    charges = []
+
+    async def sleep(seconds):
+        await clock.sleep(seconds)
+        if kind == "cancelled":
+            raise asyncio.CancelledError()
+        if kind == "sleep_exhausts_deadline":
+            clock.tick = 115
+
+    monkeypatch.setattr(api().asyncio, "sleep", sleep)
+
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            charges.append(request)
+            if kind == "does_not_fit":
+                clock.tick = 114.5
+            return httpx.Response(200, json=response_for(request), headers={
+                "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1",
+            })
+
+    expected = asyncio.CancelledError if kind == "cancelled" else api().BudgetObservationUnavailable
+    with pytest.raises(expected):
+        await collect(handler, utcnow=lambda: datetime(2026, 10, 31, 12, tzinfo=UTC),
+                      monotonic=clock.monotonic)
+    assert len(charges) == 1
+    assert clock.sleeps == ([] if kind == "does_not_fit" else [1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake_tick", [100.999, 101, 101.001])
+async def test_charge_cooldown_rechecks_not_before_after_timer_wakes(monkeypatch, wake_tick):
+    clock = CollectionClock()
+    charge_ticks = []
+
+    async def sleep(seconds):
+        await clock.sleep(seconds)
+        clock.tick = wake_tick
+
+    monkeypatch.setattr(api().asyncio, "sleep", sleep)
+
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            charge_ticks.append(clock.tick)
+            return httpx.Response(200, json=response_for(request), headers={
+                "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1",
+            })
+
+    now = datetime(2026, 10, 31, 12, tzinfo=UTC)
+    if wake_tick < 101:
+        with pytest.raises(api().BudgetObservationUnavailable) as error:
+            await collect(handler, utcnow=lambda: now, monotonic=clock.monotonic)
+        assert str(error.value) == "Budget observation unavailable"
+        assert error.value.__suppress_context__
+        assert charge_ticks == [100]
+    else:
+        observation, _ = await collect(handler, utcnow=lambda: now, monotonic=clock.monotonic)
+        assert charge_ticks == [100, wake_tick]
+        assert observation.telnyx_reported_spend_usd == Decimal("0.74")
+    assert clock.sleeps == [1]
 
 
 @pytest.mark.asyncio

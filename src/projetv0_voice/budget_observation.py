@@ -120,6 +120,20 @@ def _stamp(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
+def _charge_cooldown(headers: httpx.Headers) -> int:
+    values: dict[str, int] = {}
+    for name in ("remaining", "reset"):
+        present = [value.strip() for prefix in ("x-ratelimit", "ratelimit")
+                   if (value := headers.get(f"{prefix}-{name}")) is not None]
+        _need(bool(present) and all(len(value) <= 128
+                                   and re.fullmatch(r"[0-9]+", value) is not None
+                                   for value in present))
+        numbers = {int(value) for value in present}
+        _need(len(numbers) == 1)
+        values[name] = numbers.pop()
+    return values["reset"] if values["remaining"] == 0 else 0
+
+
 async def collect_budget_observation(
     client: httpx.AsyncClient,
     *,
@@ -178,6 +192,7 @@ async def _collect(
         _need(hashlib.sha256(value.encode()).hexdigest() == fingerprint)
 
     provenance = hashlib.sha256()
+    charge_not_before: float | None = None
 
     def remaining() -> float:
         tick = monotonic()
@@ -186,9 +201,21 @@ async def _collect(
 
     async def get(
         provider: str, path: str, params: dict[str, str | int] | None = None,
+        *, next_charge: bool = False,
     ) -> dict[str, object]:
+        nonlocal charge_not_before
         base, secret = (("https://openrouter.ai", openrouter_key) if provider == "openrouter"
                         else ("https://api.telnyx.com", telnyx_key))
+        if provider == "telnyx" and path == "/v2/charges_breakdown" \
+                and charge_not_before is not None:
+            time_left = remaining()
+            delay = max(0.0, charge_not_before - (deadline - time_left))
+            _need(delay < time_left)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            tick = monotonic()
+            _need(math.isfinite(tick)
+                  and charge_not_before <= tick < deadline)
         timeout = remaining()
         async with asyncio.timeout(timeout), client.stream(
             "GET", base + path, params=params,
@@ -196,6 +223,9 @@ async def _collect(
             auth=None, follow_redirects=False, timeout=timeout,
         ) as response:
             _need(response.status_code == 200)
+            if next_charge:
+                received_tick = deadline - remaining()
+                charge_not_before = received_tick + _charge_cooldown(response.headers)
             body = bytearray()
             async for chunk in response.aiter_bytes():
                 _need(len(body) + len(chunk) <= _MAX_BODY)
@@ -279,7 +309,7 @@ async def _collect(
         charges = await get("telnyx", "/v2/charges_breakdown", {
             "start_date": charge_start.isoformat(), "end_date": charge_end.isoformat(),
             "format": "json",
-        })
+        }, next_charge=charge_end < charge_until)
         # Original authenticated reader uses top-level fields; generated SDK uses data.
         if "data" in charges:
             _need("currency" not in charges and "results" not in charges)
