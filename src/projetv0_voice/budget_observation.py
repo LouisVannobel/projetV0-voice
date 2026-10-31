@@ -213,6 +213,9 @@ async def _collect(
             _need(delay < time_left)
             if delay > 0:
                 await asyncio.sleep(delay)
+            tick = monotonic()
+            _need(math.isfinite(tick)
+                  and charge_not_before <= tick < deadline)
         timeout = remaining()
         async with asyncio.timeout(timeout), client.stream(
             "GET", base + path, params=params,

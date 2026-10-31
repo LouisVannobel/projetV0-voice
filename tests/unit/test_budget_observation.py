@@ -492,6 +492,39 @@ async def test_charge_cooldown_stops_before_second_get_on_deadline_or_cancellati
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wake_tick", [100.999, 101, 101.001])
+async def test_charge_cooldown_rechecks_not_before_after_timer_wakes(monkeypatch, wake_tick):
+    clock = CollectionClock()
+    charge_ticks = []
+
+    async def sleep(seconds):
+        await clock.sleep(seconds)
+        clock.tick = wake_tick
+
+    monkeypatch.setattr(api().asyncio, "sleep", sleep)
+
+    def handler(request):
+        if request.url.path == "/v2/charges_breakdown":
+            charge_ticks.append(clock.tick)
+            return httpx.Response(200, json=response_for(request), headers={
+                "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1",
+            })
+
+    now = datetime(2026, 10, 31, 12, tzinfo=UTC)
+    if wake_tick < 101:
+        with pytest.raises(api().BudgetObservationUnavailable) as error:
+            await collect(handler, utcnow=lambda: now, monotonic=clock.monotonic)
+        assert str(error.value) == "Budget observation unavailable"
+        assert error.value.__suppress_context__
+        assert charge_ticks == [100]
+    else:
+        observation, _ = await collect(handler, utcnow=lambda: now, monotonic=clock.monotonic)
+        assert charge_ticks == [100, wake_tick]
+        assert observation.telnyx_reported_spend_usd == Decimal("0.74")
+    assert clock.sleeps == [1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/v2/usage_reports", "/v2/phone_numbers"])
 async def test_unqualified_multiple_pages_are_refused(path):
     def handler(request):
