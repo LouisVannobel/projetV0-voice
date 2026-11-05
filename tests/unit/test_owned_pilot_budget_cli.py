@@ -660,7 +660,8 @@ def test_release_operator_forwards_the_exact_predecessor_tuple_and_cas(monkeypat
         "malformed_store")],
     *[("renew-validity", invalid) for invalid in (
         None, "previous_image", "previous_runtime", "missing_store", "legacy_store",
-        "malformed_store", "cancel_commit", "cancel_rollback", "timeout_commit", "active_window")],
+        "malformed_store", "cancel_commit", "cancel_rollback", "timeout_commit", "active_window",
+        "native_close")],
 ])
 async def test_release_operator_loads_both_native_profile_bindings_before_real_cas(
     tmp_path, monkeypatch, action, invalid,
@@ -725,6 +726,22 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
     monkeypatch.setattr(cli, "parse_runtime_settings", lambda _: settings)
     entered, release = asyncio.Event(), asyncio.Event()
     instances = []
+    close_faults, statements = [], []
+
+    class CloseProbeWriter(PersistenceWriter):
+        async def _initialize_owner_connection(self):
+            await super()._initialize_owner_connection()
+            connection = self._connection
+            await connection.set_trace_callback(statements.append)
+            if not close_faults:
+                native_close = connection.close
+
+                async def close():
+                    await native_close()
+                    close_faults.append(True)
+                    raise OSError("offline native close acknowledgement failure")
+
+                monkeypatch.setattr(connection, "close", close)
 
     def writer_factory(path, keys, **values):
         async def pause(name):
@@ -741,7 +758,8 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
                     if invalid == "cancel_rollback":
                         raise RuntimeError("offline renewal rollback after cancellation")
 
-        writer = PersistenceWriter(path, keys, **values, utcnow=lambda: NOW, failpoint=pause,
+        writer_class = CloseProbeWriter if invalid == "native_close" else PersistenceWriter
+        writer = writer_class(path, keys, **values, utcnow=lambda: NOW, failpoint=pause,
             control_commit_timeout_seconds=0.03 if invalid == "timeout_commit" else 1)
         instances.append(writer)
         return writer
@@ -764,6 +782,20 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
         with pytest.raises(ValueError, match="does not match the injected value"):
             await cli.operate(action, **arguments)
         assert authority(settings.sqlite_path) == before
+    elif invalid == "native_close":
+        with pytest.raises(cli.OwnedPilotBudgetOutcomeUnknown,
+                           match="^owned_budget_transition_unknown$"):
+            await cli.operate(action, **arguments)
+        assert close_faults == [True] and instances[0].is_degraded
+        assert instances[0]._closed_event.is_set()
+        after = authority(settings.sqlite_path)
+        row = list(before[0]["owned_pilot_budget"][0])
+        row[1:3] = [policy.model_dump_json(), policy.sha256]
+        assert after == (before[0] | {"owned_pilot_budget": [tuple(row)]}, before[1], before[2])
+        assert sum(sql.startswith("UPDATE owned_pilot_budget ") for sql in statements) == 1
+        assert await cli.operate(action, **arguments) == "target_observed"
+        assert len(collections) == 1 and authority(settings.sqlite_path) == after
+        assert sum(sql.startswith("UPDATE owned_pilot_budget ") for sql in statements) == 1
     elif invalid in {"cancel_commit", "cancel_rollback", "timeout_commit"}:
         task = asyncio.create_task(cli.operate(action, **arguments))
         await asyncio.wait_for(entered.wait(), 2)
@@ -806,7 +838,8 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
     expected_validated = [settings, replace(settings,
         qualified_profile_path=PurePosixPath(previous_path.as_posix()),
         image_digest=arguments["predecessor_image_digest"])]
-    repeated = action == "renew-validity" and invalid in {None, "cancel_commit", "timeout_commit"}
+    repeated = action == "renew-validity" and invalid in {
+        None, "cancel_commit", "timeout_commit", "native_close"}
     assert validated == expected_validated * (2 if repeated else 1)
 
 

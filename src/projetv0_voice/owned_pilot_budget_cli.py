@@ -54,7 +54,7 @@ async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[
         print("owned_budget_transition_unknown", flush=True)
         os._exit(1)
     await owner
-    if failed:
+    if failed or (join_failed_owner and writer.is_degraded):
         raise RuntimeError("owned_budget_writer_close_failed") from None
 
 
@@ -219,7 +219,7 @@ async def operate(action: str, *, predecessor_retired: bool,
         raise
     finally:
         cleanup = asyncio.create_task(_close_operator_writer(
-            writer, owner, join_failed_owner=action == "renew-validity"))
+            writer, owner, join_failed_owner=action == "renew-validity" and submitted))
         cancellation: asyncio.CancelledError | None = None
         while not cleanup.done():
             try:
