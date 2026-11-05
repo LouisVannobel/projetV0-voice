@@ -7,6 +7,7 @@ import inspect
 import json
 from dataclasses import fields, replace
 from datetime import timedelta
+from functools import partial
 from pathlib import Path, PurePosixPath
 from uuid import UUID
 
@@ -14,6 +15,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from projetv0_voice import lifecycle
 from projetv0_voice.config import AgentManifestV1
 from projetv0_voice.crypto import CryptoKeyring
 from projetv0_voice.lifecycle import (
@@ -23,6 +25,7 @@ from projetv0_voice.lifecycle import (
     build_production_runtime,
 )
 from projetv0_voice.metrics import RuntimeMetrics
+from projetv0_voice.persistence.writer import PersistenceWriter
 from projetv0_voice.qualified_profile import QualifiedDeploymentProfileV1
 from projetv0_voice.runtime_config import (
     RuntimeSettingsV1,
@@ -283,10 +286,16 @@ async def build_archive_graph(
     )
     if audit is not None:
         audit.update(events=events, consumers=consumers)
+
+    def utcnow():
+        return NOW.replace(minute=2)
+
+    # Keep the native writer on the same logical clock as the rest of this graph.
+    monkeypatch.setattr(lifecycle, "PersistenceWriter", partial(PersistenceWriter, utcnow=utcnow))
     graph = await build_production_runtime(
         settings,
         factories=factories,
-        utcnow=lambda: NOW.replace(minute=2),
+        utcnow=utcnow,
         shutdown_timeout_seconds=0.6,
     )
     return graph, events, requests, consumers, entered, cancelled

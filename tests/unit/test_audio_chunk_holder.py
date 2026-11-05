@@ -35,6 +35,17 @@ DEADLINE = NOW + timedelta(days=30)
 CALL, WORKSPACE, RECORDING, GENERATION = (UUID(int=value) for value in (1, 2, 3, 4))
 
 
+@pytest.fixture(autouse=True)
+def fixed_holder_clock(monkeypatch):
+    # Keep holder timestamps and expiry checks on the real writer fixture's clock.
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(audio_capture, "datetime", Clock)
+
+
 def snapshot():
     return BeginCallSnapshotV2.model_validate({
         "schema_version": 2, "workspace_id": str(WORKSPACE), "call_id": str(CALL),
