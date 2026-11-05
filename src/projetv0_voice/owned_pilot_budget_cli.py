@@ -8,8 +8,9 @@ import hashlib
 import os
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from projetv0_voice.owned_pilot_budget import MAX_BUDGET_CALLS
 from projetv0_voice.persistence.writer import PersistenceWriter
@@ -30,7 +31,8 @@ class OwnedPilotBudgetOutcomeUnknown(RuntimeError):
         super().__init__("owned_budget_transition_unknown")
 
 
-async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[None]) -> None:
+async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[None], *,
+                                 join_failed_owner: bool = False) -> None:
     failed = False
     try:
         # Degradation does not stop the owner loop. Drain still queues shutdown
@@ -38,7 +40,13 @@ async def _close_operator_writer(writer: PersistenceWriter, owner: asyncio.Task[
         await writer.drain(_WRITER_CLOSE_SECONDS)
     except BaseException:
         failed = True
-        owner.cancel()
+        # A failed renewal can already be closing SQLite after rollback. Give
+        # that owner its bounded join before cancellation can interrupt close.
+        done: set[asyncio.Task[None]] = set()
+        if join_failed_owner:
+            done, _ = await asyncio.wait({owner}, timeout=_WRITER_CLOSE_SECONDS)
+        if owner not in done:
+            owner.cancel()
     done, _ = await asyncio.wait({owner}, timeout=_WRITER_CLOSE_SECONDS)
     if owner not in done:
         # Like the runtime's hard-exit boundary, an uncloseable native SQLite
@@ -54,7 +62,9 @@ async def operate(action: str, *, predecessor_retired: bool,
                   expected_policy_sha256: str | None = None,
                   expected_used_calls: int | None = None,
                   predecessor_qualified_profile_path: str | None = None,
-                  predecessor_image_digest: str | None = None) -> bool:
+                  predecessor_image_digest: str | None = None,
+                  target_paid_until: datetime | None = None
+                  ) -> bool | Literal["accepted", "target_observed"]:
     if action == "enable-reported-spend" and (
         not predecessor_retired or expected_policy_sha256 is None
         or len(expected_policy_sha256) != 64
@@ -62,7 +72,7 @@ async def operate(action: str, *, predecessor_retired: bool,
         or type(expected_used_calls) is not int or not 0 <= expected_used_calls < MAX_BUDGET_CALLS
     ):
         return False
-    if action == "rebind-release" and (
+    if action in {"rebind-release", "renew-validity"} and (
         not predecessor_retired or expected_policy_sha256 is None
         or len(expected_policy_sha256) != 64
         or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
@@ -70,6 +80,12 @@ async def operate(action: str, *, predecessor_retired: bool,
         or not (PurePosixPath(predecessor_qualified_profile_path).is_absolute()
                 or Path(predecessor_qualified_profile_path).is_absolute())
         or not predecessor_image_digest
+    ):
+        return False
+    if action == "renew-validity" and (
+        type(expected_used_calls) is not int or not 0 <= expected_used_calls < MAX_BUDGET_CALLS
+        or not isinstance(target_paid_until, datetime)
+        or target_paid_until.utcoffset() != timedelta(0)
     ):
         return False
     settings = parse_runtime_settings(capture_runtime_environment(os.environ))
@@ -82,11 +98,11 @@ async def operate(action: str, *, predecessor_retired: bool,
     if manifest.sparra is None or not isinstance(selection.profile, QualifiedDeploymentProfileV1):
         raise RuntimeError("owned_budget_operator_refused")
     if (action in {"extend-seventh-call", "enable-budgeted-calls", "rebind-release",
-                   "enable-reported-spend"}
+                   "enable-reported-spend", "renew-validity"}
             and manifest.sparra.operation_contract_version != 2):
         raise RuntimeError("owned_budget_operator_refused")
     predecessor_profile_sha256 = None
-    if action == "rebind-release":
+    if action in {"rebind-release", "renew-validity"}:
         assert predecessor_qualified_profile_path is not None
         assert predecessor_image_digest is not None
         predecessor_settings = replace(
@@ -110,7 +126,7 @@ async def operate(action: str, *, predecessor_retired: bool,
         process_agent_id=manifest.agent_id,
         process_deployment_id=settings.deployment_id,
         release_rebind_only=action == "rebind-release",
-        existing_budget_only=action == "enable-reported-spend",
+        existing_budget_only=action in {"enable-reported-spend", "renew-validity"},
     )
     or_key = factories.read_secret(settings.openrouter_api_key_file)
     tel_key = factories.read_secret(settings.telnyx_api_key_file)
@@ -137,7 +153,7 @@ async def operate(action: str, *, predecessor_retired: bool,
     submitted = False
     try:
         if not await writer.wait_ready():
-            if action in {"rebind-release", "enable-reported-spend"}:
+            if action in {"rebind-release", "enable-reported-spend", "renew-validity"}:
                 # The refusal event precedes connection close; join startup cleanup
                 # before asking the unchanged shutdown path to drain a closed owner.
                 await asyncio.wait({owner}, timeout=_WRITER_CLOSE_SECONDS)
@@ -146,14 +162,34 @@ async def operate(action: str, *, predecessor_retired: bool,
             submitted = True
             return await writer.owned_budget_request("suspend") is True
         if (action not in {"enroll", "extend-sixth-call", "extend-seventh-call",
-                           "enable-budgeted-calls", "rebind-release", "enable-reported-spend"}
+                           "enable-budgeted-calls", "rebind-release", "enable-reported-spend",
+                           "renew-validity"}
                 or not predecessor_retired):
             return False
         if action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
-                      "rebind-release", "enable-reported-spend"} and (
+                      "rebind-release", "enable-reported-spend", "renew-validity"} and (
             expected_policy_sha256 is None or len(expected_policy_sha256) != 64
             or any(c not in "0123456789abcdef" for c in expected_policy_sha256)
         ):
+            return False
+        if action == "renew-validity":
+            request = dict(predecessor_retired=True,
+                expected_policy_sha256=expected_policy_sha256,
+                expected_used_calls=expected_used_calls, target_paid_until=target_paid_until,
+                predecessor_qualified_profile_sha256=predecessor_profile_sha256,
+                predecessor_image_digest=predecessor_image_digest)
+            preflight = await writer.owned_budget_request(action, **request)
+            if preflight == "target_observed":
+                return "target_observed"
+            if preflight != "observation_required":
+                return False
+            fact = await gate.collect()
+            submitted = True
+            result = await writer.owned_budget_request(action, observation=fact, **request)
+            if result == "accepted":
+                return "accepted"
+            if result == "target_observed":
+                return "target_observed"
             return False
         fact = await gate.collect()
         submitted = True
@@ -177,12 +213,13 @@ async def operate(action: str, *, predecessor_retired: bool,
             )
             is True
         )
-    except Exception:
-        if submitted:
+    except BaseException as error:
+        if submitted and (isinstance(error, Exception) or action == "renew-validity"):
             raise OwnedPilotBudgetOutcomeUnknown() from None
         raise
     finally:
-        cleanup = asyncio.create_task(_close_operator_writer(writer, owner))
+        cleanup = asyncio.create_task(_close_operator_writer(
+            writer, owner, join_failed_owner=action == "renew-validity"))
         cancellation: asyncio.CancelledError | None = None
         while not cleanup.done():
             try:
@@ -193,11 +230,15 @@ async def operate(action: str, *, predecessor_retired: bool,
                 break
         try:
             cleanup.result()
-        except Exception:
-            if submitted:
+        except BaseException as error:
+            if submitted and (isinstance(error, Exception) or action == "renew-validity"):
                 raise OwnedPilotBudgetOutcomeUnknown() from None
+            if not isinstance(error, Exception):
+                raise
             raise RuntimeError("owned_budget_writer_close_failed") from None
         if cancellation is not None:
+            if submitted and action == "renew-validity":
+                raise OwnedPilotBudgetOutcomeUnknown() from None
             raise cancellation
 
 
@@ -205,12 +246,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Original Sparra budget operator transition")
     parser.add_argument("action", choices=(
         "enroll", "suspend-restored", "extend-sixth-call", "extend-seventh-call",
-        "enable-budgeted-calls", "rebind-release", "enable-reported-spend",
+        "enable-budgeted-calls", "rebind-release", "enable-reported-spend", "renew-validity",
     ))
     parser.add_argument("--expected-policy-sha256")
     parser.add_argument("--expected-used-calls", type=int)
     parser.add_argument("--predecessor-qualified-profile-path")
     parser.add_argument("--predecessor-image-digest")
+    parser.add_argument("--target-paid-until", type=datetime.fromisoformat)
     parser.add_argument(
         "--predecessor-retired",
         action="store_true",
@@ -218,28 +260,42 @@ def main() -> int:
     )
     args = parser.parse_args()
     if (args.action in {"enroll", "extend-sixth-call", "extend-seventh-call",
-                       "enable-budgeted-calls", "rebind-release", "enable-reported-spend"}
+                       "enable-budgeted-calls", "rebind-release", "enable-reported-spend",
+                       "renew-validity"}
             and not args.predecessor_retired):
         parser.error(f"{args.action} requires --predecessor-retired")
     if args.action in {"extend-sixth-call", "extend-seventh-call", "enable-budgeted-calls",
-                       "rebind-release", "enable-reported-spend"} and (
+                       "rebind-release", "enable-reported-spend", "renew-validity"} and (
         args.expected_policy_sha256 is None or len(args.expected_policy_sha256) != 64
         or any(c not in "0123456789abcdef" for c in args.expected_policy_sha256)
     ):
         parser.error(f"{args.action} requires --expected-policy-sha256 (64 lowercase hex)")
-    if args.action == "enable-reported-spend" and (
+    if args.action in {"enable-reported-spend", "renew-validity"} and (
         args.expected_used_calls is None or not 0 <= args.expected_used_calls < MAX_BUDGET_CALLS
     ):
-        parser.error("enable-reported-spend requires --expected-used-calls within SQLite bounds")
-    if args.action == "rebind-release":
+        parser.error(f"{args.action} requires --expected-used-calls within SQLite bounds")
+    if args.action in {"rebind-release", "renew-validity"}:
         if (not args.predecessor_qualified_profile_path
                 or not (PurePosixPath(args.predecessor_qualified_profile_path).is_absolute()
                         or Path(args.predecessor_qualified_profile_path).is_absolute())):
-            parser.error("rebind-release requires --predecessor-qualified-profile-path (absolute)")
+            parser.error(f"{args.action} requires --predecessor-qualified-profile-path (absolute)")
         if not args.predecessor_image_digest:
-            parser.error("rebind-release requires --predecessor-image-digest")
+            parser.error(f"{args.action} requires --predecessor-image-digest")
+    if args.action == "renew-validity" and (
+        args.target_paid_until is None or args.target_paid_until.utcoffset() != timedelta(0)
+    ):
+        parser.error("renew-validity requires --target-paid-until (absolute timezone-aware UTC)")
     try:
-        if args.action == "enable-reported-spend":
+        if args.action == "renew-validity":
+            accepted = asyncio.run(operate(
+                args.action, predecessor_retired=args.predecessor_retired,
+                expected_policy_sha256=args.expected_policy_sha256,
+                expected_used_calls=args.expected_used_calls,
+                predecessor_qualified_profile_path=args.predecessor_qualified_profile_path,
+                predecessor_image_digest=args.predecessor_image_digest,
+                target_paid_until=args.target_paid_until,
+            ))
+        elif args.action == "enable-reported-spend":
             accepted = asyncio.run(operate(
                 args.action, predecessor_retired=args.predecessor_retired,
                 expected_policy_sha256=args.expected_policy_sha256,
@@ -262,8 +318,12 @@ def main() -> int:
         return 1
     except Exception:
         accepted = False
-    print("owned_budget_transition_accepted" if accepted else "owned_budget_transition_refused")
-    return 0 if accepted else 1
+    if args.action == "renew-validity" and accepted == "target_observed":
+        print("owned_budget_target_observed")
+        return 0
+    succeeded = accepted is True or (args.action == "renew-validity" and accepted == "accepted")
+    print("owned_budget_transition_accepted" if succeeded else "owned_budget_transition_refused")
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":

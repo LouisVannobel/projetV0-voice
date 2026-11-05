@@ -7,6 +7,7 @@ import gc
 import hashlib
 import sqlite3
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -653,11 +654,16 @@ def test_release_operator_forwards_the_exact_predecessor_tuple_and_cas(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", [
-    None, "previous_image", "previous_runtime", "missing_store", "legacy_store", "malformed_store",
+@pytest.mark.parametrize("action,invalid", [
+    *[("rebind-release", invalid) for invalid in (
+        None, "previous_image", "previous_runtime", "missing_store", "legacy_store",
+        "malformed_store")],
+    *[("renew-validity", invalid) for invalid in (
+        None, "previous_image", "previous_runtime", "missing_store", "legacy_store",
+        "malformed_store", "cancel_commit", "cancel_rollback", "timeout_commit", "active_window")],
 ])
 async def test_release_operator_loads_both_native_profile_bindings_before_real_cas(
-    tmp_path, monkeypatch, invalid,
+    tmp_path, monkeypatch, action, invalid,
 ):
     from projetv0_voice import production_wiring as wiring
     from tests.integration.test_owned_pilot_budgeted_calls import seed_release
@@ -685,8 +691,14 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
         image_digest=settings.image_digest, agent_bundle_sha256=settings.agent_bundle_sha256,
         inference_profile_sha256=settings.inference_profile_sha256,
         qualified_profile_sha256=canonical_qualified_profile_sha256(profile))
+    if action == "renew-validity":
+        policy = policy.model_copy(update={"admission_accounting": "reported",
+                                           "paid_until": NOW + timedelta(seconds=3600)})
     previous_policy = policy.model_copy(update={"image_digest": old_image,
         "qualified_profile_sha256": canonical_qualified_profile_sha256(old_profile)})
+    if action == "renew-validity":
+        previous_policy = previous_policy.model_copy(update={
+            "paid_until": NOW + timedelta(seconds=1 if invalid == "active_window" else -1)})
     if invalid not in {"missing_store", "legacy_store"}:
         seed_release(settings.sqlite_path, policy=previous_policy)
     if invalid == "legacy_store":
@@ -711,10 +723,34 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
         "offline-or" if path == settings.openrouter_api_key_file else "offline-tel"))
     monkeypatch.setattr(cli, "capture_runtime_environment", lambda _: None)
     monkeypatch.setattr(cli, "parse_runtime_settings", lambda _: settings)
-    monkeypatch.setattr(cli, "PersistenceWriter", lambda path, keys, **values:
-        PersistenceWriter(path, keys, **values, utcnow=lambda: NOW))
+    entered, release = asyncio.Event(), asyncio.Event()
+    instances = []
+
+    def writer_factory(path, keys, **values):
+        async def pause(name):
+            if name == "after_mutation_before_commit" and invalid in {
+                "cancel_commit", "cancel_rollback", "timeout_commit",
+            }:
+                cursor = await writer._connection.execute(
+                    "SELECT policy_sha256 FROM owned_pilot_budget")
+                updated = await cursor.fetchone()
+                await cursor.close()
+                if updated == (policy.sha256,):
+                    entered.set()
+                    await release.wait()
+                    if invalid == "cancel_rollback":
+                        raise RuntimeError("offline renewal rollback after cancellation")
+
+        writer = PersistenceWriter(path, keys, **values, utcnow=lambda: NOW, failpoint=pause,
+            control_commit_timeout_seconds=0.03 if invalid == "timeout_commit" else 1)
+        instances.append(writer)
+        return writer
+
+    monkeypatch.setattr(cli, "PersistenceWriter", writer_factory)
+    collections = []
 
     async def collect():
+        collections.append(True)
         return replace(observation(), identity=identity)
 
     monkeypatch.setattr(cli, "_budget_factory", lambda _settings, writer, *_args:
@@ -722,23 +758,118 @@ async def test_release_operator_loads_both_native_profile_bindings_before_real_c
     arguments = dict(predecessor_retired=True, expected_policy_sha256=previous_policy.sha256,
         predecessor_qualified_profile_path=str(previous_path),
         predecessor_image_digest="wrong-image" if invalid == "previous_image" else old_image)
+    if action == "renew-validity":
+        arguments.update(expected_used_calls=7, target_paid_until=policy.paid_until)
     if invalid in {"previous_image", "previous_runtime"}:
         with pytest.raises(ValueError, match="does not match the injected value"):
-            await cli.operate("rebind-release", **arguments)
+            await cli.operate(action, **arguments)
         assert authority(settings.sqlite_path) == before
+    elif invalid in {"cancel_commit", "cancel_rollback", "timeout_commit"}:
+        task = asyncio.create_task(cli.operate(action, **arguments))
+        await asyncio.wait_for(entered.wait(), 2)
+        if invalid.startswith("cancel"):
+            task.cancel()
+        else:
+            await asyncio.sleep(0.05)
+        release.set()
+        with pytest.raises(cli.OwnedPilotBudgetOutcomeUnknown,
+                           match="^owned_budget_transition_unknown$"):
+            await task
+        assert all(writer._closed_event.is_set() for writer in instances)
+        if invalid == "cancel_rollback":
+            assert authority(settings.sqlite_path) == before
+        else:
+            assert authority(settings.sqlite_path)[0]["owned_pilot_budget"][0][1:3] == (
+                policy.model_dump_json(), policy.sha256)
+            after = authority(settings.sqlite_path)
+            assert await cli.operate(action, **arguments) == "target_observed"
+            assert len(collections) == 1 and authority(settings.sqlite_path) == after
     elif invalid:
-        assert not await cli.operate("rebind-release", **arguments)
+        assert await cli.operate(action, **arguments) is False
+        assert not collections
         if before:
             assert authority(settings.sqlite_path) == before
             assert settings.sqlite_path.read_bytes() == frozen
         else:
             assert not settings.sqlite_path.exists()
     else:
-        assert await cli.operate("rebind-release", **arguments)
+        assert await cli.operate(action, **arguments) == (
+            "accepted" if action == "renew-validity" else True)
         rows, schema, version = authority(settings.sqlite_path)
         assert schema == before[1] and version == before[2] == (15,)
         assert rows["owned_pilot_budget"][0][1:3] == (policy.model_dump_json(), policy.sha256)
         assert rows["owned_pilot_budget"][0][3:] == before[0]["owned_pilot_budget"][0][3:]
-    assert validated == [settings, replace(settings,
+        if action == "renew-validity":
+            after = authority(settings.sqlite_path)
+            assert await cli.operate(action, **arguments) == "target_observed"
+            assert len(collections) == 1 and authority(settings.sqlite_path) == after
+    expected_validated = [settings, replace(settings,
         qualified_profile_path=PurePosixPath(previous_path.as_posix()),
         image_digest=arguments["predecessor_image_digest"])]
+    repeated = action == "renew-validity" and invalid in {None, "cancel_commit", "timeout_commit"}
+    assert validated == expected_validated * (2 if repeated else 1)
+
+
+@pytest.mark.parametrize("result,code,message", [
+    ("accepted", 0, "owned_budget_transition_accepted"),
+    ("target_observed", 0, "owned_budget_target_observed"),
+    ("observation_required", 1, "owned_budget_transition_refused"),
+    ("refused", 1, "owned_budget_transition_refused"),
+    (False, 1, "owned_budget_transition_refused"),
+])
+def test_renew_validity_cli_distinguishes_observed_from_accepted_and_refusal(
+    monkeypatch, capsys, result, code, message,
+):
+    import sys
+
+    calls = []
+
+    async def operate(action, **values):
+        calls.append((action, values))
+        return result
+
+    monkeypatch.setattr(cli, "operate", operate)
+    monkeypatch.setattr(sys, "argv", ["budget", "renew-validity", "--predecessor-retired",
+        "--expected-policy-sha256", "e" * 64, "--expected-used-calls", "9",
+        "--predecessor-qualified-profile-path", "/secure/previous.json",
+        "--predecessor-image-digest", "fixture@sha256:" + "a" * 64,
+        "--target-paid-until", "2026-11-05T22:00:00Z"])
+    assert cli.main() == code
+    assert calls == [("renew-validity", {"predecessor_retired": True,
+        "expected_policy_sha256": "e" * 64, "expected_used_calls": 9,
+        "predecessor_qualified_profile_path": "/secure/previous.json",
+        "predecessor_image_digest": "fixture@sha256:" + "a" * 64,
+        "target_paid_until": datetime(2026, 11, 5, 22, tzinfo=UTC)})]
+    assert capsys.readouterr().out == message + "\n"
+
+
+@pytest.mark.parametrize("invalid", [
+    "retired", "cas", "count", "profile", "image", "target", "naive", "offset", "count_limit",
+])
+def test_renew_validity_requires_fixed_utc_target_and_explicit_ownership_before_runtime(
+    monkeypatch, capsys, invalid,
+):
+    import sys
+
+    options = {
+        "retired": ["--predecessor-retired"],
+        "cas": ["--expected-policy-sha256", "e" * 64],
+        "count": ["--expected-used-calls", "9"],
+        "profile": ["--predecessor-qualified-profile-path", "/secure/previous.json"],
+        "image": ["--predecessor-image-digest", "fixture@sha256:" + "a" * 64],
+        "target": ["--target-paid-until", "2026-11-05T22:00:00Z"],
+    }
+    if invalid in options:
+        del options[invalid]
+    elif invalid == "count_limit":
+        options["count"][1] = "9223372036854775807"
+    else:
+        options["target"][1] = ("2026-11-05T22:00:00" if invalid == "naive"
+                                else "2026-11-05T23:00:00+01:00")
+    monkeypatch.setattr(sys, "argv", ["budget", "renew-validity", *[
+        argument for arguments in options.values() for argument in arguments]])
+    monkeypatch.setattr(cli, "capture_runtime_environment", lambda _: pytest.fail(
+        "invalid explicit request must be rejected before runtime or collection"))
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+    assert result.value.code == 2 and "requires --" in capsys.readouterr().err

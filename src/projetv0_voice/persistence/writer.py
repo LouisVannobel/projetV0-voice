@@ -33,6 +33,7 @@ from projetv0_voice.audio_contract import (
 )
 from projetv0_voice.budget_observation import BudgetObservation
 from projetv0_voice.owned_pilot_budget import (
+    MAX_BUDGET_CALLS,
     ORIGINAL_PILOT_SLOT,
     OwnedPilotBudgetDenied,
     OwnedPilotBudgetPermit,
@@ -895,9 +896,78 @@ class PersistenceWriter:
             try:
                 floors = (Decimal(row[2]), Decimal(row[3]))
             except (ArithmeticError, TypeError, ValueError):
-                return None
+                return False if action == "renew-validity" else None
             if not reported_floors_valid(floors):
-                return None
+                return False if action == "renew-validity" else None
+        if action == "renew-validity":
+            target = payload.get("target_paid_until")
+            expected_hash, expected_count = (payload.get("expected_policy_sha256"),
+                                             payload.get("expected_used_calls"))
+            if (self._contract_version != 2 or row is None or floors is None
+                    or policy.total_calls is not None or policy.admission_accounting != "reported"
+                    or payload.get("predecessor_retired") is not True
+                    or not isinstance(expected_hash, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+                    or type(expected_count) is not int or not 0 <= expected_count < MAX_BUDGET_CALLS
+                    or not isinstance(target, datetime) or target.utcoffset() != timedelta(0)
+                    or target != policy.paid_until):
+                return False
+            try:
+                predecessor = OwnedPilotBudgetPolicy.model_validate_json(row[6])
+                validated = OwnedPilotBudgetPolicy.model_validate_json(policy.model_dump_json())
+            except ValueError:
+                return False
+            if (predecessor.sha256 != row[0] or predecessor.model_dump_json() != row[6]
+                    or validated != policy
+                    or self._pragma_int(await self._pragma_scalar("user_version"))
+                    != BUDGETED_AUDIO_BUDGET_SCHEMA_VERSION
+                    or await self._application_schema_objects()
+                    != _EXPECTED_BUDGETED_AUDIO_BUDGET_SCHEMA):
+                return False
+            # This observes a fixed durable epoch, even after expiry or later use.
+            # It never restores the original count/floors or invalidates newer facts.
+            if row[0] == policy.sha256 and row[6] == policy.model_dump_json():
+                return "target_observed"
+            renewal_fields = {"paid_until", "qualified_profile_sha256", "image_digest"}
+            if (row[4] or row[5] is not None or expected_hash != row[0]
+                    or expected_count != row[1] or policy.sha256 == row[0]
+                    or predecessor.total_calls is not None
+                    or predecessor.admission_accounting != "reported"
+                    or predecessor.qualified_profile_sha256
+                    != payload.get("predecessor_qualified_profile_sha256")
+                    or predecessor.image_digest != payload.get("predecessor_image_digest")
+                    or predecessor.model_dump_json(exclude=renewal_fields)
+                    != policy.model_dump_json(exclude=renewal_fields)
+                    or predecessor.paid_until >= target):
+                return False
+            cursor = await connection.execute(
+                "SELECT count(*) FROM call_leases WHERE state!='terminal'")
+            busy = await cursor.fetchone()
+            await cursor.close()
+            now = self._utcnow()
+            if (busy != (0,) or predecessor.paid_until > now
+                    or not self._owned_budget_start_envelope
+                    <= (target - now).total_seconds() <= 3600):
+                return False
+            if "observation" not in payload:
+                return "observation_required"
+            fact = payload.get("observation")
+            if (not isinstance(fact, BudgetObservation)
+                    or not observation_valid(policy, fact, now) or fact.active_call_control_ids
+                    or not affordable(policy, fact, row[1], reported_floors=floors)):
+                return False
+            cursor = await connection.execute(
+                "UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=? "
+                "WHERE slot=? AND policy_sha256=? AND policy_json=? AND used_calls=? "
+                "AND openrouter_floor=? AND telnyx_floor=? "
+                "AND suspended=0 AND paid_call_control_id IS NULL",
+                (policy.model_dump_json(), policy.sha256, ORIGINAL_PILOT_SLOT,
+                 row[0], row[6], row[1], row[2], row[3]),
+            )
+            if cursor.rowcount != 1:
+                raise FatalPersistenceError("owned_budget_validity_conflict")
+            await cursor.close()
+            return "accepted"
         if action == "enable-reported-spend":
             fact = payload.get("observation")
             if (self._contract_version != 2 or row is None or floors is None
@@ -4454,10 +4524,19 @@ class PersistenceWriter:
                 await connection.rollback()
                 return False, None
             self._check_storage_limit()
+            renewed_validity = (command.kind == "owned_budget"
+                               and command.payload.get("action") == "renew-validity"
+                               and command_result == "accepted")
             if (self._owned_budget_policy is not None
                     and command.kind in {"owned_budget", "webhook_effect", "lease"}):
-                self._owned_budget_pending_snapshot = await self._prepare_owned_budget_snapshot()
+                self._owned_budget_pending_snapshot = (
+                    OwnedPilotBudgetSnapshot() if renewed_validity
+                    else await self._prepare_owned_budget_snapshot())
             await connection.commit()
+            if renewed_validity:
+                # A first committed renewal requires a subsequent runtime collection.
+                # Preflight, target observation and rolled-back attempts keep facts intact.
+                self._invalidate_reported_budget_observation()
             if self._owned_budget_pending_snapshot is not None:
                 # No await between successful COMMIT and publication. A caller
                 # resuming much later cannot restore a superseded observation.
