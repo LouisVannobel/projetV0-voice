@@ -585,7 +585,12 @@ def test_manual_release_builds_once_on_default_main_and_assembles_handoff() -> N
                     "description": "Release version",
                     "required": "true",
                     "type": "string",
-                }
+                },
+                "expected-source": {
+                    "description": "Exact qualified commit SHA to publish",
+                    "required": "true",
+                    "type": "string",
+                },
             }
         }
     }
@@ -596,7 +601,8 @@ def test_manual_release_builds_once_on_default_main_and_assembles_handoff() -> N
     assert release == {
         "if": (
             "github.ref == 'refs/heads/main' && "
-            "github.event.repository.default_branch == 'main'"
+            "github.event.repository.default_branch == 'main' && "
+            "github.sha == inputs.expected-source"
         ),
         "permissions": {"contents": "read", "packages": "write"},
         "uses": (
