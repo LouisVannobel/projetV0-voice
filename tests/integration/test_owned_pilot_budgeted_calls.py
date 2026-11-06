@@ -938,6 +938,43 @@ async def test_telnyx_six_release_rebind_cannot_raise_or_corrupt_cap(tmp_path, o
 
 
 @pytest.mark.asyncio
+async def test_telnyx_six_native_enrollment_rejects_unvalidated_finite_mode(tmp_path):
+    path = tmp_path / "voice.sqlite"
+    policy = budgeted_policy(total_calls=5).model_copy(update={"telnyx_cap_usd": 6})
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case, policy=policy)
+        before = authority(path)
+        assert await case.writer.owned_budget_request("enroll",
+            observation=budgeted_observation(), predecessor_retired=True) is False
+        assert authority(path) == before and not gate.ready
+
+
+@pytest.mark.asyncio
+async def test_telnyx_six_native_rebind_rejects_intenum_but_keeps_suspension(tmp_path):
+    from enum import IntEnum
+
+    class Cap(IntEnum):
+        SIX = 6
+
+    path = tmp_path / "voice.sqlite"
+    old = candidate(admission_accounting="reported", telnyx_cap_usd=6)
+    seed_release(path, policy=old, used_calls=9)
+    policy = release_candidate(admission_accounting="reported").model_copy(
+        update={"telnyx_cap_usd": Cap.SIX})
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case, policy=policy)
+        before = authority(path)
+        assert await rebind_release(case.writer, expected_policy_sha256=old.sha256) is False
+        assert authority(path) == before and not gate.ready
+        assert await case.writer.owned_budget_request("suspend") is True
+        expected = dict(before[0])
+        row = list(expected["owned_pilot_budget"][0])
+        row[6] = 1
+        expected["owned_pilot_budget"] = [tuple(row)]
+        assert authority(path) == (expected, before[1], before[2])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("telnyx_cap", [None, 6])
 @pytest.mark.parametrize("invalid", [
     "cas", "count", "count_bool", "retired", "profile", "image", "finite", "accounting",

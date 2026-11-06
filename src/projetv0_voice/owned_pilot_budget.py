@@ -86,8 +86,7 @@ class OwnedPilotBudgetPolicy(BaseModel):
             or not self.image_digest
             or not self.deployment_id
             or self.admission_accounting is not None and self.total_calls is not None
-            or self.telnyx_cap_usd is not None and (
-                self.admission_accounting != "reported" or self.total_calls is not None)
+            or not telnyx_cap_binding_valid(self)
             or not _exact_money(self.openrouter_anchor_usd)
             or not _exact_money(self.telnyx_anchor_usd)
             or any(
@@ -109,6 +108,14 @@ class OwnedPilotBudgetPolicy(BaseModel):
     def sha256(self) -> str:
         raw = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def telnyx_cap_binding_valid(policy: OwnedPilotBudgetPolicy) -> bool:
+    """Check the in-memory binding, including copies that bypass model validators."""
+    return policy.telnyx_cap_usd is None or (
+        type(policy.telnyx_cap_usd) is int and policy.telnyx_cap_usd == 6
+        and policy.admission_accounting == "reported" and policy.total_calls is None
+    )
 
 
 class OwnedPilotBudgetPermit(BaseModel):
@@ -172,9 +179,7 @@ def affordable(
     if (not reported_floors_valid(reported_floors)
             or type(count) is not int or not 0 <= count < MAX_BUDGET_CALLS
             or policy.total_calls is not None and count >= policy.total_calls
-            or policy.telnyx_cap_usd is not None and (
-                type(policy.telnyx_cap_usd) is not int or policy.telnyx_cap_usd != 6
-                or policy.admission_accounting != "reported" or policy.total_calls is not None)):
+            or not telnyx_cap_binding_valid(policy)):
         return False
     with localcontext() as ctx:
         ctx.prec = 128

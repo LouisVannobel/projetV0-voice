@@ -42,6 +42,7 @@ from projetv0_voice.owned_pilot_budget import (
     affordable,
     observation_valid,
     reported_floors_valid,
+    telnyx_cap_binding_valid,
 )
 
 if TYPE_CHECKING:
@@ -891,6 +892,8 @@ class PersistenceWriter:
             await connection.execute("UPDATE owned_pilot_budget SET suspended=1 WHERE slot=?",
                                      (ORIGINAL_PILOT_SLOT,))
             return True
+        if not telnyx_cap_binding_valid(policy):
+            return False
         floors = None
         if row is not None:
             try:
