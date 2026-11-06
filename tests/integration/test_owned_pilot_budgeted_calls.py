@@ -798,19 +798,54 @@ async def renew_validity(writer, **changes):
 
 
 @pytest.mark.asyncio
-async def test_renew_validity_expired_coalesced_release_conserves_every_row_and_schema(tmp_path):
+@pytest.mark.parametrize("old_cap,telnyx_cap", [(None, None), (None, 6), (6, 6)])
+async def test_renew_validity_expired_coalesced_release_conserves_every_row_and_schema(
+    tmp_path, old_cap, telnyx_cap,
+):
     path = tmp_path / "voice.sqlite"
-    seed_release(path, policy=expired_reported(), used_calls=9,
-                 openrouter_floor="0.3300", telnyx_floor="3.3000")
+    policy = renewed(**({"telnyx_cap_usd": telnyx_cap} if telnyx_cap else {}))
+    fact = budgeted_observation(telnyx_reported_spend_usd=Decimal("5.20")) if telnyx_cap else (
+        budgeted_observation())
+    old = expired_reported(**({"telnyx_cap_usd": old_cap} if old_cap else {}))
+    if old_cap is None and telnyx_cap == 6:
+        # Retain actual native call/lease/outbox history, not just a seeded counter.
+        await exhausted_seven(tmp_path)
+        async with registry_case(tmp_path) as case:
+            gate = await bind_budgeted(case)
+            assert await enable(case.writer) and await gate.refresh()
+            await native_call(case, 8)
+        clock = [NOW]
+        async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
+            async def collect():
+                return budgeted_observation(collection_started_at_utc=clock[0],
+                                            collection_finished_at_utc=clock[0])
+
+            gate = await bind_budgeted(case, policy=candidate(admission_accounting="reported"),
+                                       utcnow=lambda: clock[0])
+            gate.collect = collect
+            assert await enable_reported(case.writer)
+            clock[0] += timedelta(microseconds=1)
+            assert await gate.refresh()
+            await native_call(case, 9)
+        # Synthetic expired predecessor fixture; no production state is used.
+        with sqlite3.connect(path) as db:
+            db.execute("UPDATE owned_pilot_budget SET policy_json=?,policy_sha256=?,"
+                       "openrouter_floor='0.3300',telnyx_floor='3.3000'",
+                       (old.model_dump_json(), old.sha256))
+    else:
+        seed_release(path, policy=old, used_calls=9,
+                     openrouter_floor="0.3300", telnyx_floor="3.3000")
     async with registry_case(tmp_path) as case:
-        gate = await bind_budgeted(case, policy=renewed())
+        gate = await bind_budgeted(case, policy=policy, fact=fact)
         before = authority(path)
-        assert await renew_validity(case.writer) == "observation_required"
+        assert await renew_validity(case.writer,
+            expected_policy_sha256=old.sha256) == "observation_required"
         assert authority(path) == before and not gate.ready
-        assert await renew_validity(case.writer, observation=budgeted_observation()) == "accepted"
+        assert await renew_validity(case.writer, observation=fact,
+                                    expected_policy_sha256=old.sha256) == "accepted"
         expected = dict(before[0])
         row = list(expected["owned_pilot_budget"][0])
-        row[1:3] = [renewed().model_dump_json(), renewed().sha256]
+        row[1:3] = [policy.model_dump_json(), policy.sha256]
         expected["owned_pilot_budget"] = [tuple(row)]
         assert authority(path) == (expected, before[1], (15,))
         assert not gate.ready and not case.provider.actions and not case.begins
@@ -819,11 +854,15 @@ async def test_renew_validity_expired_coalesced_release_conserves_every_row_and_
 
 
 @pytest.mark.asyncio
-async def test_renew_validity_replay_preserves_newer_facts_count_floors_after_expiry(tmp_path):
+@pytest.mark.parametrize("telnyx_cap", [None, 6])
+async def test_renew_validity_replay_preserves_newer_facts_count_floors_after_expiry(
+    tmp_path, telnyx_cap,
+):
     path, clock = tmp_path / "voice.sqlite", [NOW]
+    policy = renewed(**({"telnyx_cap_usd": telnyx_cap} if telnyx_cap else {}))
     seed_release(path, policy=expired_reported(), used_calls=9)
     async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
-        gate = await bind_budgeted(case, policy=renewed(), utcnow=lambda: clock[0])
+        gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
         assert await renew_validity(case.writer, observation=budgeted_observation()) == "accepted"
         clock[0] += timedelta(seconds=1)
         fresh = budgeted_observation(collection_started_at_utc=clock[0],
@@ -845,7 +884,7 @@ async def test_renew_validity_replay_preserves_newer_facts_count_floors_after_ex
         async def collect():
             return collected[0]
 
-        gate = OwnedPilotBudgetGate(case.writer, renewed(), collect, utcnow=lambda: clock[0])
+        gate = OwnedPilotBudgetGate(case.writer, policy, collect, utcnow=lambda: clock[0])
         case.registry.set_owned_budget(gate)
         assert not gate.ready
         assert await renew_validity(case.writer) == "target_observed"
@@ -855,15 +894,51 @@ async def test_renew_validity_replay_preserves_newer_facts_count_floors_after_ex
                                collection_finished_at_utc=clock[0])
         assert await gate.refresh()
         assert gate.ready
-    clock[0] = renewed().paid_until + timedelta(seconds=1)
+    clock[0] = policy.paid_until + timedelta(seconds=1)
     async with registry_case(tmp_path, utcnow=lambda: clock[0]) as case:
-        gate = await bind_budgeted(case, policy=renewed(), utcnow=lambda: clock[0])
+        gate = await bind_budgeted(case, policy=policy, utcnow=lambda: clock[0])
         before = authority(path)
         assert await renew_validity(case.writer) == "target_observed"
         assert not gate.ready and authority(path) == before
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("old_cap,new_cap", [(6, None), (None, 5), (None, 7), (6, 7),
+                                            (None, "6"), (None, 6.0)])
+async def test_telnyx_six_renewal_refuses_reverse_or_invalid_caps_before_collection(
+    tmp_path, old_cap, new_cap,
+):
+    path = tmp_path / "voice.sqlite"
+    old = expired_reported(**({"telnyx_cap_usd": old_cap} if old_cap else {}))
+    seed_release(path, policy=old, used_calls=9)
+    policy = renewed().model_copy(update={"telnyx_cap_usd": new_cap})
+    async with registry_case(tmp_path) as case:
+        gate = await bind_budgeted(case, policy=policy)
+        before = authority(path)
+        assert await renew_validity(case.writer, expected_policy_sha256=old.sha256) is False
+        assert await renew_validity(case.writer, expected_policy_sha256=old.sha256,
+                                    observation=budgeted_observation()) is False
+        assert authority(path) == before and not gate.ready
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_cap,new_cap", [(None, 6), (6, 6.0), (6, "6"), (6, 7)])
+async def test_telnyx_six_release_rebind_cannot_raise_or_corrupt_cap(tmp_path, old_cap, new_cap):
+    path = tmp_path / "voice.sqlite"
+    old = candidate(admission_accounting="reported",
+                    **({"telnyx_cap_usd": old_cap} if old_cap else {}))
+    seed_release(path, policy=old, used_calls=9)
+    async with registry_case(tmp_path) as case:
+        policy = release_candidate(admission_accounting="reported").model_copy(
+            update={"telnyx_cap_usd": new_cap})
+        await bind_budgeted(case, policy=policy)
+        before = authority(path)
+        assert not await rebind_release(case.writer, expected_policy_sha256=old.sha256)
+        assert authority(path) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telnyx_cap", [None, 6])
 @pytest.mark.parametrize("invalid", [
     "cas", "count", "count_bool", "retired", "profile", "image", "finite", "accounting",
     "identity", "anchor", "equivalent_anchor", "runtime", "deployment", "bundle", "inference",
@@ -871,7 +946,7 @@ async def test_renew_validity_replay_preserves_newer_facts_count_floors_after_ex
     "floor_negative", "too_short", "too_long", "target_mismatch", "target_naive", "no_advance",
     "key_expiry", "active_carrier", "stale", "fact_identity", "cap", "funds", "cash",
 ])
-async def test_renew_validity_refuses_without_changing_authority(tmp_path, invalid):
+async def test_renew_validity_refuses_without_changing_authority(tmp_path, invalid, telnyx_cap):
     path = tmp_path / "voice.sqlite"
     old = expired_reported()
     seed_release(path, policy=old, used_calls=9, **{
@@ -894,7 +969,8 @@ async def test_renew_validity_refuses_without_changing_authority(tmp_path, inval
         "no_advance": {"paid_until": old.paid_until},
         "key_expiry": {"paid_until": old.identity.openrouter_expires_at_utc + timedelta(seconds=1)},
     }
-    policy = renewed().model_copy(update=changes.get(invalid, {}))
+    policy = renewed(**({"telnyx_cap_usd": telnyx_cap} if telnyx_cap else {})).model_copy(
+        update=changes.get(invalid, {}))
     async with registry_case(tmp_path) as case:
         await bind_budgeted(case, policy=policy)
         if invalid == "active_local":

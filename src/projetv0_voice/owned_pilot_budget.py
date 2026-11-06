@@ -13,7 +13,7 @@ from decimal import Decimal, localcontext
 from typing import Literal, Protocol, TypeGuard
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from projetv0_voice.budget_observation import BudgetObservation, BudgetObservationIdentity
 
@@ -52,6 +52,9 @@ class OwnedPilotBudgetPolicy(BaseModel):
     admission_accounting: Literal["reported"] | None = Field(
         default=None, exclude_if=lambda value: value is None,
     )
+    telnyx_cap_usd: Literal[6] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     openrouter_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     telnyx_anchor_usd: Decimal = Field(ge=0, allow_inf_nan=False)
     paid_until: datetime
@@ -61,6 +64,13 @@ class OwnedPilotBudgetPolicy(BaseModel):
     inference_profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     image_digest: str
     deployment_id: str
+
+    @field_validator("telnyx_cap_usd", mode="before")
+    @classmethod
+    def exact_telnyx_cap(cls, value: object) -> object:
+        if value is not None and (type(value) is not int or value != 6):
+            raise ValueError("owned_budget_policy_invalid")
+        return value
 
     @model_validator(mode="after")
     def valid_binding(self) -> OwnedPilotBudgetPolicy:
@@ -76,6 +86,8 @@ class OwnedPilotBudgetPolicy(BaseModel):
             or not self.image_digest
             or not self.deployment_id
             or self.admission_accounting is not None and self.total_calls is not None
+            or self.telnyx_cap_usd is not None and (
+                self.admission_accounting != "reported" or self.total_calls is not None)
             or not _exact_money(self.openrouter_anchor_usd)
             or not _exact_money(self.telnyx_anchor_usd)
             or any(
@@ -159,7 +171,10 @@ def affordable(
 ) -> bool:
     if (not reported_floors_valid(reported_floors)
             or type(count) is not int or not 0 <= count < MAX_BUDGET_CALLS
-            or policy.total_calls is not None and count >= policy.total_calls):
+            or policy.total_calls is not None and count >= policy.total_calls
+            or policy.telnyx_cap_usd is not None and (
+                type(policy.telnyx_cap_usd) is not int or policy.telnyx_cap_usd != 6
+                or policy.admission_accounting != "reported" or policy.total_calls is not None)):
         return False
     with localcontext() as ctx:
         ctx.prec = 128
@@ -171,17 +186,18 @@ def affordable(
                 RESERVES, FORECASTS, MINIMUM_RESERVES, strict=True,
             )
         )
-        for anchor, spent, cash, remaining_reserve, forecast, floor in zip(
+        for anchor, spent, cash, remaining_reserve, forecast, floor, cap in zip(
             (policy.openrouter_anchor_usd, policy.telnyx_anchor_usd),
             (fact.openrouter_reported_spend_usd, fact.telnyx_reported_spend_usd),
             (fact.openrouter_available_cash_usd, fact.telnyx_available_cash_usd),
             remaining_reserves,
             FORECASTS,
             reported_floors,
+            (5, policy.telnyx_cap_usd or 5),
             strict=True,
         ):
             effective = max(floor, spent, anchor + forecast_count * forecast)
-            if (effective + remaining_reserve > 5
+            if (effective + remaining_reserve > cap
                     or cash - (effective - spent) < remaining_reserve):
                 return False
         gap = max(

@@ -928,11 +928,14 @@ class PersistenceWriter:
             # It never restores the original count/floors or invalidates newer facts.
             if row[0] == policy.sha256 and row[6] == policy.model_dump_json():
                 return "target_observed"
-            renewal_fields = {"paid_until", "qualified_profile_sha256", "image_digest"}
+            renewal_fields = {"paid_until", "qualified_profile_sha256", "image_digest",
+                              "telnyx_cap_usd"}
             if (row[4] or row[5] is not None or expected_hash != row[0]
                     or expected_count != row[1] or policy.sha256 == row[0]
                     or predecessor.total_calls is not None
                     or predecessor.admission_accounting != "reported"
+                    or not (predecessor.telnyx_cap_usd == policy.telnyx_cap_usd
+                            or predecessor.telnyx_cap_usd is None and policy.telnyx_cap_usd == 6)
                     or predecessor.qualified_profile_sha256
                     != payload.get("predecessor_qualified_profile_sha256")
                     or predecessor.image_digest != payload.get("predecessor_image_digest")

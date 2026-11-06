@@ -401,3 +401,75 @@ def test_legacy_policy_canonical_json_hashes_and_finite_arithmetic_stay_fixed(li
     without_limit = policy.model_dump()
     without_limit.pop("total_calls")
     assert OwnedPilotBudgetPolicy.model_validate(without_limit).total_calls == 5
+
+
+def test_telnyx_six_marker_preserves_legacy_serialization_when_absent_or_null():
+    from projetv0_voice.owned_pilot_budget import OwnedPilotBudgetPolicy
+
+    legacy = budgeted_policy()
+    assert legacy.sha256 == "9554376b0a27e543dad98ef03a74458d0ebd36deacf0e7e1d2abc1d3afc30e0d"
+    assert "telnyx_cap_usd" not in legacy.model_dump_json()
+    explicit_null = budgeted_policy(telnyx_cap_usd=None)
+    assert explicit_null.model_dump_json() == legacy.model_dump_json()
+    assert OwnedPilotBudgetPolicy.model_validate_json(legacy.model_dump_json()) == explicit_null
+    six = budgeted_policy(admission_accounting="reported", telnyx_cap_usd=6)
+    assert '"telnyx_cap_usd":6' in six.model_dump_json()
+    assert six.sha256 != budgeted_policy(admission_accounting="reported").sha256
+
+
+@pytest.mark.parametrize("dominant", ["raw", "floor"])
+@pytest.mark.parametrize("spent,allowed", [("5.20", True), ("5.50", True),
+                                         ("5.500001", False)])
+def test_telnyx_six_retains_reserve_and_legacy_five_at_count_nine(dominant, spent, allowed):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    legacy = budgeted_policy(admission_accounting="reported")
+    # Direct consumer coverage also protects unvalidated model copies.
+    six = legacy.model_copy(update={"telnyx_cap_usd": 6})
+    floors = (D("0.33"), D(spent) if dominant == "floor" else D("3.30"))
+    fact = budgeted_observation(telnyx_reported_spend_usd=(
+        D(spent) if dominant == "raw" else D("3.30")))
+    assert affordable(six, fact, 9, reported_floors=floors) is allowed
+    assert not affordable(legacy, fact, 9, reported_floors=floors)
+
+
+@pytest.mark.parametrize("guard", ["cap", "cash", "key", "key_limit"])
+def test_telnyx_six_never_raises_openrouter_five_or_funding(guard):
+    from projetv0_voice.owned_pilot_budget import affordable, observation_valid
+
+    policy = budgeted_policy(admission_accounting="reported").model_copy(
+        update={"telnyx_cap_usd": 6})
+    for excess, allowed in ((D("0"), True), (D("0.000001"), False)):
+        fact = budgeted_observation(telnyx_reported_spend_usd=D("5.20"), **{
+            "cap": {"openrouter_reported_spend_usd": D("4.25") + excess},
+            "cash": {"telnyx_available_cash_usd": D("0.50") - excess},
+            "key": {"openrouter_limit_remaining_usd": D("0.75") - excess},
+            "key_limit": {"openrouter_limit_usd": D("6") if excess else D("5")},
+        }[guard])
+        assert (observation_valid(policy, fact, NOW)
+                and affordable(policy, fact, 9, reported_floors=(D("0.33"), D("3.30")))) is allowed
+
+
+@pytest.mark.parametrize("changes", [
+    {"telnyx_cap_usd": 5}, {"telnyx_cap_usd": 7}, {"telnyx_cap_usd": True},
+    {"telnyx_cap_usd": "6"}, {"telnyx_cap_usd": 6.0}, {"telnyx_cap_usd": D("6")},
+    {"openrouter_cap_usd": 6}, {"telnyx_cap_usd": 6, "admission_accounting": None},
+    {"telnyx_cap_usd": 6, "total_calls": 7},
+])
+def test_telnyx_six_rejects_other_caps_or_accounting_modes(changes):
+    with pytest.raises(ValueError):
+        budgeted_policy(**{"admission_accounting": "reported", **changes})
+
+
+@pytest.mark.parametrize("changes", [
+    {"telnyx_cap_usd": 5}, {"telnyx_cap_usd": 7}, {"telnyx_cap_usd": True},
+    {"telnyx_cap_usd": "6"}, {"telnyx_cap_usd": 6.0}, {"telnyx_cap_usd": D("6")},
+    {"telnyx_cap_usd": 6, "admission_accounting": None},
+    {"telnyx_cap_usd": 6, "total_calls": 7},
+])
+def test_telnyx_six_unvalidated_model_copy_fails_closed(changes):
+    from projetv0_voice.owned_pilot_budget import affordable
+
+    policy = budgeted_policy(admission_accounting="reported").model_copy(update=changes)
+    assert not affordable(policy, budgeted_observation(), 1,
+                          reported_floors=(D("0.33"), D("3.30")))
