@@ -24,7 +24,10 @@ RUN uv lock --check \
 
 FROM ${PYTHON_IMAGE} AS runtime
 
-RUN apt-get update \
+RUN apt-get -o Acquire::Retries=0 update \
+    && apt-get -o Acquire::Retries=0 install -y --no-install-recommends --only-upgrade \
+        apt=2.6.2 \
+        libapt-pkg6.0=2.6.2 \
     && apt-get install -y --no-install-recommends libgomp1 \
     && apt-get install -y --no-install-recommends --only-upgrade \
         libpcre2-8-0=10.42-1+deb12u2 \
